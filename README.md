@@ -1,11 +1,20 @@
 # eio-fs
 
-An in-memory filesystem for [Eio](https://github.com/ocaml-multicore/eio).
+Filesystem helpers and an in-memory [Eio](https://github.com/ocaml-multicore/eio)
+backend.
 
-`Eio_fs.Fs.v ()` builds an `Eio.Fs.dir_ty Eio.Path.t` that lives entirely
-in memory, so any code written against the `Eio.Path` API runs against it
-unchanged -- no block device, no host filesystem. `Eio_fs.Fs.load`
-replicates a real directory tree into it.
+The library works with the standard `Eio.Path` interface. `Eio_fs.Fs.v ()`
+creates a fresh filesystem in memory, `Eio_fs.Fs.load` populates it from an
+existing directory tree, and `Eio_fs.Fs.tree` renders any `Eio.Path` tree.
+
+## Installation
+
+<!-- $MDX skip -->
+```sh
+opam install eio-fs
+```
+
+## Usage
 
 ```ocaml
 Eio_main.run @@ fun _env ->
@@ -14,14 +23,14 @@ Eio.Path.save ~create:(`Or_truncate 0o644) Eio.Path.(fs / "hello") "world";
 assert (Eio.Path.load Eio.Path.(fs / "hello") = "world")
 ```
 
-It is the diskless analogue of a block-backed `Eio.Path` such as
-`notafs`: unikernels and tests get a working repository or scratch tree
-with no storage backend.
+The in-memory provider is useful for tests and for scratch filesystems in
+unikernels: application code receives an ordinary `Eio.Path` and does not need
+to know which backend supplies it.
 
 ## Provenance
 
 Adapted from Patrick Ferris's
 [eio_mem](https://tangled.org/patrick.sirref.org/eio_mem), which is itself
-derived from the Eio filesystem interfaces. `lib/path.ml` is a POSIX-only
-modification of [fpath](https://github.com/dbuenzli/fpath). All are ISC
-licensed; see `LICENSE.md`.
+derived from the Eio filesystem interfaces. Its path handling also derives from
+[fpath](https://github.com/dbuenzli/fpath). All are ISC licensed; see
+`LICENSE.md`.

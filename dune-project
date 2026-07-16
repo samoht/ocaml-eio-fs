@@ -15,14 +15,13 @@
 
 (package
  (name eio-fs)
- (synopsis "In-memory filesystem for Eio")
+ (synopsis "Filesystem helpers and an in-memory backend for Eio")
  (tags (org:blacksun system))
  (description
-  "An in-memory Eio.Fs backend: [Eio_fs.Fs.make ()] builds an
-   [Eio.Fs.dir_ty Eio.Path.t] that lives entirely in memory, so any code
-   written against the [Eio.Path] API runs against it unchanged -- no block
-   device, no host filesystem. [Eio_fs.Fs.load] replicates a real directory
-   tree into it. Adapted from Patrick Ferris's eio_mem
+  "Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
+   [Eio_fs.Fs.v ()] creates a fresh filesystem, [Eio_fs.Fs.load] populates it
+   from an existing directory tree, and [Eio_fs.Fs.tree] renders a filesystem
+   tree. Adapted from Patrick Ferris's eio_mem
    (https://tangled.org/patrick.sirref.org/eio_mem), which is itself derived
    from the Eio filesystem interfaces.")
  (depends
