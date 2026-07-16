@@ -626,8 +626,45 @@ module Crash = struct
   }
 
   type entry = { efs : fstate; change : change; seq : int }
-  type unsynced = { path : string; offset : int; length : int; seq : int }
+
+  (* What kind of un-synced change a journal entry records, as seen by a
+     scripted survival predicate. *)
+  type op_kind =
+    | Data
+    | Create
+    | Mkdir
+    | Unlink
+    | Rmdir
+    | Symlink of { target : string }
+    | Rename of { dest : string }
+
+  type unsynced = {
+    path : string;
+    kind : op_kind;
+    offset : int;
+    length : int;
+    seq : int;
+  }
   (* An un-synced change, as seen by a scripted survival predicate. *)
+
+  (* Directory durability is represented by snapshots of the wrapped tree.
+     This deliberately favours a small, exact reference model over efficiency:
+     metadata operations are rare in the workloads this wrapper tests, and a
+     complete snapshot makes rename rollback (including replaced subtrees)
+     atomic and unambiguous. File contents are normalised separately from the
+     per-file durability log below. *)
+  type tree =
+    | File of { data : Cstruct.t; perm : int }
+    | Dir of { perm : int; entries : (string * tree) list }
+    | Link of string
+
+  type location = fstate * boxed * string
+
+  type metadata_entry = {
+    meta : unsynced;
+    tree : tree;
+    locations : location list;
+  }
 
   (** How the post-crash image reconstructs from the un-synced writes. *)
   type policy =
@@ -663,6 +700,9 @@ module Crash = struct
     mutable base : base_dir option;
     files : (string, fstate) Hashtbl.t;
     mutable log : entry list; (* newest first *)
+    mutable metadata : metadata_entry list; (* newest first *)
+    mutable durable_tree : tree option;
+    mutable durable_locations : location list;
     mutable seq : int;
     mutable ops : int;
     mutable crashed : bool;
@@ -678,10 +718,20 @@ module Crash = struct
   let to_unsynced e =
     match e.change with
     | Write { offset; data } ->
-        { path = e.efs.rel; offset; length = Cstruct.length data; seq = e.seq }
-    | Truncate n -> { path = e.efs.rel; offset = n; length = 0; seq = e.seq }
+        {
+          path = e.efs.rel;
+          kind = Data;
+          offset;
+          length = Cstruct.length data;
+          seq = e.seq;
+        }
+    | Truncate n ->
+        { path = e.efs.rel; kind = Data; offset = n; length = 0; seq = e.seq }
 
-  let unsynced ctl = List.rev_map to_unsynced ctl.log
+  let unsynced ctl =
+    let data = List.map to_unsynced ctl.log in
+    let metadata = List.map (fun e -> e.meta) ctl.metadata in
+    List.sort (fun a b -> Int.compare a.seq b.seq) (data @ metadata)
 
   let apply buf = function
     | Write { offset; data } -> grow_blit buf ~offset data
@@ -712,6 +762,86 @@ module Crash = struct
     if Cstruct.length content > 0 then
       Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ content ]
 
+  let rec snapshot_at (Base_dir ((module B), bv) as owner) path =
+    match B.stat bv ~follow:false path with
+    | { kind = `Regular_file; perm; _ } ->
+        let data =
+          Switch.run (fun sw -> read_all (B.open_in bv ~sw path)) |> copy_cs
+        in
+        File { data; perm }
+    | { kind = `Directory; perm; _ } ->
+        let entries =
+          B.read_dir bv path |> List.sort String.compare
+          |> List.map (fun name ->
+              let child =
+                if path = "" then name else Filename.concat path name
+              in
+              (name, snapshot_at owner child))
+        in
+        Dir { perm; entries }
+    | { kind = `Symbolic_link; _ } -> Link (B.read_link bv path)
+    | _ -> invalid_arg "Chaos.Crash: unsupported filesystem entry"
+
+  let rec remove_at (Base_dir ((module B), bv) as owner) path =
+    match B.stat bv ~follow:false path with
+    | exception Eio.Io _ -> ()
+    | { kind = `Directory; _ } ->
+        B.read_dir bv path
+        |> List.iter (fun name ->
+            let child = if path = "" then name else Filename.concat path name in
+            remove_at owner child);
+        if path <> "" then B.rmdir bv path
+    | _ -> B.unlink bv path
+
+  let rec restore_at (Base_dir ((module B), bv) as owner) path = function
+    | File { data; perm } ->
+        Switch.run @@ fun sw ->
+        let f =
+          B.open_out bv ~sw ~append:false ~create:(`Or_truncate perm) path
+        in
+        if Cstruct.length data > 0 then
+          Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ];
+        B.chmod bv ~follow:true ~perm path
+    | Link target -> B.symlink ~link_to:target bv path
+    | Dir { perm; entries } ->
+        if path <> "" then B.mkdir bv ~perm path;
+        List.iter
+          (fun (name, child) ->
+            let child_path =
+              if path = "" then name else Filename.concat path name
+            in
+            restore_at owner child_path child)
+          entries
+
+  let restore_root owner tree =
+    remove_at owner "";
+    restore_at owner "" tree
+
+  let locations ctl =
+    Hashtbl.fold (fun _ fs acc -> (fs, fs.owner, fs.rel) :: acc) ctl.files []
+
+  let root ctl =
+    match ctl.base with
+    | Some (base, _) -> box_dir (base :> Eio.Fs.dir_ty r)
+    | None -> invalid_arg "Chaos.Crash: controller was never wrapped"
+
+  let metadata_unsynced ~path ~kind ~seq =
+    { path; kind; offset = 0; length = 0; seq }
+
+  let record_metadata ctl ~path ~kind =
+    ctl.seq <- ctl.seq + 1;
+    let owner = root ctl in
+    let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
+    ctl.metadata <-
+      { meta; tree = snapshot_at owner ""; locations = locations ctl }
+      :: ctl.metadata
+
+  let commit_metadata ctl =
+    let owner = root ctl in
+    ctl.durable_tree <- Some (snapshot_at owner "");
+    ctl.durable_locations <- locations ctl;
+    ctl.metadata <- []
+
   let do_crash ctl =
     if not ctl.crashed then begin
       ctl.crashed <- true;
@@ -719,7 +849,7 @@ module Crash = struct
         List.rev ctl.log
         (* program order *)
       in
-      let survivors =
+      let data_survivors =
         match ctl.policy with
         | Drop_unsynced -> []
         | Survive pred -> List.filter (fun e -> pred (to_unsynced e)) ordered
@@ -728,20 +858,45 @@ module Crash = struct
             let kept = List.filter (fun _ -> Random.State.bool rng) ordered in
             shuffle rng kept
       in
-      Hashtbl.iter
-        (fun _ fs ->
-          (* A file with no pending change since its last sync already holds
-             exactly its durable content on disk; leave it untouched. *)
-          if List.exists (fun e -> e.efs == fs) ordered then begin
-            let changes =
-              List.filter_map
-                (fun e -> if e.efs == fs then Some e.change else None)
-                survivors
-            in
-            let content = List.fold_left apply (copy_cs fs.durable) changes in
-            rewrite fs content
-          end)
-        ctl.files
+      let ordered_metadata = List.rev ctl.metadata in
+      let rec take_prefix pred = function
+        | x :: xs when pred x -> x :: take_prefix pred xs
+        | _ -> []
+      in
+      let metadata_survivors =
+        match ctl.policy with
+        | Drop_unsynced -> []
+        | Survive pred -> take_prefix (fun e -> pred e.meta) ordered_metadata
+        | Reorder_unsynced seed ->
+            let rng = Random.State.make [| seed; 0x4d455441 |] in
+            take_prefix (fun _ -> Random.State.bool rng) ordered_metadata
+      in
+      let tree, locs =
+        match List.rev metadata_survivors with
+        | e :: _ -> (e.tree, e.locations)
+        | [] -> (
+            match ctl.durable_tree with
+            | Some tree -> (tree, ctl.durable_locations)
+            | None -> assert false)
+      in
+      let owner = root ctl in
+      restore_root owner tree;
+      List.iter
+        (fun (fs, owner, rel) ->
+          let changes =
+            List.filter_map
+              (fun e -> if e.efs == fs then Some e.change else None)
+              data_survivors
+          in
+          let content = List.fold_left apply (copy_cs fs.durable) changes in
+          let (Base_dir ((module B), bv)) = owner in
+          match B.stat bv ~follow:false rel with
+          | { kind = `Regular_file; _ } ->
+              fs.owner <- owner;
+              fs.rel <- rel;
+              rewrite fs content
+          | _ | (exception Eio.Io _) -> ())
+        locs
     end
 
   (* Advance the durability op counter and fire the configured auto-trigger. *)
@@ -757,6 +912,12 @@ module Crash = struct
           && file_offset < offset + len
     in
     if fire && not ctl.crashed then do_crash ctl
+
+  let bump_metadata ctl =
+    ctl.ops <- ctl.ops + 1;
+    match ctl.trigger with
+    | Nth_op n when ctl.ops >= n && not ctl.crashed -> do_crash ctl
+    | Manual | After_write _ | Nth_op _ -> ()
 
   (* One record backs both file wrappers. [cfs] is present exactly for a
      read-write file (the tracked durability state); reads work on either. *)
@@ -1091,6 +1252,9 @@ module Crash = struct
   let crash ctl = do_crash ctl
   let is_crashed ctl = ctl.crashed
 
+  (* TODO: implement the metadata journal commit (spec: chaos.mli). *)
+  let sync_metadata _ = failwith "TODO: implement Crash.sync_metadata"
+
   let post_crash ctl =
     do_crash ctl;
     match ctl.base with
@@ -1098,5 +1262,13 @@ module Crash = struct
     | None -> invalid_arg "Chaos.Crash.post_crash: controller was never wrapped"
 
   let pp_unsynced ppf u =
-    Fmt.pf ppf "%s @%d+%d #%d" u.path u.offset u.length u.seq
+    match u.kind with
+    | Data -> Fmt.pf ppf "%s @%d+%d #%d" u.path u.offset u.length u.seq
+    | Create -> Fmt.pf ppf "create %s #%d" u.path u.seq
+    | Mkdir -> Fmt.pf ppf "mkdir %s #%d" u.path u.seq
+    | Unlink -> Fmt.pf ppf "unlink %s #%d" u.path u.seq
+    | Rmdir -> Fmt.pf ppf "rmdir %s #%d" u.path u.seq
+    | Symlink { target } ->
+        Fmt.pf ppf "symlink %s -> %s #%d" u.path target u.seq
+    | Rename { dest } -> Fmt.pf ppf "rename %s -> %s #%d" u.path dest u.seq
 end

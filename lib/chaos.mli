@@ -130,30 +130,66 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     pointer write that became durable before the data it references, because no
     barrier separated them.
 
+    {b Directory operations are journaled.} File creation, [mkdir], [unlink],
+    [rmdir], [symlink] and [rename] enter a metadata journal in program order.
+    The journal commits -- every pending directory operation becomes durable --
+    on any successful {!Eio.File.sync} through the wrapper (as a journaling
+    filesystem commits its transaction on fsync) and on an explicit
+    {!sync_metadata}, the model's stand-in for the directory-fsync barrier that
+    Eio cannot express. At a crash the policy decides how much of the
+    uncommitted journal suffix survives; survival is always a {e prefix} of
+    program order, because metadata commits in order. A dropped operation is
+    rolled back in the post-crash image: a dropped creation removes the file, a
+    dropped unlink restores it with its durable content, a dropped rename moves
+    the file back and restores any entry it replaced -- whole, never a mixture.
+
     The crash rewrite reaches every tracked file through the directory given to
     {!Crash.wrap}, so a file staged through a short-lived subtree
     ({!Eio.Path.with_open_dir}) is rewritten even after that subtree is closed.
     A file created read-only is rewritten too, and keeps its mode. *)
 module Crash : sig
-  type unsynced = { path : string; offset : int; length : int; seq : int }
-  (** An un-synced change: {!field-path} as opened, byte {!field-offset} and
-      {!field-length} of the write (a truncation reports {!field-offset} = new
-      length, {!field-length} = 0), and the program-order sequence number
+  (** What kind of un-synced change a journal entry records. *)
+  type op_kind =
+    | Data  (** A write or truncation; offset and length locate it. *)
+    | Create  (** The open that created the file. *)
+    | Mkdir
+    | Unlink
+    | Rmdir
+    | Symlink of { target : string }  (** A new symlink to [target]. *)
+    | Rename of { dest : string }  (** An entry move to [dest]. *)
+
+  type unsynced = {
+    path : string;
+    kind : op_kind;
+    offset : int;
+    length : int;
+    seq : int;
+  }
+  (** An un-synced change: {!field-path} as opened, the {!field-kind} of change,
+      byte {!field-offset} and {!field-length} of a {!Data} write (a truncation
+      reports {!field-offset} = new length, {!field-length} = 0; directory
+      operations report both as [0]), and the program-order sequence number
       {!field-seq}. *)
 
-  (** How the post-crash image reconstructs from the un-synced writes. *)
+  (** How the post-crash image reconstructs from the un-synced changes. *)
   type policy =
     | Drop_unsynced
-        (** Every un-synced write is lost; only synced data survives. *)
+        (** Every un-synced write is lost and every uncommitted directory
+            operation is rolled back; only committed state survives. *)
     | Reorder_unsynced of int
         (** Seeded: each un-synced write survives on an even coin and the
             survivors are applied in a seeded-shuffled order, so a later write
-            may land while an earlier one is lost. The [int] is the seed; the
-            same seed and workload reproduce the same image. *)
+            may land while an earlier one is lost. Uncommitted directory
+            operations survive as a seeded-length prefix of program order --
+            metadata never reorders. The [int] is the seed; the same seed and
+            workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
-            survivors keep program order. Pins an exact scenario -- for example
-            keep a generation pointer but drop the data block it references. *)
+            survivors keep program order. An uncommitted directory operation
+            survives iff the predicate holds for it {e and} every earlier
+            uncommitted directory operation survived (the prefix rule). Pins an
+            exact scenario -- for example keep a generation pointer but drop the
+            data block it references. *)
 
   (** When a crash fires while the workload runs. *)
   type trigger =
@@ -162,7 +198,8 @@ module Crash : sig
         (** Crash right after the write covering [file_offset] on [path]
             commits, before any following sync. *)
     | Nth_op of int
-        (** Crash on the [n]th durability op (writes and syncs, 1-based). *)
+        (** Crash on the [n]th durability op (writes, syncs and directory
+            operations, 1-based). *)
 
   type t
   (** A crash controller: tracks durability across the files opened through it
@@ -195,8 +232,15 @@ module Crash : sig
       re-mounts and re-reads through. Raises [Invalid_argument] if [t] was never
       {!wrap}ped. *)
 
+  val sync_metadata : t -> unit
+  (** [sync_metadata t] commits the metadata journal: every pending directory
+      operation becomes durable, as fsync(2) on the enclosing directories would
+      make it. The model's stand-in for the directory-fsync barrier Eio cannot
+      express; a store whose recovery depends on directory-entry durability
+      calls this wherever production code fsyncs a directory. *)
+
   val unsynced : t -> unsynced list
-  (** [unsynced t] lists the writes not yet made durable, in program order. *)
+  (** [unsynced t] lists the changes not yet made durable, in program order. *)
 
   val pp_unsynced : unsynced Fmt.t
   (** [pp_unsynced] formats an un-synced change for logs and test failures. *)

@@ -279,16 +279,20 @@ let with_crash ctl fn =
   let fs = Crash.wrap ctl raw in
   fn ~raw ~fs
 
-(* A write with no intervening sync is lost after a crash. *)
+let absent p = Eio.Path.kind ~follow:false p = `Not_found
+
+(* A write with no intervening sync is lost after a crash -- and so is the
+   file itself: its creation is an uncommitted directory operation, so no
+   empty ghost file lingers. *)
 let test_crash_unsynced_lost () =
   let ctl = Crash.v ~policy:Drop_unsynced () in
   with_crash ctl @@ fun ~raw:_ ~fs ->
   Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
       Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ]);
   let post = Crash.post_crash ctl in
-  Alcotest.(check string)
-    "unsynced write lost after crash" ""
-    (Eio.Path.load (post / "img"))
+  Alcotest.(check bool)
+    "uncommitted file gone after crash" true
+    (absent (post / "img"))
 
 (* A write followed by a sync survives a crash. *)
 let test_crash_synced_survives () =
@@ -364,7 +368,8 @@ let reorder_image seed =
           [ Fmt.kstr Cstruct.of_string "%08d" i ]
       done);
   let post = Crash.post_crash ctl in
-  Eio.Path.load (post / "img")
+  (* the creation itself may not survive the seeded journal cut *)
+  try Eio.Path.load (post / "img") with Eio.Io _ -> "<absent>"
 
 let test_crash_determinism () =
   Alcotest.(check string)
@@ -468,6 +473,243 @@ let test_crash_readonly_in_closed_subtree () =
     "mode preserved" 0o444
     (Eio.Path.stat ~follow:true (post / "stage" / "img")).perm
 
+(* {2 Directory-operation durability}
+
+   Directory operations -- file creation, mkdir, unlink, rmdir, symlink,
+   rename -- are journaled in program order and commit on any successful file
+   sync or an explicit [sync_metadata] (the stand-in for a directory fsync).
+   A crash rolls back the uncommitted suffix, whole. The spec is the journal
+   model in chaos.mli. *)
+
+(* An unlink committed by the metadata barrier stays deleted: the crash must
+   not resurrect the file from its tracked durable content. *)
+let test_crash_committed_unlink_stays_deleted () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio.Path.unlink (fs / "f");
+  Crash.sync_metadata ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "committed unlink stays deleted" true
+    (absent (post / "f"))
+
+(* An unlink that never committed rolls back: the file reappears with its
+   durable content, exactly as a lost directory update leaves it on disk. *)
+let test_crash_uncommitted_unlink_rolls_back () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio.Path.unlink (fs / "f");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "uncommitted unlink rolled back" "data"
+    (Eio.Path.load (post / "f"))
+
+(* The tmp-file-then-rename commit protocol with no barrier after the rename:
+   the swap reverts whole. The file is back at the temporary path, the final
+   path is absent -- never a mixture, never both. *)
+let test_crash_uncommitted_rename_reverts () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "tmp") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "NEW" ];
+      Eio.File.sync file);
+  Eio.Path.rename (fs / "tmp") (fs / "final");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "file back at the temporary path" "NEW"
+    (Eio.Path.load (post / "tmp"));
+  Alcotest.(check bool)
+    "final path absent after reverted swap" true
+    (absent (post / "final"))
+
+(* The same protocol with the barrier: [sync_metadata] after the rename pins
+   the swap, exactly as fsyncing the parent directory would. *)
+let test_crash_sync_metadata_commits_rename () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "tmp") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "NEW" ];
+      Eio.File.sync file);
+  Eio.Path.rename (fs / "tmp") (fs / "final");
+  Crash.sync_metadata ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "committed swap survives" "NEW"
+    (Eio.Path.load (post / "final"));
+  Alcotest.(check bool)
+    "temporary path gone after committed swap" true
+    (absent (post / "tmp"))
+
+(* A reverted rename restores the entry it replaced: the old target contents
+   come back, and the source keeps its bytes at its original path. *)
+let test_crash_reverted_rename_restores_victim () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "final") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "OLD" ];
+      Eio.File.sync file);
+  Crash.sync_metadata ctl;
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "tmp") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "NEW" ];
+      Eio.File.sync file);
+  Eio.Path.rename (fs / "tmp") (fs / "final");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "clobbered target restored" "OLD"
+    (Eio.Path.load (post / "final"));
+  Alcotest.(check string)
+    "source back at its path" "NEW"
+    (Eio.Path.load (post / "tmp"))
+
+(* An uncommitted mkdir takes its whole subtree with it: the directory and the
+   file created inside both vanish, since neither entry ever became durable. *)
+let test_crash_uncommitted_mkdir_vanishes () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "d" / "f")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool) "uncommitted directory gone" true (absent (post / "d"))
+
+(* A file sync commits the journal, as fsync commits a filesystem journal
+   transaction: the mkdir and the creation before it become durable too. *)
+let test_crash_file_sync_commits_mkdir () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "d" / "f")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ];
+      Eio.File.sync file);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "file sync committed the enclosing mkdir" "x"
+    (Eio.Path.load (post / "d" / "f"))
+
+(* An uncommitted symlink vanishes at the crash. *)
+let test_crash_uncommitted_symlink_vanishes () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.symlink ~link_to:"target" (fs / "lnk");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool) "uncommitted symlink gone" true (absent (post / "lnk"))
+
+(* The current-pointer swap of a release store: replacing a committed symlink
+   through a temporary name reverts whole when uncommitted -- the old pointer
+   target is served, and the temporary never lingers. *)
+let test_crash_symlink_swap_reverts () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.symlink ~link_to:"releases/a" (fs / "current");
+  Crash.sync_metadata ctl;
+  Eio.Path.symlink ~link_to:"releases/b" (fs / ".tmp");
+  Eio.Path.rename (fs / ".tmp") (fs / "current");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "old pointer target restored" "releases/a"
+    (Eio.Path.read_link (post / "current"));
+  Alcotest.(check bool) "temporary symlink gone" true (absent (post / ".tmp"))
+
+(* An uncommitted rmdir rolls back: the (empty) directory reappears. *)
+let test_crash_uncommitted_rmdir_restored () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Crash.sync_metadata ctl;
+  Eio.Path.rmdir (fs / "d");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "uncommitted rmdir rolled back" true
+    (Eio.Path.kind ~follow:false (post / "d") = `Directory)
+
+(* A directory rename carries its tracked children. Uncommitted, the whole
+   subtree reverts to the staging path; committed, it lives at the final
+   path -- exactly the staging-directory publish of a release store. *)
+let test_crash_dir_rename_uncommitted_reverts () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "stage" / "img")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio.Path.rename (fs / "stage") (fs / "final");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "subtree back at the staging path" "data"
+    (Eio.Path.load (post / "stage" / "img"));
+  Alcotest.(check bool) "final directory absent" true (absent (post / "final"))
+
+let test_crash_dir_rename_committed_moves () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "stage" / "img")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio.Path.rename (fs / "stage") (fs / "final");
+  Crash.sync_metadata ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "subtree at the final path" "data"
+    (Eio.Path.load (post / "final" / "img"));
+  Alcotest.(check bool)
+    "staging directory absent" true
+    (absent (post / "stage"))
+
+(* Metadata survival is a prefix of program order: refusing an early directory
+   op drops everything after it, even ops the predicate would accept, because
+   a journal never commits out of order. *)
+let test_crash_survive_prefix_rule () =
+  let pred (u : Crash.unsynced) =
+    match u.kind with Crash.Mkdir -> false | _ -> true
+  in
+  let ctl = Crash.v ~policy:(Crash.Survive pred) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "d" / "f")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "rejected mkdir cuts the journal before the accepted create" true
+    (absent (post / "d"))
+
+(* Directory operations count as durability ops for the [Nth_op] trigger. *)
+let test_crash_nth_op_counts_dir_ops () =
+  let ctl = Crash.v ~policy:Drop_unsynced ~trigger:(Crash.Nth_op 1) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Alcotest.(check bool) "mkdir fired the trigger" true (Crash.is_crashed ctl)
+
+(* The pending-change listing names directory operations in program order. *)
+let test_crash_unsynced_lists_dir_ops () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "d" / "f")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "xyz" ]);
+  let kinds = List.map (fun u -> u.Crash.kind) (Crash.unsynced ctl) in
+  Alcotest.(check bool)
+    "journal lists mkdir, create, data in program order" true
+    (kinds = [ Crash.Mkdir; Crash.Create; Crash.Data ])
+
 (* {2 The same hazards against the real filesystem}
 
    The kernel is the authority on EACCES and fd invalidation; the in-memory
@@ -531,6 +773,26 @@ let test_crash_closed_subtree_real () =
         "real fs: mode preserved" 0o444
         (Eio.Path.stat ~follow:true (post / "stage" / "img")).perm)
 
+(* The kernel-side variant of the reverted tmp-rename: the rollback must
+   physically undo a rename on the real filesystem. *)
+let test_crash_rename_revert_real () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "tmp")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "NEW" ];
+          Eio.File.sync file);
+      Eio.Path.rename (fs / "tmp") (fs / "final"))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "real fs: file back at the temporary path" "NEW"
+        (Eio.Path.load (post / "tmp"));
+      Alcotest.(check bool)
+        "real fs: final path absent" true
+        (absent (post / "final")))
+
 (* An [After_write] trigger crashes the moment the covering write commits; the
    next op through the wrapper fails, and the unsynced block is lost. *)
 let test_crash_after_write_trigger () =
@@ -551,9 +813,9 @@ let test_crash_after_write_trigger () =
    with Eio.Io _ -> ());
   Alcotest.(check bool) "crash fired on the write" true (Crash.is_crashed ctl);
   let post = Crash.post_crash ctl in
-  Alcotest.(check string)
-    "unsynced block lost after auto-crash" ""
-    (Eio.Path.load (post / "img"))
+  Alcotest.(check bool)
+    "uncommitted file gone after auto-crash" true
+    (absent (post / "img"))
 
 let suite =
   ( "chaos",
@@ -595,4 +857,36 @@ let suite =
         test_crash_readonly_real;
       Alcotest.test_case "crash: closed subtree (real fs)" `Quick
         test_crash_closed_subtree_real;
+      Alcotest.test_case "crash: committed unlink stays deleted" `Quick
+        test_crash_committed_unlink_stays_deleted;
+      Alcotest.test_case "crash: uncommitted unlink rolls back" `Quick
+        test_crash_uncommitted_unlink_rolls_back;
+      Alcotest.test_case "crash: uncommitted rename reverts" `Quick
+        test_crash_uncommitted_rename_reverts;
+      Alcotest.test_case "crash: sync_metadata commits rename" `Quick
+        test_crash_sync_metadata_commits_rename;
+      Alcotest.test_case "crash: reverted rename restores victim" `Quick
+        test_crash_reverted_rename_restores_victim;
+      Alcotest.test_case "crash: uncommitted mkdir vanishes" `Quick
+        test_crash_uncommitted_mkdir_vanishes;
+      Alcotest.test_case "crash: file sync commits mkdir" `Quick
+        test_crash_file_sync_commits_mkdir;
+      Alcotest.test_case "crash: uncommitted symlink vanishes" `Quick
+        test_crash_uncommitted_symlink_vanishes;
+      Alcotest.test_case "crash: symlink swap reverts" `Quick
+        test_crash_symlink_swap_reverts;
+      Alcotest.test_case "crash: uncommitted rmdir restored" `Quick
+        test_crash_uncommitted_rmdir_restored;
+      Alcotest.test_case "crash: dir rename uncommitted reverts" `Quick
+        test_crash_dir_rename_uncommitted_reverts;
+      Alcotest.test_case "crash: dir rename committed moves" `Quick
+        test_crash_dir_rename_committed_moves;
+      Alcotest.test_case "crash: survive prefix rule" `Quick
+        test_crash_survive_prefix_rule;
+      Alcotest.test_case "crash: nth-op counts dir ops" `Quick
+        test_crash_nth_op_counts_dir_ops;
+      Alcotest.test_case "crash: unsynced lists dir ops" `Quick
+        test_crash_unsynced_lists_dir_ops;
+      Alcotest.test_case "crash: rename revert (real fs)" `Quick
+        test_crash_rename_revert_real;
     ] )
