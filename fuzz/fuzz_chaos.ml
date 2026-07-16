@@ -65,11 +65,23 @@ let run_workload ~seed ~probability ~nblocks ~block ~read_only ~via_subtree =
 let outcome : (string * string) printer =
  fun ppf (o, c) -> Fmt.pf ppf "%s/%dB" o (String.length c)
 
+(* The adversarial dimensions of a release store, as variants so a fuzzed case
+   reads as what it drives rather than a row of booleans. *)
+type access = Writable | Read_only
+type placement = Direct | Via_subtree
+type reopen = No_reopen | Trunc_reopen
+
+let access_gen = map [ bool ] (fun b -> if b then Read_only else Writable)
+let placement_gen = map [ bool ] (fun b -> if b then Via_subtree else Direct)
+let reopen_gen = map [ bool ] (fun b -> if b then Trunc_reopen else No_reopen)
+
 (* [prob_pct] in 0..100, [nblocks] in 1..16, [block] in 1..256; [seed] is any
    int (negatives seed the PRNG just as well). *)
-let test_crash_safety_and_determinism seed prob_pct nblocks block read_only
-    via_subtree =
+let test_crash_safety_and_determinism seed prob_pct nblocks block access
+    placement =
   let probability = float_of_int prob_pct /. 100. in
+  let read_only = access = Read_only
+  and via_subtree = placement = Via_subtree in
   let a =
     run_workload ~seed ~probability ~nblocks ~block ~read_only ~via_subtree
   in
@@ -138,28 +150,31 @@ let image_and_mode : (string * int) printer =
    is gone -- including anything a truncating reopen did after the barrier.
    Synced data can never be lost, un-synced data never lingers, and the file
    keeps its mode whether or not it was writable. *)
-let test_crash_barrier _seed nblocks block sync_after read_only via_subtree
-    trunc_reopen =
+let test_crash_barrier _seed nblocks block sync_after access placement reopen =
   let sync_after = sync_after - 1 in
   let got =
     post_crash_image ~policy:Drop_unsynced ~nblocks ~block ~sync_after
-      ~read_only ~via_subtree ~trunc_reopen
+      ~read_only:(access = Read_only) ~via_subtree:(placement = Via_subtree)
+      ~trunc_reopen:(reopen = Trunc_reopen)
   in
   let k = synced_count ~nblocks ~sync_after in
   let expected =
     String.concat ""
       (List.init k (fun i -> String.make block (Char.chr (i land 0xff))))
   in
-  let mode = if read_only then 0o444 else 0o644 in
+  let mode = match access with Read_only -> 0o444 | Writable -> 0o644 in
   check_eq ~pp:image_and_mode ~eq:( = ) got (expected, mode)
 
 (* {b Determinism.} The same seed, workload and barrier reproduce the exact same
    post-crash image under the seeded drop/reorder policy, whatever the file's
    mode and staging path. *)
-let test_crash_determinism seed nblocks block sync_after read_only via_subtree
-    trunc_reopen =
+let test_crash_determinism seed nblocks block sync_after access placement reopen
+    =
   let sync_after = sync_after - 1 in
   let policy = Crash.Reorder_unsynced seed in
+  let read_only = access = Read_only
+  and via_subtree = placement = Via_subtree
+  and trunc_reopen = reopen = Trunc_reopen in
   let a =
     post_crash_image ~policy ~nblocks ~block ~sync_after ~read_only ~via_subtree
       ~trunc_reopen
@@ -174,12 +189,35 @@ let suite =
   ( "chaos",
     [
       test_case "crash-safety and determinism"
-        [ int; range 101; range ~min:1 16; range ~min:1 256; bool; bool ]
+        [
+          int;
+          range 101;
+          range ~min:1 16;
+          range ~min:1 256;
+          access_gen;
+          placement_gen;
+        ]
         test_crash_safety_and_determinism;
       test_case "crash barrier invariant"
-        [ int; range ~min:1 16; range ~min:1 64; range 18; bool; bool; bool ]
+        [
+          int;
+          range ~min:1 16;
+          range ~min:1 64;
+          range 18;
+          access_gen;
+          placement_gen;
+          reopen_gen;
+        ]
         test_crash_barrier;
       test_case "crash post-image determinism"
-        [ int; range ~min:1 16; range ~min:1 64; range 18; bool; bool; bool ]
+        [
+          int;
+          range ~min:1 16;
+          range ~min:1 64;
+          range 18;
+          access_gen;
+          placement_gen;
+          reopen_gen;
+        ]
         test_crash_determinism;
     ] )
