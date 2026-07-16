@@ -25,3 +25,11 @@ val sync_dir : _ Eio.Path.t -> unit
 
     @raise Unix.Unix_error as [open] or [fsync].
     @raise Invalid_argument if [dir] has no native path. *)
+
+val sync_dir_if_native : _ Eio.Path.t -> unit
+(** [sync_dir_if_native dir] is {!sync_dir} when [dir] has a native path, and
+    nothing otherwise: a backend with no native representation (an in-memory
+    tree) offers no durability barrier and, being volatile, needs none. The
+    default for a store that must also run over in-memory backends in tests; a
+    store that only ever runs on a real filesystem prefers the strict
+    {!sync_dir}. Real barrier failures still raise. *)

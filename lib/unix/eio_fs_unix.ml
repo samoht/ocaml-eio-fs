@@ -5,3 +5,5 @@ external full_fsync : Unix.file_descr -> unit = "caml_eio_fs_full_fsync"
 let sync_dir p =
   let fd = Unix.openfile (Eio.Path.native_exn p) [ Unix.O_RDONLY ] 0 in
   Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> full_fsync fd)
+
+let sync_dir_if_native p = if Option.is_some (Eio.Path.native p) then sync_dir p
