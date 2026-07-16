@@ -1,0 +1,3 @@
+(cram
+ (deps %{bin:eio-fs-crunch})
+ (setup_scripts setup.sh))

@@ -195,15 +195,36 @@ module Symlink = struct
 end
 
 module File = struct
+  (* [Literal] aliases an immutable string (an embedded asset) and is turned
+     into an owned [Buffer] by the first write, so embedding a file costs no
+     copy until someone mutates it. *)
+  type contents = Literal of string | Buffer of Cstruct.t
+
   type t = {
     stat : Eio.File.Stat.t;
     name : string;
-    contents : Cstruct.t;
+    contents : contents;
     pos : Optint.Int63.t;
   }
 
   let v ~stat name =
-    { stat; name; contents = Cstruct.empty; pos = Optint.Int63.zero }
+    { stat; name; contents = Buffer Cstruct.empty; pos = Optint.Int63.zero }
+
+  let literal ~stat name contents =
+    { stat; name; contents = Literal contents; pos = Optint.Int63.zero }
+
+  let length = function
+    | Literal s -> String.length s
+    | Buffer b -> Cstruct.length b
+
+  let buffer = function Literal s -> Cstruct.of_string s | Buffer b -> b
+
+  let blit t ~src_off dst ~dst_off ~len =
+    match t with
+    | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
+    | Buffer b -> Cstruct.blit b src_off dst dst_off len
+
+  let to_string = function Literal s -> s | Buffer b -> Cstruct.to_string b
 end
 
 module Fd_table = Map.Make (Fd)
@@ -224,7 +245,7 @@ module Resource = struct
     | File f ->
         Fmt.pf ppf "file:%s:[%a]" f.name
           Fmt.(truncated ~max:12)
-          (Cstruct.to_string f.contents)
+          (File.to_string f.contents)
     | Dir dir ->
         Fmt.pf ppf "dir:%s:%a" dir.name
           Fmt.(
@@ -263,12 +284,14 @@ let as_dir ~label = function
 let reset_file ~truncate ~append r =
   match !r with
   | Resource.File f ->
-      let contents = if truncate then Cstruct.empty else f.contents in
+      let contents =
+        if truncate then File.Buffer Cstruct.empty else f.contents
+      in
       let pos =
-        if append then Cstruct.length contents |> Optint.Int63.of_int
+        if append then File.length contents |> Optint.Int63.of_int
         else Optint.Int63.zero
       in
-      let size = Cstruct.length contents |> Optint.Int63.of_int in
+      let size = File.length contents |> Optint.Int63.of_int in
       let stat = { f.stat with size } in
       r := File { f with contents; stat; pos }
   | _ -> ()
@@ -632,6 +655,28 @@ let mkdirat dir_fd ~perm path =
     let r = Filesystem.lookup ~follow:true dir_fd dir in
     mkdir r base
 
+let embed dir_fd ~perm path ~contents =
+  let path = check_path path in
+  let add r name =
+    let stat =
+      {
+        (new_stat ~perm:(perm land 0o7777) ()) with
+        size = Optint.Int63.of_int (String.length contents);
+      }
+    in
+    let d = as_dir ~label:"embed" !r in
+    let f = File.literal ~stat name contents in
+    Filesystem.add_file stat.ino (ref (Resource.File f));
+    r := Dir { d with entries = (stat.ino, name) :: d.entries }
+  in
+  try
+    let _ = Filesystem.lookup ~follow:true dir_fd path in
+    Error.already_exists path
+  with Eio.Io (Eio.Fs.(E (Not_found _)), _) ->
+    let dir, base = dir_base path in
+    let r = Filesystem.lookup ~follow:true dir_fd dir in
+    add r base
+
 let symlinkat ~link_to dir_fd path =
   let path = check_path path in
   let symlink r name =
@@ -779,8 +824,10 @@ let writev fd bufs =
           (* We do it one buf at a time so we can simulate some concurrency... *)
           List.iter
             (fun buf ->
-              let contents = Cstruct.concat (e.contents :: [ buf ]) in
-              let new_size = Optint.Int63.of_int @@ Cstruct.length contents in
+              let contents =
+                File.Buffer (Cstruct.concat [ File.buffer e.contents; buf ])
+              in
+              let new_size = Optint.Int63.of_int @@ File.length contents in
               let stat = { e.stat with size = new_size } in
               r := File { e with stat; contents; pos = new_size };
               Eio.Fiber.yield ())
@@ -789,9 +836,11 @@ let writev fd bufs =
           (* Position is less than the size, so need to merge contents. *)
           let src = Cstruct.concat bufs in
           let contents =
-            blit_and_grow ~src ~dst:e.contents ~off:(Optint.Int63.to_int e.pos)
+            File.Buffer
+              (blit_and_grow ~src ~dst:(File.buffer e.contents)
+                 ~off:(Optint.Int63.to_int e.pos))
           in
-          let new_size = Optint.Int63.of_int @@ Cstruct.length contents in
+          let new_size = Optint.Int63.of_int @@ File.length contents in
           let stat = { e.stat with size = new_size } in
           let new_pos =
             Optint.Int63.add e.pos (Optint.Int63.of_int (Cstruct.length src))
@@ -815,7 +864,7 @@ let readv fd bufs =
             let len = Cstruct.length buf in
             let posi = Optint.Int63.to_int !pos in
             let actual_len = max 0 (min len (size - posi)) in
-            Cstruct.blit e.contents posi buf 0 actual_len;
+            File.blit e.contents ~src_off:posi buf ~dst_off:0 ~len:actual_len;
             pos := Optint.Int63.add !pos (Optint.Int63.of_int actual_len);
             read := !read + actual_len;
             Eio.Fiber.yield ())
@@ -832,7 +881,7 @@ let preadv fd ~file_offset bufs =
   match Fd_table.find_opt fd fds |> Option.map ( ! ) with
   | None -> Error.badf ()
   | Some (Resource.File e) ->
-      let size = Cstruct.length e.contents in
+      let size = File.length e.contents in
       let start = Optint.Int63.to_int file_offset in
       if start >= size then raise End_of_file
       else begin
@@ -842,7 +891,7 @@ let preadv fd ~file_offset bufs =
           (fun buf ->
             let len = Cstruct.length buf in
             let actual = max 0 (min len (size - !off)) in
-            Cstruct.blit e.contents !off buf 0 actual;
+            File.blit e.contents ~src_off:!off buf ~dst_off:0 ~len:actual;
             off := !off + actual;
             read := !read + actual)
           bufs;
@@ -860,8 +909,10 @@ let pwritev fd ~file_offset bufs =
     | Resource.File e ->
         let src = Cstruct.concat bufs in
         let off = Optint.Int63.to_int file_offset in
-        let contents = blit_and_grow ~src ~dst:e.contents ~off in
-        let new_size = Optint.Int63.of_int (Cstruct.length contents) in
+        let contents =
+          File.Buffer (blit_and_grow ~src ~dst:(File.buffer e.contents) ~off)
+        in
+        let new_size = Optint.Int63.of_int (File.length contents) in
         let stat = { e.stat with size = new_size } in
         r := Resource.File { e with contents; stat };
         written := Cstruct.length src
@@ -899,14 +950,13 @@ let truncate_fd fd len =
       match !r with
       | Resource.File e ->
           let target = Optint.Int63.to_int len in
-          let cur = Cstruct.length e.contents in
+          let cur = File.length e.contents in
           let contents =
             if target = cur then e.contents
-            else if target < cur then Cstruct.sub e.contents 0 target
             else begin
               let c = Cstruct.create target in
-              Cstruct.blit e.contents 0 c 0 cur;
-              c
+              File.blit e.contents ~src_off:0 c ~dst_off:0 ~len:(min cur target);
+              File.Buffer c
             end
           in
           let stat = { e.stat with size = Optint.Int63.of_int target } in

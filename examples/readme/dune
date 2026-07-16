@@ -1,0 +1,14 @@
+; The README's Crunch example runs against this library: static/ is crunched
+; at build time and the generated [Assets] module is linked into the mdx run.
+
+(rule
+ (targets assets.ml assets.mli)
+ (deps
+  (source_tree static))
+ (action
+  (run %{bin:eio-fs-crunch} -o assets.ml static)))
+
+(library
+ (name assets)
+ (modules assets)
+ (libraries eio-fs eio))

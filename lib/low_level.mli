@@ -49,6 +49,11 @@ val openat : mode:int -> sw:Eio.Switch.t -> Dir.fd -> string -> int -> Fd.t
 val mkdirat : Dir.fd -> perm:int -> string -> unit
 (** Create a directory relative to a directory descriptor. *)
 
+val embed : Dir.fd -> perm:int -> string -> contents:string -> unit
+(** [embed dir ~perm path ~contents] creates the regular file [path] whose
+    contents alias the immutable [contents] string: nothing is copied until the
+    file is first written to. The parent directory must exist. *)
+
 val unlink : Dir.fd -> string -> unit
 (** Remove a non-directory entry. *)
 

@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name eio-fs-crunch)
+ (package eio-fs)
+ (libraries eio_fs cmdliner eio eio_main fmt))

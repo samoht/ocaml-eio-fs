@@ -1,0 +1,14 @@
+; Exercises the generated code end to end: crunch the fixture tree at build
+; time, link the generated module and check the rebuilt filesystem.
+
+(rule
+ (targets assets.ml assets.mli)
+ (deps
+  (source_tree fixture))
+ (action
+  (run %{bin:eio-fs-crunch} -o assets.ml fixture)))
+
+(test
+ (name verify_assets)
+ (modules verify_assets assets)
+ (libraries eio_fs eio eio.mock alcotest))
