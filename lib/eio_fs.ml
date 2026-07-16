@@ -96,18 +96,11 @@ module Fs = struct
     let open_subtree t ~sw path = open_dir t ~sw path
     let pp f t = Fmt.string f (String.escaped t.label)
 
-    let native_internal t path =
-      if Filename.is_relative path then
-        let p =
-          if t.dir_path = "." then path else Filename.concat t.dir_path path
-        in
-        if p = "" then "."
-        else if p = "." then p
-        else if Filename.is_implicit p then "./" ^ p
-        else p
-      else path
-
-    let native t path = Some (native_internal t path)
+    (* An in-memory tree has no native path. Answering one would point callers
+       at an unrelated real location -- a native open of "./x" resolves
+       against the process cwd -- so a barrier or lock taken "natively" on an
+       in-memory directory would silently hit the real filesystem. *)
+    let native _ _ = None
   end
 
   and Handler : sig
@@ -157,7 +150,7 @@ module Fs = struct
     ()
 
   let tree ~depth =
-    let name path = Filename.basename (Eio.Path.native_exn path) in
+    let name (_, p) = Filename.basename p in
     let rec node depth path =
       match Eio.Path.kind ~follow:false path with
       | `Regular_file ->
