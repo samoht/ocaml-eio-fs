@@ -115,3 +115,84 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     [schedule]. Directory operations, reads, writes and syncs are delegated to
     [base] but perturbed according to the schedule; opened files and
     subdirectories stay wrapped and share [schedule]. *)
+
+(** A power-loss durability model layered over a base directory capability.
+
+    Every write is tracked as {e un-synced} until a successful {!Eio.File.sync}
+    on that file marks all its prior writes durable. A {e crash} rewrites the
+    base to a post-crash image in which un-synced writes may be dropped and/or
+    reordered relative to each other and to the sync barrier, while synced
+    writes are always durable and never move past their barrier. Reads and
+    writes are delegated to [base] unchanged while the workload runs, so its
+    live view stays consistent; the base is rewritten only at crash time.
+
+    This makes the classic missing-{!Eio.File.sync} hazard demonstrable: a
+    pointer write that became durable before the data it references, because no
+    barrier separated them. *)
+module Crash : sig
+  type unsynced = { path : string; offset : int; length : int; seq : int }
+  (** An un-synced change: {!field-path} as opened, byte {!field-offset} and
+      {!field-length} of the write (a truncation reports {!field-offset} = new
+      length, {!field-length} = 0), and the program-order sequence number
+      {!field-seq}. *)
+
+  (** How the post-crash image reconstructs from the un-synced writes. *)
+  type policy =
+    | Drop_unsynced
+        (** Every un-synced write is lost; only synced data survives. *)
+    | Reorder_unsynced of int
+        (** Seeded: each un-synced write survives on an even coin and the
+            survivors are applied in a seeded-shuffled order, so a later write
+            may land while an earlier one is lost. The [int] is the seed; the
+            same seed and workload reproduce the same image. *)
+    | Survive of (unsynced -> bool)
+        (** Scripted: an un-synced write survives iff the predicate holds;
+            survivors keep program order. Pins an exact scenario -- for example
+            keep a generation pointer but drop the data block it references. *)
+
+  (** When a crash fires while the workload runs. *)
+  type trigger =
+    | Manual  (** Only an explicit {!crash} (or {!post_crash}) fires it. *)
+    | After_write of { path : string; file_offset : int }
+        (** Crash right after the write covering [file_offset] on [path]
+            commits, before any following sync. *)
+    | Nth_op of int
+        (** Crash on the [n]th durability op (writes and syncs, 1-based). *)
+
+  type t
+  (** A crash controller: tracks durability across the files opened through it
+      and holds the crashed image after a crash. *)
+
+  type base_dir = Eio.Fs.dir_ty Eio.Path.t
+  (** The backing store handed back after a crash. *)
+
+  val v : ?policy:policy -> ?trigger:trigger -> unit -> t
+  (** [v ()] is a fresh controller. The policy defaults to {!Drop_unsynced} and
+      the trigger to {!Manual}. *)
+
+  val wrap : t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [wrap t base] is [base] with durability tracked by [t]. Files and
+      subdirectories opened through it stay wrapped and share [t]. *)
+
+  val crash : t -> unit
+  (** [crash t] triggers a crash now: it reconstructs the post-crash image per
+      {!policy} and rewrites the base to it. Idempotent -- a second call is a
+      no-op. After a crash, reads, writes and syncs through the wrapper fail
+      with an {!Eio.Io} exception ("power lost"); re-read through {!post_crash}.
+  *)
+
+  val is_crashed : t -> bool
+  (** [is_crashed t] is [true] once a crash has fired. *)
+
+  val post_crash : t -> base_dir
+  (** [post_crash t] crashes [t] if it has not already, then returns the base
+      directory over the crashed image -- a fresh, un-perturbed handle a test
+      re-mounts and re-reads through. Raises [Invalid_argument] if [t] was never
+      {!wrap}ped. *)
+
+  val unsynced : t -> unsynced list
+  (** [unsynced t] lists the writes not yet made durable, in program order. *)
+
+  val pp_unsynced : unsynced Fmt.t
+  (** [pp_unsynced] formats an un-synced change for logs and test failures. *)
+end

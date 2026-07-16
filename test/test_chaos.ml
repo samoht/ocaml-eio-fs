@@ -265,6 +265,141 @@ let test_chaos_perturbs () =
     "some seed perturbs the clean result" true
     (List.exists (fun r -> r <> clean) perturbed)
 
+(* {2 Crash / durability model} *)
+
+module Crash = Chaos.Crash
+
+(* [raw] is the un-perturbed base; [fs] is the same in-memory tree with
+   durability tracked by [ctl]. After a crash, reads go through [raw] (or the
+   handle [Crash.post_crash] returns), never through the dead [fs]. *)
+let with_crash ctl fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let raw = env#fs in
+  let fs = Crash.wrap ctl raw in
+  fn ~raw ~fs
+
+(* A write with no intervening sync is lost after a crash. *)
+let test_crash_unsynced_lost () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "unsynced write lost after crash" ""
+    (Eio.Path.load (post / "img"))
+
+(* A write followed by a sync survives a crash. *)
+let test_crash_synced_survives () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "synced write survives crash" "data"
+    (Eio.Path.load (post / "img"))
+
+(* The barrier is respected: everything before a sync survives, the unsynced
+   suffix is dropped. Nothing before the barrier can be lost. *)
+let test_crash_barrier_respected () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "AAAA" ];
+      Eio.File.sync file;
+      Eio.File.pwrite_all file ~file_offset:(i63 4) [ Cstruct.of_string "BBBB" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "synced prefix survived, unsynced suffix lost" "AAAA"
+    (Eio.Path.load (post / "img"))
+
+(* Even when a later, un-synced write is kept, the synced data before the
+   barrier is never reordered away: it stays durable underneath. *)
+let test_crash_barrier_not_reordered () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "AAAA" ];
+      Eio.File.sync file;
+      Eio.File.pwrite_all file ~file_offset:(i63 4) [ Cstruct.of_string "BBBB" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "synced data present under a kept unsynced suffix" "AAAABBBB"
+    (Eio.Path.load (post / "img"))
+
+(* The missing-barrier hazard in miniature: a data block is written, then a
+   pointer to it, with NO sync between. A crash that keeps the pointer write but
+   drops the data write leaves a pointer referencing bytes that never became
+   durable. *)
+let test_crash_pointer_without_data () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun u -> u.offset = 0)) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      (* data block first ... *)
+      Eio.File.pwrite_all file ~file_offset:(i63 512)
+        [ Cstruct.of_string (String.make 512 'D') ];
+      (* ... then the pointer, with no fsync between: the missing barrier *)
+      Eio.File.pwrite_all file ~file_offset:(i63 0)
+        [ Cstruct.of_string "PTR->512" ]);
+  let post = Crash.post_crash ctl in
+  let img = Eio.Path.load (post / "img") in
+  Alcotest.(check string)
+    "generation pointer landed" "PTR->512" (String.sub img 0 8);
+  Alcotest.(check int)
+    "referenced data block never became durable" 8 (String.length img)
+
+(* Same seed reproduces the same post-crash image. *)
+let reorder_image seed =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let ctl = Crash.v ~policy:(Crash.Reorder_unsynced seed) () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img") (fun file ->
+      for i = 0 to 7 do
+        Eio.File.pwrite_all file
+          ~file_offset:(i63 (i * 8))
+          [ Fmt.kstr Cstruct.of_string "%08d" i ]
+      done);
+  let post = Crash.post_crash ctl in
+  Eio.Path.load (post / "img")
+
+let test_crash_determinism () =
+  Alcotest.(check string)
+    "same seed same post-crash image" (reorder_image 7) (reorder_image 7);
+  (* non-vacuous: the reordered image is a genuine perturbation of the clean,
+     fully-written result *)
+  let full = String.concat "" (List.init 8 (fun i -> Fmt.str "%08d" i)) in
+  Alcotest.(check bool)
+    "seeded drop/reorder perturbs the clean image" true
+    (reorder_image 7 <> full)
+
+(* An [After_write] trigger crashes the moment the covering write commits; the
+   next op through the wrapper fails, and the unsynced block is lost. *)
+let test_crash_after_write_trigger () =
+  let ctl =
+    Crash.v ~policy:Drop_unsynced
+      ~trigger:(Crash.After_write { path = "img"; file_offset = 0 })
+      ()
+  in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  (try
+     Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "img")
+       (fun file ->
+         Eio.File.pwrite_all file ~file_offset:(i63 0)
+           [ Cstruct.of_string "block" ];
+         (* the crash has fired; a further op must fail *)
+         Eio.File.pwrite_all file ~file_offset:(i63 5)
+           [ Cstruct.of_string "more" ])
+   with Eio.Io _ -> ());
+  Alcotest.(check bool) "crash fired on the write" true (Crash.is_crashed ctl);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "unsynced block lost after auto-crash" ""
+    (Eio.Path.load (post / "img"))
+
 let suite =
   ( "chaos",
     [
@@ -279,4 +414,18 @@ let suite =
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
       Alcotest.test_case "chaos perturbs" `Quick test_chaos_perturbs;
+      Alcotest.test_case "crash: unsynced write lost" `Quick
+        test_crash_unsynced_lost;
+      Alcotest.test_case "crash: synced write survives" `Quick
+        test_crash_synced_survives;
+      Alcotest.test_case "crash: barrier respected" `Quick
+        test_crash_barrier_respected;
+      Alcotest.test_case "crash: barrier not reordered" `Quick
+        test_crash_barrier_not_reordered;
+      Alcotest.test_case "crash: pointer without data" `Quick
+        test_crash_pointer_without_data;
+      Alcotest.test_case "crash: seeded determinism" `Quick
+        test_crash_determinism;
+      Alcotest.test_case "crash: after-write trigger" `Quick
+        test_crash_after_write_trigger;
     ] )
