@@ -753,7 +753,9 @@ let rmdir dir_fd path =
 let rename dir_fd old_path new_dir new_path =
   let old_path = check_path old_path in
   let new_path = check_path new_path in
-  let old_res = Filesystem.lookup ~follow:true dir_fd old_path in
+  (* Rename the directory entry itself. In particular, a symlink's target need
+     not exist and must not be followed while moving the link. *)
+  let old_res = Filesystem.lookup ~follow:false dir_fd old_path in
   let ino = Resource.(stat !old_res).ino in
   let old_parent_path, old_name = dir_base old_path in
   let new_parent_path, new_name = dir_base new_path in

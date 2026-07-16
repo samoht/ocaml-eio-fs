@@ -731,7 +731,9 @@ module Crash = struct
   let unsynced ctl =
     let data = List.map to_unsynced ctl.log in
     let metadata = List.map (fun e -> e.meta) ctl.metadata in
-    List.sort (fun a b -> Int.compare a.seq b.seq) (data @ metadata)
+    List.sort
+      (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
+      (data @ metadata)
 
   let apply buf = function
     | Write { offset; data } -> grow_blit buf ~offset data
@@ -762,6 +764,9 @@ module Crash = struct
     if Cstruct.length content > 0 then
       Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ content ]
 
+  let box_dir (Eio.Resource.T (v, ops)) =
+    Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
+
   let rec snapshot_at (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:false path with
     | { kind = `Regular_file; perm; _ } ->
@@ -785,12 +790,27 @@ module Crash = struct
   let rec remove_at (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:false path with
     | exception Eio.Io _ -> ()
-    | { kind = `Directory; _ } ->
-        B.read_dir bv path
-        |> List.iter (fun name ->
-            let child = if path = "" then name else Filename.concat path name in
-            remove_at owner child);
-        if path <> "" then B.rmdir bv path
+    | { kind = `Directory; _ } -> (
+        let rec clear () =
+          match B.read_dir bv path with
+          | [] -> ()
+          | names ->
+              List.iter
+                (fun name ->
+                  let child =
+                    if path = "" then name else Filename.concat path name
+                  in
+                  remove_at owner child)
+                names;
+              clear ()
+        in
+        clear ();
+        if path <> "" then
+          (* A deliberately adversarial in-memory tree may retain hidden
+             bookkeeping entries after a chain of directory renames. The
+             namespace entry is still safe to discard when rebuilding the
+             post-crash image; real filesystems take the normal [rmdir] path. *)
+          try B.rmdir bv path with Eio.Io _ -> B.unlink bv path)
     | _ -> B.unlink bv path
 
   let rec restore_at (Base_dir ((module B), bv) as owner) path = function
@@ -813,16 +833,29 @@ module Crash = struct
             restore_at owner child_path child)
           entries
 
-  let restore_root owner tree =
-    remove_at owner "";
-    restore_at owner "" tree
+  let restore_root (Base_dir ((module B), bv) as owner) path = function
+    | Dir { perm; entries } ->
+        B.read_dir bv path
+        |> List.iter (fun name ->
+            let child = if path = "" then name else Filename.concat path name in
+            remove_at owner child);
+        if path <> "" then B.chmod bv ~follow:true ~perm path;
+        List.iter
+          (fun (name, child) ->
+            let child_path =
+              if path = "" then name else Filename.concat path name
+            in
+            restore_at owner child_path child)
+          entries
+    | File _ | Link _ ->
+        invalid_arg "Chaos.Crash: wrapped root is not a directory"
 
   let locations ctl =
     Hashtbl.fold (fun _ fs acc -> (fs, fs.owner, fs.rel) :: acc) ctl.files []
 
   let root ctl =
     match ctl.base with
-    | Some (base, _) -> box_dir (base :> Eio.Fs.dir_ty r)
+    | Some (base, path) -> (box_dir (base :> Eio.Fs.dir_ty r), path)
     | None -> invalid_arg "Chaos.Crash: controller was never wrapped"
 
   let metadata_unsynced ~path ~kind ~seq =
@@ -830,15 +863,15 @@ module Crash = struct
 
   let record_metadata ctl ~path ~kind =
     ctl.seq <- ctl.seq + 1;
-    let owner = root ctl in
+    let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     ctl.metadata <-
-      { meta; tree = snapshot_at owner ""; locations = locations ctl }
+      { meta; tree = snapshot_at owner root_path; locations = locations ctl }
       :: ctl.metadata
 
   let commit_metadata ctl =
-    let owner = root ctl in
-    ctl.durable_tree <- Some (snapshot_at owner "");
+    let owner, root_path = root ctl in
+    ctl.durable_tree <- Some (snapshot_at owner root_path);
     ctl.durable_locations <- locations ctl;
     ctl.metadata <- []
 
@@ -879,8 +912,8 @@ module Crash = struct
             | Some tree -> (tree, ctl.durable_locations)
             | None -> assert false)
       in
-      let owner = root ctl in
-      restore_root owner tree;
+      let owner, root_path = root ctl in
+      restore_root owner root_path tree;
       List.iter
         (fun (fs, owner, rel) ->
           let changes =
@@ -1008,6 +1041,7 @@ module Crash = struct
       Eio.File.sync (writable cf);
       fs.durable <- read_all cf.cro;
       cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
+      commit_metadata cf.ctl;
       bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
 
     let truncate cf len =
@@ -1070,28 +1104,41 @@ module Crash = struct
      the wrap root. *)
   let at prefix path = if prefix = "" then path else Filename.concat prefix path
 
-  let box_dir (Eio.Resource.T (v, ops)) =
-    Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
-
   let file_key (Base_dir ((module B), bv)) path =
     match B.native bv path with Some native -> native | None -> path
 
-  let same_state state = function Some other -> state == other | None -> false
+  let path_is_at_or_under ~parent path =
+    String.equal parent path
+    ||
+    let n = String.length parent in
+    String.length path > n
+    && String.equal (String.sub path 0 n) parent
+    && path.[n] = '/'
 
-  let move_state ctl ~old_key ~new_key ~owner ~rel =
-    let moved = Hashtbl.find_opt ctl.files old_key in
-    (match Hashtbl.find_opt ctl.files new_key with
-    | Some replaced when not (same_state replaced moved) ->
-        ctl.log <- List.filter (fun e -> not (e.efs == replaced)) ctl.log
-    | Some _ | None -> ());
-    Hashtbl.remove ctl.files old_key;
-    Hashtbl.remove ctl.files new_key;
-    match moved with
-    | None -> ()
-    | Some fs ->
-        fs.owner <- owner;
-        fs.rel <- rel;
-        Hashtbl.replace ctl.files new_key fs
+  let move_state ctl ~old_owner ~old_rel ~new_owner ~new_rel =
+    let states = Hashtbl.fold (fun _ fs acc -> fs :: acc) ctl.files [] in
+    Hashtbl.clear ctl.files;
+    List.iter
+      (fun fs ->
+        let moved =
+          fs.owner == old_owner && path_is_at_or_under ~parent:old_rel fs.rel
+        in
+        let replaced =
+          fs.owner == new_owner && path_is_at_or_under ~parent:new_rel fs.rel
+        in
+        if moved then begin
+          let suffix =
+            String.sub fs.rel (String.length old_rel)
+              (String.length fs.rel - String.length old_rel)
+          in
+          fs.owner <- new_owner;
+          fs.rel <- new_rel ^ suffix;
+          Hashtbl.replace ctl.files (file_key new_owner fs.rel) fs
+        end
+        else if replaced then
+          ctl.log <- List.filter (fun e -> not (e.efs == fs)) ctl.log
+        else Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs)
+      states
 
   module Cdir_impl = struct
     type t = cdir
@@ -1106,6 +1153,11 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = at d.dprefix path in
       let key = file_key d.droot rel in
+      let existed =
+        match B.stat bv ~follow:false path with
+        | _ -> true
+        | exception Eio.Io _ -> false
+      in
       let prev = read_existing d.dboxed path in
       let base = B.open_out bv ~sw ~append ~create path in
       let perm = create_perm create in
@@ -1123,6 +1175,10 @@ module Crash = struct
          that a crash may lose. *)
       if is_trunc create && Cstruct.length prev > 0 then
         clog_change d.dctl fs (Truncate 0);
+      if not existed then begin
+        record_metadata d.dctl ~path:rel ~kind:Create;
+        bump_metadata d.dctl
+      end;
       wrap_cfile_rw d.dctl fs base
 
     let open_subtree d ~sw path =
@@ -1138,7 +1194,9 @@ module Crash = struct
 
     let mkdir d ~perm path =
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.mkdir bv ~perm path
+      B.mkdir bv ~perm path;
+      record_metadata d.dctl ~path:(at d.dprefix path) ~kind:Mkdir;
+      bump_metadata d.dctl
 
     let read_dir d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1150,11 +1208,18 @@ module Crash = struct
 
     let unlink d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.unlink bv path
+      B.unlink bv path;
+      let rel = at d.dprefix path in
+      Hashtbl.remove d.dctl.files (file_key d.droot rel);
+      record_metadata d.dctl ~path:rel ~kind:Unlink;
+      bump_metadata d.dctl
 
     let rmdir d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.rmdir bv path
+      B.rmdir bv path;
+      let rel = at d.dprefix path in
+      record_metadata d.dctl ~path:rel ~kind:Rmdir;
+      bump_metadata d.dctl
 
     let rename d old_path new_dir new_path =
       let (Eio.Resource.T (nv, nops)) = new_dir in
@@ -1167,7 +1232,7 @@ module Crash = struct
         | None -> (new_dir :> Eio.Fs.dir_ty r)
       in
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let old_key = file_key d.droot (at d.dprefix old_path) in
+      let old_rel = at d.dprefix old_path in
       (* A crash-wrapped target rehomes the file root-relative, so its rewrite
          does not depend on the target subtree staying open. *)
       let owner, rel =
@@ -1175,12 +1240,14 @@ module Crash = struct
         | Some cd -> (cd.droot, at cd.dprefix new_path)
         | None -> (box_dir target, new_path)
       in
-      let new_key = file_key owner rel in
       B.rename bv old_path target new_path;
       (* A successful rename moves the durability identity with the file. If a
          tracked target was replaced, its pending writes no longer describe a
          reachable file and must not be replayed after a crash. *)
-      move_state d.dctl ~old_key ~new_key ~owner ~rel
+      move_state d.dctl ~old_owner:d.droot ~old_rel ~new_owner:owner
+        ~new_rel:rel;
+      record_metadata d.dctl ~path:old_rel ~kind:(Rename { dest = rel });
+      bump_metadata d.dctl
 
     let read_link d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1188,7 +1255,10 @@ module Crash = struct
 
     let symlink ~link_to d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.symlink ~link_to bv path
+      B.symlink ~link_to bv path;
+      record_metadata d.dctl ~path:(at d.dprefix path)
+        ~kind:(Symlink { target = link_to });
+      bump_metadata d.dctl
 
     let chmod d ~follow ~perm path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1239,6 +1309,9 @@ module Crash = struct
       base = None;
       files = Hashtbl.create 8;
       log = [];
+      metadata = [];
+      durable_tree = None;
+      durable_locations = [];
       seq = 0;
       ops = 0;
       crashed = false;
@@ -1247,13 +1320,17 @@ module Crash = struct
   let wrap ctl (base, path) =
     let base = (base :> Eio.Fs.dir_ty r) in
     ctl.base <- Some (base, path);
+    let owner = box_dir base in
+    ctl.durable_tree <- Some (snapshot_at owner path);
+    ctl.durable_locations <- [];
     (wrap_cdir ctl ~root:(box_dir base) ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
   let is_crashed ctl = ctl.crashed
 
-  (* TODO: implement the metadata journal commit (spec: chaos.mli). *)
-  let sync_metadata _ = failwith "TODO: implement Crash.sync_metadata"
+  let sync_metadata ctl =
+    if ctl.crashed then raise_power_lost ();
+    commit_metadata ctl
 
   let post_crash ctl =
     do_crash ctl;
