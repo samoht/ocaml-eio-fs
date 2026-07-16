@@ -33,3 +33,26 @@ val sync_dir_if_native : _ Eio.Path.t -> unit
     default for a store that must also run over in-memory backends in tests; a
     store that only ever runs on a real filesystem prefers the strict
     {!sync_dir}. Real barrier failures still raise. *)
+
+val save_durable :
+  ?sync_dir:('a Eio.Path.t -> unit) ->
+  create:Eio.Fs.create ->
+  'a Eio.Path.t ->
+  string ->
+  unit
+(** [save_durable ~create path content] replaces [path]'s contents with
+    [content] atomically and durably: the sibling temporary [<path>.tmp] is
+    written and fsynced, renamed over [path] -- a reader or a crash sees the old
+    file or the whole new one, never a torn or empty file -- and the directory
+    is barriered so a power cut cannot revert the publication to the prior
+    contents. The temporary is removed if the write fails.
+
+    [create] is applied to the temporary (its permission becomes the target's);
+    [`Or_truncate] is the usual choice. [sync_dir] is the directory barrier,
+    defaulting to {!sync_dir_if_native}; a crash-model test harness substitutes
+    the model's barrier.
+
+    The temporary's name is deterministic, so concurrent writers to one target
+    must be serialised by the caller -- every store consuming this already holds
+    a per-store lock. A store with genuinely concurrent same-target writers
+    needs unique temporary names and its own protocol. *)

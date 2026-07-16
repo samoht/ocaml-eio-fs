@@ -60,6 +60,37 @@ let test_full_fsync_surfaces_errors () =
   | () -> Alcotest.fail "full_fsync accepted a closed descriptor"
   | exception Unix.Unix_error (Unix.EBADF, _, _) -> ()
 
+(* save_durable publishes atomically: the content lands whole, a second save
+   replaces it, and no temporary lingers. *)
+let test_save_durable () =
+  with_real_dir @@ fun dir ->
+  Eio_fs_unix.save_durable ~create:(`Or_truncate 0o644) (dir / "cfg") "one";
+  Alcotest.(check string) "published" "one" (Eio.Path.load (dir / "cfg"));
+  Eio_fs_unix.save_durable ~create:(`Or_truncate 0o644) (dir / "cfg") "two";
+  Alcotest.(check string) "replaced" "two" (Eio.Path.load (dir / "cfg"));
+  Alcotest.(check bool)
+    "temporary cleaned" true
+    (Eio.Path.kind ~follow:false (dir / "cfg.tmp") = `Not_found)
+
+(* Under the crash model, a completed save_durable survives Drop_unsynced on
+   its own barriers: the data fsync commits the bytes and the injected
+   directory barrier commits the rename. *)
+let test_save_durable_survives_crash () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio_fs_unix.save_durable
+    ~sync_dir:(fun _ -> Crash.sync_metadata ctl)
+    ~create:(`Or_truncate 0o644)
+    Eio.Path.(fs / "cfg")
+    "durable";
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "completed save survives the crash" "durable"
+    (Eio.Path.load Eio.Path.(post / "cfg"))
+
 (* A directory with no native path is a caller error, not a crash. *)
 let test_sync_dir_refuses_non_native () =
   Eio_mock.Backend.run @@ fun () ->
@@ -80,6 +111,10 @@ let () =
           Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
           Alcotest.test_case "full_fsync surfaces errors" `Quick
             test_full_fsync_surfaces_errors;
+          Alcotest.test_case "save_durable publishes atomically" `Quick
+            test_save_durable;
+          Alcotest.test_case "save_durable survives a crash" `Quick
+            test_save_durable_survives_crash;
           Alcotest.test_case "refuses a non-native directory" `Quick
             test_sync_dir_refuses_non_native;
         ] );
