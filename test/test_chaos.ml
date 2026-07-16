@@ -376,6 +376,161 @@ let test_crash_determinism () =
     "seeded drop/reorder perturbs the clean image" true
     (reorder_image 7 <> full)
 
+(* {2 Crash rewrite of read-only and subtree-staged files}
+
+   A store that stages immutable artefacts writes them read-only (0o444) and
+   through short-lived subtree capabilities. The crash model must rewrite such
+   files all the same: the post-crash image reflects the durability barrier,
+   the file keeps its mode, and a staging subtree closed long before the crash
+   does not strand the file. *)
+
+(* A read-only file whose writes were all synced survives a crash byte-for-byte
+   with its mode intact. The rewrite must not fail with EACCES just because the
+   file cannot be reopened for writing. *)
+let test_crash_readonly_synced () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o444) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  (* an unsynced write on a second file forces the crash to rewrite state *)
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "scratch")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "tmp" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "synced read-only file survives" "data"
+    (Eio.Path.load (post / "img"));
+  Alcotest.(check int)
+    "read-only mode preserved" 0o444
+    (Eio.Path.stat ~follow:true (post / "img")).perm
+
+(* A read-only file with an unsynced tail is rewritten to its synced prefix:
+   the model grants itself write access for the rewrite and restores the mode
+   after. *)
+let test_crash_readonly_unsynced_tail () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o444) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "AAAA" ];
+      Eio.File.sync file;
+      Eio.File.pwrite_all file ~file_offset:(i63 4) [ Cstruct.of_string "BBBB" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "read-only file rewritten to its synced prefix" "AAAA"
+    (Eio.Path.load (post / "img"));
+  Alcotest.(check int)
+    "read-only mode preserved after rewrite" 0o444
+    (Eio.Path.stat ~follow:true (post / "img")).perm
+
+(* A file staged through a short-lived subtree ([with_open_dir]) is rewritten
+   through the long-lived wrap root: the subtree fd is closed well before the
+   crash fires and must not strand the file. *)
+let test_crash_closed_subtree () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+  Eio.Path.with_open_dir (fs / "stage") (fun stage ->
+      Eio.Path.with_open_out ~create:(`Or_truncate 0o644)
+        Eio.Path.(stage / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file;
+          Eio.File.pwrite_all file ~file_offset:(i63 4)
+            [ Cstruct.of_string "BBBB" ]));
+  (* the staging subtree is closed here; only now does the crash fire *)
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "subtree-staged file rewritten through the root" "AAAA"
+    (Eio.Path.load (post / "stage" / "img"))
+
+(* The composed hazard, as an OTA release store stages images: a read-only
+   file created inside a short-lived staging subtree. *)
+let test_crash_readonly_in_closed_subtree () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+  Eio.Path.with_open_dir (fs / "stage") (fun stage ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o444)
+        Eio.Path.(stage / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "data" ];
+          Eio.File.sync file;
+          Eio.File.pwrite_all file ~file_offset:(i63 4)
+            [ Cstruct.of_string "junk" ]));
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "read-only subtree-staged file rewritten" "data"
+    (Eio.Path.load (post / "stage" / "img"));
+  Alcotest.(check int)
+    "mode preserved" 0o444
+    (Eio.Path.stat ~follow:true (post / "stage" / "img")).perm
+
+(* {2 The same hazards against the real filesystem}
+
+   The kernel is the authority on EACCES and fd invalidation; the in-memory
+   runs above only count because the backend models both. These runs pin the
+   primitive against the real thing. *)
+
+(* Run [fn] over a crash-wrapped private temp directory on the real
+   filesystem, then hand the recovered directory to [check]. *)
+let with_real_crash ctl fn ~check =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-crash" "" in
+  Sys.remove dir;
+  Eio.Path.mkdir ~perm:0o755 Eio.Path.(fs / dir);
+  let real = (Eio.Path.(fs / dir) :> Eio.Fs.dir_ty Eio.Path.t) in
+  Fun.protect ~finally:(fun () ->
+      Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / dir))
+  @@ fun () ->
+  let wrapped = Crash.wrap ctl real in
+  fn wrapped;
+  check (Crash.post_crash ctl)
+
+let test_crash_readonly_real () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o444) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file;
+          Eio.File.pwrite_all file ~file_offset:(i63 4)
+            [ Cstruct.of_string "BBBB" ]))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "real fs: read-only file rewritten to its synced prefix" "AAAA"
+        (Eio.Path.load (post / "img"));
+      Alcotest.(check int)
+        "real fs: mode preserved" 0o444
+        (Eio.Path.stat ~follow:true (post / "img")).perm)
+
+let test_crash_closed_subtree_real () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+      Eio.Path.with_open_dir (fs / "stage") (fun stage ->
+          Eio.Path.with_open_out ~create:(`Exclusive 0o444)
+            Eio.Path.(stage / "img")
+            (fun file ->
+              Eio.File.pwrite_all file ~file_offset:(i63 0)
+                [ Cstruct.of_string "data" ];
+              Eio.File.sync file;
+              Eio.File.pwrite_all file ~file_offset:(i63 4)
+                [ Cstruct.of_string "junk" ])))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "real fs: read-only subtree-staged file rewritten" "data"
+        (Eio.Path.load (post / "stage" / "img"));
+      Alcotest.(check int)
+        "real fs: mode preserved" 0o444
+        (Eio.Path.stat ~follow:true (post / "stage" / "img")).perm)
+
 (* An [After_write] trigger crashes the moment the covering write commits; the
    next op through the wrapper fails, and the unsynced block is lost. *)
 let test_crash_after_write_trigger () =
@@ -428,4 +583,16 @@ let suite =
         test_crash_determinism;
       Alcotest.test_case "crash: after-write trigger" `Quick
         test_crash_after_write_trigger;
+      Alcotest.test_case "crash: read-only synced file" `Quick
+        test_crash_readonly_synced;
+      Alcotest.test_case "crash: read-only unsynced tail" `Quick
+        test_crash_readonly_unsynced_tail;
+      Alcotest.test_case "crash: closed staging subtree" `Quick
+        test_crash_closed_subtree;
+      Alcotest.test_case "crash: read-only in closed subtree" `Quick
+        test_crash_readonly_in_closed_subtree;
+      Alcotest.test_case "crash: read-only file (real fs)" `Quick
+        test_crash_readonly_real;
+      Alcotest.test_case "crash: closed subtree (real fs)" `Quick
+        test_crash_closed_subtree_real;
     ] )
