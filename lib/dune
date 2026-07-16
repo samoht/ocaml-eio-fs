@@ -1,0 +1,5 @@
+(library
+ (name eio_fs)
+ (public_name eio-fs)
+ (private_modules low_level)
+ (libraries eio fmt cstruct optint))
