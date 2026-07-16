@@ -485,7 +485,13 @@ module Filesystem = struct
           if is_confined ~root:cwd_path resource_path then r
           else Error.permission_denied resource_path
       | Dir.Dir_fd dir ->
-          let dir = read_fd_table (Fd_table.find dir) in
+          (* A directory fd closed with its switch is EBADF, as for a real
+             O_DIRECTORY fd, never a silent success. *)
+          let dir =
+            match read_fd_table (Fd_table.find_opt dir) with
+            | Some d -> d
+            | None -> Error.badf ()
+          in
           let resource_path, r =
             find_entry_relative_to_dir ~check:true ~follow fs dir path
           in
@@ -504,7 +510,36 @@ let close fd =
   | None -> Error.badf ()
   | Some _ -> Fd_table.remove fd fds
 
-let openat ~mode:_ ~sw dir_fd path flags =
+(* open(2): opening an existing file for writing requires the write permission
+   bit; the mode given at creation does not restrict the creating open itself.
+   The model is single-user, so the owner bit is the one consulted. *)
+let check_write_access path flags r =
+  if Open_flags.(mem o_rdwr flags) then
+    match !r with
+    | Resource.File f when f.stat.perm land 0o200 = 0 ->
+        Error.permission_denied path
+    | _ -> ()
+
+(* Create [path] in its parent directory, register the new file in the
+   filesystem, and return its resource. *)
+let new_file ~follow ~mode dir_fd path =
+  let fname = Filename.basename path in
+  let dir = Filename.dirname path in
+  let rdir = Filesystem.lookup ~follow dir_fd dir in
+  let dir =
+    match !rdir with
+    | Resource.Dir d -> d
+    | _ -> Fmt.failwith "Creating file: no path"
+  in
+  let stat = new_stat ~perm:(mode land 0o7777) () in
+  let f = File.v ~stat fname in
+  let dir = { dir with entries = (f.stat.ino, f.name) :: dir.entries } in
+  rdir := Resource.Dir dir;
+  let file = ref (Resource.File f) in
+  Filesystem.add_file f.stat.ino file;
+  file
+
+let openat ~mode ~sw dir_fd path flags =
   let path = check_path path in
   let is_create = Open_flags.(mem o_creat flags) in
   let is_excl = Open_flags.(mem o_excl flags) in
@@ -517,7 +552,9 @@ let openat ~mode:_ ~sw dir_fd path flags =
       update_fd_table_with_result @@ fun fds ->
       let fd = next_fd_of_fds fds in
       let r = Filesystem.lookup ~follow dir_fd path in
+      check_write_access path flags r;
       reset_file ~truncate ~append r;
+      Eio.Switch.on_release sw (fun () -> close fd);
       (fd, Fd_table.add fd r fds)
   | true -> (
       let () =
@@ -535,28 +572,14 @@ let openat ~mode:_ ~sw dir_fd path flags =
       in
       match r with
       | Some r ->
+          check_write_access path flags r;
           let fds = Fd_table.add fd r fds in
           reset_file ~truncate ~append r;
           Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds)
       | None ->
-          let fname = Filename.basename path in
-          let dir = Filename.dirname path in
-          let rdir = Filesystem.lookup ~follow dir_fd dir in
-          let dir =
-            match !rdir with
-            | Resource.Dir d -> d
-            | _ -> Fmt.failwith "Creating file: no path"
-          in
-          let stat = new_stat ~perm:flags () in
-          let f = File.v ~stat fname in
-          let dir =
-            { dir with entries = (f.stat.ino, f.name) :: dir.entries }
-          in
-          rdir := Resource.Dir dir;
-          let new_file = ref (Resource.File f) in
-          Filesystem.add_file f.stat.ino new_file;
-          let fds = Fd_table.add fd new_file fds in
+          let file = new_file ~follow ~mode dir_fd path in
+          let fds = Fd_table.add fd file fds in
           Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds))
 
