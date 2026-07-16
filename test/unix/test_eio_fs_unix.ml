@@ -43,6 +43,23 @@ let test_full_fsync_file () =
     ~finally:(fun () -> Unix.close fd)
     (fun () -> Eio_fs_unix.full_fsync fd)
 
+(* full_fsync pushes a real file's data to stable storage and surfaces the OS
+   error on a dead descriptor -- on Darwin this exercises the F_FULLFSYNC path
+   (and its fsync fallback), elsewhere plain fsync. Power-cut durability
+   itself is not unit-testable; what is pinned here is that the barrier is
+   issued on the right descriptor and failures are not swallowed. *)
+let test_full_fsync_surfaces_errors () =
+  let path = Filename.temp_file "eio-fs-fullfsync" ".dat" in
+  let fd = Unix.openfile path [ Unix.O_WRONLY ] 0o644 in
+  let written = Unix.write_substring fd "durable bytes" 0 13 in
+  Alcotest.(check int) "wrote the payload" 13 written;
+  Eio_fs_unix.full_fsync fd;
+  Unix.close fd;
+  Sys.remove path;
+  match Eio_fs_unix.full_fsync fd with
+  | () -> Alcotest.fail "full_fsync accepted a closed descriptor"
+  | exception Unix.Unix_error (Unix.EBADF, _, _) -> ()
+
 (* A directory with no native path is a caller error, not a crash. *)
 let test_sync_dir_refuses_non_native () =
   Eio_mock.Backend.run @@ fun () ->
@@ -61,6 +78,8 @@ let () =
           Alcotest.test_case "barrier empty and repeated" `Quick
             test_sync_dir_empty_and_repeated;
           Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
+          Alcotest.test_case "full_fsync surfaces errors" `Quick
+            test_full_fsync_surfaces_errors;
           Alcotest.test_case "refuses a non-native directory" `Quick
             test_sync_dir_refuses_non_native;
         ] );
