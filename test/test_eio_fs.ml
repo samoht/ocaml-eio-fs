@@ -63,6 +63,44 @@ let test_rename () =
   Eio.Path.rename (fs / "old") (fs / "new");
   Alcotest.(check string) "moved" "data" (Eio.Path.load (fs / "new"))
 
+(* POSIX [rename(2)] MOVES: after the rename the source path no longer exists
+   and the target is an independent file, not a hardlink sharing the source's
+   storage. *)
+let test_rename_moves () =
+  with_fs @@ fun fs ->
+  write fs "a" "data";
+  Eio.Path.rename (fs / "a") (fs / "b");
+  (* (1) the source path no longer resolves. *)
+  (match Eio.Path.load (fs / "a") with
+  | (_ : string) -> Alcotest.fail "source still resolves after rename"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ());
+  (* (2) the target carries the moved content. *)
+  Alcotest.(check string) "target content" "data" (Eio.Path.load (fs / "b"));
+  (* (3) a fresh file created at the source shares no storage with the target:
+     writing it must not change the target, and vice versa. *)
+  write fs "a" "fresh";
+  Alcotest.(check string) "target unchanged" "data" (Eio.Path.load (fs / "b"));
+  Alcotest.(check string) "new source" "fresh" (Eio.Path.load (fs / "a"))
+
+(* The atomic-save idiom (write a temporary, then rename it over the target)
+   behaves like a real filesystem: after the rename the temporary is gone, so a
+   later [`Or_truncate] save through the same temporary name starts from a fresh
+   file and never truncates the committed target's shared storage. *)
+let test_rename_atomic_save () =
+  with_fs @@ fun fs ->
+  write fs "db.tmp" "v1";
+  Eio.Path.rename (fs / "db.tmp") (fs / "db");
+  (* A second atomic save reuses the temporary name. *)
+  write fs "db.tmp" "v2";
+  (* The committed target from the first round is untouched by the second save. *)
+  Alcotest.(check string)
+    "committed target intact" "v1"
+    (Eio.Path.load (fs / "db"));
+  Eio.Path.rename (fs / "db.tmp") (fs / "db");
+  Alcotest.(check string)
+    "second commit visible" "v2"
+    (Eio.Path.load (fs / "db"))
+
 let test_unlink () =
   with_fs @@ fun fs ->
   write fs "gone" "x";
@@ -154,6 +192,8 @@ let suite =
       Alcotest.test_case "chmod" `Quick test_chmod;
       Alcotest.test_case "chown" `Quick test_chown;
       Alcotest.test_case "rename" `Quick test_rename;
+      Alcotest.test_case "rename moves" `Quick test_rename_moves;
+      Alcotest.test_case "rename atomic save" `Quick test_rename_atomic_save;
       Alcotest.test_case "unlink" `Quick test_unlink;
       Alcotest.test_case "stat kind" `Quick test_stat_kind;
       Alcotest.test_case "symlink" `Quick test_symlink;
