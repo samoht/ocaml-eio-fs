@@ -18,6 +18,9 @@ module Fs : sig
   (** A [tree]-like pretty printer. *)
 end
 
+module Chaos = Chaos
+(** An adversarial filesystem wrapper for fault-injection testing. *)
+
 type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 
 val run : ?cwd:string -> (stdenv -> 'a) -> 'a

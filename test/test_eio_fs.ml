@@ -88,6 +88,63 @@ let test_symlink () =
     (Eio.Path.read_link (fs / "link"));
   Alcotest.(check string) "follows" "payload" (Eio.Path.load (fs / "link"))
 
+let i63 = Optint.Int63.of_int
+
+(* Positioned I/O: [pwrite] addresses an explicit offset without moving the
+   cursor and grows the file, leaving a zero-filled gap. *)
+let test_pwrite_pread () =
+  with_fs @@ fun fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "f") @@ fun file ->
+  Eio.File.pwrite_all file ~file_offset:(i63 5) [ Cstruct.of_string "world" ];
+  Alcotest.(check int) "size" 10 (Optint.Int63.to_int (Eio.File.size file));
+  let buf = Cstruct.create 5 in
+  Eio.File.pread_exact file ~file_offset:(i63 5) [ buf ];
+  Alcotest.(check string) "pread" "world" (Cstruct.to_string buf);
+  let gap = Cstruct.create 5 in
+  Eio.File.pread_exact file ~file_offset:(i63 0) [ gap ];
+  Alcotest.(check string)
+    "gap zero-filled" (String.make 5 '\000') (Cstruct.to_string gap)
+
+(* [pread] past end-of-file raises rather than looping forever. *)
+let test_pread_eof () =
+  with_fs @@ fun fs ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (fs / "f") "abc";
+  Eio.Path.with_open_in (fs / "f") @@ fun file ->
+  Alcotest.check_raises "eof" End_of_file (fun () ->
+      Eio.File.pread_exact file ~file_offset:(i63 3) [ Cstruct.create 1 ])
+
+let test_seek () =
+  with_fs @@ fun fs ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (fs / "f") "0123456789";
+  Eio.Path.with_open_in (fs / "f") @@ fun file ->
+  let pos = Eio.File.seek file (i63 4) `Set in
+  Alcotest.(check int) "seek pos" 4 (Optint.Int63.to_int pos);
+  let buf = Cstruct.create 3 in
+  let got = Eio.Flow.single_read file buf in
+  Alcotest.(check string)
+    "read from cursor" "456"
+    (Cstruct.to_string (Cstruct.sub buf 0 got))
+
+let test_truncate () =
+  with_fs @@ fun fs ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (fs / "f") "0123456789";
+  Eio.Path.with_open_out ~create:`Never (fs / "f") @@ fun file ->
+  Eio.File.truncate file (i63 4);
+  Alcotest.(check int) "shrunk" 4 (Optint.Int63.to_int (Eio.File.size file));
+  Eio.File.truncate file (i63 6);
+  let buf = Cstruct.create 6 in
+  Eio.File.pread_exact file ~file_offset:(i63 0) [ buf ];
+  Alcotest.(check string)
+    "extend zero-fills" "0123\000\000" (Cstruct.to_string buf)
+
+(* The in-memory store is already durable, so [sync] is a no-op that must not
+   raise. *)
+let test_sync_noop () =
+  with_fs @@ fun fs ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (fs / "f") @@ fun file ->
+  Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ];
+  Eio.File.sync file
+
 let suite =
   ( "eio_fs",
     [
@@ -100,4 +157,9 @@ let suite =
       Alcotest.test_case "unlink" `Quick test_unlink;
       Alcotest.test_case "stat kind" `Quick test_stat_kind;
       Alcotest.test_case "symlink" `Quick test_symlink;
+      Alcotest.test_case "pwrite/pread" `Quick test_pwrite_pread;
+      Alcotest.test_case "pread eof" `Quick test_pread_eof;
+      Alcotest.test_case "seek" `Quick test_seek;
+      Alcotest.test_case "truncate" `Quick test_truncate;
+      Alcotest.test_case "sync no-op" `Quick test_sync_noop;
     ] )

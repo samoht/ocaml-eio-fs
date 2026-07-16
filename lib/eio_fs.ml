@@ -186,6 +186,8 @@ module Fs = struct
     fun ppf v -> pp_node ~depth "" true ppf v
 end
 
+module Chaos = Chaos
+
 type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 
 let run ?(cwd = "/") fn =

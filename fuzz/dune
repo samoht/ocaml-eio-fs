@@ -1,0 +1,26 @@
+; Crowbar fuzz testing for the chaos filesystem wrapper
+;
+; Quick check: dune build @fuzz
+; With AFL: crow start --cpus=4
+
+(executable
+ (name fuzz)
+ (libraries eio eio.mock eio_fs alcobar fmt cstruct optint))
+
+(rule
+ (alias runtest)
+ (enabled_if
+  (<> %{profile} afl))
+ (deps fuzz.exe)
+ (action
+  (run %{exe:fuzz.exe})))
+
+(rule
+ (alias fuzz)
+ (enabled_if
+  (= %{profile} afl))
+ (deps fuzz.exe)
+ (action
+  (progn
+   (run %{exe:fuzz.exe} --gen-corpus corpus)
+   (run afl-fuzz -V 60 -i corpus -o _fuzz -- %{exe:fuzz.exe} @@))))

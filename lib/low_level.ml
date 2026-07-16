@@ -788,6 +788,96 @@ let readv fd bufs =
   in
   (!read, fds)
 
+(* Positioned reads and writes address an explicit [file_offset] and never move
+   the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
+let preadv fd ~file_offset bufs =
+  read_fd_table @@ fun fds ->
+  match Fd_table.find_opt fd fds |> Option.map ( ! ) with
+  | None -> Error.badf ()
+  | Some (Resource.File e) ->
+      let size = Cstruct.length e.contents in
+      let start = Optint.Int63.to_int file_offset in
+      if start >= size then raise End_of_file
+      else begin
+        let off = ref start in
+        let read = ref 0 in
+        List.iter
+          (fun buf ->
+            let len = Cstruct.length buf in
+            let actual = max 0 (min len (size - !off)) in
+            Cstruct.blit e.contents !off buf 0 actual;
+            off := !off + actual;
+            read := !read + actual)
+          bufs;
+        if !read = 0 then raise End_of_file else !read
+      end
+  | Some r -> Fmt.failwith "pread: not a file: %a" Resource.pp r
+
+let pwritev fd ~file_offset bufs =
+  update_fd_table_with_result @@ fun fds ->
+  let written = ref 0 in
+  let () =
+    update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
+    @@ fun r ->
+    match !r with
+    | Resource.File e ->
+        let src = Cstruct.concat bufs in
+        let off = Optint.Int63.to_int file_offset in
+        let contents = blit_and_grow ~src ~dst:e.contents ~off in
+        let new_size = Optint.Int63.of_int (Cstruct.length contents) in
+        let stat = { e.stat with size = new_size } in
+        r := Resource.File { e with contents; stat };
+        written := Cstruct.length src
+    | r -> Fmt.failwith "pwrite: not a file: %a" Resource.pp r
+  in
+  (!written, fds)
+
+let seek_fd fd off cmd =
+  update_fd_table_with_result @@ fun fds ->
+  let result = ref Optint.Int63.zero in
+  let () =
+    update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
+    @@ fun r ->
+    match !r with
+    | Resource.File e ->
+        let base =
+          match cmd with
+          | `Set -> Optint.Int63.zero
+          | `Cur -> e.pos
+          | `End -> e.stat.size
+        in
+        let newpos = Optint.Int63.add base off in
+        r := Resource.File { e with pos = newpos };
+        result := newpos
+    | r -> Fmt.failwith "seek: not a file: %a" Resource.pp r
+  in
+  (!result, fds)
+
+let truncate_fd fd len =
+  update_fd_table @@ fun fds ->
+  update_entry
+    ~if_missing:(fun () -> ignore (Error.badf () : 'a))
+    fd fds
+    (fun r ->
+      match !r with
+      | Resource.File e ->
+          let target = Optint.Int63.to_int len in
+          let cur = Cstruct.length e.contents in
+          let contents =
+            if target = cur then e.contents
+            else if target < cur then Cstruct.sub e.contents 0 target
+            else begin
+              let c = Cstruct.create target in
+              Cstruct.blit e.contents 0 c 0 cur;
+              c
+            end
+          in
+          let stat = { e.stat with size = Optint.Int63.of_int target } in
+          let pos = if Optint.Int63.compare e.pos len > 0 then len else e.pos in
+          r := Resource.File { e with contents; stat; pos }
+      | r -> Fmt.failwith "truncate: not a file: %a" Resource.pp r);
+  fds
+
 module Flow = struct
   module Impl = struct
     type tag = [ `Generic | `Unix ]
@@ -822,11 +912,13 @@ module Flow = struct
     let getsockopt _ _ = Fmt.failwith "in-memory flow has no socket options"
     let setsockopt _ _ _ = Fmt.failwith "in-memory flow has no socket options"
     let read_methods = []
-    let pread _ ~file_offset:_ _bufs = Fmt.failwith "TODO: pread"
-    let pwrite _ ~file_offset:_ _bufs = Fmt.failwith "TODO: pwrite"
-    let seek _ _ = Fmt.failwith "TODO: seek"
-    let sync _ = Fmt.failwith "TODO: sync"
-    let truncate _ = Fmt.failwith "TODO: truncate"
+    let pread t ~file_offset bufs = preadv t ~file_offset bufs
+    let pwrite t ~file_offset bufs = pwritev t ~file_offset bufs
+    let seek t off cmd = seek_fd t off cmd
+
+    (* The in-memory store is already durable, so [sync] has nothing to flush. *)
+    let sync _ = ()
+    let truncate t len = truncate_fd t len
     let close = close
   end
 

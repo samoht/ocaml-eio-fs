@@ -32,4 +32,5 @@
   optint
   (eio_main :with-test)
   (mdx :with-test)
-  (alcotest :with-test)))
+  (alcotest :with-test)
+  (alcobar :with-test)))
