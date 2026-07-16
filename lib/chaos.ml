@@ -616,8 +616,8 @@ module Crash = struct
      the file live in the controller's global log. [owner] and [rel] locate the
      file in the base so a crash can rewrite it. *)
   type fstate = {
-    owner : boxed;
-    rel : string;
+    mutable owner : boxed;
+    mutable rel : string;
     mutable perm : int;
     mutable durable : Cstruct.t;
   }
@@ -867,6 +867,29 @@ module Crash = struct
     | `Never -> 0o644
     | `If_missing p | `Or_truncate p | `Exclusive p -> p
 
+  let box_dir (Eio.Resource.T (v, ops)) =
+    Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
+
+  let file_key (Base_dir ((module B), bv)) path =
+    match B.native bv path with Some native -> native | None -> path
+
+  let same_state state = function Some other -> state == other | None -> false
+
+  let move_state ctl ~old_key ~new_key ~target ~new_path =
+    let moved = Hashtbl.find_opt ctl.files old_key in
+    (match Hashtbl.find_opt ctl.files new_key with
+    | Some replaced when not (same_state replaced moved) ->
+        ctl.log <- List.filter (fun e -> not (e.efs == replaced)) ctl.log
+    | Some _ | None -> ());
+    Hashtbl.remove ctl.files old_key;
+    Hashtbl.remove ctl.files new_key;
+    match moved with
+    | None -> ()
+    | Some fs ->
+        fs.owner <- target;
+        fs.rel <- new_path;
+        Hashtbl.replace ctl.files new_key fs
+
   module Cdir_impl = struct
     type t = cdir
 
@@ -936,7 +959,14 @@ module Crash = struct
         | None -> (new_dir :> Eio.Fs.dir_ty r)
       in
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.rename bv old_path target new_path
+      let old_key = file_key d.dboxed old_path in
+      let target_boxed = box_dir target in
+      let new_key = file_key target_boxed new_path in
+      B.rename bv old_path target new_path;
+      (* A successful rename moves the durability identity with the file. If a
+         tracked target was replaced, its pending writes no longer describe a
+         reachable file and must not be replayed after a crash. *)
+      move_state d.dctl ~old_key ~new_key ~target:target_boxed ~new_path
 
     let read_link d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
