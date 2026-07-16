@@ -128,7 +128,12 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     This makes the classic missing-{!Eio.File.sync} hazard demonstrable: a
     pointer write that became durable before the data it references, because no
-    barrier separated them. *)
+    barrier separated them.
+
+    The crash rewrite reaches every tracked file through the directory given to
+    {!Crash.wrap}, so a file staged through a short-lived subtree
+    ({!Eio.Path.with_open_dir}) is rewritten even after that subtree is closed.
+    A file created read-only is rewritten too, and keeps its mode. *)
 module Crash : sig
   type unsynced = { path : string; offset : int; length : int; seq : int }
   (** An un-synced change: {!field-path} as opened, byte {!field-offset} and

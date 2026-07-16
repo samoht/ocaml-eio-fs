@@ -613,8 +613,11 @@ module Crash = struct
 
   (* Per-file durability state. [durable] is the content as of the last
      successful [sync] (empty for a never-synced file); the pending changes for
-     the file live in the controller's global log. [owner] and [rel] locate the
-     file in the base so a crash can rewrite it. *)
+     the file live in the controller's global log. [owner] is the boxed
+     directory the controller was wrapped over -- long-lived, unlike a staging
+     subtree the file may have been opened through -- and [rel] the path from
+     it, so a crash can rewrite the file after intermediate subtrees close.
+     Both move when the file is renamed. *)
   type fstate = {
     mutable owner : boxed;
     mutable rel : string;
@@ -684,9 +687,24 @@ module Crash = struct
     | Write { offset; data } -> grow_blit buf ~offset data
     | Truncate n -> resize buf n
 
-  (* Rewrite the base file to [content]: truncate and re-lay the bytes. *)
+  (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
+     staged read-only cannot be reopened for writing, so grant the owner-write
+     bit for the duration of the rewrite and restore the mode after. *)
   let rewrite fs content =
     let (Base_dir ((module B), bv)) = fs.owner in
+    let restore =
+      match B.stat bv ~follow:true fs.rel with
+      | exception Eio.Io _ -> None
+      | { kind = `Regular_file; perm; _ } when perm land 0o200 = 0 ->
+          B.chmod bv ~follow:true ~perm:(perm lor 0o200) fs.rel;
+          Some perm
+      | _ -> None
+    in
+    Fun.protect ~finally:(fun () ->
+        match restore with
+        | Some perm -> B.chmod bv ~follow:true ~perm fs.rel
+        | None -> ())
+    @@ fun () ->
     Switch.run @@ fun sw ->
     let f =
       B.open_out bv ~sw ~append:false ~create:(`Or_truncate fs.perm) fs.rel
@@ -712,13 +730,17 @@ module Crash = struct
       in
       Hashtbl.iter
         (fun _ fs ->
-          let changes =
-            List.filter_map
-              (fun e -> if e.efs == fs then Some e.change else None)
-              survivors
-          in
-          let content = List.fold_left apply (copy_cs fs.durable) changes in
-          rewrite fs content)
+          (* A file with no pending change since its last sync already holds
+             exactly its durable content on disk; leave it untouched. *)
+          if List.exists (fun e -> e.efs == fs) ordered then begin
+            let changes =
+              List.filter_map
+                (fun e -> if e.efs == fs then Some e.change else None)
+                survivors
+            in
+            let content = List.fold_left apply (copy_cs fs.durable) changes in
+            rewrite fs content
+          end)
         ctl.files
     end
 
@@ -848,16 +870,32 @@ module Crash = struct
         },
         crw_handler )
 
-  type cdir = { dctl : t; dbase : Eio.Fs.dir_ty r; dboxed : boxed }
+  (* [droot] is the boxed directory the controller was wrapped over and
+     [dprefix] this directory's path from it: tracked files are addressed
+     through the long-lived root so a crash can rewrite them after any
+     intermediate staging subtree is closed. *)
+  type cdir = {
+    dctl : t;
+    dbase : Eio.Fs.dir_ty r;
+    dboxed : boxed;
+    droot : boxed;
+    dprefix : string;
+  }
 
-  (* Unwrap a crash directory to its base so a rename target that is itself a
-     crash directory reaches the base backend. *)
+  (* Expose the whole crash directory so a rename whose target is itself a
+     crash directory reaches both its base (for the backend call) and its
+     root-relative location (to rehome durability state). *)
   type (_, _, _) Eio.Resource.pi +=
-    | Crash_base : ('t, 't -> Eio.Fs.dir_ty r, [> `Crash_base ]) Eio.Resource.pi
+    | Crash_dir : ('t, 't -> cdir, [> `Crash_dir ]) Eio.Resource.pi
 
   let crash_dir_hook :
-      (t -> base:Eio.Fs.dir_ty r -> [ `Close | Eio.Fs.dir_ty ] r) ref =
-    ref (fun _ ~base:_ -> assert false)
+      (t ->
+      root:boxed ->
+      prefix:string ->
+      base:Eio.Fs.dir_ty r ->
+      [ `Close | Eio.Fs.dir_ty ] r)
+      ref =
+    ref (fun _ ~root:_ ~prefix:_ ~base:_ -> assert false)
 
   let is_trunc = function
     | `Or_truncate _ | `Exclusive _ -> true
@@ -867,6 +905,10 @@ module Crash = struct
     | `Never -> 0o644
     | `If_missing p | `Or_truncate p | `Exclusive p -> p
 
+  (* Compose a path opened through a subtree with the subtree's own path from
+     the wrap root. *)
+  let at prefix path = if prefix = "" then path else Filename.concat prefix path
+
   let box_dir (Eio.Resource.T (v, ops)) =
     Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
 
@@ -875,7 +917,7 @@ module Crash = struct
 
   let same_state state = function Some other -> state == other | None -> false
 
-  let move_state ctl ~old_key ~new_key ~target ~new_path =
+  let move_state ctl ~old_key ~new_key ~owner ~rel =
     let moved = Hashtbl.find_opt ctl.files old_key in
     (match Hashtbl.find_opt ctl.files new_key with
     | Some replaced when not (same_state replaced moved) ->
@@ -886,8 +928,8 @@ module Crash = struct
     match moved with
     | None -> ()
     | Some fs ->
-        fs.owner <- target;
-        fs.rel <- new_path;
+        fs.owner <- owner;
+        fs.rel <- rel;
         Hashtbl.replace ctl.files new_key fs
 
   module Cdir_impl = struct
@@ -901,7 +943,8 @@ module Crash = struct
     let open_out d ~sw ~append ~create path =
       if d.dctl.crashed then raise_power_lost ();
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let key = match B.native bv path with Some n -> n | None -> path in
+      let rel = at d.dprefix path in
+      let key = file_key d.droot rel in
       let prev = read_existing d.dboxed path in
       let base = B.open_out bv ~sw ~append ~create path in
       let perm = create_perm create in
@@ -911,7 +954,7 @@ module Crash = struct
             fs.perm <- perm;
             fs
         | None ->
-            let fs = { owner = d.dboxed; rel = path; perm; durable = prev } in
+            let fs = { owner = d.droot; rel; perm; durable = prev } in
             Hashtbl.replace d.dctl.files key fs;
             fs
       in
@@ -925,7 +968,8 @@ module Crash = struct
       if d.dctl.crashed then raise_power_lost ();
       let (Base_dir ((module B), bv)) = d.dboxed in
       let sub = B.open_subtree bv ~sw path in
-      !crash_dir_hook d.dctl ~base:(sub :> Eio.Fs.dir_ty r)
+      !crash_dir_hook d.dctl ~root:d.droot ~prefix:(at d.dprefix path)
+        ~base:(sub :> Eio.Fs.dir_ty r)
 
     let stat d ~follow path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -953,20 +997,29 @@ module Crash = struct
 
     let rename d old_path new_dir new_path =
       let (Eio.Resource.T (nv, nops)) = new_dir in
+      let target_cdir =
+        Option.map (fun f -> f nv) (Eio.Resource.get_opt nops Crash_dir)
+      in
       let target =
-        match Eio.Resource.get_opt nops Crash_base with
-        | Some unwrap -> unwrap nv
+        match target_cdir with
+        | Some cd -> cd.dbase
         | None -> (new_dir :> Eio.Fs.dir_ty r)
       in
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let old_key = file_key d.dboxed old_path in
-      let target_boxed = box_dir target in
-      let new_key = file_key target_boxed new_path in
+      let old_key = file_key d.droot (at d.dprefix old_path) in
+      (* A crash-wrapped target rehomes the file root-relative, so its rewrite
+         does not depend on the target subtree staying open. *)
+      let owner, rel =
+        match target_cdir with
+        | Some cd -> (cd.droot, at cd.dprefix new_path)
+        | None -> (box_dir target, new_path)
+      in
+      let new_key = file_key owner rel in
       B.rename bv old_path target new_path;
       (* A successful rename moves the durability identity with the file. If a
          tracked target was replaced, its pending writes no longer describe a
          reachable file and must not be replayed after a crash. *)
-      move_state d.dctl ~old_key ~new_key ~target:target_boxed ~new_path
+      move_state d.dctl ~old_key ~new_key ~owner ~rel
 
     let read_link d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -993,22 +1046,30 @@ module Crash = struct
       Fmt.pf ppf "crash(%a)" B.pp bv
   end
 
-  let cdir_handler :
-      (cdir, [ `Dir | `Close | `Crash_base ]) Eio.Resource.handler =
+  let cdir_handler : (cdir, [ `Dir | `Close | `Crash_dir ]) Eio.Resource.handler
+      =
     Eio.Resource.handler
       [
         H (Eio.Fs.Pi.Dir, (module Cdir_impl));
         H (Eio.Resource.Close, fun d -> close_resource d.dbase);
-        H (Crash_base, fun d -> d.dbase);
+        H (Crash_dir, fun d -> d);
       ]
 
-  let wrap_cdir ctl ~base : [ `Close | Eio.Fs.dir_ty ] r =
-    let (Eio.Resource.T (bv, bops)) = base in
-    let boxed = Base_dir (Eio.Resource.get bops Eio.Fs.Pi.Dir, bv) in
-    (Eio.Resource.T ({ dctl = ctl; dbase = base; dboxed = boxed }, cdir_handler)
+  let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
+    (Eio.Resource.T
+       ( {
+           dctl = ctl;
+           dbase = base;
+           dboxed = box_dir base;
+           droot = root;
+           dprefix = prefix;
+         },
+         cdir_handler )
       :> [ `Close | Eio.Fs.dir_ty ] r)
 
-  let () = crash_dir_hook := fun ctl ~base -> wrap_cdir ctl ~base
+  let () =
+    crash_dir_hook :=
+      fun ctl ~root ~prefix ~base -> wrap_cdir ctl ~root ~prefix ~base
 
   let v ?(policy = Drop_unsynced) ?(trigger = Manual) () =
     {
@@ -1025,7 +1086,7 @@ module Crash = struct
   let wrap ctl (base, path) =
     let base = (base :> Eio.Fs.dir_ty r) in
     ctl.base <- Some (base, path);
-    (wrap_cdir ctl ~base, path)
+    (wrap_cdir ctl ~root:(box_dir base) ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
   let is_crashed ctl = ctl.crashed
