@@ -687,21 +687,35 @@ let rename dir_fd old_path new_dir new_path =
   let new_path = check_path new_path in
   let old_res = Filesystem.lookup ~follow:true dir_fd old_path in
   let ino = Resource.(stat !old_res).ino in
-  let new_parent, new_name = dir_base new_path in
-  let new_parent = Filesystem.lookup ~follow:true new_dir new_parent in
-  let d = as_dir ~label:"rename" !new_parent in
-  let rec loop (added, entries) = function
-    | [] -> (added, List.rev entries)
-    | ((_, e) as v) :: rest ->
-        if String.equal e new_name then
-          (true, ((ino, new_name) :: entries) @ rest)
-        else loop (added, v :: entries) rest
+  let old_parent_path, old_name = dir_base old_path in
+  let new_parent_path, new_name = dir_base new_path in
+  let old_parent = Filesystem.lookup ~follow:true dir_fd old_parent_path in
+  let new_parent = Filesystem.lookup ~follow:true new_dir new_parent_path in
+  let without name entries =
+    List.filter (fun (_, n) -> not (String.equal n name)) entries
   in
-  let did_add, new_entries = loop (false, []) d.entries in
-  let entries =
-    if did_add then new_entries else (ino, new_name) :: new_entries
-  in
-  new_parent := Resource.Dir { d with entries }
+  (* [rename] MOVES: the source directory loses [old_name] and the target gains
+     [new_name] (replacing any prior entry of that name) pointing at [ino]. The
+     source path no longer resolves afterwards, so a file later created there
+     gets a fresh inode and shares no storage with the target. When both parents
+     are the same directory they resolve to the same ref, so apply both edits to
+     one entries list; otherwise write each parent in turn. No fiber yields
+     between the reads and the writes, so the move is atomic. *)
+  if old_parent == new_parent then begin
+    let d = as_dir ~label:"rename" !new_parent in
+    let entries =
+      (ino, new_name) :: without new_name (without old_name d.entries)
+    in
+    new_parent := Resource.Dir { d with entries }
+  end
+  else begin
+    let dst = as_dir ~label:"rename-dst" !new_parent in
+    let entries = (ino, new_name) :: without new_name dst.entries in
+    new_parent := Resource.Dir { dst with entries };
+    let src = as_dir ~label:"rename-src" !old_parent in
+    old_parent :=
+      Resource.Dir { src with entries = without old_name src.entries }
+  end
 
 let stat fd =
   read_fd_table @@ fun fds ->
