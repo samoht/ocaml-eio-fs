@@ -72,18 +72,17 @@ let test_save_durable () =
     "temporary cleaned" true
     (Eio.Path.kind ~follow:false (dir / "cfg.tmp") = `Not_found)
 
-(* Under the crash model, a completed save_durable survives Drop_unsynced on
-   its own barriers: the data fsync commits the bytes and the injected
-   directory barrier commits the rename. *)
+(* Under the crash model, a completed save_durable survives Drop_unsynced
+   with no test-side plumbing: the data fsync commits the bytes and the crash
+   wrapper's registered barrier commits the rename when the store's
+   unconditional sync_dir reaches it. *)
 let test_save_durable_survives_crash () =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
   let module Crash = Eio_fs.Chaos.Crash in
   let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
   let fs = Crash.wrap ctl env#fs in
-  Eio_fs_unix.save_durable
-    ~sync_dir:(fun _ -> Crash.sync_metadata ctl)
-    ~create:(`Or_truncate 0o644)
+  Eio_fs_unix.save_durable ~create:(`Or_truncate 0o644)
     Eio.Path.(fs / "cfg")
     "durable";
   let post = Crash.post_crash ctl in
@@ -91,31 +90,33 @@ let test_save_durable_survives_crash () =
     "completed save survives the crash" "durable"
     (Eio.Path.load Eio.Path.(post / "cfg"))
 
-(* A directory with no native path is a caller error, not a crash. *)
-let test_sync_dir_refuses_non_native () =
+(* The in-memory backend registers its barrier as a no-op -- volatile storage
+   has nothing to sync -- so the same store code runs unchanged over it. *)
+let test_sync_dir_in_memory_no_op () =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
-  match Eio_fs_unix.sync_dir env#fs with
-  | () -> Alcotest.fail "sync_dir accepted an in-memory directory"
-  | exception (Invalid_argument _ | Unix.Unix_error _ | Eio.Io _) -> ()
+  Eio_fs_unix.sync_dir env#fs;
+  Eio_fs_unix.save_durable ~create:(`Or_truncate 0o644)
+    Eio.Path.(env#fs / "f")
+    "x";
+  Alcotest.(check string)
+    "saved through the no-op barrier" "x"
+    (Eio.Path.load Eio.Path.(env#fs / "f"))
 
-let () =
-  Alcotest.run "eio-fs.unix"
+let suite =
+  ( "eio_fs_unix",
     [
-      ( "sync_dir",
-        [
-          Alcotest.test_case "barrier after rename" `Quick
-            test_sync_dir_after_rename;
-          Alcotest.test_case "barrier empty and repeated" `Quick
-            test_sync_dir_empty_and_repeated;
-          Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
-          Alcotest.test_case "full_fsync surfaces errors" `Quick
-            test_full_fsync_surfaces_errors;
-          Alcotest.test_case "save_durable publishes atomically" `Quick
-            test_save_durable;
-          Alcotest.test_case "save_durable survives a crash" `Quick
-            test_save_durable_survives_crash;
-          Alcotest.test_case "refuses a non-native directory" `Quick
-            test_sync_dir_refuses_non_native;
-        ] );
-    ]
+      Alcotest.test_case "barrier after rename" `Quick
+        test_sync_dir_after_rename;
+      Alcotest.test_case "barrier empty and repeated" `Quick
+        test_sync_dir_empty_and_repeated;
+      Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
+      Alcotest.test_case "full_fsync surfaces errors" `Quick
+        test_full_fsync_surfaces_errors;
+      Alcotest.test_case "save_durable publishes atomically" `Quick
+        test_save_durable;
+      Alcotest.test_case "save_durable survives a crash" `Quick
+        test_save_durable_survives_crash;
+      Alcotest.test_case "in-memory barrier is a no-op" `Quick
+        test_sync_dir_in_memory_no_op;
+    ] )

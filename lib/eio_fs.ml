@@ -91,7 +91,9 @@ module Fs = struct
         else path
       in
       let d = v ~label ~path:full_path (Low_level.Dir.Dir_fd fd) in
-      Eio.Resource.T (d, Handler.v)
+      (* The upcast drops the barrier tag from the static row to fit
+         [Pi.DIR]; the operation itself stays probeable on the resource. *)
+      (Eio.Resource.T (d, Handler.v) :> [ `Close | `Dir ] Eio.Resource.t)
 
     let open_subtree t ~sw path = open_dir t ~sw path
     let pp f t = Fmt.string f (String.escaped t.label)
@@ -104,17 +106,22 @@ module Fs = struct
   end
 
   and Handler : sig
-    val v : (Dir.t, [ `Dir | `Close ]) Eio.Resource.handler
+    val v : (Dir.t, [ `Dir | `Close | `Dir_sync ]) Eio.Resource.handler
   end = struct
     let v =
       Eio.Resource.handler
-        [ H (Eio.Fs.Pi.Dir, (module Dir)); H (Memfs_dir, Dir.fd) ]
+        [
+          H (Eio.Fs.Pi.Dir, (module Dir));
+          H (Memfs_dir, Dir.fd);
+          (* Volatile storage: the strongest barrier it has is nothing. *)
+          H (Eio_fs_sync.Dir_sync, fun _ ~path:_ -> ());
+        ]
   end
 
   (* Full access to the filesystem. *)
   let fs = Eio.Resource.T (Dir.v ~label:"fs" ~path:"." Fs, Handler.v)
   let cwd = Eio.Resource.T (Dir.v ~label:"cwd" ~path:"." Cwd, Handler.v)
-  let v () = (fs, "/")
+  let v () = ((fs :> [ `Close | Eio.Fs.dir_ty ] Eio.Resource.t), "/")
 
   let load ?(filter = fun _ -> true) path =
     Low_level.reset ();

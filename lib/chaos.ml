@@ -482,12 +482,23 @@ module Dir_impl = struct
     Fmt.pf ppf "chaos(%a)" B.pp bv
 end
 
-let dir_handler : (dir, [ `Dir | `Close | `Chaos ]) Eio.Resource.handler =
+let dir_handler :
+    (dir, [ `Dir | `Close | `Chaos | `Dir_sync ]) Eio.Resource.handler =
   Eio.Resource.handler
     [
       H (Eio.Fs.Pi.Dir, (module Dir_impl));
       H (Eio.Resource.Close, fun t -> close_resource t.base);
       H (Chaos_base, fun t -> t.base);
+      (* The barrier is a sync the schedule may fault; it then reaches the
+         base's own barrier when one is registered. A test-only wrapper never
+         fsyncs natively itself. *)
+      H
+        ( Eio_fs_sync.Dir_sync,
+          fun t ~path ->
+            (match Schedule.next t.sched (Op.sync path) with
+            | Some (Fault.Sync_error c) -> raise_io c path
+            | _ -> ());
+            match Eio_fs_sync.find t.base with Some f -> f ~path | None -> () );
     ]
 
 let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =
@@ -1277,13 +1288,21 @@ module Crash = struct
       Fmt.pf ppf "crash(%a)" B.pp bv
   end
 
-  let cdir_handler : (cdir, [ `Dir | `Close | `Crash_dir ]) Eio.Resource.handler
-      =
+  let cdir_handler :
+      (cdir, [ `Dir | `Close | `Crash_dir | `Dir_sync ]) Eio.Resource.handler =
     Eio.Resource.handler
       [
         H (Eio.Fs.Pi.Dir, (module Cdir_impl));
         H (Eio.Resource.Close, fun d -> close_resource d.dbase);
         H (Crash_dir, fun d -> d);
+        (* A store's directory barrier commits the metadata journal, exactly
+           as the platform's directory fsync would; after the power cut it
+           fails like every other operation. *)
+        H
+          ( Eio_fs_sync.Dir_sync,
+            fun d ~path:_ ->
+              if d.dctl.crashed then raise_power_lost ();
+              commit_metadata d.dctl );
       ]
 
   let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =

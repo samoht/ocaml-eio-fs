@@ -1,6 +1,6 @@
-; eio-fs.unix: durability barriers that need a native file descriptor. A
-; separate library so the core in-memory backend stays free of unix and
-; usable from unikernels.
+; eio-fs.unix: the POSIX durability barrier. A separate library so the
+; portable machinery (eio-fs.sync) and the in-memory backend stay free of
+; unix.
 
 (library
  (name eio_fs_unix)
@@ -10,4 +10,4 @@
   (names eio_fs_unix_stubs)
   (flags
    (:standard -std=gnu11 -Wall -Wextra -Werror)))
- (libraries eio unix))
+ (libraries eio eio-fs.sync fmt unix))

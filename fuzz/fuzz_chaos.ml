@@ -252,7 +252,7 @@ module Model = struct
   let file_id m path =
     match SM.find path m.live with File id -> id | _ -> assert false
 
-  let create m path =
+  let new_file m path =
     let id = m.next_id in
     m.next_id <- id + 1;
     m.live <- SM.add path (File id) m.live;
@@ -305,7 +305,7 @@ let snapshot dir =
     List.fold_left
       (fun acc name ->
         let q = Eio.Path.(p / name) in
-        let key = if rel = "" then name else rel ^ "/" ^ name in
+        let key = if String.equal rel "" then name else rel ^ "/" ^ name in
         match Eio.Path.kind ~follow:false q with
         | `Regular_file -> SM.add key (`File (Eio.Path.load q)) acc
         | `Directory -> walk (SM.add key `Dir acc) key q
@@ -325,6 +325,33 @@ let pp_tree ppf t =
   Fmt.pf ppf "@[<v>%a@]"
     (Fmt.list (fun ppf (k, v) -> Fmt.pf ppf "%s: %a" k pp_node v))
     (Model.SM.bindings t)
+
+(* A rename pick is applicable when it moves to a genuinely new name outside
+   its own subtree: a file or symlink may clobber a file or symlink, a
+   directory only lands on a fresh name. *)
+let rename_ok (m : Model.t) ~src ~dst =
+  let src_is_dir =
+    match Model.SM.find src m.Model.live with
+    | Model.Dir -> true
+    | Model.File _ | Model.Link _ -> false
+  in
+  (not (String.equal dst src))
+  && (not (Model.under src dst))
+  &&
+  match Model.SM.find_opt dst m.Model.live with
+  | None -> true
+  | Some Model.Dir -> false
+  | Some (Model.File _ | Model.Link _) -> not src_is_dir
+
+(* Create [path] with unsynced [content], in the tree and the model. *)
+let make_file fs (m : Model.t) path content =
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    Eio.Path.(fs / path)
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0)
+        [ Cstruct.of_string content ]);
+  Model.new_file m path;
+  Model.write m path content
 
 (* One tape step: four bytes pick an operation and its arguments. Picks that
    do not apply to the current tree (unlink with nothing to unlink, mkdir over
@@ -362,14 +389,7 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
       (* create a file with unsynced content *)
       match fresh_path b1 b2 with
       | None -> ()
-      | Some path ->
-          let content = Fmt.str "c%d" b3 in
-          Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / path)
-            (fun file ->
-              Eio.File.pwrite_all file ~file_offset:(i63 0)
-                [ Cstruct.of_string content ]);
-          Model.create m path;
-          Model.write m path content)
+      | Some path -> make_file fs m path (Fmt.str "c%d" b3))
   | 1 -> (
       (* rewrite an existing file, unsynced *)
       match pick (files ()) b1 with
@@ -428,17 +448,7 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
           | None -> ()
           | Some parent ->
               let dst = join parent names.(b3 mod 4) in
-              let src_is_dir = SM.find src m.Model.live = Model.Dir in
-              let dst_ok =
-                (not (String.equal dst src))
-                && (not (Model.under src dst))
-                &&
-                match SM.find_opt dst m.Model.live with
-                | None -> true
-                | Some Model.Dir -> false
-                | Some (Model.File _ | Model.Link _) -> not src_is_dir
-              in
-              if dst_ok then begin
+              if rename_ok m ~src ~dst then begin
                 Eio.Path.rename (fs / src) (fs / dst);
                 Model.rename m ~src ~dst
               end))
