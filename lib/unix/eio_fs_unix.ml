@@ -11,6 +11,3 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
   | None ->
       let fd = Unix.openfile (Eio.Path.native_exn p) [ Unix.O_RDONLY ] 0 in
       Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> full_fsync fd)
-
-let save_durable ~create path content =
-  Eio_fs_sync.save_durable_with ~sync_dir ~create path content

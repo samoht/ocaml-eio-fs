@@ -72,14 +72,3 @@ val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
 
     [create] is applied to the temporary (its permission becomes the target's);
     [`Or_truncate] is the usual choice. *)
-
-val save_durable_with :
-  sync_dir:('a Eio.Path.t -> unit) ->
-  create:Eio.Fs.create ->
-  'a Eio.Path.t ->
-  string ->
-  unit
-(** [save_durable_with ~sync_dir ~create path content] is
-    [save_durable ~create path content] with the directory barrier resolved by
-    [sync_dir]: the plumbing a platform facade such as [Eio_fs_unix] shares, not
-    an entry point for stores. *)

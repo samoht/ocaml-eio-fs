@@ -43,8 +43,7 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
    barrier the target's directory so a power cut cannot revert the
    publication. [publish_with] is the plumbing the POSIX facade shares;
    stores call {!publish} or {!save_durable}. *)
-let publish_with ~sync_dir:barrier ?(durable = true) ~tmp ~create
-    ((dir, target) as path) content =
+let publish ?(durable = true) ~tmp ~create ((dir, target) as path) content =
   (try
      Eio.Path.with_open_out ~create tmp (fun f ->
          Eio.Flow.copy_string content f;
@@ -56,13 +55,7 @@ let publish_with ~sync_dir:barrier ?(durable = true) ~tmp ~create
    with e ->
      (try Eio.Path.unlink tmp with Eio.Io _ -> ());
      raise e);
-  if durable then barrier (dir, Filename.dirname target)
-
-let publish ?durable ~tmp ~create path content =
-  publish_with ~sync_dir ?durable ~tmp ~create path content
-
-let save_durable_with ~sync_dir ~create ((dir, target) as path) content =
-  publish_with ~sync_dir ~tmp:(dir, target ^ ".tmp") ~create path content
+  if durable then sync_dir (dir, Filename.dirname target)
 
 let save_durable ~create ((dir, target) as path) content =
   publish ~tmp:(dir, target ^ ".tmp") ~create path content

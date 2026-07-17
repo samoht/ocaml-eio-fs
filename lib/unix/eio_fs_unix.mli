@@ -28,8 +28,3 @@ val sync_dir : _ Eio.Path.t -> unit
     @raise Unix.Unix_error as [open] or [fsync].
     @raise Invalid_argument
       if [dir] registers no barrier and has no native path. *)
-
-val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
-(** [save_durable ~create path content] is {!Eio_fs_sync.save_durable} with the
-    barrier resolved by {!sync_dir}: replace [path]'s contents atomically and
-    durably at full platform strength. *)
