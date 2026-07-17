@@ -606,14 +606,36 @@ module Crash = struct
       buf
     end
 
+  (* The model observes the disk as a disk, not as a user: a file whose mode
+     denies reading (a write-only spool) is still bytes on the platter. Grant
+     owner read for the duration of the model's own reads and restore the
+     exact mode after. *)
+  let with_readable (Base_dir ((module B), bv)) path fn =
+    let restore =
+      match B.stat bv ~follow:false path with
+      | exception Eio.Io _ -> None
+      | { kind = `Regular_file; perm; _ } when perm land 0o400 = 0 ->
+          B.chmod bv ~follow:true ~perm:(perm lor 0o400) path;
+          Some perm
+      | _ -> None
+    in
+    Fun.protect
+      ~finally:(fun () ->
+        match restore with
+        | Some perm -> B.chmod bv ~follow:true ~perm path
+        | None -> ())
+      fn
+
   (* The base content before a truncating open, used to seed a file's durable
      baseline. A missing path, or one that is not a regular file, seeds an empty
      baseline. *)
-  let read_existing (Base_dir ((module B), bv)) path =
+  let read_existing (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:true path with
     | exception Eio.Io _ -> Cstruct.empty
     | { kind = `Regular_file; _ } -> (
-        try Switch.run (fun sw -> read_all (B.open_in bv ~sw path))
+        try
+          with_readable owner path (fun () ->
+              Switch.run (fun sw -> read_all (B.open_in bv ~sw path)))
         with Eio.Io _ -> Cstruct.empty)
     | _ -> Cstruct.empty
 
@@ -751,15 +773,16 @@ module Crash = struct
     | Truncate n -> resize buf n
 
   (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
-     staged read-only cannot be reopened for writing, so grant the owner-write
-     bit for the duration of the rewrite and restore the mode after. *)
+     staged read-only or write-only cannot be reopened O_RDWR, so grant the
+     owner read and write bits for the duration of the rewrite and restore
+     the exact mode after. *)
   let rewrite fs content =
     let (Base_dir ((module B), bv)) = fs.owner in
     let restore =
       match B.stat bv ~follow:true fs.rel with
       | exception Eio.Io _ -> None
-      | { kind = `Regular_file; perm; _ } when perm land 0o200 = 0 ->
-          B.chmod bv ~follow:true ~perm:(perm lor 0o200) fs.rel;
+      | { kind = `Regular_file; perm; _ } when perm land 0o600 <> 0o600 ->
+          B.chmod bv ~follow:true ~perm:(perm lor 0o600) fs.rel;
           Some perm
       | _ -> None
     in
@@ -782,7 +805,9 @@ module Crash = struct
     match B.stat bv ~follow:false path with
     | { kind = `Regular_file; perm; _ } ->
         let data =
-          Switch.run (fun sw -> read_all (B.open_in bv ~sw path)) |> copy_cs
+          with_readable owner path (fun () ->
+              Switch.run (fun sw -> read_all (B.open_in bv ~sw path)))
+          |> copy_cs
         in
         File { data; perm }
     | { kind = `Directory; perm; _ } ->

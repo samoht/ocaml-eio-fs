@@ -533,15 +533,18 @@ let close fd =
   | None -> Error.badf ()
   | Some _ -> Fd_table.remove fd fds
 
-(* open(2): opening an existing file for writing requires the write permission
-   bit; the mode given at creation does not restrict the creating open itself.
-   The model is single-user, so the owner bit is the one consulted. *)
-let check_write_access path flags r =
-  if Open_flags.(mem o_rdwr flags) then
-    match !r with
-    | Resource.File f when f.stat.perm land 0o200 = 0 ->
-        Error.permission_denied path
-    | _ -> ()
+(* open(2): opening an existing file requires the permission bits the access
+   mode asks for; the mode given at creation does not restrict the creating
+   open itself. This backend opens files O_RDONLY or O_RDWR, so the read bit
+   is always required and the write bit with o_rdwr. The model is
+   single-user, so the owner bits are the ones consulted. Directories are
+   exempt: fixtures predate recorded directory modes. *)
+let check_access path flags r =
+  let need = if Open_flags.(mem o_rdwr flags) then 0o600 else 0o400 in
+  match !r with
+  | Resource.File f when f.stat.perm land need <> need ->
+      Error.permission_denied path
+  | _ -> ()
 
 (* Create [path] in its parent directory, register the new file in the
    filesystem, and return its resource. *)
@@ -575,7 +578,7 @@ let openat ~mode ~sw dir_fd path flags =
       update_fd_table_with_result @@ fun fds ->
       let fd = next_fd_of_fds fds in
       let r = Filesystem.lookup ~follow dir_fd path in
-      check_write_access path flags r;
+      check_access path flags r;
       reset_file ~truncate ~append r;
       Eio.Switch.on_release sw (fun () -> close fd);
       (fd, Fd_table.add fd r fds)
@@ -595,7 +598,7 @@ let openat ~mode ~sw dir_fd path flags =
       in
       match r with
       | Some r ->
-          check_write_access path flags r;
+          check_access path flags r;
           let fds = Fd_table.add fd r fds in
           reset_file ~truncate ~append r;
           Eio.Switch.on_release sw (fun () -> close fd);
