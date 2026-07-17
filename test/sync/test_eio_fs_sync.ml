@@ -67,6 +67,47 @@ let test_failed_save_cleans_temporary () =
     "no temporary left behind" true
     (Eio.Path.kind ~follow:false (env#fs / "missing-dir") = `Not_found)
 
+(* publish takes a caller-chosen temporary, possibly in another directory on
+   the same filesystem, so a watched target directory never sees temporary
+   churn. The temporary is consumed by the rename. *)
+let test_publish_with_remote_tmp () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "tmp");
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "live");
+  Eio_fs_sync.publish
+    ~tmp:(env#fs / "tmp" / "stage-1")
+    ~create:(`Or_truncate 0o644)
+    (env#fs / "live" / "cfg")
+    "payload";
+  Alcotest.(check string)
+    "published" "payload"
+    (Eio.Path.load (env#fs / "live" / "cfg"));
+  Alcotest.(check bool)
+    "temporary consumed" true
+    (Eio.Path.kind ~follow:false (env#fs / "tmp" / "stage-1") = `Not_found)
+
+(* The durability flag has teeth: under the crash model a default publish
+   survives Drop_unsynced on its own barriers, and an explicitly non-durable
+   one loses its rename -- the window the caller opted into. *)
+let test_publish_durability_flag () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio_fs_sync.publish ~tmp:(fs / "safe-tmp") ~create:(`Or_truncate 0o644)
+    (fs / "safe") "s";
+  Eio_fs_sync.publish ~durable:false ~tmp:(fs / "fast-tmp")
+    ~create:(`Or_truncate 0o644) (fs / "fast") "f";
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "durable publish survives" "s"
+    (Eio.Path.load Eio.Path.(post / "safe"));
+  Alcotest.(check bool)
+    "non-durable publish lost" true
+    (Eio.Path.kind ~follow:false Eio.Path.(post / "fast") = `Not_found)
+
 let suite =
   ( "eio_fs_sync",
     [
@@ -77,4 +118,8 @@ let suite =
         test_unissuable_barrier_raises;
       Alcotest.test_case "failed save cleans temporary" `Quick
         test_failed_save_cleans_temporary;
+      Alcotest.test_case "publish with a remote temporary" `Quick
+        test_publish_with_remote_tmp;
+      Alcotest.test_case "publish durability flag" `Quick
+        test_publish_durability_flag;
     ] )

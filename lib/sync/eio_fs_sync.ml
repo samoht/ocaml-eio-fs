@@ -38,23 +38,31 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
             "syncing directory (backend registers no Dir_sync barrier)")
 
 (* The durable-publication protocol shared by every store in the tree: write
-   the sibling temporary [<target>.tmp] (same directory: a rename must not
-   cross filesystems), push its bytes to stable storage, rename it over the
-   target (atomic: readers see the old or the new file, never a torn one) and
-   barrier the directory so a power cut cannot revert the publication.
-   [save_durable_with] is the plumbing the POSIX facade shares; stores call
-   {!save_durable}. *)
-let save_durable_with ~sync_dir:barrier ~create (dir, target) content =
-  let tmp = (dir, target ^ ".tmp") in
+   a temporary, push its bytes to stable storage, rename it over the target
+   (atomic: readers see the old or the new file, never a torn one) and
+   barrier the target's directory so a power cut cannot revert the
+   publication. [publish_with] is the plumbing the POSIX facade shares;
+   stores call {!publish} or {!save_durable}. *)
+let publish_with ~sync_dir:barrier ?(durable = true) ~tmp ~create
+    ((dir, target) as path) content =
   (try
      Eio.Path.with_open_out ~create tmp (fun f ->
          Eio.Flow.copy_string content f;
-         Eio.File.sync f)
+         if durable then Eio.File.sync f)
    with e ->
      (try Eio.Path.unlink tmp with Eio.Io _ -> ());
      raise e);
-  Eio.Path.rename tmp (dir, target);
-  barrier (dir, Filename.dirname target)
+  (try Eio.Path.rename tmp path
+   with e ->
+     (try Eio.Path.unlink tmp with Eio.Io _ -> ());
+     raise e);
+  if durable then barrier (dir, Filename.dirname target)
 
-let save_durable ~create path content =
-  save_durable_with ~sync_dir ~create path content
+let publish ?durable ~tmp ~create path content =
+  publish_with ~sync_dir ?durable ~tmp ~create path content
+
+let save_durable_with ~sync_dir ~create ((dir, target) as path) content =
+  publish_with ~sync_dir ~tmp:(dir, target ^ ".tmp") ~create path content
+
+let save_durable ~create ((dir, target) as path) content =
+  publish ~tmp:(dir, target ^ ".tmp") ~create path content

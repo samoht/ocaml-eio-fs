@@ -38,17 +38,40 @@ val sync_dir : _ Eio.Path.t -> unit
       sync operation -- a wiring error, since silence would silently lose
       durability. *)
 
+val publish :
+  ?durable:bool ->
+  tmp:'a Eio.Path.t ->
+  create:Eio.Fs.create ->
+  'a Eio.Path.t ->
+  string ->
+  unit
+(** [publish ~tmp ~create path content] replaces [path]'s contents with
+    [content] atomically and durably through the caller-chosen temporary [tmp]:
+    the temporary is written and fsynced, renamed over [path] -- a reader or a
+    crash sees the old file or the whole new one, never a torn or empty file --
+    and [path]'s directory is barriered with {!sync_dir} so a power cut cannot
+    revert the publication. The temporary is removed if the write or the rename
+    fails.
+
+    [tmp] must live on the same filesystem as [path] (rename cannot cross
+    devices) but not necessarily in the same directory: a store watched by
+    filesystem monitors points it at a quiet directory, and a store with
+    concurrent writers to one target gives each writer a unique name. Only
+    [path]'s directory is barriered; a stale temporary resurrected by a power
+    cut is garbage for the store's usual cleanup, never served state.
+
+    [~durable:false] keeps only the atomicity -- no fsync, no barrier -- for a
+    store that deliberately trades the power-cut window for write speed, as git
+    does for loose objects; say why at the call site. *)
+
 val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
-(** [save_durable ~create path content] replaces [path]'s contents with
-    [content] atomically and durably: the sibling temporary [<path>.tmp] is
-    written and fsynced, renamed over [path] -- a reader or a crash sees the old
-    file or the whole new one, never a torn or empty file -- and the directory
-    is barriered with {!sync_dir} so a power cut cannot revert the publication.
-    The temporary is removed if the write fails.
+(** [save_durable ~create path content] is {!publish} with the sibling temporary
+    [<path>.tmp]: the shape for a store whose writers are serialised by its own
+    lock, where the deterministic name lets path-triggered crash tests address
+    the temporary.
 
     [create] is applied to the temporary (its permission becomes the target's);
-    [`Or_truncate] is the usual choice. The temporary's name is deterministic,
-    so concurrent writers to one target must be serialised by the caller. *)
+    [`Or_truncate] is the usual choice. *)
 
 val save_durable_with :
   sync_dir:('a Eio.Path.t -> unit) ->
