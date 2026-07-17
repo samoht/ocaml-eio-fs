@@ -489,16 +489,16 @@ let dir_handler :
       H (Eio.Fs.Pi.Dir, (module Dir_impl));
       H (Eio.Resource.Close, fun t -> close_resource t.base);
       H (Chaos_base, fun t -> t.base);
-      (* The barrier is a sync the schedule may fault; it then reaches the
-         base's own barrier when one is registered. A test-only wrapper never
-         fsyncs natively itself. *)
+      (* The barrier is a sync the schedule may fault; it then delegates to
+         the base's barrier, so a wrapped POSIX directory still reaches the
+         real fsync. *)
       H
         ( Eio_fs_sync.Dir_sync,
           fun t ~path ->
             (match Schedule.next t.sched (Op.sync path) with
             | Some (Fault.Sync_error c) -> raise_io c path
             | _ -> ());
-            match Eio_fs_sync.find t.base with Some f -> f ~path | None -> () );
+            Eio_fs_sync.sync_dir (t.base, path) );
     ]
 
 let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =

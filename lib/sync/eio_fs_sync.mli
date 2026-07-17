@@ -1,15 +1,14 @@
 (** The directory-durability barrier, portable across backends.
 
-    Eio exposes no directory fsync, yet a write-temporary-then-rename commit
-    protocol is durable only once the directory entry itself reaches stable
-    storage. This library keeps the barrier portable -- it depends on nothing
-    but eio, so pure Eio adapters that cross-compile to unikernels link it
-    freely. Each backend registers the strongest barrier it has: the in-memory
-    backend registers nothing to do (volatile storage needs no barrier), a
-    crash-model wrapper its journal commit, a block-device filesystem its flush.
-    A plain POSIX directory registers none: a POSIX main grants the barrier as a
-    capability by wrapping the directory with [Eio_fs_unix.wrap] before handing
-    it to a store. *)
+    A write-temporary-then-rename commit protocol is durable only once the
+    directory entry itself reaches stable storage. {!sync_dir} issues that
+    barrier over any backend. A backend with its own barrier semantics registers
+    {!Dir_sync} in its resource handler: the in-memory backend a no-op (volatile
+    storage has nothing to sync), a crash-model wrapper its journal commit, a
+    block-device filesystem its flush. A plain POSIX directory needs no
+    registration: it is opened read-only and its handle fsynced. This library
+    depends on nothing but eio, so pure Eio adapters that cross-compile to
+    unikernels link it freely. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
@@ -23,13 +22,21 @@ val find : 'a Eio.Resource.t -> (path:string -> unit) option
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
     issues after renaming a file into place, without which a power cut can
-    revert the rename to the prior entry. Resolves through the barrier [dir]'s
-    backend registers.
+    revert the rename to the prior entry. A backend that registers {!Dir_sync}
+    answers through it; otherwise [dir] is opened read-only and its handle
+    fsynced, which is the POSIX directory barrier. On Darwin that fsync reaches
+    the drive's cache, the same strength Eio gives file data;
+    [Eio_fs_unix.sync_dir] upgrades the barrier to platter strength for programs
+    that can link unix.
 
+    @raise Eio.Io
+      if the directory cannot be opened for its barrier or the sync itself
+      fails; the error carries context naming the missing {!Dir_sync}
+      registration.
     @raise Failure
-      if the backend registers no barrier -- a wiring error, since silence would
-      silently lose durability. On POSIX, hand the store a directory wrapped
-      with [Eio_fs_unix.wrap]. *)
+      if the backend registers no barrier and its directory handles expose no
+      sync operation -- a wiring error, since silence would silently lose
+      durability. *)
 
 val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
 (** [save_durable ~create path content] replaces [path]'s contents with

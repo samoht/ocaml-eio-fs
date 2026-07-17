@@ -1,11 +1,13 @@
-(* The directory-durability barrier as a probeable resource operation, so it
-   stays portable: the in-memory backend registers nothing to do (volatile
-   storage has no barrier and needs none), a crash-model wrapper registers its
-   journal commit, a block-device filesystem its flush -- and a plain POSIX
-   directory, which registers nothing, resolves through the platform fallback
-   that eio-fs.unix installs when linked. Eio itself exposes no directory
-   sync, which is why this lives here; it depends on nothing but eio, so
-   unikernel targets link it freely. *)
+(* The directory-durability barrier. A backend with its own barrier
+   semantics registers [Dir_sync] in its resource handler: the in-memory
+   backend a no-op (volatile storage has nothing to sync), a crash-model
+   wrapper its journal commit, a fault-injecting wrapper its faultable sync.
+   A backend that registers nothing gets the POSIX route: the directory is
+   opened read-only and its handle fsynced, the barrier POSIX defines for
+   directory entries. Eio types [File.sync] as write-only, but the POSIX
+   backends build every descriptor from one read-write implementation, so
+   the operation is probed from the handle. This library depends on nothing
+   but eio, so unikernel targets link it freely. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
@@ -13,17 +15,27 @@ type (_, _, _) Eio.Resource.pi +=
 let find (Eio.Resource.T (v, ops)) =
   Option.map (fun f -> f v) (Eio.Resource.get_opt ops Dir_sync)
 
-(* A missing registration is a wiring error, not a soft condition: silence
-   here would silently lose durability. A POSIX main grants the barrier as a
-   capability by wrapping its directory with [Eio_fs_unix.wrap] before
-   handing it to a store. *)
-let sync_dir ((res, path) : _ Eio.Path.t) =
-  match find res with
-  | Some barrier -> barrier ~path
+(* A directory handle that cannot sync is a wiring error, loudly: silence
+   here would silently lose durability. *)
+let fsync_handle (Eio.Resource.T (v, ops)) =
+  match Eio.Resource.get_opt ops Eio.File.Pi.Write with
+  | Some (module W) -> W.sync v
   | None ->
       failwith
-        "Eio_fs_sync.sync_dir: this backend registers no directory barrier; on \
-         POSIX hand the store a directory wrapped with Eio_fs_unix.wrap"
+        "Eio_fs_sync.sync_dir: this backend's directory handle cannot sync; \
+         register a Dir_sync barrier on the directory resource"
+
+let sync_dir ((res, path) as p : _ Eio.Path.t) =
+  match find res with
+  | Some barrier -> barrier ~path
+  | None -> (
+      Eio.Switch.run @@ fun sw ->
+      match Eio.Path.open_in ~sw p with
+      | handle -> fsync_handle handle
+      | exception (Eio.Io _ as ex) ->
+          let bt = Printexc.get_raw_backtrace () in
+          Eio.Exn.reraise_with_context ex bt
+            "syncing directory (backend registers no Dir_sync barrier)")
 
 (* The durable-publication protocol shared by every store in the tree: write
    the sibling temporary [<target>.tmp] (same directory: a rename must not
