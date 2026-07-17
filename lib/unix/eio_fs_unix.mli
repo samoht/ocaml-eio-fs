@@ -1,11 +1,12 @@
-(** The POSIX durability barrier.
+(** The POSIX durability barrier, at full platform strength.
 
-    The portable barrier machinery lives in {!Eio_fs_sync}: backends register
-    the strongest barrier they have, and stores call it unconditionally. This
-    facade adds what only POSIX can provide -- the native directory fsync -- in
-    two forms: direct calls for unix-linked stores, and {!wrap}, which grants
-    the barrier as a capability on a directory before it is handed to a pure-Eio
-    store (one that cross-compiles to unikernels and never links unix). *)
+    The portable machinery lives in {!Eio_fs_sync}: backends with their own
+    barrier semantics register {!Eio_fs_sync.Dir_sync}, and a plain POSIX
+    directory is fsynced through its own handle. This facade is for programs
+    that link unix anyway and want the strongest barrier the platform offers: on
+    Darwin {!full_fsync} (F_FULLFSYNC, through to the platter) where the
+    portable route's fsync only reaches the drive's cache. Elsewhere the two are
+    the same barrier. *)
 
 val full_fsync : Unix.file_descr -> unit
 (** [full_fsync fd] pushes [fd]'s data through to stable storage. On Darwin it
@@ -31,12 +32,4 @@ val sync_dir : _ Eio.Path.t -> unit
 val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
 (** [save_durable ~create path content] is {!Eio_fs_sync.save_durable} with the
     barrier resolved by {!sync_dir}: replace [path]'s contents atomically and
-    durably over any backend, including a plain POSIX directory. *)
-
-val wrap : _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-(** [wrap dir] is [dir] with the native POSIX barrier registered as its
-    {!Eio_fs_sync.Dir_sync} operation, and every subtree opened through it
-    wrapped the same way. What a POSIX main hands to a pure-Eio store: the store
-    calls {!Eio_fs_sync.sync_dir} unconditionally and this wrapper answers with
-    the platform fsync. Backends that already register a barrier keep their own.
-    Directory operations delegate to [dir] unchanged. *)
+    durably at full platform strength. *)
