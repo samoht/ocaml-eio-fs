@@ -344,7 +344,7 @@ let rename_ok (m : Model.t) ~src ~dst =
   | Some (Model.File _ | Model.Link _) -> not src_is_dir
 
 (* Create [path] with unsynced [content], in the tree and the model. *)
-let make_file fs (m : Model.t) path content =
+let add_file fs (m : Model.t) path content =
   Eio.Path.with_open_out ~create:(`Exclusive 0o644)
     Eio.Path.(fs / path)
     (fun file ->
@@ -389,7 +389,7 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
       (* create a file with unsynced content *)
       match fresh_path b1 b2 with
       | None -> ()
-      | Some path -> make_file fs m path (Fmt.str "c%d" b3))
+      | Some path -> add_file fs m path (Fmt.str "c%d" b3))
   | 1 -> (
       (* rewrite an existing file, unsynced *)
       match pick (files ()) b1 with
