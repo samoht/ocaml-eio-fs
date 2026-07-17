@@ -710,6 +710,25 @@ let test_crash_unsynced_lists_dir_ops () =
     "journal lists mkdir, create, data in program order" true
     (kinds = [ Crash.Mkdir; Crash.Create; Crash.Data ])
 
+(* A write-only (0o200) file is still rewritten at crash time: the rewrite
+   opens O_RDWR, which needs the read bit too, so the model grants owner
+   read and write for the duration and restores the exact mode after. *)
+let test_crash_write_only_file () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o200) (fs / "img") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "AAAA" ];
+      Eio.File.sync file;
+      Eio.File.pwrite_all file ~file_offset:(i63 4) [ Cstruct.of_string "BBBB" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check int)
+    "write-only mode preserved after rewrite" 0o200
+    (Eio.Path.stat ~follow:true (post / "img")).perm;
+  Eio.Path.chmod ~follow:true ~perm:0o644 (post / "img");
+  Alcotest.(check string)
+    "write-only file rewritten to its synced prefix" "AAAA"
+    (Eio.Path.load (post / "img"))
+
 (* {2 The same hazards against the real filesystem}
 
    The kernel is the authority on EACCES and fd invalidation; the in-memory
@@ -853,6 +872,8 @@ let suite =
         test_crash_closed_subtree;
       Alcotest.test_case "crash: read-only in closed subtree" `Quick
         test_crash_readonly_in_closed_subtree;
+      Alcotest.test_case "crash: write-only file" `Quick
+        test_crash_write_only_file;
       Alcotest.test_case "crash: read-only file (real fs)" `Quick
         test_crash_readonly_real;
       Alcotest.test_case "crash: closed subtree (real fs)" `Quick

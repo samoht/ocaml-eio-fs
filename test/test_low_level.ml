@@ -93,6 +93,17 @@ let test_chmod_restores_writability () =
   Eio.Path.save ~create:(`Or_truncate 0o644) (env#fs / "ro") "y";
   Alcotest.(check string) "rewritten" "y" (Eio.Path.load (env#fs / "ro"))
 
+(* open(2): EACCES also when read permission is missing. A write-only file
+   can be created -- the creating open is unrestricted -- but not reopened:
+   this backend opens files O_RDONLY or O_RDWR, and both need the read bit. *)
+let test_unreadable_reopen_denied () =
+  with_env @@ fun env ->
+  Eio.Path.save ~create:(`Or_truncate 0o200) (env#fs / "wo") "x";
+  expect_io_error "permission denied" (fun () ->
+      ignore (Eio.Path.load (env#fs / "wo")));
+  expect_io_error "permission denied" (fun () ->
+      Eio.Path.save ~create:(`Or_truncate 0o200) (env#fs / "wo") "y")
+
 (* A directory capability opened for a switch dies with the switch, as a real
    O_DIRECTORY fd does: using it afterwards is EBADF, not silent success. *)
 let test_subtree_fd_dies_with_switch () =
@@ -118,6 +129,8 @@ let suite =
       Alcotest.test_case "create records mode" `Quick test_create_mode_recorded;
       Alcotest.test_case "read-only reopen denied" `Quick
         test_readonly_reopen_denied;
+      Alcotest.test_case "unreadable reopen denied" `Quick
+        test_unreadable_reopen_denied;
       Alcotest.test_case "fresh read-only create writable" `Quick
         test_readonly_fresh_create_writable;
       Alcotest.test_case "chmod restores writability" `Quick
