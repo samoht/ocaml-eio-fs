@@ -158,6 +158,40 @@ let test_stat_error () =
   expect_io "stat" (fun () ->
       ignore (Eio.Path.stat ~follow:false (chaos / "f")))
 
+(* A [Swap_symlink] fault reproduces a TOCTOU: the scripted [`Stat] on "victim"
+   still returns the original regular file, then the path becomes a symlink to
+   the secret, so a follow-up open on the same path -- as a builder that stats
+   then opens would do -- resolves to what was swapped in. The check saw one
+   thing; the use sees another. *)
+let test_swap_symlink () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Stat; path = "victim" };
+          fault = Swap_symlink "secret";
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "victim") "safe";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "secret") "SECRET";
+  (* The check: the stat through chaos still sees the original regular file... *)
+  let st = Eio.Path.stat ~follow:false (chaos / "victim") in
+  Alcotest.(check bool)
+    "the checked path is a regular file at stat time" true
+    (match st.Eio.File.Stat.kind with `Regular_file -> true | _ -> false);
+  (* ...but the fault swapped it underneath: the path is now a symlink to the
+     secret, so the use that follows the check reads what was swapped in. *)
+  Alcotest.(check bool)
+    "the path became a symlink after the stat" true
+    (match Eio.Path.kind ~follow:false (raw / "victim") with
+    | `Symbolic_link -> true
+    | _ -> false);
+  Alcotest.(check string)
+    "the swapped-in link points at the secret" "secret"
+    (Eio.Path.read_link (raw / "victim"))
+
 (* {2 Schedule as an inspectable value} *)
 
 (* A scripted rule fires the first time its trigger matches, then is spent. *)
@@ -846,6 +880,7 @@ let suite =
       Alcotest.test_case "sync error" `Quick test_sync_error;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
+      Alcotest.test_case "swap-symlink TOCTOU" `Quick test_swap_symlink;
       Alcotest.test_case "scripted fires once" `Quick test_scripted_fires_once;
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;

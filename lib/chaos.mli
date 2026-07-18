@@ -24,9 +24,11 @@ module Fault : sig
     | `Write_error
     | `Sync_error
     | `Open_error
-    | `Stat_error ]
+    | `Stat_error
+    | `Swap ]
   (** The family a fault belongs to, used to enable/disable kinds in a seeded
-      schedule. *)
+      schedule. [`Swap] is scripted-only (it carries a concrete symlink target),
+      so a seeded schedule never generates it. *)
 
   type t =
     | Short_read of int
@@ -42,6 +44,13 @@ module Fault : sig
     | Sync_error of code  (** Fail a flush/sync. *)
     | Open_error of code  (** Fail an open/open_dir. *)
     | Stat_error of code  (** Fail a stat. *)
+    | Swap_symlink of string
+        (** Perform the operation, then replace its path with a symlink to the
+            given target. Scripted on a [`Stat] op, the stat still sees the
+            original file while the following open on the same path resolves to
+            the symlink -- the check-to-use window a TOCTOU exploits.
+            Reproduces, deterministically, a concurrent modifier swapping a
+            checked file for a symlink between a builder's stat and its open. *)
 
   val equal : t -> t -> bool
   (** [equal a b] is [true] when [a] and [b] are the same fault. *)

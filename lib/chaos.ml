@@ -43,7 +43,8 @@ module Fault = struct
     | `Write_error
     | `Sync_error
     | `Open_error
-    | `Stat_error ]
+    | `Stat_error
+    | `Swap ]
 
   type t =
     | Short_read of int
@@ -56,6 +57,13 @@ module Fault = struct
     | Sync_error of code  (** Fail a flush/sync. *)
     | Open_error of code  (** Fail an open/open_dir. *)
     | Stat_error of code  (** Fail a stat. *)
+    | Swap_symlink of string
+        (** Perform the operation, then replace its path with a symlink to the
+            given target: the check-to-use window a TOCTOU exploits. Scripted on
+            a [`Stat] op, it lets the stat see the original file and the
+            following open see a symlink, so a builder that reads the same
+            pathname twice reads what was swapped in. Only meaningful in a
+            scripted schedule. *)
 
   let equal a b =
     match (a, b) with
@@ -68,6 +76,7 @@ module Fault = struct
     | Open_error x, Open_error y
     | Stat_error x, Stat_error y ->
         x = y
+    | Swap_symlink x, Swap_symlink y -> String.equal x y
     | _ -> false
 
   let pp ppf = function
@@ -78,6 +87,7 @@ module Fault = struct
     | Sync_error c -> Fmt.pf ppf "sync-error(%s)" (code_name c)
     | Open_error c -> Fmt.pf ppf "open-error(%s)" (code_name c)
     | Stat_error c -> Fmt.pf ppf "stat-error(%s)" (code_name c)
+    | Swap_symlink t -> Fmt.pf ppf "swap-symlink(%s)" t
 end
 
 module Op = struct
@@ -193,6 +203,11 @@ module Schedule = struct
     | `Sync_error -> Sync_error `Eio
     | `Open_error -> Open_error (some_code rng)
     | `Stat_error -> Stat_error (some_code rng)
+    | `Swap ->
+        (* A swap needs a concrete symlink target, so it has no random form; it is
+           driven by a scripted rule, never a seed. [all_kinds] omits it, and
+           [applies_to] excludes it, so a seeded schedule never reaches here. *)
+        invalid_arg "Chaos: `Swap is scripted-only, not a seeded fault"
 
   let next t (op : Op.t) =
     match t with
@@ -421,11 +436,21 @@ module Dir_impl = struct
     !wrap_dir_hook ~base:(sub :> Eio.Fs.dir_ty r) ~sched:t.sched
 
   let stat t ~follow path =
-    (match Schedule.next t.sched (Op.stat path) with
+    let fault = Schedule.next t.sched (Op.stat path) in
+    (match fault with
     | Some (Fault.Stat_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
-    B.stat bv ~follow path
+    let result = B.stat bv ~follow path in
+    (* A swap fires AFTER the real stat: the caller gets the pre-swap metadata,
+       then the path becomes a symlink, so its next open on the same path resolves
+       to the target -- the exact check-to-use window a TOCTOU exploits. *)
+    (match fault with
+    | Some (Fault.Swap_symlink target) ->
+        B.unlink bv path;
+        B.symlink ~link_to:target bv path
+    | _ -> ());
+    result
 
   let mkdir t ~perm path =
     let (Base_dir ((module B), bv)) = t.boxed in
