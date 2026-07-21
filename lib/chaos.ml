@@ -962,7 +962,12 @@ module Crash = struct
         | Drop_unsynced -> []
         | Survive pred -> take_prefix (fun e -> pred e.meta) ordered_metadata
         | Reorder_unsynced seed ->
-            let rng = Random.State.make [| seed; 0x4d455441 |] in
+            (* Arbitrary salt for the reorder RNG. Written as a shift so the
+               32-bit "META" value (0x4d455441) is not an int literal that
+               overflows a 31-bit int (js_of_ocaml, wasm_of_ocaml); the 64-bit
+               value, and so the fault-injection sequence, is unchanged. *)
+            let salt = (0x4d45 lsl 16) lor 0x5441 in
+            let rng = Random.State.make [| seed; salt |] in
             take_prefix (fun _ -> Random.State.bool rng) ordered_metadata
       in
       let tree, locs =
