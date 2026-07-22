@@ -840,7 +840,7 @@ module Crash = struct
           B.read_dir bv path |> List.sort String.compare
           |> List.map (fun name ->
               let child =
-                if path = "" then name else Filename.concat path name
+                if String.equal path "" then name else Filename.concat path name
               in
               (name, snapshot_at owner child))
         in
@@ -859,14 +859,15 @@ module Crash = struct
               List.iter
                 (fun name ->
                   let child =
-                    if path = "" then name else Filename.concat path name
+                    if String.equal path "" then name
+                    else Filename.concat path name
                   in
                   remove_at owner child)
                 names;
               clear ()
         in
         clear ();
-        if path <> "" then
+        if not (String.equal path "") then
           (* A deliberately adversarial in-memory tree may retain hidden
              bookkeeping entries after a chain of directory renames. The
              namespace entry is still safe to discard when rebuilding the
@@ -885,11 +886,11 @@ module Crash = struct
         B.chmod bv ~follow:true ~perm path
     | Link target -> B.symlink ~link_to:target bv path
     | Dir { perm; entries } ->
-        if path <> "" then B.mkdir bv ~perm path;
+        if not (String.equal path "") then B.mkdir bv ~perm path;
         List.iter
           (fun (name, child) ->
             let child_path =
-              if path = "" then name else Filename.concat path name
+              if String.equal path "" then name else Filename.concat path name
             in
             restore_at owner child_path child)
           entries
@@ -898,13 +899,15 @@ module Crash = struct
     | Dir { perm; entries } ->
         B.read_dir bv path
         |> List.iter (fun name ->
-            let child = if path = "" then name else Filename.concat path name in
+            let child =
+              if String.equal path "" then name else Filename.concat path name
+            in
             remove_at owner child);
-        if path <> "" then B.chmod bv ~follow:true ~perm path;
+        if not (String.equal path "") then B.chmod bv ~follow:true ~perm path;
         List.iter
           (fun (name, child) ->
             let child_path =
-              if path = "" then name else Filename.concat path name
+              if String.equal path "" then name else Filename.concat path name
             in
             restore_at owner child_path child)
           entries
