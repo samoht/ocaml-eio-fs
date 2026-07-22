@@ -183,27 +183,6 @@ let test_sync_noop () =
   Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ];
   Eio.File.sync file
 
-let suite =
-  ( "eio_fs",
-    [
-      Alcotest.test_case "write/read" `Quick test_write_read;
-      Alcotest.test_case "mkdir/read_dir" `Quick test_mkdir_read_dir;
-      Alcotest.test_case "read_dir_entries" `Quick test_read_dir_entries;
-      Alcotest.test_case "chmod" `Quick test_chmod;
-      Alcotest.test_case "chown" `Quick test_chown;
-      Alcotest.test_case "rename" `Quick test_rename;
-      Alcotest.test_case "rename moves" `Quick test_rename_moves;
-      Alcotest.test_case "rename atomic save" `Quick test_rename_atomic_save;
-      Alcotest.test_case "unlink" `Quick test_unlink;
-      Alcotest.test_case "stat kind" `Quick test_stat_kind;
-      Alcotest.test_case "symlink" `Quick test_symlink;
-      Alcotest.test_case "pwrite/pread" `Quick test_pwrite_pread;
-      Alcotest.test_case "pread eof" `Quick test_pread_eof;
-      Alcotest.test_case "seek" `Quick test_seek;
-      Alcotest.test_case "truncate" `Quick test_truncate;
-      Alcotest.test_case "sync no-op" `Quick test_sync_noop;
-    ] )
-
 module Crunch = struct
   let ( / ) = Eio.Path.( / )
 
@@ -362,3 +341,25 @@ module Crunch = struct
         Alcotest.test_case "interface" `Quick test_interface;
       ] )
 end
+
+let suite =
+  ( "eio_fs",
+    [
+      Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "mkdir/read_dir" `Quick test_mkdir_read_dir;
+      Alcotest.test_case "read_dir_entries" `Quick test_read_dir_entries;
+      Alcotest.test_case "chmod" `Quick test_chmod;
+      Alcotest.test_case "chown" `Quick test_chown;
+      Alcotest.test_case "rename" `Quick test_rename;
+      Alcotest.test_case "rename moves" `Quick test_rename_moves;
+      Alcotest.test_case "rename atomic save" `Quick test_rename_atomic_save;
+      Alcotest.test_case "unlink" `Quick test_unlink;
+      Alcotest.test_case "stat kind" `Quick test_stat_kind;
+      Alcotest.test_case "symlink" `Quick test_symlink;
+      Alcotest.test_case "pwrite/pread" `Quick test_pwrite_pread;
+      Alcotest.test_case "pread eof" `Quick test_pread_eof;
+      Alcotest.test_case "seek" `Quick test_seek;
+      Alcotest.test_case "truncate" `Quick test_truncate;
+      Alcotest.test_case "sync no-op" `Quick test_sync_noop;
+    ]
+    @ snd Crunch.suite )
