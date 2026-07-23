@@ -51,4 +51,5 @@ pin-depends: [
   ["eio.dev" "git+https://github.com/ocaml-multicore/eio.git#e7e6cf38a643ff0665c96d9ef6e68a998663a246"]
   ["eio_main.dev" "git+https://github.com/ocaml-multicore/eio.git#e7e6cf38a643ff0665c96d9ef6e68a998663a246"]
   ["cstruct.6.2.0" "git+https://github.com/samoht/ocaml-cstruct.git#d1e1f46bd0711d301a613411ef325160c0d8b21c"]
+  ["optint.0.3.0" "git+https://github.com/samoht/optint.git#fix-wasm-integer-overflow"]
 ]
