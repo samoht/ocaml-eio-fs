@@ -5,7 +5,7 @@
 
 (executable
  (name fuzz)
- (libraries eio eio.mock eio_fs alcobar fmt cstruct optint))
+ (libraries eio eio.mock eio_fs eio-fs.sync alcobar fmt cstruct optint))
 
 (rule
  (alias runtest)
