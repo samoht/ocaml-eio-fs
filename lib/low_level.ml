@@ -476,7 +476,13 @@ module Filesystem = struct
             parent sym.link_to
         in
         entries_exn ~check ~follow ~parent fs r
-    | r -> Fmt.failwith "Resource not a directory: %a" Resource.pp r
+    (* Walking *through* something that is not a directory: POSIX answers
+       ENOTDIR, which every real Eio backend surfaces as an [Eio.Io]. Raise the
+       same shape rather than a bare [Failure], or this backend is not
+       substitutable for a real one -- a caller that correctly handles Eio's
+       error model would still crash, and only here. Eio.Fs has no ENOTDIR
+       constructor, so the path simply does not resolve. *)
+    | r -> Fmt.kstr Error.not_found "not a directory: %a" Resource.pp r
 
   let lookup ~follow dir_fd path =
     read_filesystem @@ fun fs ->

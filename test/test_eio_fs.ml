@@ -342,6 +342,29 @@ module Crunch = struct
       ] )
 end
 
+(* A path that traverses *through* a regular file resolves to nothing: POSIX
+   answers ENOTDIR, and every real Eio backend surfaces that as an [Eio.Io].
+   The in-memory backend must too, or it is not substitutable for one -- code
+   written correctly against Eio's error model still crashes on it, and only on
+   this backend. Serving static files is the everyday way to hit it: a server
+   that falls back from "page.txt" to "page.txt/index.html" walks straight into
+   this path on any request for a file that exists. *)
+let test_path_through_file_is_io_error () =
+  with_fs @@ fun fs ->
+  write fs "page.txt" "hello";
+  let expect_io what f =
+    match f () with
+    | _ -> Alcotest.failf "%s: expected an Eio.Io error" what
+    | exception Eio.Io _ -> ()
+    | exception exn ->
+        Alcotest.failf "%s: raised %s, want an Eio.Io error" what
+          (Printexc.to_string exn)
+  in
+  expect_io "load through a file" (fun () ->
+      Eio.Path.load (fs / "page.txt" / "index.html"));
+  expect_io "read_dir through a file" (fun () ->
+      Eio.Path.read_dir (fs / "page.txt"))
+
 let suite =
   ( "eio_fs",
     [
@@ -361,5 +384,7 @@ let suite =
       Alcotest.test_case "seek" `Quick test_seek;
       Alcotest.test_case "truncate" `Quick test_truncate;
       Alcotest.test_case "sync no-op" `Quick test_sync_noop;
+      Alcotest.test_case "path through a file is an Eio.Io error" `Quick
+        test_path_through_file_is_io_error;
     ]
     @ snd Crunch.suite )
