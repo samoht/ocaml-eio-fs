@@ -1,6 +1,6 @@
 pin-depends: [
-  ["eio.dev" "git+https://github.com/ocaml-multicore/eio.git#e7e6cf38a643ff0665c96d9ef6e68a998663a246"]
-  ["eio_main.dev" "git+https://github.com/ocaml-multicore/eio.git#e7e6cf38a643ff0665c96d9ef6e68a998663a246"]
+  ["eio.dev" "git+https://github.com/ocaml-multicore/eio.git#085cce2e110b53aa3002a2cdb28502c3f297d374"]
+  ["eio_main.dev" "git+https://github.com/ocaml-multicore/eio.git#085cce2e110b53aa3002a2cdb28502c3f297d374"]
   ["cstruct.6.2.0" "git+https://github.com/samoht/ocaml-cstruct.git#d1e1f46bd0711d301a613411ef325160c0d8b21c"]
   ["optint.0.3.0" "git+https://github.com/samoht/optint.git#ffb8eb0e3bbfca3089bc5b015cc5dfab8c0f8dd3"]
 ]
