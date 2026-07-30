@@ -119,6 +119,56 @@ let test_subtree_fd_dies_with_switch () =
       Alcotest.fail "stale directory fd still resolves after its switch exited"
   | exception Eio.Io _ -> ()
 
+(* {2 Descriptors that are not regular files}
+
+   Opening a directory as a flow is a supported operation: eio-fs.sync reaches a
+   directory's write pi that way, and both real Eio backends allow the O_RDONLY
+   open. The descriptor that comes back still answers the whole file interface,
+   so every operation on it has to fail the way a real backend fails one.
+   read(2) and write(2) on a directory descriptor are EISDIR, which Eio raises
+   as an [Eio.Io]; a bare [Failure] would leave a caller that handles Eio's
+   error model correctly crashing on this backend alone. *)
+
+let expect_eio_io what fn =
+  match fn () with
+  | () -> Alcotest.failf "expected %s to fail" what
+  | exception Eio.Io _ -> ()
+  | exception exn ->
+      Alcotest.failf "expected %s to raise Eio.Io, got %s" what
+        (Printexc.to_string exn)
+
+let test_read_directory_fd () =
+  with_env @@ fun env ->
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "d");
+  Eio.Path.with_open_in (env#fs / "d") @@ fun flow ->
+  let buf = Cstruct.create 8 in
+  expect_eio_io "reading a directory descriptor" (fun () ->
+      ignore (Eio.Flow.single_read flow buf : int));
+  expect_eio_io "positioned read of a directory descriptor" (fun () ->
+      ignore (Eio.File.pread flow ~file_offset:Optint.Int63.zero [ buf ] : int))
+
+let test_write_directory_fd () =
+  with_env @@ fun env ->
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "d");
+  Eio.Path.with_open_out ~create:`Never (env#fs / "d") @@ fun flow ->
+  let buf = Cstruct.of_string "x" in
+  expect_eio_io "writing to a directory descriptor" (fun () ->
+      ignore (Eio.Flow.single_write flow [ buf ] : int));
+  expect_eio_io "positioned write to a directory descriptor" (fun () ->
+      ignore
+        (Eio.File.pwrite_single flow ~file_offset:Optint.Int63.zero [ buf ]
+          : int))
+
+(* open(2) with O_CREAT answers ENOTDIR when a component of the path prefix is
+   not a directory. This backend already reports a walk through a regular file
+   as a path that does not resolve; creating under one must agree instead of
+   escaping the error model. *)
+let test_create_under_regular_file () =
+  with_env @@ fun env ->
+  Eio.Path.save ~create:(`Or_truncate 0o600) (env#fs / "reg") "x";
+  expect_eio_io "creating a file under a regular file" (fun () ->
+      Eio.Path.save ~create:(`Or_truncate 0o600) (env#fs / "reg/child") "y")
+
 let suite =
   ( "low_level",
     [
@@ -137,4 +187,8 @@ let suite =
         test_chmod_restores_writability;
       Alcotest.test_case "subtree fd dies with switch" `Quick
         test_subtree_fd_dies_with_switch;
+      Alcotest.test_case "read directory fd" `Quick test_read_directory_fd;
+      Alcotest.test_case "write directory fd" `Quick test_write_directory_fd;
+      Alcotest.test_case "create under regular file" `Quick
+        test_create_under_regular_file;
     ] )
