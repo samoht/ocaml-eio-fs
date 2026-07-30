@@ -11,8 +11,8 @@
       exact same success/failure outcome and the exact same committed bytes.
     + {b Barrier invariant.} Under [Drop_unsynced] the post-crash image is
       exactly the synced prefix, and the file keeps its mode -- whatever the
-      file's mode, staging subtree, or truncating reopens after the barrier. A
-      file whose creation never committed does not exist at all.
+      file's mode, staging subtree, or truncating reopens after the barrier. The
+      name is pinned separately, by the directory barrier.
     + {b Reference model.} An arbitrary operation tape -- creates, writes,
       syncs, unlinks, mkdirs, rmdirs, symlinks, renames, metadata barriers --
       drives a crash-wrapped tree in lockstep with a pure model of the journal
@@ -132,6 +132,9 @@ let post_crash_image ~policy ~nblocks ~block ~sync_after ~read_only ~via_subtree
         write_blocks Eio.Path.(stage / "f"))
   end
   else write_blocks (fs / "f");
+  (* The store's directory barrier, pinning the new name; what the file holds
+     is the file sync's business, settled block by block above. *)
+  Crash.sync_metadata ctl;
   (* A truncating reopen of a writable file discards the durable bytes and
      overwrites the head -- all unsynced, so all at the crash's mercy. *)
   if trunc_reopen && not read_only then
@@ -161,9 +164,9 @@ let image_and_mode : (string * int) option printer =
    the synced prefix: every synced block survives whole, every un-synced block
    is gone -- including anything a truncating reopen did after the barrier.
    Synced data can never be lost, un-synced data never lingers, and the file
-   keeps its mode whether or not it was writable. When no sync ever fired the
-   creation itself never committed, so the file (and any staging directory
-   made for it) does not exist at all. *)
+   keeps its mode whether or not it was writable. The name is pinned by the
+   directory barrier, so the file is always there; when no sync ever fired it
+   is there and empty. *)
 let test_crash_barrier _seed nblocks block sync_after access placement reopen =
   let sync_after = sync_after - 1 in
   let got =
@@ -173,14 +176,12 @@ let test_crash_barrier _seed nblocks block sync_after access placement reopen =
   in
   let k = synced_count ~nblocks ~sync_after in
   let expected =
-    if k = 0 then None
-    else
-      let img =
-        String.concat ""
-          (List.init k (fun i -> String.make block (Char.chr (i land 0xff))))
-      in
-      let mode = match access with Read_only -> 0o444 | Writable -> 0o644 in
-      Some (img, mode)
+    let img =
+      String.concat ""
+        (List.init k (fun i -> String.make block (Char.chr (i land 0xff))))
+    in
+    let mode = match access with Read_only -> 0o444 | Writable -> 0o644 in
+    Some (img, mode)
   in
   check_eq ~pp:image_and_mode ~eq:( = ) got expected
 
@@ -262,10 +263,12 @@ module Model = struct
 
   let write m path s = m.live_data <- IM.add (file_id m path) s m.live_data
 
+  (* A file sync makes that file's contents durable and nothing else: the
+     directory entries naming it are the metadata journal's business, committed
+     only by the barrier below, as fsync(2) divides them. *)
   let sync m path =
     let id = file_id m path in
-    m.durable_data <- IM.add id (IM.find id m.live_data) m.durable_data;
-    commit m
+    m.durable_data <- IM.add id (IM.find id m.live_data) m.durable_data
 
   let unlink m path =
     m.live <- SM.remove path m.live;
