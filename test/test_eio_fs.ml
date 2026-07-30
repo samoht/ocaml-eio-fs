@@ -365,10 +365,36 @@ let test_path_through_file_is_io_error () =
   expect_io "read_dir through a file" (fun () ->
       Eio.Path.read_dir (fs / "page.txt"))
 
+(* Closing a file that was opened with [~sw] must not leave the switch a second
+   close to make: [Eio.Resource.close] is the documented way to release early,
+   and the switch releases whatever is still open when it finishes. The POSIX
+   backends drop the hook on close, so a store that opens a scratch file, closes
+   it and carries on -- writing a journal, fsyncing it, closing it, then removing
+   it, as a rollback-journal commit does -- runs fine there and died here on the
+   switch's second close. That is a substitutability bug: the in-memory backend
+   exists so storage tests can run against it instead of a real directory. *)
+let test_close_then_switch_release () =
+  with_fs @@ fun fs ->
+  Eio.Switch.run @@ fun sw ->
+  let file = Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (fs / "j") in
+  Eio.Resource.close file
+
+(* The same for a read handle, which takes the other open path. *)
+let test_close_in_then_switch_release () =
+  with_fs @@ fun fs ->
+  write fs "r" "x";
+  Eio.Switch.run @@ fun sw ->
+  let file = Eio.Path.open_in ~sw (fs / "r") in
+  Eio.Resource.close file
+
 let suite =
   ( "eio_fs",
     [
       Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "close then switch release" `Quick
+        test_close_then_switch_release;
+      Alcotest.test_case "close read handle then switch release" `Quick
+        test_close_in_then_switch_release;
       Alcotest.test_case "mkdir/read_dir" `Quick test_mkdir_read_dir;
       Alcotest.test_case "read_dir_entries" `Quick test_read_dir_entries;
       Alcotest.test_case "chmod" `Quick test_chmod;
