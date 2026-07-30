@@ -530,6 +530,34 @@ let test_crash_committed_unlink_stays_deleted () =
     "committed unlink stays deleted" true
     (absent (post / "f"))
 
+(* Syncing a file commits that file's data, not the directory's entries:
+   fsync(2) on a descriptor says nothing about the directory a name lives in.
+   So an unlink still pending when some *other* file is synced must roll back,
+   exactly as it would had the machine lost power right there.
+
+   Conflating the two hides a class of bug rather than a corner of one. A store
+   that removes a journal or a log and reaches for the file barrier instead of
+   the directory barrier tests green here and loses data on real hardware: that
+   is how the WAL half of a durability bug in ocaml-sqlite stayed invisible
+   while the journal half was caught. *)
+let test_crash_file_sync_leaves_metadata_pending () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Crash.sync_metadata ctl;
+  Eio.Path.unlink (fs / "f");
+  (* the barrier below is on a different file, so it must not commit the
+     unlink above *)
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "other") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "x" ];
+      Eio.File.sync file);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "another file's sync did not commit the unlink" "data"
+    (Eio.Path.load (post / "f"))
+
 (* An unlink that never committed rolls back: the file reappears with its
    durable content, exactly as a lost directory update leaves it on disk. *)
 let test_crash_uncommitted_unlink_rolls_back () =
@@ -917,6 +945,8 @@ let suite =
         test_crash_committed_unlink_stays_deleted;
       Alcotest.test_case "crash: uncommitted unlink rolls back" `Quick
         test_crash_uncommitted_unlink_rolls_back;
+      Alcotest.test_case "crash: a file sync leaves metadata pending" `Quick
+        test_crash_file_sync_leaves_metadata_pending;
       Alcotest.test_case "crash: uncommitted rename reverts" `Quick
         test_crash_uncommitted_rename_reverts;
       Alcotest.test_case "crash: sync_metadata commits rename" `Quick
