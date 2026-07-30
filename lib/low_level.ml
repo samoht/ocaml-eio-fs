@@ -567,7 +567,11 @@ let new_file ~follow ~mode dir_fd path =
   let dir =
     match !rdir with
     | Resource.Dir d -> d
-    | _ -> Fmt.failwith "Creating file: no path"
+    (* open(2) with O_CREAT answers ENOTDIR when a component of the path prefix
+       is not a directory. Eio.Fs has no ENOTDIR constructor, so report what a
+       walk through such a component already reports here: the path does not
+       resolve. *)
+    | _ -> Error.not_found path
   in
   let stat = new_stat ~perm:(mode land 0o7777) () in
   let f = File.v ~stat fname in
@@ -829,6 +833,13 @@ let blit_and_grow ~src ~dst ~off =
     new_dst
   end
 
+(* A descriptor open on something other than a regular file still answers the
+   whole file interface: [Eio.Path.open_in] on a directory is legal, and the
+   portable directory barrier in eio-fs.sync depends on it. So the operations
+   below have to refuse one the way a real backend does, with the EISDIR that
+   read(2) and write(2) answer on a directory descriptor. Eio leaves that
+   unclassified, which is an [Eio.Io] a caller can match on, unlike a bare
+   [Failure]. *)
 let writev fd bufs =
   update_fd_table_with_result @@ fun fds ->
   let () =
@@ -863,7 +874,7 @@ let writev fd bufs =
             Optint.Int63.add e.pos (Optint.Int63.of_int (Cstruct.length src))
           in
           r := File { e with stat; contents; pos = new_pos }
-    | r -> Fmt.failwith "TODO: writev %a" Resource.pp r
+    | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
   in
   (Cstruct.length (Cstruct.concat bufs), fds)
 
@@ -887,7 +898,7 @@ let readv fd bufs =
             Eio.Fiber.yield ())
           bufs;
         r := File { e with pos = !pos }
-    | r -> Fmt.failwith "TODO: readv %a" Resource.pp r
+    | r -> Fmt.kstr Error.err "readv: not a file: %a" Resource.pp r
   in
   (!read, fds)
 
@@ -914,7 +925,7 @@ let preadv fd ~file_offset bufs =
           bufs;
         if !read = 0 then raise End_of_file else !read
       end
-  | Some r -> Fmt.failwith "pread: not a file: %a" Resource.pp r
+  | Some r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
 
 let pwritev fd ~file_offset bufs =
   update_fd_table_with_result @@ fun fds ->
@@ -933,7 +944,7 @@ let pwritev fd ~file_offset bufs =
         let stat = { e.stat with size = new_size } in
         r := Resource.File { e with contents; stat };
         written := Cstruct.length src
-    | r -> Fmt.failwith "pwrite: not a file: %a" Resource.pp r
+    | r -> Fmt.kstr Error.err "pwrite: not a file: %a" Resource.pp r
   in
   (!written, fds)
 
@@ -954,7 +965,7 @@ let seek_fd fd off cmd =
         let newpos = Optint.Int63.add base off in
         r := Resource.File { e with pos = newpos };
         result := newpos
-    | r -> Fmt.failwith "seek: not a file: %a" Resource.pp r
+    | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
   in
   (!result, fds)
 
@@ -979,7 +990,7 @@ let truncate_fd fd len =
           let stat = { e.stat with size = Optint.Int63.of_int target } in
           let pos = if Optint.Int63.compare e.pos len > 0 then len else e.pos in
           r := Resource.File { e with contents; stat; pos }
-      | r -> Fmt.failwith "truncate: not a file: %a" Resource.pp r);
+      | r -> Fmt.kstr Error.err "truncate: not a file: %a" Resource.pp r);
   fds
 
 module Flow = struct
