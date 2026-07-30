@@ -539,6 +539,12 @@ let close fd =
   | None -> Error.badf ()
   | Some _ -> Fd_table.remove fd fds
 
+(* What the switch runs for a handle still open when it finishes. Unlike
+   {!close} it tolerates an fd that has gone, because releasing a handle the
+   caller already closed is the normal way to use [Eio.Resource.close]: closing
+   twice by hand stays an error, as close(2) makes it. *)
+let release fd = update_fd_table @@ fun fds -> Fd_table.remove fd fds
+
 (* open(2): opening an existing file requires the permission bits the access
    mode asks for; the mode given at creation does not restrict the creating
    open itself. This backend opens files O_RDONLY or O_RDWR, so the read bit
@@ -586,7 +592,7 @@ let openat ~mode ~sw dir_fd path flags =
       let r = Filesystem.lookup ~follow dir_fd path in
       check_access path flags r;
       reset_file ~truncate ~append r;
-      Eio.Switch.on_release sw (fun () -> close fd);
+      Eio.Switch.on_release sw (fun () -> release fd);
       (fd, Fd_table.add fd r fds)
   | true -> (
       let () =
@@ -607,12 +613,12 @@ let openat ~mode ~sw dir_fd path flags =
           check_access path flags r;
           let fds = Fd_table.add fd r fds in
           reset_file ~truncate ~append r;
-          Eio.Switch.on_release sw (fun () -> close fd);
+          Eio.Switch.on_release sw (fun () -> release fd);
           (fd, fds)
       | None ->
           let file = new_file ~follow ~mode dir_fd path in
           let fds = Fd_table.add fd file fds in
-          Eio.Switch.on_release sw (fun () -> close fd);
+          Eio.Switch.on_release sw (fun () -> release fd);
           (fd, fds))
 
 let statat ~follow dir_fd path =
