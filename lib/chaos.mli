@@ -142,11 +142,14 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     {b Directory operations are journaled.} File creation, [mkdir], [unlink],
     [rmdir], [symlink] and [rename] enter a metadata journal in program order.
     The journal commits -- every pending directory operation becomes durable --
-    on any successful {!Eio.File.sync} through the wrapper (as a journaling
-    filesystem commits its transaction on fsync) and on an explicit
-    {!sync_metadata}, the model's stand-in for the directory-fsync barrier that
-    Eio cannot express. At a crash the policy decides how much of the
-    uncommitted journal suffix survives; survival is always a {e prefix} of
+    on an explicit {!sync_metadata}, the model's stand-in for the
+    directory-fsync barrier that Eio cannot express, or on a registered
+    {!Eio_fs_sync.Dir_sync} through the wrapper. Syncing a {e file} does not
+    commit it: fsync(2) on a descriptor makes that file's data durable and says
+    nothing about the directory its name lives in, so a store that removes a
+    journal and reaches for the file barrier instead of the directory one is
+    modelled as losing the removal. At a crash the policy decides how much of
+    the uncommitted journal suffix survives; survival is always a {e prefix} of
     program order, because metadata commits in order. A dropped operation is
     rolled back in the post-crash image: a dropped creation removes the file, a
     dropped unlink restores it with its durable content, a dropped rename moves

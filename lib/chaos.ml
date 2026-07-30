@@ -1103,14 +1103,15 @@ module Crash = struct
 
     (* The sync barrier: the live content becomes durable and the file's pending
        changes leave the log, so a later crash can neither drop nor reorder
-       them. *)
+       them. It commits this file's data and nothing else -- the directory
+       entries a name lives in are the metadata journal's business, committed by
+       [sync_metadata] or a registered [Dir_sync], as fsync(2) divides them. *)
     let sync cf =
       guard cf;
       let fs = fstate_of cf in
       Eio.File.sync (writable cf);
       fs.durable <- read_all cf.cro;
       cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
-      commit_metadata cf.ctl;
       bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
 
     let truncate cf len =
