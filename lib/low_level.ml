@@ -229,19 +229,16 @@ end
 
 module Fd_table = Map.Make (Fd)
 
+(* Only what the tree itself holds. This backend has no console, so it has no
+   standard streams to open: descriptors 0 to 2 are reserved by {!first_fd} and
+   never resolve to anything. *)
 module Resource = struct
   type t =
-    | Stdin
-    | Stdout
-    | Stderr
     | File of File.t
     | Dir of (Inode.t * string) Dir.t
     | Symlink of Symlink.t
 
   let pp ppf = function
-    | Stdin -> Fmt.string ppf "stdin"
-    | Stdout -> Fmt.string ppf "stdout"
-    | Stderr -> Fmt.string ppf "stderr"
     | File f ->
         Fmt.pf ppf "file:%s:[%a]" f.name
           Fmt.(truncated ~max:12)
@@ -255,24 +252,18 @@ module Resource = struct
           dir.entries
     | Symlink s -> Fmt.pf ppf "sym:%s -> %s" s.name s.link_to
 
-  let name = function
-    | File f -> f.name
-    | Dir d -> d.name
-    | Symlink s -> s.name
-    | r -> Fmt.invalid_arg "No name for %a" pp r
+  let name = function File f -> f.name | Dir d -> d.name | Symlink s -> s.name
 
   let stat = function
     | File f -> f.stat
     | Dir dir -> dir.stat
     | Symlink s -> s.stat
-    | _ -> Fmt.failwith "No stat"
 
   let set_stat r stat =
     match r with
     | File f -> File { f with stat }
     | Dir d -> Dir { d with stat }
     | Symlink s -> Symlink { s with stat }
-    | r -> r
 end
 
 type resource = Resource.t
@@ -296,13 +287,10 @@ let reset_file ~truncate ~append r =
       r := File { f with contents; stat; pos }
   | _ -> ()
 
-let std_table =
-  let open Resource in
-  Fd_table.add (Fd.of_int 0) (ref Stdin) Fd_table.empty
-  |> Fd_table.add (Fd.of_int 1) (ref Stdout)
-  |> Fd_table.add (Fd.of_int 2) (ref Stderr)
-
-let fd_table : resource ref Fd_table.t ref = ref std_table
+(* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
+   backend hands out is never one a caller reads as stdin, stdout or stderr. *)
+let first_fd = Fd.of_int 3
+let fd_table : resource ref Fd_table.t ref = ref Fd_table.empty
 
 let update_fd_table_with_result fn =
   let v, new_fd_table = fn !fd_table in
@@ -319,9 +307,9 @@ let update_entry ?(if_missing = fun () -> ()) fd fds fn =
 let read_fd_table fn = fn !fd_table
 
 let next_fd_of_fds fds =
-  Fd_table.to_list fds
-  |> List.sort (fun (i, _) (j, _) -> Fd.compare i j)
-  |> List.rev |> List.hd |> fst |> Fd.incr
+  match Fd_table.max_binding_opt fds with
+  | None -> first_fd
+  | Some (fd, _) -> Fd.incr fd
 
 let default_stat =
   Eio.File.Stat.
@@ -808,11 +796,9 @@ let rename dir_fd old_path new_dir new_path =
 
 let stat fd =
   read_fd_table @@ fun fds ->
-  match Fd_table.find_opt fd fds |> Option.map ( ! ) with
+  match Fd_table.find_opt fd fds with
   | None -> Error.badf ()
-  | Some (File f) -> f.stat
-  | Some (Dir dir) -> dir.stat
-  | _ -> failwith "stat: todo"
+  | Some r -> Resource.stat !r
 
 (* TODO: update access times *)
 
@@ -1057,4 +1043,4 @@ end
 
 let reset () =
   Filesystem.root := Filesystem.empty ();
-  fd_table := std_table
+  fd_table := Fd_table.empty
