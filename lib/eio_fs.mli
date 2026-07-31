@@ -1,21 +1,25 @@
-(** {1 In-memory {! Eio} Resources}
+(** In-memory {!Eio} resources.
 
-    {! Eio_fs} provides in-memory resources for {! Eio}. *)
+    [Eio_fs] provides in-memory resources for {!Eio}: a filesystem ({!Fs}) that
+    lives entirely in the process, a way to embed a directory tree into an OCaml
+    module at compile time ({!Crunch}), and a fault-injecting wrapper
+    ({!Chaos}). There is a single in-memory filesystem per process; {!Fs.v},
+    {!Fs.load} and {!Crunch.load} all reset it. *)
 
-(** An in-memory filesystem for {! Eio}. *)
+(** An in-memory filesystem for {!Eio}. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** Construct a fresh, empty in-memory file-system. *)
+  (** [v ()] is the root of a fresh, empty in-memory filesystem. *)
 
   val load : ?filter:('a Eio.Path.t -> bool) -> 'a Eio.Path.t -> unit
-  (** [load path] will reset the in-memory filesystem and fill it with the
-      directory tree at [path].
-
-      @param filter
-        Called on every path, if it returns [true] then this file is kept. *)
+  (** [load ~filter path] resets the in-memory filesystem and fills it with the
+      directory tree at [path]. [filter] is called on every path and the path is
+      copied only if it returns [true] (defaults to [fun _ -> true]). *)
 
   val tree : depth:int -> _ Eio.Path.t Fmt.t
-  (** A [tree]-like pretty printer. *)
+  (** [tree ~depth] formats a path as a [tree]-like listing [depth] levels deep:
+      [depth = 1] is the path alone, and [depth <= 0] prints nothing. Symbolic
+      links are shown as [name -> target] and are not followed. *)
 end
 
 (** Compile-time file embedding for the in-memory filesystem, in the style of
@@ -23,15 +27,16 @@ end
     OCaml module of {!Crunch.entry} values; at runtime the generated module's
     [load ()] rebuilds the tree in {!Fs}. *)
 module Crunch : sig
-  (** One node of an embedded file tree. Paths are absolute within the image and
-      use ["/"] as separator. *)
+  (** The type for nodes of an embedded file tree. Paths are absolute within the
+      image and use ["/"] as separator. *)
   type entry =
     | Dir of { path : string; perm : int }
     | File of { path : string; perm : int; contents : string }
     | Symlink of { path : string; target : string }
 
   type t = entry list
-  (** An embedded file tree: every directory precedes its children. *)
+  (** The type for embedded file trees. Every directory precedes its children.
+  *)
 
   val scan : _ Eio.Path.t -> t
   (** [scan dir] serializes the directory tree rooted at [dir]. The root is
@@ -51,19 +56,21 @@ module Crunch : sig
       [load : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t]. *)
 
   val interface : string
-  (** The interface matching {!source} output, for the generated module's [.mli]
-      file. *)
+  (** [interface] is the [.mli] file matching what {!source} prints: it declares
+      the generated module's entry list and its loading function. *)
 end
 
 module Chaos = Chaos
 (** An adversarial filesystem wrapper for fault-injection testing. *)
 
 type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
+(** The type for the standard environment {!run} passes on: an in-memory
+    filesystem and current directory. *)
 
 val run : ?cwd:string -> (stdenv -> 'a) -> 'a
-(** [run fn] runs [fn] which provides in-memory resources to [fn]. Note that
-    this does not install an effect handler and you should use something like
-    [Eio_mock.Backend.run] around this call.
+(** [run ~cwd fn] resets the in-memory filesystem and is [fn env], with [env]
+    holding in-memory resources and the current directory bound to [cwd]
+    (defaults to ["/"]).
 
-    @param cwd
-      Set the current working directory, otherwise it is assumed to be "/". *)
+    {b Note.} This does not install an effect handler; wrap the call in
+    something like [Eio_mock.Backend.run]. *)

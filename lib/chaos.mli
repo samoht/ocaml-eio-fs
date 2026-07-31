@@ -207,7 +207,7 @@ module Crash : sig
   type trigger =
     | Manual  (** Only an explicit {!crash} (or {!post_crash}) fires it. *)
     | After_write of { path : string; file_offset : int }
-        (** Crash right after the write covering [file_offset] on [path]
+        (** Crash right after the write covering that offset in that file
             commits, before any following sync. *)
     | Nth_op of int
         (** Crash on the [n]th durability op (writes, syncs and directory
