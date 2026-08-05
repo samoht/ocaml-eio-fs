@@ -510,13 +510,12 @@ let test_crash_determinism seed nblocks block sync_after access placement reopen
   in
   check_eq ~pp:image_and_mode ~eq:( = ) a b
 
-(* ── [Eio_fs_sync.save_durable] under crash and fault ──────────────── *)
+(* ── [Eio_fs_sync.publish] under crash and fault ──────────────────── *)
 
-(* [save_durable] is the durability primitive the storage packages in this tree
-   are built on: irmin's car, git and parquet stores, gauth's credential file,
-   and the OCI registry all commit through it or its sibling [publish]. So its
-   guarantee is worth fuzzing directly rather than five times over in the
-   consumers.
+(* [publish] is the durability primitive the storage packages in this tree are
+   built on: irmin's car, git and parquet stores, gauth's credential file, and
+   the OCI registry all commit through it. Its guarantee is worth fuzzing
+   directly rather than five times over in the consumers.
 
    The guarantee is atomic replacement: after a crash the target holds either
    the old content or the new one, never a splice of the two and never a
@@ -524,7 +523,18 @@ let test_crash_determinism seed nblocks block sync_after access placement reopen
    comes back half-written is worse than one that never changed -- the old
    content was valid, and the caller has no way to tell the difference. *)
 
-let test_save_durable_is_atomic old_body new_body =
+let publish_string path data =
+  let config =
+    Eio_fs_sync.
+      {
+        durable = true;
+        perm = 0o644;
+        max_bytes = Int64.of_int (String.length data);
+      }
+  in
+  Eio_fs_sync.publish ~config path (Eio.Flow.copy_string data)
+
+let test_publish_is_atomic old_body new_body =
   let cap s = if String.length s > 2048 then String.sub s 0 2048 else s in
   let old_body = cap old_body and new_body = cap new_body in
   Eio_mock.Backend.run @@ fun () ->
@@ -532,21 +542,15 @@ let test_save_durable_is_atomic old_body new_body =
   let module Crash = Eio_fs.Chaos.Crash in
   let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
   let fs = Crash.wrap ctl env#fs in
-  Eio_fs_sync.save_durable ~create:(`Or_truncate 0o644)
-    Eio.Path.(fs / "f")
-    old_body;
+  publish_string Eio.Path.(fs / "f") old_body;
   (* The second save is the one the crash interrupts. *)
-  (try
-     Eio_fs_sync.save_durable ~create:(`Or_truncate 0o644)
-       Eio.Path.(fs / "f")
-       new_body
-   with Eio.Io _ -> ());
+  (try publish_string Eio.Path.(fs / "f") new_body with Eio.Io _ -> ());
   let post = Crash.post_crash ctl in
   match Eio.Path.kind ~follow:false Eio.Path.(post / "f") with
   | `Not_found ->
       (* Losing the file entirely would be a broken replacement: the old
          content was already durable before the second save began. *)
-      fail "save_durable removed a file that was already durable"
+      fail "publish removed a file that was already durable"
   | _ ->
       let got = Eio.Path.load Eio.Path.(post / "f") in
       if got <> old_body && got <> new_body then
@@ -565,28 +569,23 @@ let test_failed_save_preserves_old seed old_body new_body =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
   (* Write the original through a clean view, then fault the replacement. *)
-  Eio_fs_sync.save_durable ~create:(`Or_truncate 0o644)
-    Eio.Path.(env#fs / "f")
-    old_body;
+  publish_string Eio.Path.(env#fs / "f") old_body;
   let sched =
     Eio_fs.Chaos.Schedule.seeded ~probability:1.0
       ~kinds:[ `Write_error; `Sync_error ]
       ~seed ()
   in
   let hostile = Eio_fs.Chaos.wrap sched env#fs in
-  (try
-     Eio_fs_sync.save_durable ~create:(`Or_truncate 0o644)
-       Eio.Path.(hostile / "f")
-       new_body
+  (try publish_string Eio.Path.(hostile / "f") new_body
    with Eio.Io _ | Sys_error _ -> ());
   match Eio.Path.kind ~follow:false Eio.Path.(env#fs / "f") with
-  | `Not_found -> fail "a failed save_durable deleted the previous content"
+  | `Not_found -> fail "a failed publish deleted the previous content"
   | _ ->
       let got = Eio.Path.load Eio.Path.(env#fs / "f") in
       if got <> old_body && got <> new_body then
         failf
-          "a failed save_durable left %d bytes that are neither the old (%d) \
-           nor the new (%d) content"
+          "a failed publish left %d bytes that are neither the old (%d) nor \
+           the new (%d) content"
           (String.length got) (String.length old_body) (String.length new_body)
 
 let suite =
@@ -627,8 +626,8 @@ let suite =
       test_case "crash reference model" [ bytes ] test_crash_reference_model;
       test_case "crash reorder model determinism" [ bytes; int ]
         test_crash_reorder_model_determinism;
-      test_case "save_durable survives a crash whole or not at all"
-        [ bytes; bytes ] test_save_durable_is_atomic;
-      test_case "a failed save_durable leaves the old content intact"
+      test_case "publish survives a crash whole or not at all" [ bytes; bytes ]
+        test_publish_is_atomic;
+      test_case "a failed publish leaves the old content intact"
         [ int; bytes; bytes ] test_failed_save_preserves_old;
     ] )

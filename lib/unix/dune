@@ -10,4 +10,4 @@
   (names eio_fs_unix_stubs)
   (flags
    (:standard -std=gnu11 -Wall -Wextra -Werror)))
- (libraries eio eio-fs.sync unix))
+ (libraries eio eio.unix eio-fs.sync unix))

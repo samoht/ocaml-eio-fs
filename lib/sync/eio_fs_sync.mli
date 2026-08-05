@@ -38,37 +38,48 @@ val sync_dir : _ Eio.Path.t -> unit
       sync operation -- a wiring error, since silence would silently lose
       durability. *)
 
+type config = {
+  durable : bool;
+      (** Push the temporary and target directory to stable storage. *)
+  perm : Eio.File.Unix_perm.t;
+      (** Permissions used when creating the temporary, and therefore the
+          published file. *)
+  max_bytes : int64;  (** Hard ceiling on bytes accepted from the producer. *)
+}
+(** Publication policy. A finite {!type-config.field-max_bytes} is mandatory:
+    streaming avoids buffering a whole value, but it must not turn an allocation
+    failure into unbounded disk consumption. *)
+
+exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
+(** Raised before a write that would exceed {!type-config.field-max_bytes}. *)
+
 val publish :
-  ?durable:bool ->
-  tmp:'a Eio.Path.t ->
-  create:Eio.Fs.create ->
+  config:config ->
+  ?tmp:'a Eio.Path.t ->
   'a Eio.Path.t ->
-  string ->
-  unit
-(** [publish ~tmp ~create path content] replaces [path]'s contents with
-    [content] atomically and durably through the caller-chosen temporary [tmp]:
-    the temporary is written and fsynced, renamed over [path] -- a reader or a
-    crash sees the old file or the whole new one, never a torn or empty file --
-    and [path]'s directory is barriered with {!sync_dir} so a power cut cannot
-    revert the publication. The temporary is removed if the write or the rename
-    fails.
+  (Eio.Flow.sink_ty Eio.Resource.t -> 'b) ->
+  'b
+(** [publish ~config path write] replaces [path]'s contents atomically and
+    durably. [write file] streams the new contents into a temporary Eio file;
+    after it returns, the temporary is fsynced, renamed over [path] -- a reader
+    or a crash sees the old file or the whole new one, never a torn or empty
+    file -- and [path]'s directory is barriered with {!sync_dir}. The callback's
+    result is returned only after publication completes.
 
-    [tmp] must live on the same filesystem as [path] (rename cannot cross
-    devices) but not necessarily in the same directory: a store watched by
-    filesystem monitors points it at a quiet directory, and a store with
-    concurrent writers to one target gives each writer a unique name. Only
-    [path]'s directory is barriered; a stale temporary resurrected by a power
-    cut is garbage for the store's usual cleanup, never served state.
+    When [tmp] is omitted, a fresh sibling name is opened exclusively. An
+    explicit [tmp] is also opened exclusively, must not exist, must be distinct
+    from [path], and must live on the same filesystem (rename cannot cross
+    devices), but need not share its directory. Only [path]'s directory is
+    barriered; a stale temporary resurrected by a power cut is garbage for the
+    store's usual cleanup, never served state.
 
-    [~durable:false] keeps only the atomicity -- no fsync, no barrier -- for a
-    store that deliberately trades the power-cut window for write speed, as git
-    does for loose objects; say why at the call site. *)
+    {!type-config.field-max_bytes} is enforced by the sink before each write. If
+    [write], the temporary sync, or the rename fails, the owned temporary is
+    removed and the old [path] remains intact. A directory-barrier failure is
+    reported after the rename: the new file is visible but its power-cut
+    durability is uncertain.
 
-val save_durable : create:Eio.Fs.create -> _ Eio.Path.t -> string -> unit
-(** [save_durable ~create path content] is {!publish} with the sibling temporary
-    [<path>.tmp]: the shape for a store whose writers are serialised by its own
-    lock, where the deterministic name lets path-triggered crash tests address
-    the temporary.
-
-    [create] is applied to the temporary (its permission becomes the target's);
-    [`Or_truncate] is the usual choice. *)
+    Setting {!type-config.field-durable} to [false] keeps only the atomicity --
+    no fsync, no barrier -- for a store that deliberately trades the power-cut
+    window for write speed, as git does for loose objects; say why at the call
+    site. *)

@@ -1,8 +1,7 @@
-; eio-fs.sync: the portable directory-durability barrier. Depends on nothing
-; but eio, so pure Eio adapters that cross-compile to unikernels link it
-; freely; the POSIX fallback lives in eio-fs.unix.
+; eio-fs.sync: portable durability and bounded atomic publication. It remains
+; unikernel-safe; the POSIX fallback lives in eio-fs.unix.
 
 (library
  (name eio_fs_sync)
  (public_name eio-fs.sync)
- (libraries eio))
+ (libraries cstruct eio))

@@ -30,3 +30,86 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
   | None ->
       let fd = Unix.openfile (Eio.Path.native_exn p) [ Unix.O_RDONLY ] 0 in
       Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> full_fsync fd)
+
+exception Lock_unavailable of string
+
+type local_lock = { mutex : Eio.Mutex.t; mutable users : int }
+
+let local_locks = Hashtbl.create 16
+let local_locks_mutex = Stdlib.Mutex.create ()
+
+let use_local_lock key fn =
+  let lock =
+    Stdlib.Mutex.protect local_locks_mutex @@ fun () ->
+    match Hashtbl.find_opt local_locks key with
+    | Some lock ->
+        lock.users <- lock.users + 1;
+        lock
+    | None ->
+        let lock = { mutex = Eio.Mutex.create (); users = 1 } in
+        Hashtbl.add local_locks key lock;
+        lock
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Stdlib.Mutex.protect local_locks_mutex @@ fun () ->
+      lock.users <- lock.users - 1;
+      if lock.users = 0 then Hashtbl.remove local_locks key)
+    (fun () -> fn lock.mutex)
+
+let canonical_lock_path path =
+  Eio_unix.run_in_systhread ~label:"eio-fs-lock-path" @@ fun () ->
+  match Unix.realpath path with
+  | path -> path
+  | exception Unix.Unix_error (Unix.ENOENT, _, _) ->
+      Filename.concat
+        (Unix.realpath (Filename.dirname path))
+        (Filename.basename path)
+
+let use_mutex ~block ~path mutex fn =
+  let locked = ref false in
+  Fun.protect
+    ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
+    (fun () ->
+      if block then begin
+        Eio.Mutex.lock mutex;
+        locked := true
+      end
+      else if Eio.Mutex.try_lock mutex then locked := true
+      else raise (Lock_unavailable path);
+      fn ())
+
+let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
+
+let use_os_lock ~block ~path fd fn =
+  let acquired = ref false in
+  Fun.protect
+    ~finally:(fun () ->
+      if !acquired then
+        Eio.Cancel.protect @@ fun () ->
+        Eio_unix.run_in_systhread ~label:"eio-fs-unlock" (fun () ->
+            lockf fd Unix.F_ULOCK))
+    (fun () ->
+      Eio.Cancel.protect (fun () ->
+          match
+            Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
+                lockf fd (if block then Unix.F_LOCK else Unix.F_TLOCK))
+          with
+          | () -> acquired := true
+          | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) ->
+              raise (Lock_unavailable path));
+      fn ())
+
+let with_lock ?(block = true) ?(perm = 0o600) path fn =
+  let native_path = Eio.Path.native_exn path in
+  let key = canonical_lock_path native_path in
+  use_local_lock key @@ fun mutex ->
+  use_mutex ~block ~path:native_path mutex @@ fun () ->
+  Eio.Switch.run @@ fun sw ->
+  let file = Eio.Path.open_out ~sw ~create:(`If_missing perm) path in
+  match Eio_unix.Resource.fd_opt file with
+  | None ->
+      invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"
+  | Some fd ->
+      Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
+      use_os_lock ~block ~path:native_path fd fn
