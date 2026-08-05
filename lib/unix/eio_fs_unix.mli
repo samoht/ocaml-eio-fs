@@ -36,6 +36,7 @@ exception Lock_unavailable of string
 val with_lock :
   ?block:bool ->
   ?perm:Eio.File.Unix_perm.t ->
+  ?contents:string ->
   _ Eio.Path.t ->
   (unit -> 'a) ->
   'a
@@ -43,9 +44,14 @@ val with_lock :
     lock, and runs [fn ()] while holding it. Waiting for the operating-system
     lock suspends only the calling fiber, not the Eio scheduler.
 
-    [perm] (default [0o600]) is used only when creating the lock file. If
-    [block] is [false] (default [true]), an immediately unavailable lock raises
-    {!Lock_unavailable}.
+    [perm] (default [0o600]) is used only when creating the lock file.
+    [contents], when present, replaces the lock file's contents after acquiring
+    it. The update is made through the locked file handle, preserving the inode
+    on which the advisory lock is held. This is useful for recording holder
+    diagnostics such as a process identifier.
+
+    If [block] is [false] (default [true]), an immediately unavailable lock
+    raises {!Lock_unavailable}.
 
     Locks are coordinated both between fibers in this process and between
     processes. The lock is always released when [fn] returns or raises.

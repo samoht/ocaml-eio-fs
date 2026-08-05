@@ -100,7 +100,12 @@ let use_os_lock ~block ~path fd fn =
               raise (Lock_unavailable path));
       fn ())
 
-let with_lock ?(block = true) ?(perm = 0o600) path fn =
+let update_lock_contents file contents =
+  ignore (Eio.File.seek file Optint.Int63.zero `Set : Optint.Int63.t);
+  Eio.Flow.copy_string contents file;
+  Eio.File.truncate file (Optint.Int63.of_int (String.length contents))
+
+let with_lock ?(block = true) ?(perm = 0o600) ?contents path fn =
   let native_path = Eio.Path.native_exn path in
   let key = canonical_lock_path native_path in
   use_local_lock key @@ fun mutex ->
@@ -112,4 +117,6 @@ let with_lock ?(block = true) ?(perm = 0o600) path fn =
       invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~block ~path:native_path fd fn
+      use_os_lock ~block ~path:native_path fd @@ fun () ->
+      Option.iter (update_lock_contents file) contents;
+      fn ()
