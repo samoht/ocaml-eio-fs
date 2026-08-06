@@ -192,6 +192,108 @@ let test_swap_symlink () =
     "the swapped-in link points at the secret" "secret"
     (Eio.Path.read_link (raw / "victim"))
 
+(* The whole of a file, read through the handle rather than through its name. *)
+let contents file =
+  let len = Optint.Int63.to_int (Eio.File.size file) in
+  let buf = Cstruct.create len in
+  Eio.File.pread_exact file ~file_offset:(i63 0) [ buf ];
+  Cstruct.to_string buf
+
+(* An open leaves the same window a stat does, and the descriptor it hands back
+   is what makes it worth exploiting: the caller keeps the file the name meant at
+   the open, while the name goes on to mean the target, so everything the caller
+   asks the path afterwards -- how long it is, what it holds -- is answered about
+   another file. Scripted on the [`Open], the fault pins that window for a
+   reader. *)
+let test_swap_symlink_on_open_in () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Open; path = "current" };
+          fault = Swap_symlink "decoy";
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "log") "the original";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "decoy") "decoy";
+  Eio.Path.symlink ~link_to:"log" (raw / "current");
+  let read = Eio.Path.with_open_in (chaos / "current") contents in
+  Alcotest.(check string)
+    "the handle reads the file the name meant at the open" "the original" read;
+  Alcotest.(check string)
+    "and the name points at the target from then on" "decoy"
+    (Eio.Path.read_link (raw / "current"));
+  Alcotest.(check string)
+    "so the path answers about the other file" "decoy"
+    (Eio.Path.load (raw / "current"))
+
+(* The writer's half of the window, which costs more: the bytes go to the file
+   the open returned, and the name they were written under has come to mean
+   another file, so a reader following the name finds neither them nor the file
+   they landed in. *)
+let test_swap_symlink_on_open_out () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Open; path = "current" };
+          fault = Swap_symlink "decoy";
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "log") "";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "decoy") "decoy";
+  Eio.Path.symlink ~link_to:"log" (raw / "current");
+  Eio.Path.with_open_out ~create:(`If_missing 0o644) (chaos / "current")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0)
+        [ Cstruct.of_string "written" ]);
+  Alcotest.(check string)
+    "the write lands in the file the name meant at the open" "written"
+    (Eio.Path.load (raw / "log"));
+  Alcotest.(check string)
+    "the file the name means now is untouched" "decoy"
+    (Eio.Path.load (raw / "decoy"));
+  Alcotest.(check string)
+    "and the name points at it" "decoy"
+    (Eio.Path.read_link (raw / "current"))
+
+(* A subtree opens the same way, and everything reached through the handle keeps
+   resolving under the directory it was opened on while the name it was opened
+   under leads elsewhere. *)
+let test_swap_symlink_on_open_subtree () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Open; path = "current" };
+          fault = Swap_symlink "other";
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.mkdir ~perm:0o755 (raw / "tree");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "tree" / "f") "in the tree";
+  Eio.Path.mkdir ~perm:0o755 (raw / "other");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "other" / "f") "elsewhere";
+  Eio.Path.symlink ~link_to:"tree" (raw / "current");
+  let read =
+    Eio.Path.with_open_dir (chaos / "current") @@ fun dir ->
+    Eio.Path.load (dir / "f")
+  in
+  Alcotest.(check string)
+    "the handle reads under the directory the name meant at the open"
+    "in the tree" read;
+  Alcotest.(check string)
+    "and the name points at the target from then on" "other"
+    (Eio.Path.read_link (raw / "current"));
+  Alcotest.(check string)
+    "so the path answers about the other tree" "elsewhere"
+    (Eio.Path.load (raw / "current" / "f"))
+
 (* {2 Schedule as an inspectable value} *)
 
 (* A scripted rule fires the first time its trigger matches, then is spent. *)
@@ -930,6 +1032,12 @@ let suite =
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "swap-symlink TOCTOU" `Quick test_swap_symlink;
+      Alcotest.test_case "swap-symlink on open_in" `Quick
+        test_swap_symlink_on_open_in;
+      Alcotest.test_case "swap-symlink on open_out" `Quick
+        test_swap_symlink_on_open_out;
+      Alcotest.test_case "swap-symlink on open_subtree" `Quick
+        test_swap_symlink_on_open_subtree;
       Alcotest.test_case "scripted fires once" `Quick test_scripted_fires_once;
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
