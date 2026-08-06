@@ -49,17 +49,42 @@ module Path = struct
     in
     (own stat, children)
 
+  let usage_batch paths =
+    List.fold_left
+      (fun (total, next) path ->
+        let entry, children = usage_entry path in
+        (add total entry, List.rev_append children next))
+      ({ allocated_bytes = 0L; latest_mtime = 0. }, [])
+      paths
+
+  (* [Fiber.List.map ~max_fibers] creates one fiber per input and parks the
+     excess on its limiter. Large, flat directories therefore create thousands
+     of short-lived fibers even though only [max_fibers] can do useful work.
+     Partition the level first so the number of fibers is bounded structurally;
+     each worker then performs its share sequentially. *)
+  let usage_level ~max_fibers paths =
+    let worker_count = Int.min max_fibers (List.length paths) in
+    let work = Array.make worker_count [] in
+    List.iteri
+      (fun i path ->
+        let worker = i mod worker_count in
+        work.(worker) <- path :: work.(worker))
+      paths;
+    match Array.to_list work with
+    | [ batch ] -> [ usage_batch batch ]
+    | batches -> Eio.Fiber.List.map usage_batch batches
+
   let usage ?(max_fibers = 32) path =
     if max_fibers <= 0 then invalid_arg "Eio_fs.Path.usage: max_fibers <= 0";
     let rec loop total = function
       | [] -> total
       | level ->
-          let entries = Eio.Fiber.List.map ~max_fibers usage_entry level in
+          let batches = usage_level ~max_fibers level in
           let total, next =
             List.fold_left
-              (fun (total, next) (entry, children) ->
-                (add total entry, List.rev_append children next))
-              (total, []) entries
+              (fun (total, next) (batch, children) ->
+                (add total batch, List.rev_append children next))
+              (total, []) batches
           in
           loop total next
     in
