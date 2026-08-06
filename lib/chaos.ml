@@ -410,29 +410,51 @@ let wrap_dir_hook :
     ref =
   ref (fun ~base:_ ~sched:_ -> assert false)
 
+(* A swap fires AFTER the operation it was scheduled on: the operation sees the
+   original file, then the name is unlinked and re-created as a symlink to the
+   target, so everything that resolves the path afterwards reaches the target
+   instead -- the check-to-use window a TOCTOU exploits. On a stat the check is
+   the metadata the caller was handed; on an open it is the descriptor, which
+   keeps the original file while its name goes on to mean another. *)
+let swap_after boxed fault path =
+  match fault with
+  | Some (Fault.Swap_symlink target) ->
+      let (Base_dir ((module B), bv)) = boxed in
+      B.unlink bv path;
+      B.symlink ~link_to:target bv path
+  | Some _ | None -> ()
+
 module Dir_impl = struct
   type t = dir
 
   let open_in t ~sw path =
-    (match Schedule.next t.sched (Op.open_ path) with
+    let fault = Schedule.next t.sched (Op.open_ path) in
+    (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
-    wrap_ro t.sched ~path (B.open_in bv ~sw path)
+    let file = B.open_in bv ~sw path in
+    swap_after t.boxed fault path;
+    wrap_ro t.sched ~path file
 
   let open_out t ~sw ~append ~create path =
-    (match Schedule.next t.sched (Op.open_ path) with
+    let fault = Schedule.next t.sched (Op.open_ path) in
+    (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
-    wrap_rw t.sched ~path (B.open_out bv ~sw ~append ~create path)
+    let file = B.open_out bv ~sw ~append ~create path in
+    swap_after t.boxed fault path;
+    wrap_rw t.sched ~path file
 
   let open_subtree t ~sw path =
-    (match Schedule.next t.sched (Op.open_ path) with
+    let fault = Schedule.next t.sched (Op.open_ path) in
+    (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
     let sub = B.open_subtree bv ~sw path in
+    swap_after t.boxed fault path;
     !wrap_dir_hook ~base:(sub :> Eio.Fs.dir_ty r) ~sched:t.sched
 
   let stat t ~follow path =
@@ -442,14 +464,7 @@ module Dir_impl = struct
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
     let result = B.stat bv ~follow path in
-    (* A swap fires AFTER the real stat: the caller gets the pre-swap metadata,
-       then the path becomes a symlink, so its next open on the same path resolves
-       to the target -- the exact check-to-use window a TOCTOU exploits. *)
-    (match fault with
-    | Some (Fault.Swap_symlink target) ->
-        B.unlink bv path;
-        B.symlink ~link_to:target bv path
-    | _ -> ());
+    swap_after t.boxed fault path;
     result
 
   let mkdir t ~perm path =

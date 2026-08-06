@@ -46,11 +46,16 @@ module Fault : sig
     | Stat_error of code  (** Fail a stat. *)
     | Swap_symlink of string
         (** Perform the operation, then replace its path with a symlink to the
-            given target. Scripted on a [`Stat] op, the stat still sees the
-            original file while the following open on the same path resolves to
-            the symlink -- the check-to-use window a TOCTOU exploits.
+            given target -- the check-to-use window a TOCTOU exploits.
             Reproduces, deterministically, a concurrent modifier swapping a
-            checked file for a symlink between a builder's stat and its open. *)
+            checked file for a symlink under a caller that is still using it.
+
+            Scripted on a [`Stat] op, the stat still sees the original file
+            while the following open on the same path resolves to the symlink.
+            Scripted on an [`Open] op -- a file opened for reading or writing,
+            or a subtree -- the caller keeps its handle on the file the name
+            meant at the open, while everything it asks the path afterwards is
+            answered about the target. *)
 
   val equal : t -> t -> bool
   (** [equal a b] is [true] when [a] and [b] are the same fault. *)
