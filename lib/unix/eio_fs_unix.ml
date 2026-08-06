@@ -25,7 +25,9 @@ type statvfs = {
   available_blocks : int64;
 }
 
-let statvfs _ = invalid_arg "Eio_fs_unix.statvfs: not implemented"
+external statvfs_native : string -> statvfs = "caml_eio_fs_statvfs"
+
+let statvfs path = statvfs_native (Eio.Path.native_exn path)
 
 (* A registered barrier keeps its own semantics (the crash model commits its
    journal, the in-memory backend does nothing); a plain POSIX directory is
