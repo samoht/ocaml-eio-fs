@@ -6,6 +6,25 @@
     ({!Chaos}). There is a single in-memory filesystem per process; {!Fs.v},
     {!Fs.load} and {!Crunch.load} all reset it. *)
 
+(** Helpers over standard {!Eio.Path} values. *)
+module Path : sig
+  type usage = { allocated_bytes : int64; latest_mtime : float }
+  (** The allocated size and newest modification time of a tree. *)
+
+  val usage : ?max_fibers:int -> _ Eio.Path.t -> usage
+  (** [usage path] measures [path] and all descendants without following
+      symbolic links. {!field-allocated_bytes} is based on allocated 512-byte
+      blocks, not apparent file length, and saturates at [Int64.max_int]. The
+      immediate children are measured concurrently, bounded by [max_fibers]
+      (default [32]); each child tree is walked serially so concurrency stays
+      bounded.
+
+      Filesystem errors are propagated. This makes a caller deciding whether to
+      remove a tree fail closed instead of acting on a partial measurement.
+
+      @raise Invalid_argument if [max_fibers] is not positive. *)
+end
+
 (** An in-memory filesystem for {!Eio}. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t

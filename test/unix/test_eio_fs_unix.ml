@@ -186,6 +186,28 @@ let test_lock_existing_does_not_create () =
   Alcotest.(check bool)
     "probing does not create the rendezvous" false (Eio.Path.is_file lock)
 
+let test_path_usage_counts_allocated_tree_without_following_links () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "sub");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "a") "a";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "sub/b") "payload";
+  Eio.Path.symlink ~link_to:"sub" (dir / "link");
+  let paths = [ dir; dir / "a"; dir / "sub"; dir / "sub/b"; dir / "link" ] in
+  let expected_bytes, expected_mtime =
+    List.fold_left
+      (fun (bytes, mtime) path ->
+        let stat = Eio.Path.stat ~follow:false path in
+        ( Int64.add bytes (Int64.mul stat.blocks 512L),
+          Float.max mtime stat.mtime ))
+      (0L, 0.) paths
+  in
+  let usage = Eio_fs.Path.usage dir in
+  Alcotest.(check int64)
+    "allocated blocks, with the symlink counted once" expected_bytes
+    usage.allocated_bytes;
+  Alcotest.(check (float 0.))
+    "latest tree mtime" expected_mtime usage.latest_mtime
+
 let suite =
   ( "eio_fs_unix",
     [
@@ -208,4 +230,6 @@ let suite =
         test_lock_non_blocking_unavailable;
       Alcotest.test_case "existing-only lock does not create" `Quick
         test_lock_existing_does_not_create;
+      Alcotest.test_case "path usage is allocated and symlink-safe" `Quick
+        test_path_usage_counts_allocated_tree_without_following_links;
     ] )

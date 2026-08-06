@@ -16,6 +16,51 @@
  *)
 open Eio.Std
 
+module Path = struct
+  type usage = { allocated_bytes : int64; latest_mtime : float }
+
+  let add_bytes a b =
+    if Int64.sub Int64.max_int a < b then Int64.max_int else Int64.add a b
+
+  let bytes_of_blocks blocks =
+    if blocks <= 0L then 0L
+    else if blocks > Int64.div Int64.max_int 512L then Int64.max_int
+    else Int64.mul blocks 512L
+
+  let own stat =
+    {
+      allocated_bytes = bytes_of_blocks stat.Eio.File.Stat.blocks;
+      latest_mtime = stat.mtime;
+    }
+
+  let add a b =
+    {
+      allocated_bytes = add_bytes a.allocated_bytes b.allocated_bytes;
+      latest_mtime = Float.max a.latest_mtime b.latest_mtime;
+    }
+
+  let rec usage_serial path =
+    let stat = Eio.Path.stat ~follow:false path in
+    let initial = own stat in
+    if stat.kind <> `Directory then initial
+    else
+      Eio.Path.read_dir path
+      |> List.fold_left
+           (fun total name -> add total (usage_serial Eio.Path.(path / name)))
+           initial
+
+  let usage ?(max_fibers = 32) path =
+    if max_fibers <= 0 then invalid_arg "Eio_fs.Path.usage: max_fibers <= 0";
+    let stat = Eio.Path.stat ~follow:false path in
+    let initial = own stat in
+    if stat.kind <> `Directory then initial
+    else
+      Eio.Path.read_dir path
+      |> Eio.Fiber.List.map ~max_fibers (fun name ->
+          usage_serial Eio.Path.(path / name))
+      |> List.fold_left add initial
+end
+
 module Fs = struct
   type dir_fd = Low_level.Dir.fd
 
