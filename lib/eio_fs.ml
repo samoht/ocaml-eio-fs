@@ -39,26 +39,31 @@ module Path = struct
       latest_mtime = Float.max a.latest_mtime b.latest_mtime;
     }
 
-  let rec usage_serial path =
+  let usage_entry path =
     let stat = Eio.Path.stat ~follow:false path in
-    let initial = own stat in
-    if stat.kind <> `Directory then initial
-    else
-      Eio.Path.read_dir path
-      |> List.fold_left
-           (fun total name -> add total (usage_serial Eio.Path.(path / name)))
-           initial
+    let children =
+      if stat.kind <> `Directory then []
+      else
+        Eio.Path.read_dir path
+        |> List.rev_map (fun name -> Eio.Path.(path / name))
+    in
+    (own stat, children)
 
   let usage ?(max_fibers = 32) path =
     if max_fibers <= 0 then invalid_arg "Eio_fs.Path.usage: max_fibers <= 0";
-    let stat = Eio.Path.stat ~follow:false path in
-    let initial = own stat in
-    if stat.kind <> `Directory then initial
-    else
-      Eio.Path.read_dir path
-      |> Eio.Fiber.List.map ~max_fibers (fun name ->
-          usage_serial Eio.Path.(path / name))
-      |> List.fold_left add initial
+    let rec loop total = function
+      | [] -> total
+      | level ->
+          let entries = Eio.Fiber.List.map ~max_fibers usage_entry level in
+          let total, next =
+            List.fold_left
+              (fun (total, next) (entry, children) ->
+                (add total entry, List.rev_append children next))
+              (total, []) entries
+          in
+          loop total next
+    in
+    loop { allocated_bytes = 0L; latest_mtime = 0. } [ path ]
 end
 
 module Fs = struct

@@ -15,9 +15,8 @@ module Path : sig
   (** [usage path] measures [path] and all descendants without following
       symbolic links. {!field-allocated_bytes} is based on allocated 512-byte
       blocks, not apparent file length, and saturates at [Int64.max_int]. The
-      immediate children are measured concurrently, bounded by [max_fibers]
-      (default [32]); each child tree is walked serially so concurrency stays
-      bounded.
+      Each level of the tree is measured concurrently, bounded by [max_fibers]
+      (default [32]).
 
       Filesystem errors are propagated. This makes a caller deciding whether to
       remove a tree fail closed instead of acting on a partial measurement.
