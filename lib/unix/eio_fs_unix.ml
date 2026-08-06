@@ -19,6 +19,14 @@ let full_fsync fd =
            strongest barrier that volume offers, matching SQLite's practice. *)
         retry_eintr Unix.fsync fd
 
+type statvfs = {
+  block_size : int64;
+  total_blocks : int64;
+  available_blocks : int64;
+}
+
+let statvfs _ = invalid_arg "Eio_fs_unix.statvfs: not implemented"
+
 (* A registered barrier keeps its own semantics (the crash model commits its
    journal, the in-memory backend does nothing); a plain POSIX directory is
    opened natively -- Eio directory resources do not expose their descriptor

@@ -60,6 +60,19 @@ let test_full_fsync_surfaces_errors () =
   | () -> Alcotest.fail "full_fsync accepted a closed descriptor"
   | exception Unix.Unix_error (Unix.EBADF, _, _) -> ()
 
+let test_statvfs_reports_raw_block_capacity () =
+  with_real_dir @@ fun dir ->
+  let usage = Eio_fs_unix.statvfs dir in
+  Alcotest.(check bool)
+    "filesystem block size is positive" true
+    (Int64.compare usage.block_size 0L > 0);
+  Alcotest.(check bool)
+    "filesystem has blocks" true
+    (Int64.compare usage.total_blocks 0L > 0);
+  Alcotest.(check bool)
+    "available blocks do not exceed total" true
+    (Int64.compare usage.available_blocks usage.total_blocks <= 0)
+
 (* The in-memory backend registers its barrier as a no-op -- volatile storage
    has nothing to sync -- so the platter-strength entry point runs unchanged
    over it too. *)
@@ -218,6 +231,8 @@ let suite =
       Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
       Alcotest.test_case "full_fsync surfaces errors" `Quick
         test_full_fsync_surfaces_errors;
+      Alcotest.test_case "statvfs reports raw block capacity" `Quick
+        test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "in-memory barrier is a no-op" `Quick
         test_sync_dir_in_memory_no_op;
       Alcotest.test_case "lock wait does not block Eio" `Quick

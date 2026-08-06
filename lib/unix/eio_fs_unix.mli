@@ -16,6 +16,21 @@ val full_fsync : Unix.file_descr -> unit
 
     @raise Unix.Unix_error as [fsync]. *)
 
+type statvfs = {
+  block_size : int64;
+  total_blocks : int64;
+  available_blocks : int64;
+}
+(** Raw filesystem capacity returned by POSIX [statvfs]. Policy such as free
+    percentages and cache watermarks belongs in the OCaml caller. *)
+
+val statvfs : _ Eio.Path.t -> statvfs
+(** [statvfs path] reports the fragment size, total blocks and blocks available
+    to an unprivileged process on the filesystem holding [path].
+
+    @raise Unix.Unix_error as POSIX [statvfs].
+    @raise Invalid_argument if [path] has no native Unix representation. *)
+
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
     issues after renaming a file into place, without which a power cut can
