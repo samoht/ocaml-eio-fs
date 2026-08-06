@@ -105,13 +105,15 @@ let update_lock_contents file contents =
   Eio.Flow.copy_string contents file;
   Eio.File.truncate file (Optint.Int63.of_int (String.length contents))
 
-let with_lock ?(block = true) ?(perm = 0o600) ?contents path fn =
+let with_lock ?(block = true)
+    ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
+      `If_missing 0o600) ?contents path fn =
   let native_path = Eio.Path.native_exn path in
   let key = canonical_lock_path native_path in
   use_local_lock key @@ fun mutex ->
   use_mutex ~block ~path:native_path mutex @@ fun () ->
   Eio.Switch.run @@ fun sw ->
-  let file = Eio.Path.open_out ~sw ~create:(`If_missing perm) path in
+  let file = Eio.Path.open_out ~sw ~create:(create :> Eio.Fs.create) path in
   match Eio_unix.Resource.fd_opt file with
   | None ->
       invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"

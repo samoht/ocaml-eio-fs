@@ -35,7 +35,7 @@ exception Lock_unavailable of string
 
 val with_lock :
   ?block:bool ->
-  ?perm:Eio.File.Unix_perm.t ->
+  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
   _ Eio.Path.t ->
   (unit -> 'a) ->
@@ -44,11 +44,14 @@ val with_lock :
     lock, and runs [fn ()] while holding it. Waiting for the operating-system
     lock suspends only the calling fiber, not the Eio scheduler.
 
-    [perm] (default [0o600]) is used only when creating the lock file.
-    [contents], when present, replaces the lock file's contents after acquiring
-    it. The update is made through the locked file handle, preserving the inode
-    on which the advisory lock is held. This is useful for recording holder
-    diagnostics such as a process identifier.
+    [create] controls whether an absent rendezvous is created. The default,
+    [`If_missing 0o600], creates it with owner-only permissions. [`Never] locks
+    only an existing file and raises {!Eio.Fs.Not_found} when absent; this is
+    suitable for probing a rendezvous without leaving one behind. [contents],
+    when present, replaces the lock file's contents after acquiring it. The
+    update is made through the locked file handle, preserving the inode on which
+    the advisory lock is held. This is useful for recording holder diagnostics
+    such as a process identifier.
 
     If [block] is [false] (default [true]), an immediately unavailable lock
     raises {!Lock_unavailable}.
@@ -57,5 +60,8 @@ val with_lock :
     processes. The lock is always released when [fn] returns or raises.
 
     @raise Lock_unavailable as described above.
+    @raise Eio.Io
+      with {!Eio.Fs.Not_found} when [create] is [`Never] and [path] does not
+      exist.
     @raise Invalid_argument if [path] has no native Unix representation.
     @raise Unix.Unix_error as [open] or [lockf]. *)

@@ -177,6 +177,15 @@ let test_lock_non_blocking_unavailable () =
   | `Exited n -> Alcotest.failf "lock holder exited %d" n
   | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
 
+let test_lock_existing_does_not_create () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "absent" in
+  (match Eio_fs_unix.with_lock ~create:`Never lock (fun () -> ()) with
+  | () -> Alcotest.fail "an absent rendezvous was locked"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ());
+  Alcotest.(check bool)
+    "probing does not create the rendezvous" false (Eio.Path.is_file lock)
+
 let suite =
   ( "eio_fs_unix",
     [
@@ -197,4 +206,6 @@ let suite =
         test_lock_updates_contents_in_place;
       Alcotest.test_case "non-blocking lock reports unavailable" `Quick
         test_lock_non_blocking_unavailable;
+      Alcotest.test_case "existing-only lock does not create" `Quick
+        test_lock_existing_does_not_create;
     ] )
