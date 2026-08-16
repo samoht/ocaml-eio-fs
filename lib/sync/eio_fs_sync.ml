@@ -37,6 +37,9 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio.Exn.reraise_with_context ex bt
             "syncing directory (backend registers no Dir_sync barrier)")
 
+let sync_parent (_ : _ Eio.Path.t) =
+  failwith "TODO: implement Eio_fs_sync.sync_parent"
+
 type config = { durable : bool; perm : Eio.File.Unix_perm.t; max_bytes : int64 }
 
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }

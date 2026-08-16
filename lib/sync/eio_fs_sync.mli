@@ -38,6 +38,18 @@ val sync_dir : _ Eio.Path.t -> unit
       sync operation -- a wiring error, since silence would silently lose
       durability. *)
 
+val sync_parent : _ Eio.Path.t -> unit
+(** [sync_parent p] makes the directory that holds [p]'s entry durable: the
+    typed answer to "barrier the directory this name lives in", the barrier a
+    commit protocol issues after creating or renaming [p]. The parent comes from
+    {!Eio.Path.split}, so it keeps the directory capability [p] was expressed
+    against, where taking the parent through the path's string half
+    ([Filename.dirname]) drops that confinement. A path with no parent is the
+    root of the capability itself, and its barrier is {!sync_dir} of that path:
+    there is nothing above it a confined path may reach for.
+
+    @raise Eio.Io as {!sync_dir}, on the directory the barrier lands on. *)
+
 type config = {
   durable : bool;
       (** Push the temporary and target directory to stable storage. *)

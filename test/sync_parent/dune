@@ -1,0 +1,7 @@
+; Its own executable, and its own directory so it stays the only test stanza
+; in one: it names [Eio_fs_sync.sync_parent], which does not exist yet, so this
+; is the only thing in the package that fails to build until the barrier lands.
+
+(test
+ (name test)
+ (libraries eio eio.mock eio_fs eio-fs.sync alcotest cstruct optint))
