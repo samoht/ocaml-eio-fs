@@ -294,6 +294,115 @@ let test_swap_symlink_on_open_subtree () =
     "so the path answers about the other tree" "elsewhere"
     (Eio.Path.load (raw / "current" / "f"))
 
+(* {2 A swap over a real POSIX filesystem}
+
+   The in-memory runs above pin the window; the kernel is the authority on what
+   a name may be replaced by. [swap_after] (chaos.ml:419) frees the name with a
+   plain [B.unlink], which is portable for a symlink name and for a regular
+   file and for nothing else: unlinking a directory is EPERM on Darwin and
+   EISDIR on Linux, so a swap scripted on [open_subtree] of a TRUE directory
+   fails where the contract says it fires. Measured 2026-08-15 on Darwin, on
+   the populated case below:
+   [Eio.Io (Eio.Fs.E (Permission_denied (Unix_error (Operation not permitted,
+   "unlinkat", "current"))))], with the name still a directory afterwards.
+
+   The Crash module already frees a name kind-aware -- [remove_at]
+   (chaos.ml:866-892) clears the entries first, then
+   [try rmdir with Eio.Io _ -> unlink] -- and the swap must free its name the
+   same way. The two directory cases are separate on purpose: the bare
+   [try rmdir with unlink] idiom answers the empty one and still leaves the
+   populated one raising ENOTEMPTY, and a staging directory a store swaps under
+   a caller is never empty. *)
+
+(* Run [fn] over a private temp directory on the real filesystem, opened as a
+   subtree so the paths the schedule matches are relative to it. *)
+let with_real_dir fn =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let name = Filename.temp_file "eio-fs-chaos-swap" "" in
+  Eio.Path.unlink (fs / name);
+  Eio.Path.mkdir ~perm:0o755 (fs / name);
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / name))
+  @@ fun () -> Eio.Path.with_open_dir (fs / name) fn
+
+let swap_on_open path target =
+  Schedule.scripted
+    [
+      {
+        trigger = Op_on_path { kind = `Open; path };
+        fault = Swap_symlink target;
+      };
+    ]
+
+(* The name the swap frees is a symlink: the portable case, and the guard rail
+   for the fixture -- if this one fails the real-filesystem harness is broken,
+   not the directory cases under it. *)
+let test_swap_on_real_symlink_subtree () =
+  with_real_dir @@ fun raw ->
+  let chaos = Chaos.wrap (swap_on_open "current" "other") raw in
+  Eio.Path.mkdir ~perm:0o755 (raw / "tree");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "tree" / "f") "in the tree";
+  Eio.Path.mkdir ~perm:0o755 (raw / "other");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "other" / "f") "elsewhere";
+  Eio.Path.symlink ~link_to:"tree" (raw / "current");
+  let read =
+    Eio.Path.with_open_dir (chaos / "current") @@ fun dir ->
+    Eio.Path.load (dir / "f")
+  in
+  Alcotest.(check string)
+    "real fs: the handle reads under the tree the name meant at the open"
+    "in the tree" read;
+  Alcotest.(check string)
+    "real fs: the name points at the target from then on" "other"
+    (Eio.Path.read_link (raw / "current"));
+  Alcotest.(check string)
+    "real fs: so the path answers about the other tree" "elsewhere"
+    (Eio.Path.load (raw / "current" / "f"))
+
+(* An empty true directory. The open completes, the name is a symlink to the
+   target afterwards, and every path-based follow-up is answered about the
+   target -- the whole point of the fault. *)
+let test_swap_on_real_empty_directory_subtree () =
+  with_real_dir @@ fun raw ->
+  let chaos = Chaos.wrap (swap_on_open "current" "other") raw in
+  Eio.Path.mkdir ~perm:0o755 (raw / "current");
+  Eio.Path.mkdir ~perm:0o755 (raw / "other");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "other" / "f") "elsewhere";
+  Eio.Path.with_open_dir (chaos / "current") (fun (_ : _ Eio.Path.t) -> ());
+  Alcotest.(check bool)
+    "real fs: the empty directory name became a symlink" true
+    (Eio.Path.kind ~follow:false (raw / "current") = `Symbolic_link);
+  Alcotest.(check string)
+    "real fs: the name points at the target from then on" "other"
+    (Eio.Path.read_link (raw / "current"));
+  Alcotest.(check string)
+    "real fs: so the path answers about the other tree" "elsewhere"
+    (Eio.Path.load (raw / "current" / "f"))
+
+(* A populated true directory -- the shape a store's staging directory has, and
+   the shape the in-memory subtree case above uses. Freeing this name takes the
+   entries with it, so the swap must clear them rather than stop at ENOTEMPTY.
+*)
+let test_swap_on_real_populated_directory_subtree () =
+  with_real_dir @@ fun raw ->
+  let chaos = Chaos.wrap (swap_on_open "current" "other") raw in
+  Eio.Path.mkdir ~perm:0o755 (raw / "current");
+  Eio.Path.save ~create:(`Or_truncate 0o644)
+    (raw / "current" / "f")
+    "in the tree";
+  Eio.Path.mkdir ~perm:0o755 (raw / "other");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "other" / "f") "elsewhere";
+  Eio.Path.with_open_dir (chaos / "current") (fun (_ : _ Eio.Path.t) -> ());
+  Alcotest.(check bool)
+    "real fs: the populated directory name became a symlink" true
+    (Eio.Path.kind ~follow:false (raw / "current") = `Symbolic_link);
+  Alcotest.(check string)
+    "real fs: the name points at the target from then on" "other"
+    (Eio.Path.read_link (raw / "current"));
+  Alcotest.(check string)
+    "real fs: so the path answers about the other tree" "elsewhere"
+    (Eio.Path.load (raw / "current" / "f"))
+
 (* {2 Schedule as an inspectable value} *)
 
 (* A scripted rule fires the first time its trigger matches, then is spent. *)
@@ -1038,6 +1147,12 @@ let suite =
         test_swap_symlink_on_open_out;
       Alcotest.test_case "swap-symlink on open_subtree" `Quick
         test_swap_symlink_on_open_subtree;
+      Alcotest.test_case "swap on a symlink subtree (real fs)" `Quick
+        test_swap_on_real_symlink_subtree;
+      Alcotest.test_case "swap on an empty directory subtree (real fs)" `Quick
+        test_swap_on_real_empty_directory_subtree;
+      Alcotest.test_case "swap on a populated directory subtree (real fs)"
+        `Quick test_swap_on_real_populated_directory_subtree;
       Alcotest.test_case "scripted fires once" `Quick test_scripted_fires_once;
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
