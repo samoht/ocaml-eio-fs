@@ -217,6 +217,13 @@ module Crash : sig
     | Nth_op of int
         (** Crash on the [n]th durability op (writes, syncs and directory
             operations, 1-based). *)
+    | After_dir_op of { kind : op_kind; path : string }
+        (** Crash once the directory operation of that {!type-op_kind} on that
+            path has entered the metadata journal, and before any following
+            operation can commit it: the window a directory operation with no
+            barrier of its own leaves open. [kind] and [path] are matched
+            structurally, exactly as {!type-unsynced} records them, so a
+            {!Rename} names its destination and a {!Symlink} its target. *)
 
   type t
   (** A crash controller: tracks durability across the files opened through it

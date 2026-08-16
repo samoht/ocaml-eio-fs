@@ -1,0 +1,8 @@
+; Its own executable, and its own directory so it stays the only test stanza
+; in one: it names [Eio_fs.Chaos.Crash.After_dir_op], which does not exist yet,
+; so this is the only thing in the package that fails to build until the
+; trigger lands.
+
+(test
+ (name test)
+ (libraries eio eio.mock eio_fs alcotest cstruct optint))

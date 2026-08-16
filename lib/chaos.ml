@@ -763,6 +763,9 @@ module Crash = struct
             commits, before any following sync. *)
     | Nth_op of int
         (** Crash on the [n]th durability op (writes and syncs, 1-based). *)
+    | After_dir_op of { kind : op_kind; path : string }
+        (** Crash once that directory operation has entered the metadata
+            journal, before any following operation can commit it. *)
 
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The backing store handed back after a crash. *)
@@ -1023,6 +1026,7 @@ module Crash = struct
       match ctl.trigger with
       | Manual -> false
       | Nth_op n -> ctl.ops >= n
+      | After_dir_op _ -> failwith "TODO: implement Crash.After_dir_op"
       | After_write { path; file_offset } ->
           (match kind with `Write -> true | `Sync -> false)
           && String.equal path fs.rel && offset <= file_offset
@@ -1034,6 +1038,7 @@ module Crash = struct
     ctl.ops <- ctl.ops + 1;
     match ctl.trigger with
     | Nth_op n when ctl.ops >= n && not ctl.crashed -> do_crash ctl
+    | After_dir_op _ -> failwith "TODO: implement Crash.After_dir_op"
     | Manual | After_write _ | Nth_op _ -> ()
 
   (* One record backs both file wrappers. [cfs] is present exactly for a
