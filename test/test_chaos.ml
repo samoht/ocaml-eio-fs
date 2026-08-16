@@ -1000,6 +1000,107 @@ let test_crash_unsynced_lists_dir_ops () =
     "journal lists mkdir, create, data in program order" true
     (kinds = [ Crash.Mkdir; Crash.Create; Crash.Data ])
 
+(* {2 The directory barrier is scoped to one directory}
+
+   [Eio_fs_sync.sync_dir] through the crash wrapper is the model's metadata
+   barrier, and fsync(2) fixes what one barrier covers: syncing directory D
+   makes the entries OF D durable -- the journal entries whose recorded path's
+   parent is D -- and says nothing about D's own entry in its parent, nor about
+   a sibling of D, nor about an entry one level further down. A barrier that
+   commits the whole journal cannot tell a store that barriered the right
+   directory from one that barriered any directory at all, so a missing barrier
+   on one level of a mkdirs reads as durable.
+
+   The tightening leaves correct call sites alone: a store barriers the parent
+   directory of the file it just published, which is exactly the directory that
+   holds that file's entry, so ocaml-sqlite's crash tests stay green. It does
+   not close the window that a crash trigger on a directory operation opens
+   either -- there both operations are entries of the SAME directory, so the
+   barrier that commits one commits the other whatever its scope. Both gaps are
+   real and they need different changes. *)
+
+(* Syncing a directory does not commit that directory's own name: [a]'s entry
+   lives in the root, and only the root's barrier makes it durable. The sibling
+   [b] is pending for the same reason. *)
+let test_crash_dir_sync_leaves_its_own_entry_pending () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.mkdir ~perm:0o755 (fs / "b");
+  Eio_fs_sync.sync_dir (fs / "a");
+  Crash.crash ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "the barriered directory's own entry stayed pending" true
+    (absent (post / "a"));
+  Alcotest.(check bool) "and so did its sibling" true (absent (post / "b"))
+
+(* The entries the barrier does commit are the ones inside it: with [a] made
+   durable by the root's barrier, syncing [a] commits the file created in [a]
+   and leaves [b], created in the root, pending. *)
+let test_crash_dir_sync_commits_its_own_entries () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio_fs_sync.sync_dir fs;
+  Eio.Path.mkdir ~perm:0o755 (fs / "b");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "a" / "f")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio_fs_sync.sync_dir (fs / "a");
+  Crash.crash ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the entry created in the barriered directory survives" "data"
+    (Eio.Path.load (post / "a" / "f"));
+  Alcotest.(check bool)
+    "the sibling created in the root did not" true
+    (absent (post / "b"))
+
+(* The root's barrier commits the root's entries, both of them: scoping the
+   commit must not shrink it to one path. *)
+let test_crash_root_sync_commits_both_siblings () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.mkdir ~perm:0o755 (fs / "b");
+  Eio_fs_sync.sync_dir fs;
+  Crash.crash ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "first sibling durable" true
+    (Eio.Path.kind ~follow:false (post / "a") = `Directory);
+  Alcotest.(check bool)
+    "second sibling durable" true
+    (Eio.Path.kind ~follow:false (post / "b") = `Directory)
+
+(* One level, not the whole subtree: syncing [a] commits the mkdir of [a/sub],
+   whose entry is in [a], and not the file created inside [a/sub], whose entry
+   is in [a/sub]. A store that barriers the top of a mkdirs and expects the
+   bottom to be durable is the bug the model has to show. *)
+let test_crash_dir_sync_does_not_reach_a_grandchild () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio_fs_sync.sync_dir fs;
+  Eio.Path.mkdir ~perm:0o755 (fs / "a" / "sub");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "a" / "sub" / "g")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
+      Eio.File.sync file);
+  Eio_fs_sync.sync_dir (fs / "a");
+  Crash.crash ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check bool)
+    "the child directory, an entry of the barriered one, is durable" true
+    (Eio.Path.kind ~follow:false (post / "a" / "sub") = `Directory);
+  Alcotest.(check bool)
+    "the file one level further down is not" true
+    (absent (post / "a" / "sub" / "g"))
+
 (* A write-only (0o200) file is still rewritten at crash time: the rewrite
    opens O_RDWR, which needs the read bit too, so the model grants owner
    read and write for the duration and restores the exact mode after. *)
@@ -1217,6 +1318,14 @@ let suite =
         test_crash_nth_op_counts_dir_ops;
       Alcotest.test_case "crash: unsynced lists dir ops" `Quick
         test_crash_unsynced_lists_dir_ops;
+      Alcotest.test_case "crash: dir sync leaves its own entry pending" `Quick
+        test_crash_dir_sync_leaves_its_own_entry_pending;
+      Alcotest.test_case "crash: dir sync commits its own entries" `Quick
+        test_crash_dir_sync_commits_its_own_entries;
+      Alcotest.test_case "crash: root sync commits both siblings" `Quick
+        test_crash_root_sync_commits_both_siblings;
+      Alcotest.test_case "crash: dir sync does not reach a grandchild" `Quick
+        test_crash_dir_sync_does_not_reach_a_grandchild;
       Alcotest.test_case "crash: rename revert (real fs)" `Quick
         test_crash_rename_revert_real;
     ] )
