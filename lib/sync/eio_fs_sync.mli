@@ -75,8 +75,9 @@ val publish :
     durably. [write file] streams the new contents into a temporary Eio file;
     after it returns, the temporary is fsynced, renamed over [path] -- a reader
     or a crash sees the old file or the whole new one, never a torn or empty
-    file -- and [path]'s directory is barriered with {!sync_dir}. The callback's
-    result is returned only after publication completes.
+    file -- and the directory holding [path]'s entry is barriered with
+    {!sync_parent}. The callback's result is returned only after publication
+    completes.
 
     When [tmp] is omitted, a fresh sibling name is opened exclusively. An
     explicit [tmp] is also opened exclusively, must not exist, must be distinct

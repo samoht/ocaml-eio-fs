@@ -37,8 +37,17 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio.Exn.reraise_with_context ex bt
             "syncing directory (backend registers no Dir_sync barrier)")
 
-let sync_parent (_ : _ Eio.Path.t) =
-  failwith "TODO: implement Eio_fs_sync.sync_parent"
+(* The barrier on the directory that holds a path's entry. [Eio.Path.split]
+   answers the parent with the directory capability still attached, where
+   taking it through the path's string half ([Filename.dirname]) would pair a
+   fresh string with the capability and drop the confinement that made the
+   original path safe. A path with no parent is the root of the capability
+   itself: there is nothing above it a confined path may reach for, so its
+   barrier is its own. *)
+let sync_parent p =
+  match Eio.Path.split p with
+  | Some (parent, _) -> sync_dir parent
+  | None -> sync_dir p
 
 type config = { durable : bool; perm : Eio.File.Unix_perm.t; max_bytes : int64 }
 
@@ -152,7 +161,7 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
    a temporary, push its bytes to stable storage, rename it over the target
    (atomic: readers see the old or the new file, never a torn one), and barrier
    the target's directory so a power cut cannot revert the publication. *)
-let publish ~config ?tmp:requested_tmp ((dir, target) as path) write =
+let publish ~config ?tmp:requested_tmp path write =
   if Int64.compare config.max_bytes 0L < 0 then
     invalid_arg "Eio_fs_sync.publish: max_bytes must be non-negative";
   let tmp, owned, cleanup, result = produce ~config ~requested_tmp path write in
@@ -160,7 +169,7 @@ let publish ~config ?tmp:requested_tmp ((dir, target) as path) write =
      Eio.Cancel.protect @@ fun () ->
      Eio.Path.rename tmp path;
      owned := false;
-     if config.durable then sync_dir (dir, Filename.dirname target)
+     if config.durable then sync_parent path
    with e ->
      cleanup ();
      raise e);
