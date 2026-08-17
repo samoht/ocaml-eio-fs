@@ -199,6 +199,96 @@ let test_lock_existing_does_not_create () =
   Alcotest.(check bool)
     "probing does not create the rendezvous" false (Eio.Path.is_file lock)
 
+(* ---- the lock path is the lock's own file ----
+
+   A rendezvous lives in a directory another party writes, which is exactly
+   where an entry gets planted under the name a locker is about to use. If the
+   lock follows what it finds there, the exclusive lock lands on the entry's
+   target: two processes then hold two locks over one resource, both read the
+   same state and both publish, with nothing in either run to say the exclusion
+   was absent. So the lock path must be its own regular file, and anything else
+   under that name is refused.
+
+   The refusal is Eio's own vocabulary for a path it declines to resolve --
+   [Eio.Io (Eio.Fs.E (Permission_denied _))], as Eio raises for a name outside a
+   sandbox -- and it names the lock path, because an operator reading the failure
+   needs to know which entry is wrong. *)
+
+let mentions ~needle haystack =
+  let n = String.length needle and h = String.length haystack in
+  let rec at i =
+    i + n <= h && (String.equal (String.sub haystack i n) needle || at (i + 1))
+  in
+  at 0
+
+let check_refusal what path fn =
+  let native = Eio.Path.native_exn path in
+  match fn () with
+  | () -> Alcotest.failf "%s at the lock path was locked" what
+  | exception (Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) as e) ->
+      Alcotest.(check bool)
+        (what ^ ": the refusal names the lock path")
+        true
+        (mentions ~needle:native (Printexc.to_string e))
+
+(* A link to a sibling regular file: the shape an adversary plants, and the
+   shape a stale deployment leaves behind. The sibling must come back neither
+   locked nor written. *)
+let test_lock_refuses_a_symlink_at_the_lock_path () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Or_truncate 0o600) (dir / "target") "target\n";
+  Eio.Path.symlink ~link_to:"target" (dir / "lock");
+  check_refusal "a symbolic link" (dir / "lock") (fun () ->
+      Eio_fs_unix.with_lock ~contents:"holder\n" (dir / "lock") (fun () -> ()));
+  Alcotest.(check string)
+    "the link's target was not written through the link" "target\n"
+    (Eio.Path.load (dir / "target"));
+  (* The target's own path still locks, so the refusal took nothing with it. *)
+  Eio_fs_unix.with_lock (dir / "target") (fun () -> ())
+
+(* A dangling link is the sharper case: creating the rendezvous through it
+   creates a file wherever the link points, so the refusal has to come before
+   the open, not after it. *)
+let test_lock_refuses_a_dangling_symlink_without_creating_its_target () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.symlink ~link_to:"elsewhere" (dir / "lock");
+  check_refusal "a dangling symbolic link" (dir / "lock") (fun () ->
+      Eio_fs_unix.with_lock (dir / "lock") (fun () -> ()));
+  Alcotest.(check bool)
+    "the link's target was not created" false
+    (Eio.Path.is_file (dir / "elsewhere"))
+
+(* Neither a directory nor a FIFO carries the record lock the interface
+   promises, so both are refused in the same vocabulary rather than surfacing
+   as whichever [open] error the platform happens to pick. *)
+let test_lock_refuses_a_directory_or_a_fifo () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "as-a-directory");
+  Unix.mkfifo (Eio.Path.native_exn (dir / "as-a-fifo")) 0o600;
+  check_refusal "a directory" (dir / "as-a-directory") (fun () ->
+      Eio_fs_unix.with_lock (dir / "as-a-directory") (fun () -> ()));
+  check_refusal "a FIFO" (dir / "as-a-fifo") (fun () ->
+      Eio_fs_unix.with_lock (dir / "as-a-fifo") (fun () -> ()))
+
+(* An absent rendezvous is still created, as its own owner-only regular file:
+   refusing what is not a regular file must not refuse the ordinary first
+   acquisition. *)
+let test_lock_creates_a_missing_rendezvous_as_a_regular_file () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  Alcotest.(check bool)
+    "no rendezvous before the first acquisition" false (Eio.Path.is_file lock);
+  Eio_fs_unix.with_lock lock (fun () ->
+      let held = Eio.Path.stat ~follow:false lock in
+      Alcotest.(check bool)
+        "the rendezvous is a regular file while held" true
+        (held.kind = `Regular_file);
+      Alcotest.(check int) "created owner-only" 0o600 held.perm);
+  let after = Eio.Path.stat ~follow:false lock in
+  Alcotest.(check bool)
+    "the rendezvous survives as a regular file" true
+    (after.kind = `Regular_file)
+
 let test_path_usage_counts_allocated_tree_without_following_links () =
   with_real_dir @@ fun dir ->
   Eio.Path.mkdir ~perm:0o755 (dir / "sub");
@@ -245,6 +335,14 @@ let suite =
         test_lock_non_blocking_unavailable;
       Alcotest.test_case "existing-only lock does not create" `Quick
         test_lock_existing_does_not_create;
+      Alcotest.test_case "lock refuses a symlink at the lock path" `Quick
+        test_lock_refuses_a_symlink_at_the_lock_path;
+      Alcotest.test_case "lock refuses a dangling symlink" `Quick
+        test_lock_refuses_a_dangling_symlink_without_creating_its_target;
+      Alcotest.test_case "lock refuses a directory or a FIFO" `Quick
+        test_lock_refuses_a_directory_or_a_fifo;
+      Alcotest.test_case "missing rendezvous is created as a regular file"
+        `Quick test_lock_creates_a_missing_rendezvous_as_a_regular_file;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick
         test_path_usage_counts_allocated_tree_without_following_links;
     ] )
