@@ -296,6 +296,94 @@ let test_lock_refuses_a_dangling_symlink_without_creating_its_target () =
     "the link's target was not created" false
     (Eio.Path.is_file (dir / "elsewhere"))
 
+(* ---- the window between the name check and the open ----
+
+   The name is weighed before the file is opened and the descriptor after the
+   lock is held, and in between the open resolves that same name a second time.
+   An entry planted in that window is what the second resolution follows. It is
+   a real window rather than a theoretical one: eio runs [stat] and [openat] on
+   a system thread, so the fiber suspends at each and another fiber of the same
+   domain -- let alone another process sharing the rendezvous directory -- runs
+   between them.
+
+   A test cannot hook between two calls it does not make, so the directory
+   itself does the planting: [Plant_after_stat] answers a stat about the base
+   directory as it stands, then takes the name it was asked about with a
+   dangling symbolic link before returning. Everything else, including the
+   descriptor an open returns, is the base directory's own. *)
+module Plant_after_stat = struct
+  type t = {
+    base : Eio.Fs.dir_ty Eio.Resource.t;
+    link_to : string;
+    planted : bool ref;
+  }
+
+  let at t path = (t.base, path)
+
+  let plant t path =
+    if not !(t.planted) then begin
+      t.planted := true;
+      Eio.Path.symlink ~link_to:t.link_to (at t path)
+    end
+
+  let stat t ~follow path =
+    Fun.protect
+      ~finally:(fun () -> plant t path)
+      (fun () -> Eio.Path.stat ~follow (at t path))
+
+  let open_in t ~sw path = Eio.Path.open_in ~sw (at t path)
+
+  let open_out t ~sw ~append ~create path =
+    Eio.Path.open_out ~sw ~append ~create (at t path)
+
+  let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)
+  let read_dir t path = Eio.Path.read_dir (at t path)
+  let with_dir_entries t path fn = Eio.Path.with_dir_entries (at t path) fn
+  let unlink t path = Eio.Path.unlink (at t path)
+  let rmdir t path = Eio.Path.rmdir (at t path)
+  let rename t path dir dst = Eio.Path.rename (at t path) (dir, dst)
+  let read_link t path = Eio.Path.read_link (at t path)
+  let symlink ~link_to t path = Eio.Path.symlink ~link_to (at t path)
+  let chmod t ~follow ~perm path = Eio.Path.chmod ~follow ~perm (at t path)
+
+  let chown ~follow ?uid ?gid t path =
+    Eio.Path.chown ~follow ?uid ?gid (at t path)
+
+  let native t path = Eio.Path.native (at t path)
+  let pp f _ = Format.pp_print_string f "plant-after-stat"
+
+  let open_subtree _ ~sw:_ _ =
+    failwith "Plant_after_stat: the lock opens no subtree"
+end
+
+let plant_after_stat ~link_to ((base, _) : Eio.Fs.dir_ty Eio.Path.t) =
+  let t = { Plant_after_stat.base; link_to; planted = ref false } in
+  (Eio.Resource.T
+     ( t,
+       Eio.Resource.handler
+         [ Eio.Resource.H (Eio.Fs.Pi.Dir, (module Plant_after_stat)) ] )
+    : Eio.Fs.dir_ty Eio.Resource.t)
+
+(* A link planted in that window is followed by the open, and a creating open
+   that follows one creates the file at the far end: an empty, owner-writable
+   file wherever the party that planted the link chose, left behind after the
+   lock itself was refused. Refusing is only half the guarantee; the other half
+   is that the attempt created nothing. *)
+let test_lock_creates_nothing_through_a_link_planted_after_the_check () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  let racing =
+    (plant_after_stat ~link_to:"victim" dir, Eio.Path.native_exn lock)
+  in
+  check_refusal "a link planted after the name check" lock (fun () ->
+      Eio_fs_unix.with_lock racing (fun () -> ()));
+  Alcotest.(check bool)
+    "the planted link took the name" true
+    ((Eio.Path.stat ~follow:false lock).kind = `Symbolic_link);
+  Alcotest.(check bool)
+    "the link's target was not created" false
+    (Eio.Path.is_file (dir / "victim"))
+
 (* Neither a directory nor a FIFO carries the record lock the interface
    promises, so both are refused in the same vocabulary rather than surfacing
    as whichever [open] error the platform happens to pick. *)
@@ -379,6 +467,9 @@ let suite =
         test_lock_refuses_a_symlink_at_the_lock_path;
       Alcotest.test_case "lock refuses a dangling symlink" `Quick
         test_lock_refuses_a_dangling_symlink_without_creating_its_target;
+      Alcotest.test_case
+        "lock creates nothing through a link planted after the check" `Quick
+        test_lock_creates_nothing_through_a_link_planted_after_the_check;
       Alcotest.test_case "lock refuses a directory or a FIFO" `Quick
         test_lock_refuses_a_directory_or_a_fifo;
       Alcotest.test_case "missing rendezvous is created as a regular file"
