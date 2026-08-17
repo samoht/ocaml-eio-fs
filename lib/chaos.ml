@@ -410,6 +410,39 @@ let wrap_dir_hook :
     ref =
   ref (fun ~base:_ ~sched:_ -> assert false)
 
+(* Free the name at [path], whatever kind of entry holds it. Unlinking a
+   directory is EPERM on Darwin and EISDIR on Linux, so a name that may be a
+   directory is emptied first and then removed with [rmdir]; anything else is
+   unlinked. The two wrappers that free a name -- the scripted swap below and
+   the crash model rebuilding its post-crash image -- both go through here, so
+   what a name may be replaced by is decided in one place. *)
+let rec remove_at (Base_dir ((module B), bv) as owner) path =
+  match B.stat bv ~follow:false path with
+  | exception Eio.Io _ -> ()
+  | { kind = `Directory; _ } -> (
+      let rec clear () =
+        match B.read_dir bv path with
+        | [] -> ()
+        | names ->
+            List.iter
+              (fun name ->
+                let child =
+                  if String.equal path "" then name
+                  else Filename.concat path name
+                in
+                remove_at owner child)
+              names;
+            clear ()
+      in
+      clear ();
+      if not (String.equal path "") then
+        (* A deliberately adversarial in-memory tree may retain hidden
+           bookkeeping entries after a chain of directory renames. The
+           namespace entry is still safe to discard; real filesystems take the
+           normal [rmdir] path. *)
+        try B.rmdir bv path with Eio.Io _ -> B.unlink bv path)
+  | _ -> B.unlink bv path
+
 (* A swap fires AFTER the operation it was scheduled on: the operation sees the
    original file, then the name is unlinked and re-created as a symlink to the
    target, so everything that resolves the path afterwards reaches the target
@@ -420,7 +453,7 @@ let swap_after boxed fault path =
   match fault with
   | Some (Fault.Swap_symlink target) ->
       let (Base_dir ((module B), bv)) = boxed in
-      B.unlink bv path;
+      remove_at boxed path;
       B.symlink ~link_to:target bv path
   | Some _ | None -> ()
 
@@ -865,33 +898,6 @@ module Crash = struct
         Dir { perm; entries }
     | { kind = `Symbolic_link; _ } -> Link (B.read_link bv path)
     | _ -> invalid_arg "Chaos.Crash: unsupported filesystem entry"
-
-  let rec remove_at (Base_dir ((module B), bv) as owner) path =
-    match B.stat bv ~follow:false path with
-    | exception Eio.Io _ -> ()
-    | { kind = `Directory; _ } -> (
-        let rec clear () =
-          match B.read_dir bv path with
-          | [] -> ()
-          | names ->
-              List.iter
-                (fun name ->
-                  let child =
-                    if String.equal path "" then name
-                    else Filename.concat path name
-                  in
-                  remove_at owner child)
-                names;
-              clear ()
-        in
-        clear ();
-        if not (String.equal path "") then
-          (* A deliberately adversarial in-memory tree may retain hidden
-             bookkeeping entries after a chain of directory renames. The
-             namespace entry is still safe to discard when rebuilding the
-             post-crash image; real filesystems take the normal [rmdir] path. *)
-          try B.rmdir bv path with Eio.Io _ -> B.unlink bv path)
-    | _ -> B.unlink bv path
 
   let rec restore_at (Base_dir ((module B), bv) as owner) path = function
     | File { data; perm } ->
