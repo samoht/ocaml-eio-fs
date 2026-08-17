@@ -48,6 +48,11 @@ exception Lock_unavailable of string
 (** Raised by {!with_lock} in non-blocking mode when the lock is held. The
     string is the native path of the lock file. *)
 
+type Eio.Exn.Backend.t +=
+  | Not_a_lock_file of string
+        (** Why {!with_lock} refused a lock path: the name is not the lock's own
+            regular file. The string is the native path of the lock file. *)
+
 val with_lock :
   ?block:bool ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
@@ -74,9 +79,22 @@ val with_lock :
     Locks are coordinated both between fibers in this process and between
     processes. The lock is always released when [fn] returns or raises.
 
+    [path] must be the lock's own regular file. A rendezvous sits in a directory
+    another party writes, and resolving its name follows a symbolic link left
+    there, so a link under that name would send the record lock to whatever the
+    link points at: two processes would hold two locks over one resource and
+    both publish. A link, a directory, a FIFO, and an entry that took the name
+    between the resolution and the open are all refused with
+    {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file}. The name is weighed
+    before the file is opened, so [create] never creates the file a dangling
+    link points at.
+
     @raise Lock_unavailable as described above.
     @raise Eio.Io
       with {!Eio.Fs.Not_found} when [create] is [`Never] and [path] does not
       exist.
+    @raise Eio.Io
+      with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
+      is not the lock's own regular file.
     @raise Invalid_argument if [path] has no native Unix representation.
     @raise Unix.Unix_error as [open] or [lockf]. *)

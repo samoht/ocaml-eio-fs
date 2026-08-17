@@ -110,6 +110,64 @@ let use_os_lock ~block ~path fd fn =
               raise (Lock_unavailable path));
       fn ())
 
+(* ---- the lock path is the lock's own file ----
+
+   A rendezvous sits in a directory another party writes, which is exactly
+   where an entry gets planted under the name a locker is about to use.
+   [Eio.Path] resolves a name for its caller and follows a link it finds at the
+   end, so a link left under that name sends the record lock to whatever the
+   link names: two processes then hold two locks over one resource, both read
+   the same state and both publish, with nothing in either run to say the
+   exclusion was absent.
+
+   The name is weighed before the file is opened, so [create] never creates the
+   file a dangling link points at, and the descriptor is weighed again once the
+   lock is held, because a name is resolved a second time by the open and an
+   entry that took it in between would leave the lock on an inode the name no
+   longer reaches. Comparing the descriptor's device and inode with the name's
+   own is what settles that: on a symbolic link the two differ, since the name
+   carries the link's inode and the descriptor the target's. *)
+
+type Eio.Exn.Backend.t += Not_a_lock_file of string
+
+let () =
+  Eio.Exn.Backend.register_pp (fun f -> function
+    | Not_a_lock_file path ->
+        Fmt.pf f "Not_a_lock_file %S" path;
+        true
+    | _ -> false)
+
+let not_a_lock_file native =
+  raise (Eio.Fs.err (Eio.Fs.Permission_denied (Not_a_lock_file native)))
+
+let is_regular : Eio.File.Stat.kind -> bool = function
+  | `Regular_file -> true
+  | _ -> false
+
+(* An absent name is the ordinary first acquisition: [create] decides whether
+   the open makes one, and the descriptor is weighed either way. *)
+let named_kind path =
+  match Eio.Path.stat ~follow:false path with
+  | stat -> Some stat
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
+
+let check_lock_name ~native path =
+  match named_kind path with
+  | None -> ()
+  | Some stat -> if not (is_regular stat.kind) then not_a_lock_file native
+
+let check_locked_file ~native path file =
+  let opened = Eio.File.stat file in
+  match named_kind path with
+  | None -> not_a_lock_file native
+  | Some named ->
+      if
+        (not (is_regular opened.kind))
+        || (not (is_regular named.kind))
+        || Int64.compare opened.dev named.dev <> 0
+        || Int64.compare opened.ino named.ino <> 0
+      then not_a_lock_file native
+
 let update_lock_contents file contents =
   ignore (Eio.File.seek file Optint.Int63.zero `Set : Optint.Int63.t);
   Eio.Flow.copy_string contents file;
@@ -122,6 +180,7 @@ let with_lock ?(block = true)
   let key = canonical_lock_path native_path in
   use_local_lock key @@ fun mutex ->
   use_mutex ~block ~path:native_path mutex @@ fun () ->
+  check_lock_name ~native:native_path path;
   Eio.Switch.run @@ fun sw ->
   let file = Eio.Path.open_out ~sw ~create:(create :> Eio.Fs.create) path in
   match Eio_unix.Resource.fd_opt file with
@@ -130,5 +189,6 @@ let with_lock ?(block = true)
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
       use_os_lock ~block ~path:native_path fd @@ fun () ->
+      check_locked_file ~native:native_path path file;
       Option.iter (update_lock_contents file) contents;
       fn ()
