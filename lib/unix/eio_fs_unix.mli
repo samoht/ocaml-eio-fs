@@ -26,7 +26,8 @@ type statvfs = {
 
 val statvfs : _ Eio.Path.t -> statvfs
 (** [statvfs path] reports the fragment size, total blocks and blocks available
-    to an unprivileged process on the filesystem holding [path].
+    to an unprivileged process on the filesystem holding [path]. The call is
+    made on a system thread, so it suspends only the calling fiber.
 
     @raise Unix.Unix_error as POSIX [statvfs].
     @raise Invalid_argument if [path] has no native Unix representation. *)
@@ -39,6 +40,11 @@ val sync_dir : _ Eio.Path.t -> unit
     backend does nothing, being volatile; a crash-model wrapper commits its
     journal -- and a plain POSIX directory is opened natively and
     {!full_fsync}ed.
+
+    The native open and barrier are made on a system thread, so waiting for the
+    platter suspends only the calling fiber and not the other fibers of its
+    domain. A registered barrier answers on the calling fiber, as its backend
+    wrote it.
 
     @raise Unix.Unix_error as [open] or [fsync].
     @raise Invalid_argument

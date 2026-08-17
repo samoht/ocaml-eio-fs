@@ -27,18 +27,28 @@ type statvfs = {
 
 external statvfs_native : string -> statvfs = "caml_eio_fs_statvfs"
 
-let statvfs path = statvfs_native (Eio.Path.native_exn path)
+let statvfs path =
+  let native = Eio.Path.native_exn path in
+  Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
+  statvfs_native native
 
 (* A registered barrier keeps its own semantics (the crash model commits its
    journal, the in-memory backend does nothing); a plain POSIX directory is
    opened natively -- Eio directory resources do not expose their descriptor
    -- and pushed through to stable storage, which on Darwin means F_FULLFSYNC
-   where the portable fallback's fsync only reaches the drive's cache. *)
+   where the portable fallback's fsync only reaches the drive's cache.
+
+   That barrier is the slowest call the process makes, so it runs on a system
+   thread: a fiber's own thread carries the domain's scheduler, and holding it
+   inside the fsync would stop every other fiber -- the timers, the connections
+   -- for the length of a write to the platter. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match Eio_fs_sync.find res with
   | Some barrier -> barrier ~path
   | None ->
-      let fd = Unix.openfile (Eio.Path.native_exn p) [ Unix.O_RDONLY ] 0 in
+      let native = Eio.Path.native_exn p in
+      Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
+      let fd = Unix.openfile native [ Unix.O_RDONLY ] 0 in
       Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> full_fsync fd)
 
 exception Lock_unavailable of string
