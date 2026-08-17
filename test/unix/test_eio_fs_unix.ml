@@ -33,6 +33,44 @@ let test_sync_dir_empty_and_repeated () =
   Eio_fs_unix.sync_dir dir;
   Eio_fs_unix.sync_dir dir
 
+(* The barrier runs on a fiber that shares its domain with every other fiber of
+   the program: a server publishes while it serves. So the open and the fsync
+   belong on a system thread, not on the fiber's own thread -- an inline pair
+   holds the domain's scheduler inside the C call for the whole barrier, which
+   on Darwin is F_FULLFSYNC, through to the platter and the slowest call the
+   process makes. Here one fiber issues a run of barriers while a sibling
+   counts its own turns; the sibling gets none at all while the pair runs
+   inline. *)
+let test_sync_dir_lets_a_sibling_fiber_run () =
+  with_real_dir @@ fun dir ->
+  (* One turn every other barrier is a floor the fixed shape clears with room
+     to spare -- it suspends once per barrier -- and the inline pair cannot
+     reach at all, having no suspension point between the first barrier and
+     the last. ([/] is [Eio.Path.( / )] here, so the floor is spelt out.) *)
+  let barriers = 200 in
+  let floor = 100 in
+  let started = ref false in
+  let finished = ref false in
+  let turns = ref 0 in
+  Eio.Fiber.both
+    (fun () ->
+      started := true;
+      for _ = 1 to barriers do
+        Eio_fs_unix.sync_dir dir
+      done;
+      finished := true)
+    (fun () ->
+      while not !started do
+        Eio.Fiber.yield ()
+      done;
+      while not !finished do
+        incr turns;
+        Eio.Fiber.yield ()
+      done);
+  if !turns < floor then
+    Alcotest.failf "sibling fiber ran %d times during %d barriers, wanted %d"
+      !turns barriers floor
+
 (* full_fsync accepts a regular file descriptor, including a read-only one. *)
 let test_full_fsync_file () =
   with_real_dir @@ fun dir ->
@@ -318,6 +356,8 @@ let suite =
         test_sync_dir_after_rename;
       Alcotest.test_case "barrier empty and repeated" `Quick
         test_sync_dir_empty_and_repeated;
+      Alcotest.test_case "barrier lets a sibling fiber run" `Quick
+        test_sync_dir_lets_a_sibling_fiber_run;
       Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
       Alcotest.test_case "full_fsync surfaces errors" `Quick
         test_full_fsync_surfaces_errors;
