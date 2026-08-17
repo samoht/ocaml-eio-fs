@@ -268,9 +268,17 @@ end
 
 type resource = Resource.t
 
+(* A path component that had to be a directory and is not. POSIX answers
+   ENOTDIR and every real Eio backend surfaces that as an [Eio.Io], so raising
+   [Invalid_argument] would make this backend the only one a caller written
+   correctly against Eio's error model dies on. Eio.Fs has no ENOTDIR
+   constructor, so report what the walk in [entries_exn] already reports: the
+   path does not resolve. [label] names the operation that resolved it. *)
 let as_dir ~label = function
   | Resource.Dir dir -> dir
-  | r -> Fmt.invalid_arg "as_dir(%s): %a" label Resource.pp r
+  | r ->
+      Fmt.kstr Error.not_found "as_dir(%s): not a directory: %a" label
+        Resource.pp r
 
 let reset_file ~truncate ~append r =
   match !r with
