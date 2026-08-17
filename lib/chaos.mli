@@ -146,10 +146,15 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     {b Directory operations are journaled.} File creation, [mkdir], [unlink],
     [rmdir], [symlink] and [rename] enter a metadata journal in program order.
-    The journal commits -- every pending directory operation becomes durable --
-    on an explicit {!sync_metadata}, the model's stand-in for the
-    directory-fsync barrier that Eio cannot express, or on a registered
-    {!Eio_fs_sync.Dir_sync} through the wrapper. Syncing a {e file} does not
+    An explicit {!sync_metadata} commits the journal whole. A barrier issued
+    through the wrapper -- {!Eio_fs_sync.sync_dir} on a directory, which reaches
+    the registered {!Eio_fs_sync.Dir_sync} -- commits what fsync(2) commits: the
+    entries {e of} that directory, the journal entries whose recorded path names
+    one of its children. It says nothing about that directory's own entry in its
+    parent, about a sibling of it, or about an entry one level further down, so
+    a store that barriers the top of a [mkdirs] and expects the bottom to be
+    durable is modelled as losing the bottom. An entry of a directory whose own
+    entry is not durable stays pending with it. Syncing a {e file} does not
     commit it: fsync(2) on a descriptor makes that file's data durable and says
     nothing about the directory its name lives in, so a store that removes a
     journal and reaches for the file barrier instead of the directory one is

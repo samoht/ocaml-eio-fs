@@ -765,10 +765,19 @@ module Crash = struct
     | Link of string
 
   type location = fstate * boxed * string
+  type delta = (string list * tree option) list
+  (* The namespace effect of one directory operation: each path it touched, in
+     the durable image's own coordinates, and the node that path holds
+     afterwards -- [None] for a name it freed. Captured from the same snapshot
+     the entry carries, so replaying the deltas of a set of entries in program
+     order onto the durable image reproduces exactly those operations and no
+     others, which a whole-tree snapshot cannot do once the set is no longer a
+     prefix of the journal. *)
 
   type metadata_entry = {
     meta : unsynced;
     tree : tree;
+    delta : delta;
     locations : location list;
   }
 
@@ -946,6 +955,97 @@ module Crash = struct
     | Some (base, path) -> (box_dir (base :> Eio.Fs.dir_ty r), path)
     | None -> invalid_arg "Chaos.Crash: controller was never wrapped"
 
+  (* A journal path as the model records it: root-relative, '/'-separated, ""
+     for the root itself. A barrier names its directory in whatever spelling
+     the caller had -- [Filename.dirname] answers "." for a root-level file,
+     and a subtree prefix leaves a trailing slash -- so every path reaching the
+     journal is reduced to one key first. *)
+  let path_segments path =
+    String.split_on_char '/' path
+    |> List.filter (fun seg ->
+        (not (String.equal seg "")) && not (String.equal seg "."))
+
+  let path_key path = String.concat "/" (path_segments path)
+
+  let parent_key path =
+    match List.rev (path_segments path) with
+    | [] -> ""
+    | _ :: up -> String.concat "/" (List.rev up)
+
+  (* The journal names an entry as the base directory resource sees it: the path
+     {!wrap} was handed, with the entry below it. The durable image is a
+     snapshot rooted at that same path, so indexing the image means dropping the
+     root's own segments first. A path that is not under the root -- a rename
+     out of the wrapped tree -- has no place in the image at all. *)
+  let tree_path ~root path =
+    let rec strip root segs =
+      match (root, segs) with
+      | [], segs -> Some segs
+      | r :: root, s :: segs when String.equal r s -> strip root segs
+      | _ -> None
+    in
+    strip root (path_segments path)
+
+  let rec tree_find tree segs =
+    match (tree, segs) with
+    | _, [] -> Some tree
+    | (File _ | Link _), _ -> None
+    | Dir { entries; _ }, name :: rest -> (
+        match List.assoc_opt name entries with
+        | Some child -> tree_find child rest
+        | None -> None)
+
+  (* [tree_replace tree segs node] is [tree] with the entry at [segs] set to
+     [node], or freed when [node] is [None]. A path whose parent the tree does
+     not hold, or holds as something other than a directory, leaves the tree
+     untouched: the entry went with the directory that was to hold it. Entries
+     stay sorted, as [snapshot_at] leaves them. *)
+  let rec tree_replace tree segs node =
+    match (tree, segs) with
+    | _, [] -> tree
+    | (File _ | Link _), _ -> tree
+    | Dir d, [ name ] ->
+        let entries = List.remove_assoc name d.entries in
+        let entries =
+          match node with
+          | None -> entries
+          | Some child -> (name, child) :: entries
+        in
+        let entries =
+          List.sort (fun (a, _) (b, _) -> String.compare a b) entries
+        in
+        Dir { d with entries }
+    | Dir d, name :: rest -> (
+        match List.assoc_opt name d.entries with
+        | None -> tree
+        | Some child ->
+            let child = tree_replace child rest node in
+            let entries =
+              List.map
+                (fun (n, c) ->
+                  if String.equal n name then (n, child) else (n, c))
+                d.entries
+            in
+            Dir { d with entries })
+
+  let apply_delta tree delta =
+    List.fold_left
+      (fun tree (segs, node) -> tree_replace tree segs node)
+      tree delta
+
+  (* The paths one directory operation touched: its own, and for a rename the
+     destination as well, since a rename frees one name and fills another. *)
+  let delta_of ~root ~tree ~path ~kind =
+    let paths =
+      match kind with Rename { dest } -> [ path; dest ] | _ -> [ path ]
+    in
+    List.filter_map
+      (fun p ->
+        match tree_path ~root p with
+        | None -> None
+        | Some segs -> Some (segs, tree_find tree segs))
+      paths
+
   let metadata_unsynced ~path ~kind ~seq =
     { path; kind; offset = 0; length = 0; seq }
 
@@ -953,15 +1053,75 @@ module Crash = struct
     ctl.seq <- ctl.seq + 1;
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
+    let tree = snapshot_at owner root_path in
+    let delta = delta_of ~root:(path_segments root_path) ~tree ~path ~kind in
     ctl.metadata <-
-      { meta; tree = snapshot_at owner root_path; locations = locations ctl }
-      :: ctl.metadata
+      { meta; tree; delta; locations = locations ctl } :: ctl.metadata
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
     ctl.durable_tree <- Some (snapshot_at owner root_path);
     ctl.durable_locations <- locations ctl;
     ctl.metadata <- []
+
+  (* fsync(2) on a directory commits that directory's entries and nothing else:
+     the journal entries whose recorded path names a child of [dir], in program
+     order. It says nothing about [dir]'s own entry in its parent, about a
+     sibling of [dir], or about an entry one level further down. A model that
+     commits the journal whole cannot tell a store that barriered the directory
+     holding the entry it cares about from one that barriered any directory at
+     all.
+
+     The entries a barrier commits are not in general a prefix of the journal --
+     a barrier on one directory leaves an older operation on another pending --
+     so no entry's whole-tree snapshot can become the durable image. The image
+     advances by replaying the committed entries' deltas onto it, and the
+     entries left pending are rebased onto the result: [do_crash] reads the last
+     surviving entry's snapshot, so that snapshot must hold everything already
+     durable at the moment of the crash.
+
+     An entry of a directory whose own entry is not durable cannot be durable
+     either -- after the power cut there is no directory to hold it -- so a
+     barrier on such a directory commits nothing. A rename committed through its
+     source's directory lands the same way round: [apply_delta] drops the half
+     whose parent the durable image does not hold. *)
+  let commit_dir ctl ~dir =
+    match (ctl.base, ctl.durable_tree) with
+    | None, _ | _, None -> ()
+    | Some (_, root_path), Some durable -> (
+        let root = path_segments root_path in
+        let in_image =
+          match tree_path ~root dir with
+          | None -> None
+          | Some segs -> tree_find durable segs
+        in
+        let dir = path_key dir in
+        match in_image with
+        | None | Some (File _ | Link _) -> ()
+        | Some (Dir _) -> (
+            let committed, pending =
+              List.partition
+                (fun e -> String.equal (parent_key e.meta.path) dir)
+                (List.rev ctl.metadata)
+            in
+            match committed with
+            | [] -> ()
+            | _ :: _ ->
+                let durable =
+                  List.fold_left
+                    (fun tree e -> apply_delta tree e.delta)
+                    durable committed
+                in
+                ctl.durable_tree <- Some durable;
+                ctl.durable_locations <- locations ctl;
+                let _, rebased =
+                  List.fold_left
+                    (fun (tree, acc) e ->
+                      let tree = apply_delta tree e.delta in
+                      (tree, { e with tree } :: acc))
+                    (durable, []) pending
+                in
+                ctl.metadata <- rebased))
 
   let do_crash ctl =
     if not ctl.crashed then begin
@@ -1380,14 +1540,16 @@ module Crash = struct
         H (Eio.Fs.Pi.Dir, (module Cdir_impl));
         H (Eio.Resource.Close, fun d -> close_resource d.dbase);
         H (Crash_dir, fun d -> d);
-        (* A store's directory barrier commits the metadata journal, exactly
-           as the platform's directory fsync would; after the power cut it
-           fails like every other operation. *)
+        (* A store's directory barrier commits the entries of the directory it
+           names, exactly as the platform's directory fsync would, and the
+           journal is asked root-relative so a barrier issued through a staging
+           subtree still names the same directory. After the power cut it fails
+           like every other operation. *)
         H
           ( Eio_fs_sync.Dir_sync,
-            fun d ~path:_ ->
+            fun d ~path ->
               if d.dctl.crashed then raise_power_lost ();
-              commit_metadata d.dctl );
+              commit_dir d.dctl ~dir:(at d.dprefix path) );
       ]
 
   let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
