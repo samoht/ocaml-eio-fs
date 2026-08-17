@@ -744,6 +744,15 @@ module Crash = struct
     | Symlink of { target : string }
     | Rename of { dest : string }
 
+  let equal_op_kind (a : op_kind) b =
+    match (a, b) with
+    | Data, Data | Create, Create | Mkdir, Mkdir -> true
+    | Unlink, Unlink | Rmdir, Rmdir -> true
+    | Symlink a, Symlink b -> String.equal a.target b.target
+    | Rename a, Rename b -> String.equal a.dest b.dest
+    | (Data | Create | Mkdir | Unlink | Rmdir | Symlink _ | Rename _), _ ->
+        false
+
   type unsynced = {
     path : string;
     kind : op_kind;
@@ -1192,7 +1201,9 @@ module Crash = struct
       match ctl.trigger with
       | Manual -> false
       | Nth_op n -> ctl.ops >= n
-      | After_dir_op _ -> failwith "TODO: implement Crash.After_dir_op"
+      (* A write records no journal entry, so the entry [After_dir_op] names
+         cannot be this op. *)
+      | After_dir_op _ -> false
       | After_write { path; file_offset } ->
           (match kind with `Write -> true | `Sync -> false)
           && String.equal path fs.rel && offset <= file_offset
@@ -1200,12 +1211,23 @@ module Crash = struct
     in
     if fire && not ctl.crashed then do_crash ctl
 
-  let bump_metadata ctl =
+  (* A directory operation has just entered the journal. [After_dir_op] fires
+     here -- after [record_metadata], before anything that could commit the
+     entry -- so the crash lands inside the window an operation with no barrier
+     of its own leaves open, which is one statement wide and is the only place
+     it can be seen from. Kind and path are matched exactly as the journal
+     records them, so a rename must spell its destination and a symlink its
+     target. *)
+  let bump_metadata ctl ~path ~kind =
     ctl.ops <- ctl.ops + 1;
-    match ctl.trigger with
-    | Nth_op n when ctl.ops >= n && not ctl.crashed -> do_crash ctl
-    | After_dir_op _ -> failwith "TODO: implement Crash.After_dir_op"
-    | Manual | After_write _ | Nth_op _ -> ()
+    let fire =
+      match ctl.trigger with
+      | Manual | After_write _ -> false
+      | Nth_op n -> ctl.ops >= n
+      | After_dir_op { kind = k; path = p } ->
+          equal_op_kind k kind && String.equal p path
+    in
+    if fire && not ctl.crashed then do_crash ctl
 
   (* One record backs both file wrappers. [cfs] is present exactly for a
      read-write file (the tracked durability state); reads work on either. *)
@@ -1433,7 +1455,7 @@ module Crash = struct
         clog_change d.dctl fs (Truncate 0);
       if not existed then begin
         record_metadata d.dctl ~path:rel ~kind:Create;
-        bump_metadata d.dctl
+        bump_metadata d.dctl ~path:rel ~kind:Create
       end;
       wrap_cfile_rw d.dctl fs base
 
@@ -1451,8 +1473,9 @@ module Crash = struct
     let mkdir d ~perm path =
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.mkdir bv ~perm path;
-      record_metadata d.dctl ~path:(at d.dprefix path) ~kind:Mkdir;
-      bump_metadata d.dctl
+      let rel = at d.dprefix path in
+      record_metadata d.dctl ~path:rel ~kind:Mkdir;
+      bump_metadata d.dctl ~path:rel ~kind:Mkdir
 
     let read_dir d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1468,14 +1491,14 @@ module Crash = struct
       let rel = at d.dprefix path in
       Hashtbl.remove d.dctl.files (file_key d.droot rel);
       record_metadata d.dctl ~path:rel ~kind:Unlink;
-      bump_metadata d.dctl
+      bump_metadata d.dctl ~path:rel ~kind:Unlink
 
     let rmdir d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.rmdir bv path;
       let rel = at d.dprefix path in
       record_metadata d.dctl ~path:rel ~kind:Rmdir;
-      bump_metadata d.dctl
+      bump_metadata d.dctl ~path:rel ~kind:Rmdir
 
     let rename d old_path new_dir new_path =
       let (Eio.Resource.T (nv, nops)) = new_dir in
@@ -1502,8 +1525,9 @@ module Crash = struct
          reachable file and must not be replayed after a crash. *)
       move_state d.dctl ~old_owner:d.droot ~old_rel ~new_owner:owner
         ~new_rel:rel;
-      record_metadata d.dctl ~path:old_rel ~kind:(Rename { dest = rel });
-      bump_metadata d.dctl
+      let kind = Rename { dest = rel } in
+      record_metadata d.dctl ~path:old_rel ~kind;
+      bump_metadata d.dctl ~path:old_rel ~kind
 
     let read_link d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1512,9 +1536,10 @@ module Crash = struct
     let symlink ~link_to d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.symlink ~link_to bv path;
-      record_metadata d.dctl ~path:(at d.dprefix path)
-        ~kind:(Symlink { target = link_to });
-      bump_metadata d.dctl
+      let rel = at d.dprefix path in
+      let kind = Symlink { target = link_to } in
+      record_metadata d.dctl ~path:rel ~kind;
+      bump_metadata d.dctl ~path:rel ~kind
 
     let chmod d ~follow ~perm path =
       let (Base_dir ((module B), bv)) = d.dboxed in
