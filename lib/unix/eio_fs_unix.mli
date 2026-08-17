@@ -91,9 +91,13 @@ val with_lock :
     link points at: two processes would hold two locks over one resource and
     both publish. A link, a directory, a FIFO, and an entry that took the name
     between the resolution and the open are all refused with
-    {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file}. The name is weighed
-    before the file is opened, so [create] never creates the file a dangling
-    link points at.
+    {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file}. What carries that
+    refusal is the open itself, not a check of the name, which can change the
+    moment after it is read: [create] creates exclusively, and an exclusive open
+    refuses a name that exists, a dangling link included, so a refused
+    acquisition leaves nothing behind at the far end of one; a name that is
+    already there is verified after the open by identity, the descriptor's
+    device and inode against the name's own.
 
     @raise Lock_unavailable as described above.
     @raise Eio.Io

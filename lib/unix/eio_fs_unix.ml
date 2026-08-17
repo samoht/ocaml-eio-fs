@@ -130,13 +130,21 @@ let use_os_lock ~block ~path fd fn =
    the same state and both publish, with nothing in either run to say the
    exclusion was absent.
 
-   The name is weighed before the file is opened, so [create] never creates the
-   file a dangling link points at, and the descriptor is weighed again once the
-   lock is held, because a name is resolved a second time by the open and an
-   entry that took it in between would leave the lock on an inode the name no
-   longer reaches. Comparing the descriptor's device and inode with the name's
-   own is what settles that: on a symbolic link the two differ, since the name
-   carries the link's inode and the descriptor the target's. *)
+   Two things settle it, and the check of the name is neither of them. Creating
+   the rendezvous is an exclusive open: O_CREAT|O_EXCL refuses a name that
+   exists, and a symbolic link at the last component counts as existing even
+   when it dangles, so a creating open never lands at the far end of one. The
+   descriptor is then weighed once the lock is held, because the open resolves
+   the name a second time and an entry that took it in between would leave the
+   lock on an inode the name no longer reaches. Comparing the descriptor's
+   device and inode with the name's own is what settles that: on a symbolic
+   link the two differ, since the name carries the link's inode and the
+   descriptor the target's.
+
+   Weighing the name before the open is an early refusal and nothing rests on
+   it: it answers the ordinary planted link in the interface's own vocabulary
+   rather than as whichever [open] error the platform picks, but the name can
+   change the moment after it is read. *)
 
 type Eio.Exn.Backend.t += Not_a_lock_file of string
 
@@ -183,6 +191,26 @@ let update_lock_contents file contents =
   Eio.Flow.copy_string contents file;
   Eio.File.truncate file (Optint.Int63.of_int (String.length contents))
 
+(* An absent rendezvous is created exclusively, so the kernel refuses the name
+   a link holds rather than following it. A name that is already there is the
+   ordinary second acquisition and is opened without creating, its identity
+   settled afterwards by [check_locked_file]. A name that exists for the
+   exclusive open and is gone for the plain one is whatever took it in between
+   -- a dangling link, or an entry another party removed -- and is not the
+   lock's own regular file. *)
+let open_lock_file ~sw ~native
+    ~(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ]) path =
+  match create with
+  | `Never -> Eio.Path.open_out ~sw ~create:`Never path
+  | `If_missing perm -> (
+      match Eio.Path.open_out ~sw ~create:(`Exclusive perm) path with
+      | file -> file
+      | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) -> (
+          match Eio.Path.open_out ~sw ~create:`Never path with
+          | file -> file
+          | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+              not_a_lock_file native))
+
 let with_lock ?(block = true)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
@@ -192,7 +220,7 @@ let with_lock ?(block = true)
   use_mutex ~block ~path:native_path mutex @@ fun () ->
   check_lock_name ~native:native_path path;
   Eio.Switch.run @@ fun sw ->
-  let file = Eio.Path.open_out ~sw ~create:(create :> Eio.Fs.create) path in
+  let file = open_lock_file ~sw ~native:native_path ~create path in
   match Eio_unix.Resource.fd_opt file with
   | None ->
       invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"
