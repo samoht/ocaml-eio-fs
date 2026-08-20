@@ -243,6 +243,63 @@ let test_lock_serializes_fibers () =
   Alcotest.(check bool)
     "same-process critical sections did not overlap" false !overlapped
 
+(* ---- the exclusion is the file's, not the name's ----
+
+   POSIX record locks do not exclude within a process: a second [lockf] over
+   one file, taken through a second descriptor, is granted to the process that
+   already holds it, and closing any one of those descriptors drops the lock
+   for all of them. Between two fibers of this process the mutex is therefore
+   the whole of the exclusion, and it excludes exactly what its key identifies.
+
+   A name does not identify a file. Here one file is reached by two of them --
+   a hard link, which is what a snapshot, a stale deployment, or a party who
+   writes the rendezvous directory leaves behind -- and canonicalising does not
+   merge them, [Unix.realpath] resolving symbolic links and a hard link being
+   none of those. Two keys are two mutexes; the operating system grants the
+   second acquisition; and both callers run their critical section over one
+   file at once, with nothing in either run to say the exclusion was absent. *)
+let test_lock_excludes_another_name_for_the_locked_file () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Or_truncate 0o600) (dir / "lock") "";
+  Unix.link
+    (Eio.Path.native_exn (dir / "lock"))
+    (Eio.Path.native_exn (dir / "alias"));
+  let held, hold = Eio.Promise.create () in
+  let checked, check = Eio.Promise.create () in
+  let granted = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock (dir / "lock") @@ fun () ->
+      Eio.Promise.resolve hold ();
+      Eio.Promise.await checked)
+    (fun () ->
+      Eio.Promise.await held;
+      (match
+         Eio_fs_unix.with_lock ~block:false (dir / "alias") (fun () -> ())
+       with
+      | () -> granted := true
+      | exception Eio_fs_unix.Lock_unavailable _ -> ());
+      Eio.Promise.resolve check ());
+  Alcotest.(check bool)
+    "a second name for the held file was not granted the lock" false !granted
+
+(* The key is resolved unconfined as well. [Unix.realpath] walks the name from
+   [/], through the directories a party other than the caller writes, where the
+   open that follows it resolves every component beneath the capability the
+   path carries. Where the two disagree, realpath answers first and answers for
+   the lock: a rendezvous under a parent link that points nowhere ends the
+   acquisition in [Unix.Unix_error (ENOENT, "realpath", ...)] before the lock's
+   own resolution has said anything -- a failure of the key, and none of the
+   answers this interface gives, which are Eio's own for a path it declines and
+   [Not_found] for a rendezvous that is not there. *)
+let test_lock_answers_a_parent_link_that_leads_nowhere () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.symlink ~link_to:"gone" (dir / "parent");
+  match Eio_fs_unix.with_lock (dir / "parent" / "lock") (fun () -> ()) with
+  | () ->
+      Alcotest.fail "a rendezvous under a link that points nowhere was locked"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+
 let test_lock_updates_contents_in_place () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
@@ -519,6 +576,10 @@ let suite =
         test_lock_wait_does_not_block_eio;
       Alcotest.test_case "lock serializes fibers" `Quick
         test_lock_serializes_fibers;
+      Alcotest.test_case "lock excludes another name for its file" `Quick
+        test_lock_excludes_another_name_for_the_locked_file;
+      Alcotest.test_case "lock answers a parent link that leads nowhere" `Quick
+        test_lock_answers_a_parent_link_that_leads_nowhere;
       Alcotest.test_case "lock contents stay on the locked inode" `Quick
         test_lock_updates_contents_in_place;
       Alcotest.test_case "non-blocking lock reports unavailable" `Quick
