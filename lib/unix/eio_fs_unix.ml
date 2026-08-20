@@ -34,22 +34,41 @@ let statvfs path =
 
 (* A registered barrier keeps its own semantics (the crash model commits its
    journal, the in-memory backend does nothing); a plain POSIX directory is
-   opened natively -- Eio directory resources do not expose their descriptor
-   -- and pushed through to stable storage, which on Darwin means F_FULLFSYNC
-   where the portable fallback's fsync only reaches the drive's cache.
+   opened and pushed through to stable storage, which on Darwin means
+   F_FULLFSYNC where the portable fallback's fsync only reaches the drive's
+   cache.
+
+   The open goes through the directory capability the path carries, because
+   the barrier belongs to the directory the caller holds and not to whatever
+   its name resolves to at that instant. Eio says as much of the flattening:
+   [Path.native] "does not check for confinement (the resulting path might not
+   be accessible via [t] itself)", and answers a directory opened with
+   [open_subtree] and later renamed with the old name. Every component of
+   [Eio.Path.open_in] instead opens beneath that capability, so a name a link
+   has taken is refused rather than fsynced in place of the caller's
+   directory, and a directory whose name is gone is still barriered.
 
    That barrier is the slowest call the process makes, so it runs on a system
    thread: a fiber's own thread carries the domain's scheduler, and holding it
    inside the fsync would stop every other fiber -- the timers, the connections
-   -- for the length of a write to the platter. *)
+   -- for the length of a write to the platter. The open is off that thread
+   already, eio running its own openat in a worker.
+
+   A directory handle carrying no descriptor cannot take the platform-strength
+   barrier, so it takes the portable one, which syncs the handle itself and
+   fails loudly if the backend cannot do that either. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match Eio_fs_sync.find res with
   | Some barrier -> barrier ~path
-  | None ->
-      let native = Eio.Path.native_exn p in
-      Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
-      let fd = Unix.openfile native [ Unix.O_RDONLY ] 0 in
-      Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> full_fsync fd)
+  | None -> (
+      Eio.Switch.run @@ fun sw ->
+      let handle = Eio.Path.open_in ~sw p in
+      match Eio_unix.Resource.fd_opt handle with
+      | None -> Eio_fs_sync.sync_dir p
+      | Some fd ->
+          Eio_unix.Fd.use_exn "eio-fs-sync-dir" fd @@ fun fd ->
+          Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
+          full_fsync fd)
 
 exception Lock_unavailable of string
 

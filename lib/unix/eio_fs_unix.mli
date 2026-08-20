@@ -38,17 +38,24 @@ val sync_dir : _ Eio.Path.t -> unit
     revert the rename to the prior entry. A backend that registers its own
     barrier ({!Eio_fs_sync.Dir_sync}) answers through it -- the in-memory
     backend does nothing, being volatile; a crash-model wrapper commits its
-    journal -- and a plain POSIX directory is opened natively and
-    {!full_fsync}ed.
+    journal -- and a plain POSIX directory is opened and {!full_fsync}ed on the
+    descriptor that open returns.
 
-    The native open and barrier are made on a system thread, so waiting for the
-    platter suspends only the calling fiber and not the other fibers of its
+    The barrier lands on the directory the caller holds, not on whatever [dir]'s
+    name resolves to when it is issued: the open resolves every component
+    beneath the directory capability [dir] carries, so a name a link has taken
+    is refused rather than fsynced in place of the caller's directory, and a
+    directory whose name is gone is barriered all the same. A backend whose
+    directory handles carry no file descriptor takes the portable barrier
+    ({!Eio_fs_sync.sync_dir}) instead of this one.
+
+    The open and the barrier are made off the calling fiber's thread, so waiting
+    for the platter suspends only that fiber and not the other fibers of its
     domain. A registered barrier answers on the calling fiber, as its backend
     wrote it.
 
-    @raise Unix.Unix_error as [open] or [fsync].
-    @raise Invalid_argument
-      if [dir] registers no barrier and has no native path. *)
+    @raise Eio.Io if [dir] cannot be opened for its barrier.
+    @raise Unix.Unix_error as [fsync]. *)
 
 exception Lock_unavailable of string
 (** Raised by {!with_lock} in non-blocking mode when the lock is held. The
