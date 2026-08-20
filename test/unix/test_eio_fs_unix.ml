@@ -5,6 +5,13 @@
 
 let ( / ) = Eio.Path.( / )
 
+let mentions ~needle haystack =
+  let n = String.length needle and h = String.length haystack in
+  let rec at i =
+    i + n <= h && (String.equal (String.sub haystack i n) needle || at (i + 1))
+  in
+  at 0
+
 let with_real_dir fn =
   Eio_main.run @@ fun env ->
   let fs = Eio.Stdenv.fs env in
@@ -32,6 +39,64 @@ let test_sync_dir_empty_and_repeated () =
   with_real_dir @@ fun dir ->
   Eio_fs_unix.sync_dir dir;
   Eio_fs_unix.sync_dir dir
+
+(* ---- the barrier lands on the directory the caller holds ----
+
+   [sync_dir] is handed an [Eio.Path.t]: a directory capability and a name
+   resolved beneath it. Flattening that pair into a native string and opening
+   the string from [/] hands the barrier to whatever the name resolves to at
+   that instant. Eio says as much of the flattening itself -- [Path.native]
+   "does not check for confinement (the resulting path might not be accessible
+   via [t] itself)", and "if a directory was opened with [open_subtree] and
+   later renamed, this might use the old name" -- and the last step of a commit
+   protocol is exactly where that matters, since what a barrier reports durable
+   has to be the directory whose entry was just renamed into place.
+
+   Which inode an [fsync] reached is not observable from a program: nothing
+   short of cutting power tells a barrier on one directory from a barrier on
+   another. The resolution is observable, and these two cases pin it from both
+   sides.
+
+   Here the capability outlives the name. The directory is opened, then its
+   name is taken away; the caller still holds the directory, so the barrier it
+   asks for is the one that directory can give and there is nothing to fail. A
+   barrier that re-resolves the name instead finds nothing under it and fails a
+   publication that is already complete. *)
+let test_sync_dir_barriers_the_held_directory () =
+  with_real_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o700 (root / "d");
+  Eio.Path.with_open_dir (root / "d") @@ fun d ->
+  Eio.Path.rename (root / "d") (root / "moved");
+  Eio_fs_unix.sync_dir d
+
+(* And here the name outlives the directory, which is the shape that costs a
+   publication rather than merely failing one. The store is moved aside and a
+   link to a directory of the adversary's own left under its name: re-resolving
+   the name follows the link, fsyncs a directory the caller never named, and
+   returns, so the caller is told its rename reached stable storage while
+   nothing of its own was flushed at all. Resolving through the capability
+   refuses the link, its target being outside the tree the capability names, so
+   the caller learns rather than being handed a barrier it did not get. *)
+let test_sync_dir_refuses_a_name_a_link_took () =
+  with_real_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o700 (root / "tree");
+  Eio.Path.mkdir ~perm:0o700 (root / "elsewhere");
+  Eio.Path.with_open_dir (root / "tree") @@ fun tree ->
+  Eio.Path.mkdir ~perm:0o700 (tree / "store");
+  (* The adversary writes this directory: the store goes aside and a link to a
+     directory of their own takes its name. *)
+  Eio.Path.rename (tree / "store") (tree / "moved");
+  Eio.Path.symlink
+    ~link_to:(Eio.Path.native_exn (root / "elsewhere"))
+    (tree / "store");
+  match Eio_fs_unix.sync_dir (tree / "store") with
+  | () ->
+      Alcotest.fail
+        "the barrier reported a directory the caller never named durable"
+  | exception (Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) as e) ->
+      Alcotest.(check bool)
+        "the refusal names the directory it was asked to barrier" true
+        (mentions ~needle:"store" (Printexc.to_string e))
 
 (* The barrier runs on a fiber that shares its domain with every other fiber of
    the program: a server publishes while it serves. So the open and the fsync
@@ -252,13 +317,6 @@ let test_lock_existing_does_not_create () =
    sandbox -- and it names the lock path, because an operator reading the failure
    needs to know which entry is wrong. *)
 
-let mentions ~needle haystack =
-  let n = String.length needle and h = String.length haystack in
-  let rec at i =
-    i + n <= h && (String.equal (String.sub haystack i n) needle || at (i + 1))
-  in
-  at 0
-
 let check_refusal what path fn =
   let native = Eio.Path.native_exn path in
   match fn () with
@@ -446,6 +504,10 @@ let suite =
         test_sync_dir_empty_and_repeated;
       Alcotest.test_case "barrier lets a sibling fiber run" `Quick
         test_sync_dir_lets_a_sibling_fiber_run;
+      Alcotest.test_case "barrier reaches the directory held" `Quick
+        test_sync_dir_barriers_the_held_directory;
+      Alcotest.test_case "barrier refuses a name a link took" `Quick
+        test_sync_dir_refuses_a_name_a_link_took;
       Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
       Alcotest.test_case "full_fsync surfaces errors" `Quick
         test_full_fsync_surfaces_errors;
