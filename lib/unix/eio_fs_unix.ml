@@ -43,10 +43,10 @@ let statvfs path =
    its name resolves to at that instant. Eio says as much of the flattening:
    [Path.native] "does not check for confinement (the resulting path might not
    be accessible via [t] itself)", and answers a directory opened with
-   [open_subtree] and later renamed with the old name. Every component of
-   [Eio.Path.open_in] instead opens beneath that capability, so a name a link
-   has taken is refused rather than fsynced in place of the caller's
-   directory, and a directory whose name is gone is still barriered.
+   [open_subtree] and later renamed with the old name. [Eio.Path.open_in]
+   instead opens every component beneath that capability, so a name a link has
+   taken is refused rather than fsynced in place of the caller's directory,
+   and a directory whose name is gone is still barriered.
 
    That barrier is the slowest call the process makes, so it runs on a system
    thread: a fiber's own thread carries the domain's scheduler, and holding it
