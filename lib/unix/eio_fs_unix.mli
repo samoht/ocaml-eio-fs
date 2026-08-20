@@ -59,12 +59,14 @@ val sync_dir : _ Eio.Path.t -> unit
 
 exception Lock_unavailable of string
 (** Raised by {!with_lock} in non-blocking mode when the lock is held. The
-    string is the native path of the lock file. *)
+    string is the native path of the lock file, or the path as it prints itself
+    on a backend that has no native one. *)
 
 type Eio.Exn.Backend.t +=
   | Not_a_lock_file of string
         (** Why {!with_lock} refused a lock path: the name is not the lock's own
-            regular file. The string is the native path of the lock file. *)
+            regular file. The string is the native path of the lock file, or the
+            path as it prints itself on a backend that has no native one. *)
 
 val with_lock :
   ?block:bool ->
@@ -90,7 +92,11 @@ val with_lock :
     raises {!Lock_unavailable}.
 
     Locks are coordinated both between fibers in this process and between
-    processes. The lock is always released when [fn] returns or raises.
+    processes. The lock is always released when [fn] returns or raises. Between
+    fibers the lock is the file's, not the name's: two paths that name one file
+    take one lock, the file being identified by the device and inode of the
+    descriptor the lock is held on. The operating-system lock cannot stand in
+    for that, POSIX record locks not excluding within a process.
 
     [path] must be the lock's own regular file. A rendezvous sits in a directory
     another party writes, and resolving its name follows a symbolic link left
@@ -108,10 +114,13 @@ val with_lock :
 
     @raise Lock_unavailable as described above.
     @raise Eio.Io
-      with {!Eio.Fs.Not_found} when [create] is [`Never] and [path] does not
-      exist.
+      with {!Eio.Fs.Not_found} when the rendezvous cannot be opened where it is
+      named: [create] is [`Never] and [path] does not exist, or the directory
+      holding it does not.
     @raise Eio.Io
       with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
       is not the lock's own regular file.
-    @raise Invalid_argument if [path] has no native Unix representation.
-    @raise Unix.Unix_error as [open] or [lockf]. *)
+    @raise Invalid_argument
+      if the opened rendezvous carries no Unix file descriptor, there being no
+      operating-system lock to take on it.
+    @raise Unix.Unix_error as [lockf]. *)

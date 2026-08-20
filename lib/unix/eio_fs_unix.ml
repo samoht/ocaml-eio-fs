@@ -72,6 +72,26 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
 
 exception Lock_unavailable of string
 
+(* ---- the exclusion is the file's, not the name's ----
+
+   The mutex two fibers of this process contend for is keyed by the file the
+   record lock is taken on, its device and inode, and not by a name that
+   reaches that file. A name does not identify a file: two of them lead to one
+   file wherever a hard link does, and canonicalising a name does not merge
+   those, [Unix.realpath] resolving symbolic links and a hard link being none
+   of them.
+
+   Nothing else carries this half of the exclusion. POSIX record locks do not
+   exclude within a process -- a second [lockf] over one file, through a second
+   descriptor, is granted to the process that already holds it, and closing any
+   one of those descriptors drops the lock for all of them -- so a key that
+   misses hands one file to two fibers, each believing it holds the lock.
+
+   The file stays open for as long as its key is in use, so no inode number is
+   reused under the table while it names a held lock. *)
+type lock_key = int64 * int64
+(** The device and inode a record lock is held on. *)
+
 type local_lock = { mutex : Eio.Mutex.t; mutable users : int }
 
 let local_locks = Hashtbl.create 16
@@ -95,15 +115,6 @@ let use_local_lock key fn =
       lock.users <- lock.users - 1;
       if lock.users = 0 then Hashtbl.remove local_locks key)
     (fun () -> fn lock.mutex)
-
-let canonical_lock_path path =
-  Eio_unix.run_in_systhread ~label:"eio-fs-lock-path" @@ fun () ->
-  match Unix.realpath path with
-  | path -> path
-  | exception Unix.Unix_error (Unix.ENOENT, _, _) ->
-      Filename.concat
-        (Unix.realpath (Filename.dirname path))
-        (Filename.basename path)
 
 let use_mutex ~block ~path mutex fn =
   let locked = ref false in
@@ -174,8 +185,16 @@ let () =
         true
     | _ -> false)
 
-let not_a_lock_file native =
-  raise (Eio.Fs.err (Eio.Fs.Permission_denied (Not_a_lock_file native)))
+let not_a_lock_file name =
+  raise (Eio.Fs.err (Eio.Fs.Permission_denied (Not_a_lock_file name)))
+
+(* The name a refusal carries. A backend with no native path is named as it
+   prints itself, rather than taken out through the exception [native_exn]
+   raises for one. *)
+let lock_name path =
+  match Eio.Path.native path with
+  | Some native -> native
+  | None -> Fmt.str "%a" Eio.Path.pp path
 
 let is_regular : Eio.File.Stat.kind -> bool = function
   | `Regular_file -> true
@@ -188,22 +207,21 @@ let named_kind path =
   | stat -> Some stat
   | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
 
-let check_lock_name ~native path =
+let check_lock_name ~name path =
   match named_kind path with
   | None -> ()
-  | Some stat -> if not (is_regular stat.kind) then not_a_lock_file native
+  | Some stat -> if not (is_regular stat.kind) then not_a_lock_file name
 
-let check_locked_file ~native path file =
-  let opened = Eio.File.stat file in
+let check_locked_file ~name ~(opened : Eio.File.Stat.t) path =
   match named_kind path with
-  | None -> not_a_lock_file native
+  | None -> not_a_lock_file name
   | Some named ->
       if
         (not (is_regular opened.kind))
         || (not (is_regular named.kind))
         || Int64.compare opened.dev named.dev <> 0
         || Int64.compare opened.ino named.ino <> 0
-      then not_a_lock_file native
+      then not_a_lock_file name
 
 let update_lock_contents file contents =
   ignore (Eio.File.seek file Optint.Int63.zero `Set : Optint.Int63.t);
@@ -217,7 +235,7 @@ let update_lock_contents file contents =
    exclusive open and is gone for the plain one is whatever took it in between
    -- a dangling link, or an entry another party removed -- and is not the
    lock's own regular file. *)
-let open_lock_file ~sw ~native
+let open_lock_file ~sw ~name
     ~(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ]) path =
   match create with
   | `Never -> Eio.Path.open_out ~sw ~create:`Never path
@@ -228,24 +246,28 @@ let open_lock_file ~sw ~native
           match Eio.Path.open_out ~sw ~create:`Never path with
           | file -> file
           | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
-              not_a_lock_file native))
+              not_a_lock_file name))
 
+(* The rendezvous is opened before the mutex is taken, because the key the
+   mutex is found by comes from the opened descriptor. Opening is not holding:
+   the exclusion begins at the mutex and, across processes, at the record lock,
+   both of which are taken on the file this open settled. *)
 let with_lock ?(block = true)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
-  let native_path = Eio.Path.native_exn path in
-  let key = canonical_lock_path native_path in
-  use_local_lock key @@ fun mutex ->
-  use_mutex ~block ~path:native_path mutex @@ fun () ->
-  check_lock_name ~native:native_path path;
+  let name = lock_name path in
+  check_lock_name ~name path;
   Eio.Switch.run @@ fun sw ->
-  let file = open_lock_file ~sw ~native:native_path ~create path in
+  let file = open_lock_file ~sw ~name ~create path in
+  let opened : Eio.File.Stat.t = Eio.File.stat file in
+  use_local_lock ((opened.dev, opened.ino) : lock_key) @@ fun mutex ->
+  use_mutex ~block ~path:name mutex @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | None ->
       invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~block ~path:native_path fd @@ fun () ->
-      check_locked_file ~native:native_path path file;
+      use_os_lock ~block ~path:name fd @@ fun () ->
+      check_locked_file ~name ~opened path;
       Option.iter (update_lock_contents file) contents;
       fn ()
