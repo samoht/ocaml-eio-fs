@@ -552,9 +552,53 @@ let test_path_usage_counts_allocated_tree_without_following_links () =
   Alcotest.(check (float 0.))
     "latest tree mtime" expected_mtime usage.latest_mtime
 
+(* A path reached straight through the unconfined filesystem is named by the
+   spelling the host knows it under, so a message carrying that name hands its
+   reader something to open, stat or remove rather than a label private to the
+   program that printed it. *)
+let test_name_is_the_host_spelling () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "image.raw") "payload";
+  let name = Eio_fs.Path.name (dir / "image.raw") in
+  Alcotest.(check string)
+    "a path on the host filesystem is named by its native spelling"
+    (Eio.Path.native_exn (dir / "image.raw"))
+    name;
+  Alcotest.(check bool)
+    "the name picks the file out for anything outside the program" true
+    (Sys.file_exists name)
+
+(* A file reached through an opened directory has a second rendering, and it is
+   the wrong one to name it by: a directory capability is labelled with the
+   basename it was opened under, so Eio prints a member of it as
+   "<label:member>", which points at no file on the host and matches no path the
+   caller asked for. The name stays the full native path, so one file answers to
+   one name whichever capability reached it. *)
+let test_name_of_a_member_of_an_opened_subtree () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "shadow") "root:x:0:0:::\n";
+  Eio.Switch.run @@ fun sw ->
+  let member = Eio.Path.open_subtree ~sw dir / "shadow" in
+  let name = Eio_fs.Path.name member in
+  Alcotest.(check string)
+    "a member of an opened subtree is named by its full native path"
+    (Eio.Path.native_exn (dir / "shadow"))
+    name;
+  Alcotest.(check bool)
+    "the name picks the file out for anything outside the program" true
+    (Sys.file_exists name);
+  Alcotest.(check string)
+    "one file answers to one name, whichever capability reached it"
+    (Eio_fs.Path.name (dir / "shadow"))
+    name
+
 let suite =
   ( "eio_fs_unix",
     [
+      Alcotest.test_case "name is the host's spelling of the path" `Quick
+        test_name_is_the_host_spelling;
+      Alcotest.test_case "name of a member of an opened subtree" `Quick
+        test_name_of_a_member_of_an_opened_subtree;
       Alcotest.test_case "barrier after rename" `Quick
         test_sync_dir_after_rename;
       Alcotest.test_case "barrier empty and repeated" `Quick

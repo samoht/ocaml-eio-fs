@@ -89,6 +89,11 @@ module Path = struct
           loop total next
     in
     loop { allocated_bytes = 0L; latest_mtime = 0. } [ path ]
+
+  (* TODO: implement. [name] answers [Eio.Path.native] when the capability has
+     a native spelling for the path, and the [Eio.Path.pp] rendering when it
+     has none. *)
+  let name _ = failwith "TODO: implement Eio_fs.Path.name"
 end
 
 module Fs = struct

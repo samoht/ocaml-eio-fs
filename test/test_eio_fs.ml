@@ -387,10 +387,29 @@ let test_close_in_then_switch_release () =
   let file = Eio.Path.open_in ~sw (fs / "r") in
   Eio.Resource.close file
 
+(* Not every path has a spelling the host would recognise: nothing outside the
+   process backs an in-memory tree, so a native name for it would point at an
+   unrelated real location. A path still has to be nameable when it is refused,
+   so the name falls back to the rendering Eio gives the path itself -- the
+   capability's label and the member inside it -- which at least says which
+   path was meant. *)
+let test_name_falls_back_to_the_eio_rendering () =
+  with_fs @@ fun fs ->
+  write fs "hello.txt" "world";
+  let path = fs / "hello.txt" in
+  Alcotest.(check (option string))
+    "an in-memory path has no native spelling to be named by" None
+    (Eio.Path.native path);
+  Alcotest.(check string)
+    "the name is what Eio.Path.pp renders the path as" "<fs:hello.txt>"
+    (Eio_fs.Path.name path)
+
 let suite =
   ( "eio_fs",
     [
       Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "name falls back to the Eio rendering" `Quick
+        test_name_falls_back_to_the_eio_rendering;
       Alcotest.test_case "close then switch release" `Quick
         test_close_then_switch_release;
       Alcotest.test_case "close read handle then switch release" `Quick

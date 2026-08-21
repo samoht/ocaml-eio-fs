@@ -22,6 +22,16 @@ module Path : sig
       remove a tree fail closed instead of acting on a partial measurement.
 
       @raise Invalid_argument if [max_fibers] is not positive. *)
+
+  val name : _ Eio.Path.t -> string
+  (** [name path] is what [path] is called outside the program: its native
+      spelling when the capability it is reached through has one, and the
+      rendering {!Eio.Path.pp} gives it when it has not.
+
+      A path reached through an opened directory is therefore named by its full
+      native path rather than by the capability's label, so a message naming a
+      path this way names something its reader can act on, and something the
+      caller can match against the path it asked for. *)
 end
 
 (** An in-memory filesystem for {!Eio}. *)
