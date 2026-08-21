@@ -90,10 +90,17 @@ module Path = struct
     in
     loop { allocated_bytes = 0L; latest_mtime = 0. } [ path ]
 
-  (* TODO: implement. [name] answers [Eio.Path.native] when the capability has
-     a native spelling for the path, and the [Eio.Path.pp] rendering when it
-     has none. *)
-  let name _ = failwith "TODO: implement Eio_fs.Path.name"
+  (* A path has two renderings and only one of them names a file to anything
+     outside the program. [Eio.Path.pp] prints a path through the label its
+     capability was opened under -- a member of an opened subtree comes out as
+     "<label:member>" -- which picks out no file on the host and matches no
+     path the caller asked for. The native spelling does both, and every path a
+     real filesystem backs has one, so the rendering is what is left for the
+     paths that have none, such as a member of an in-memory tree. *)
+  let name path =
+    match Eio.Path.native path with
+    | Some native -> native
+    | None -> Fmt.str "%a" Eio.Path.pp path
 end
 
 module Fs = struct
