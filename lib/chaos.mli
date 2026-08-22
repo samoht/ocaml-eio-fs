@@ -128,7 +128,21 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 (** [wrap schedule base] is [base] with adversarial behaviour driven by
     [schedule]. Directory operations, reads, writes and syncs are delegated to
     [base] but perturbed according to the schedule; opened files and
-    subdirectories stay wrapped and share [schedule]. *)
+    subdirectories stay wrapped and share [schedule].
+
+    A wrapper answers for the base it was given. The wrapped directory reports
+    the base's own {!Eio_fs_sync.Process_local}, so a caller weighing whether an
+    exclusion taken between the fibers of this process is the whole exclusion
+    weighs the storage underneath: over the in-memory backend it is, over a real
+    directory it is not. A file opened read-write carries whatever the base's
+    file carries beyond reading, writing, syncing and closing -- over a real
+    directory the Unix descriptor [Eio_unix.Resource.fd_opt] answers with, so a
+    caller that must take a record lock on the file or hand it to a launcher
+    can; over the in-memory backend there is no descriptor to carry.
+
+    That descriptor is the operations the operating system offers on an open
+    file, and not a way past the schedule: a read or write issued on it is not
+    an operation the schedule is consulted about. *)
 
 (** A power-loss durability model layered over a base directory capability.
 
@@ -243,7 +257,25 @@ module Crash : sig
 
   val wrap : t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [wrap t base] is [base] with durability tracked by [t]. Files and
-      subdirectories opened through it stay wrapped and share [t]. *)
+      subdirectories opened through it stay wrapped and share [t].
+
+      A wrapper answers for the base it was given. The wrapped directory reports
+      the base's own {!Eio_fs_sync.Process_local}, and a file opened read-write
+      carries the base's own descriptor where the base has one -- over a real
+      directory that is the descriptor [Eio_unix.Resource.fd_opt] answers with,
+      so a store that takes a record lock on a file, or hands one to a launcher,
+      runs under the model rather than around it.
+
+      {b The model's authority is the wrapper, not the descriptor.} What that
+      descriptor offers is the operations the operating system offers on an open
+      file, and none of them enter the journal: a write issued on it is not a
+      write the model saw and is not in the post-crash image, and a barrier
+      issued on it is not the model's barrier -- a file's writes stay un-synced
+      until {!Eio.File.sync} through the wrapper. A crash rebuilds the whole
+      wrapped tree from the model, so a change made to that tree outside the
+      wrapper -- through a carried-over descriptor, by a child process, or by
+      native name -- is gone from the post-crash image whether or not the model
+      would have kept a change of its own. *)
 
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per

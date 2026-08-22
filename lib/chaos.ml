@@ -261,6 +261,53 @@ let close_resource r =
   | Some close -> close v
   | None -> ()
 
+(* {2 What a wrapped file carries over}
+
+   A wrapper answers for the base it was given, so a file it hands back keeps
+   the base's own value and puts the wrapper's read, write, sync and close in
+   front of the base's bindings. Eio resolves an interface through the first
+   binding that answers for it, so every operation the wrapper implements
+   reaches the wrapper, and what stays reachable is what the base offers and
+   the wrapper has no answer for: over a real directory that is the Unix
+   descriptor of the file, which a caller takes a record lock on or hands to a
+   launcher, and over the in-memory backend nothing, its files having no
+   descriptor to carry.
+
+   A descriptor carried over is the operations the operating system offers on
+   an open file, and not a second way past the wrapper: a write issued on it is
+   not a write the wrapper saw, and a barrier issued on it is not the wrapper's
+   barrier.
+
+   Only a file opened read-write carries anything over. [Eio.File.Pi.rw]
+   implements every interface that reads, writes, syncs or closes the file, so
+   none of the base's own stays reachable behind it; [Eio.File.Pi.ro]
+   implements no write, so the base's write would stay reachable behind a
+   read-only wrapper, and a file opened for reading is re-boxed whole
+   instead. *)
+let rw_over (type a s) (module X : Eio.File.Pi.WRITE with type t = s)
+    (state : s) (bv : a) (bops : (a, _) Eio.Resource.handler) : Eio.File.rw_ty r
+    =
+  let module Over = struct
+    type t = a
+
+    let read_methods = []
+    let single_read _ buf = X.single_read state buf
+    let pread _ ~file_offset bufs = X.pread state ~file_offset bufs
+    let stat _ = X.stat state
+    let seek _ off cmd = X.seek state off cmd
+    let close _ = X.close state
+    let single_write _ bufs = X.single_write state bufs
+    let copy _ ~src = X.copy state ~src
+    let pwrite _ ~file_offset bufs = X.pwrite state ~file_offset bufs
+    let sync _ = X.sync state
+    let truncate _ len = X.truncate state len
+  end in
+  Eio.Resource.T
+    ( bv,
+      Eio.Resource.handler
+        (Eio.Resource.bindings (Eio.File.Pi.rw (module Over))
+        @ Eio.Resource.bindings bops) )
+
 (* {2 File wrappers} *)
 
 (* Reads are shared between the read-only and read-write wrappers; a read-write
@@ -378,18 +425,18 @@ module Rw_impl = struct
   let truncate t len = Eio.File.truncate (writable t) len
 end
 
-let rw_handler = Eio.File.Pi.rw (module Rw_impl)
-
 let wrap_rw sched ~path base : Eio.File.rw_ty r =
-  Eio.Resource.T
-    ( {
-        sched;
-        path;
-        pos = ref 0;
-        ro = (base :> Eio.File.ro_ty r);
-        rw = Some base;
-      },
-      rw_handler )
+  let state =
+    {
+      sched;
+      path;
+      pos = ref 0;
+      ro = (base :> Eio.File.ro_ty r);
+      rw = Some base;
+    }
+  in
+  let (Eio.Resource.T (bv, bops)) = base in
+  rw_over (module Rw_impl) state bv bops
 
 (* {2 Directory wrapper} *)
 
@@ -556,12 +603,21 @@ module Dir_impl = struct
 end
 
 let dir_handler :
-    (dir, [ `Dir | `Close | `Chaos | `Dir_sync ]) Eio.Resource.handler =
+    ( dir,
+      [ `Dir | `Close | `Chaos | `Dir_sync | `Process_local ] )
+    Eio.Resource.handler =
   Eio.Resource.handler
     [
       H (Eio.Fs.Pi.Dir, (module Dir_impl));
       H (Eio.Resource.Close, fun t -> close_resource t.base);
       H (Chaos_base, fun t -> t.base);
+      (* Who can open these files is the base's to say, and the wrapper adds
+         no opener of its own: it gives a file no name outside this process
+         and no descriptor it did not already have. One binding serves every
+         base because the answer is taken from the resource -- over the
+         in-memory backend nothing outside this process reaches its files,
+         over a real directory any process opens them by name. *)
+      H (Eio_fs_sync.Process_local, fun t -> Eio_fs_sync.is_process_local t.base);
       (* The barrier is a sync the schedule may fault; it then delegates to
          the base's barrier, so a wrapped POSIX directory still reaches the
          real fsync. *)
@@ -1330,18 +1386,18 @@ module Crash = struct
       bump cf.ctl fs ~kind:`Write ~offset:0 ~len:0
   end
 
-  let crw_handler = Eio.File.Pi.rw (module Crw_impl)
-
   let wrap_cfile_rw ctl fs base : Eio.File.rw_ty r =
-    Eio.Resource.T
-      ( {
-          ctl;
-          cfs = Some fs;
-          cro = (base :> Eio.File.ro_ty r);
-          crw = Some base;
-          cpos = ref 0;
-        },
-        crw_handler )
+    let state =
+      {
+        ctl;
+        cfs = Some fs;
+        cro = (base :> Eio.File.ro_ty r);
+        crw = Some base;
+        cpos = ref 0;
+      }
+    in
+    let (Eio.Resource.T (bv, bops)) = base in
+    rw_over (module Crw_impl) state bv bops
 
   (* [droot] is the boxed directory the controller was wrapped over and
      [dprefix] this directory's path from it: tracked files are addressed
@@ -1559,12 +1615,21 @@ module Crash = struct
   end
 
   let cdir_handler :
-      (cdir, [ `Dir | `Close | `Crash_dir | `Dir_sync ]) Eio.Resource.handler =
+      ( cdir,
+        [ `Dir | `Close | `Crash_dir | `Dir_sync | `Process_local ] )
+      Eio.Resource.handler =
     Eio.Resource.handler
       [
         H (Eio.Fs.Pi.Dir, (module Cdir_impl));
         H (Eio.Resource.Close, fun d -> close_resource d.dbase);
         H (Crash_dir, fun d -> d);
+        (* Who can open these files is the base's to say: the model tracks
+           what is written through it and adds no opener of its own, so a
+           caller weighing whether an in-process exclusion is the whole
+           exclusion is weighing the storage underneath. *)
+        H
+          ( Eio_fs_sync.Process_local,
+            fun d -> Eio_fs_sync.is_process_local d.dbase );
         (* A store's directory barrier commits the entries of the directory it
            names, exactly as the platform's directory fsync would, and the
            journal is asked root-relative so a barrier issued through a staging
