@@ -98,6 +98,19 @@ val with_lock :
     descriptor the lock is held on. The operating-system lock cannot stand in
     for that, POSIX record locks not excluding within a process.
 
+    Fibers of this process are granted the lock in the order they entered
+    [with_lock], so a caller may number the work it does under the lock by the
+    order it was served. Entering queues on [path] as the caller spelled it,
+    before the rendezvous is opened, because the open suspends and the exclusion
+    it settles is the file's: without that queue the order fibers reach the lock
+    in would be the order their opens came back in. Being the name's, the queue
+    is the name's too -- two names for one file (a hard link, another spelling)
+    take one lock but wait in two queues, and which of the two is served first
+    is not ordered. A [block:false] acquisition waits its turn to enter, which
+    is the length of another caller's open and not of any critical section, and
+    then answers about the lock itself. Nothing orders the processes contending
+    for the operating-system lock; that order is the platform's.
+
     The record lock is taken on a Unix file descriptor, and a backend that is
     not the host filesystem hands out files carrying none. Such a rendezvous is
     refused, unless its backend declares itself process-local

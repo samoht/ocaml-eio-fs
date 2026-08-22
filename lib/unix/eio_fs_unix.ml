@@ -94,27 +94,33 @@ type lock_key = int64 * int64
 
 type local_lock = { mutex : Eio.Mutex.t; mutable users : int }
 
-let local_locks = Hashtbl.create 16
-let local_locks_mutex = Stdlib.Mutex.create ()
+let local_locks : (lock_key, local_lock) Hashtbl.t = Hashtbl.create 16
+let entry_gates : (string, local_lock) Hashtbl.t = Hashtbl.create 16
+let tables_mutex = Stdlib.Mutex.create ()
 
-let use_local_lock key fn =
+(* A mutex per key, kept for as long as a caller is using it. The tables are
+   process-wide, so an entry that outlived its last user would grow with every
+   file a program has ever locked. *)
+let use_shared_mutex table key fn =
   let lock =
-    Stdlib.Mutex.protect local_locks_mutex @@ fun () ->
-    match Hashtbl.find_opt local_locks key with
+    Stdlib.Mutex.protect tables_mutex @@ fun () ->
+    match Hashtbl.find_opt table key with
     | Some lock ->
         lock.users <- lock.users + 1;
         lock
     | None ->
         let lock = { mutex = Eio.Mutex.create (); users = 1 } in
-        Hashtbl.add local_locks key lock;
+        Hashtbl.add table key lock;
         lock
   in
   Fun.protect
     ~finally:(fun () ->
-      Stdlib.Mutex.protect local_locks_mutex @@ fun () ->
+      Stdlib.Mutex.protect tables_mutex @@ fun () ->
       lock.users <- lock.users - 1;
-      if lock.users = 0 then Hashtbl.remove local_locks key)
+      if lock.users = 0 then Hashtbl.remove table key)
     (fun () -> fn lock.mutex)
+
+let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
 
 let use_mutex ~block ~path mutex fn =
   let locked = ref false in
@@ -127,6 +133,38 @@ let use_mutex ~block ~path mutex fn =
       end
       else if Eio.Mutex.try_lock mutex then locked := true
       else raise (Lock_unavailable path);
+      fn ())
+
+(* ---- entering is queued, so the order granted is the order entered ----
+
+   The exclusion is the file's, and which file a name reaches only the open can
+   say, so the open comes first -- and it suspends, eio running it off the
+   calling fiber. Two fibers entering in order therefore reach the file's mutex
+   in whatever order their opens came back in, which is no order at all. A
+   caller that sequences its work by the order it was served, a spool numbering
+   its writers as it admits them, gets that sequence back scrambled, and it has
+   nowhere of its own to stand between entering and holding.
+
+   So entering is queued as well, on a mutex keyed by the name the caller
+   passed. It is taken before the name is weighed, and left as the file's own
+   mutex is about to be taken, with no suspension in between: the order fibers
+   queue at the file's mutex is then the order they entered.
+
+   The queue is left there rather than held for the length of the critical
+   section, because a name is not a file. Two names reach one file wherever a
+   hard link does, and a backend with no native path names its files as they
+   print, so one name can stand for files of two unrelated filesystems. A gate
+   held across [fn] would let a caller's critical section keep an unrelated
+   lock waiting on a name it happens to share; held only across the open, what
+   a collision costs is one open. *)
+let in_entry_order name fn =
+  use_shared_mutex entry_gates name @@ fun mutex ->
+  let entered = ref false in
+  Fun.protect
+    ~finally:(fun () -> if !entered then Eio.Mutex.unlock mutex)
+    (fun () ->
+      Eio.Mutex.lock mutex;
+      entered := true;
       fn ())
 
 let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
@@ -259,7 +297,9 @@ let hold ~name ~opened ~contents ~file path fn =
 (* The rendezvous is opened before the mutex is taken, because the key the
    mutex is found by comes from the opened descriptor. Opening is not holding:
    the exclusion begins at the mutex and, across processes, at the record lock,
-   both of which are taken on the file this open settled.
+   both of which are taken on the file this open settled. What the open does
+   settle is the caller's turn: it is made inside the name's entry queue, so a
+   fiber that entered earlier reaches the file's mutex earlier.
 
    A rendezvous carrying no descriptor has no record lock to take, and the
    backend that handed it out is the only party that knows what that costs. One
@@ -272,11 +312,14 @@ let with_lock ?(block = true)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
   let name = lock_name path in
-  check_lock_name ~name path;
   Eio.Switch.run @@ fun sw ->
-  let file = open_lock_file ~sw ~name ~create path in
-  let opened : Eio.File.Stat.t = Eio.File.stat file in
-  use_local_lock ((opened.dev, opened.ino) : lock_key) @@ fun mutex ->
+  let file, (opened : Eio.File.Stat.t) =
+    in_entry_order name @@ fun () ->
+    check_lock_name ~name path;
+    let file = open_lock_file ~sw ~name ~create path in
+    (file, Eio.File.stat file)
+  in
+  use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
   use_mutex ~block ~path:name mutex @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
