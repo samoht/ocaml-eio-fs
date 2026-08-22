@@ -12,7 +12,7 @@ let mentions ~needle haystack =
   in
   at 0
 
-let with_real_dir fn =
+let with_real_dir_env fn =
   Eio_main.run @@ fun env ->
   let fs = Eio.Stdenv.fs env in
   let dir = Filename.temp_file "eio-fs-sync-dir" "" in
@@ -20,7 +20,9 @@ let with_real_dir fn =
   Eio.Path.mkdir ~perm:0o755 Eio.Path.(fs / dir);
   Fun.protect ~finally:(fun () ->
       Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / dir))
-  @@ fun () -> fn (Eio.Path.(fs / dir) :> Eio.Fs.dir_ty Eio.Path.t)
+  @@ fun () -> fn env (Eio.Path.(fs / dir) :> Eio.Fs.dir_ty Eio.Path.t)
+
+let with_real_dir fn = with_real_dir_env (fun _env dir -> fn dir)
 
 (* The commit-protocol shape: write a temporary, fsync it, rename it into
    place, barrier the directory. Every step must succeed and the published
@@ -183,44 +185,57 @@ let test_sync_dir_in_memory_no_op () =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env -> Eio_fs_unix.sync_dir env#fs
 
-let test_lock_wait_does_not_block_eio () =
-  Eio_main.run @@ fun env ->
-  let fs = Eio.Stdenv.fs env in
-  let clock = Eio.Stdenv.clock env in
-  let root = Filename.temp_dir "eio-fs-lock" "" in
-  Fun.protect ~finally:(fun () ->
-      Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / root))
-  @@ fun () ->
-  let lock = Filename.concat root "lock" in
-  let ready = Filename.concat root "ready" in
-  Eio.Switch.run @@ fun sw ->
+(* A second process holding the record lock over the rendezvous: the opener the
+   mutex in this process cannot see, and the only one that tells a real
+   exclusion from an in-process one. The child takes the lock, reports [ready],
+   and holds it for [seconds]; the caller resumes once the lock is taken. *)
+let hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready ~seconds =
   let self = Sys.executable_name in
   let child =
     Eio.Process.spawn ~sw
       (Eio.Stdenv.process_mgr env)
       ~executable:self
-      [ self; "--hold-eio-fs-lock"; lock; ready; "0.25" ]
+      [
+        self;
+        "--hold-eio-fs-lock";
+        Eio.Path.native_exn lock;
+        Eio.Path.native_exn ready;
+        seconds;
+      ]
   in
   let rec await_ready () =
-    if Eio.Path.is_file Eio.Path.(fs / ready) then ()
+    if Eio.Path.is_file ready then ()
     else begin
       Eio.Time.sleep clock 0.01;
       await_ready ()
     end
   in
   await_ready ();
+  child
+
+let await_holder child =
+  match Eio.Process.await child with
+  | `Exited 0 -> ()
+  | `Exited n -> Alcotest.failf "lock holder exited %d" n
+  | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
+
+let test_lock_wait_does_not_block_eio () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
+      ~ready:(dir / "ready") ~seconds:"0.25"
+  in
   let progressed = ref false in
   Eio.Switch.run @@ fun tick_sw ->
   Eio.Fiber.fork ~sw:tick_sw (fun () ->
       Eio.Time.sleep clock 0.05;
       progressed := true);
-  Eio_fs_unix.with_lock Eio.Path.(fs / lock) (fun () -> ());
+  Eio_fs_unix.with_lock (dir / "lock") (fun () -> ());
   Alcotest.(check bool)
     "another fiber progressed while waiting" true !progressed;
-  match Eio.Process.await child with
-  | `Exited 0 -> ()
-  | `Exited n -> Alcotest.failf "lock holder exited %d" n
-  | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
+  await_holder child
 
 let test_lock_serializes_fibers () =
   with_real_dir @@ fun dir ->
@@ -314,41 +329,19 @@ let test_lock_updates_contents_in_place () =
   Alcotest.(check int64) "inode survives acquisition" before.ino after.ino
 
 let test_lock_non_blocking_unavailable () =
-  Eio_main.run @@ fun env ->
-  let fs = Eio.Stdenv.fs env in
+  with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
-  let root = Filename.temp_dir "eio-fs-lock" "" in
-  Fun.protect ~finally:(fun () ->
-      Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / root))
-  @@ fun () ->
-  let lock = Filename.concat root "lock" in
-  let ready = Filename.concat root "ready" in
+  let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let self = Sys.executable_name in
   let child =
-    Eio.Process.spawn ~sw
-      (Eio.Stdenv.process_mgr env)
-      ~executable:self
-      [ self; "--hold-eio-fs-lock"; lock; ready; "0.15" ]
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"0.15"
   in
-  let rec await_ready () =
-    if Eio.Path.is_file Eio.Path.(fs / ready) then ()
-    else begin
-      Eio.Time.sleep clock 0.01;
-      await_ready ()
-    end
-  in
-  await_ready ();
-  (match
-     Eio_fs_unix.with_lock ~block:false Eio.Path.(fs / lock) (fun () -> ())
-   with
+  (match Eio_fs_unix.with_lock ~block:false lock (fun () -> ()) with
   | () -> Alcotest.fail "non-blocking lock unexpectedly succeeded"
   | exception Eio_fs_unix.Lock_unavailable path ->
-      Alcotest.(check string) "unavailable path" lock path);
-  match Eio.Process.await child with
-  | `Exited 0 -> ()
-  | `Exited n -> Alcotest.failf "lock holder exited %d" n
-  | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
+      Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
+  await_holder child
 
 let test_lock_existing_does_not_create () =
   with_real_dir @@ fun dir ->
@@ -530,6 +523,116 @@ let test_lock_creates_a_missing_rendezvous_as_a_regular_file () =
     "the rendezvous survives as a regular file" true
     (after.kind = `Regular_file)
 
+(* ---- a rendezvous that carries no descriptor ----
+
+   The record lock is taken on a Unix descriptor, and a backend that is not the
+   host filesystem hands out files carrying none. Two such backends exist here
+   and one answer cannot serve both.
+
+   This package's in-memory filesystem holds its files in this process's heap.
+   No other process can open them: there is no name to open them by --
+   [Eio.Path.native] answers [None] over it -- and no descriptor to inherit. So
+   no opener outside this process exists to be excluded, and the in-process
+   mutex is not a weaker lock there, it is the whole exclusion the backend
+   admits. A unikernel filesystem is the same case.
+
+   A wrapper over a real host directory is the other case and is nothing like
+   it: the file whose descriptor it keeps to itself is an ordinary host file,
+   which any process opens by name and locks. Running under the mutex alone
+   there puts two processes inside one critical section with nothing in either
+   run to say the exclusion was absent -- the failure this interface exists to
+   prevent.
+
+   So the missing descriptor is not the question. Whether the backend admits an
+   opener outside this process is, and only the backend knows: one that admits
+   none says so, and its rendezvous is held under the mutex alone. Every other
+   rendezvous with no descriptor is refused -- loudly, as the barrier next door
+   refuses a backend that registers none -- rather than locked in name only,
+   silence being what turns a missing exclusion into a bug nobody sees. *)
+
+let with_in_memory_fs fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env -> fn env#fs
+
+let test_lock_over_a_process_local_backend_serializes_fibers () =
+  with_in_memory_fs @@ fun fs ->
+  let lock = fs / "lock" in
+  Alcotest.(check bool)
+    "no name outside this process reaches the rendezvous" true
+    (Option.is_none (Eio.Path.native lock));
+  let entered, set_entered = Eio.Promise.create () in
+  let first_inside = ref false in
+  let second_ran = ref false in
+  let overlapped = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      first_inside := true;
+      Eio.Promise.resolve set_entered ();
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      first_inside := false)
+    (fun () ->
+      Eio.Promise.await entered;
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      second_ran := true;
+      if !first_inside then overlapped := true);
+  Alcotest.(check bool)
+    "the critical section ran over a backend with no descriptors" true
+    !second_ran;
+  Alcotest.(check bool)
+    "same-process critical sections did not overlap" false !overlapped;
+  Alcotest.(check bool)
+    "the rendezvous is the backend's own regular file" true
+    ((Eio.Path.stat ~follow:false lock).kind = `Regular_file)
+
+(* Holding under the mutex alone is not a licence to skip what the name is
+   weighed for: the in-memory backend has links too, and a link at the lock
+   name is not the lock's own file whatever the exclusion behind it is. *)
+let test_lock_over_a_process_local_backend_refuses_a_symlink () =
+  with_in_memory_fs @@ fun fs ->
+  Eio.Path.save ~create:(`Or_truncate 0o600) (fs / "target") "target\n";
+  Eio.Path.symlink ~link_to:"target" (fs / "lock");
+  (match
+     Eio_fs_unix.with_lock ~contents:"holder\n" (fs / "lock") (fun () -> ())
+   with
+  | () -> Alcotest.fail "a symbolic link at the lock path was locked"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ());
+  Alcotest.(check string)
+    "the link's target was not written through the link" "target\n"
+    (Eio.Path.load (fs / "target"))
+
+(* The other backend with no descriptors, and the one the answer above must not
+   reach: [Eio_fs.Chaos] wraps a real host directory, delegating every operation
+   to it -- the native name included -- while the files it hands back carry no
+   descriptor of their own. The rendezvous is a host file another process is
+   holding the record lock on right here, so the mutex in this process excludes
+   nobody, and a caller let into its critical section would be the second writer
+   of a resource one process already holds. It is refused instead, and the
+   refusal names the interface that made it so a wiring error reads as one. *)
+let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
+      ~ready:(dir / "ready") ~seconds:"0.25"
+  in
+  let wrapped = Eio_fs.Chaos.wrap Eio_fs.Chaos.Schedule.empty dir in
+  let ran = ref false in
+  (match Eio_fs_unix.with_lock (wrapped / "lock") (fun () -> ran := true) with
+  | () ->
+      Alcotest.fail
+        "a rendezvous with no descriptor was locked while another process held \
+         it"
+  | exception Invalid_argument message ->
+      Alcotest.(check bool)
+        "the refusal names the interface that refused" true
+        (mentions ~needle:"Eio_fs_unix.with_lock" message));
+  Alcotest.(check bool)
+    "the critical section did not run over the held file" false !ran;
+  await_holder child
+
 let test_path_usage_counts_allocated_tree_without_following_links () =
   with_real_dir @@ fun dir ->
   Eio.Path.mkdir ~perm:0o755 (dir / "sub");
@@ -641,6 +744,12 @@ let suite =
         test_lock_refuses_a_directory_or_a_fifo;
       Alcotest.test_case "missing rendezvous is created as a regular file"
         `Quick test_lock_creates_a_missing_rendezvous_as_a_regular_file;
+      Alcotest.test_case "lock serializes fibers over a process-local backend"
+        `Quick test_lock_over_a_process_local_backend_serializes_fibers;
+      Alcotest.test_case "a process-local backend still refuses a symlink"
+        `Quick test_lock_over_a_process_local_backend_refuses_a_symlink;
+      Alcotest.test_case "lock refuses a wrapper that hides a host descriptor"
+        `Quick test_lock_refuses_a_wrapper_that_hides_a_host_descriptor;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick
         test_path_usage_counts_allocated_tree_without_following_links;
     ] )
