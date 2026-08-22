@@ -529,17 +529,18 @@ module Filesystem = struct
           else Error.permission_denied resource_path
 end
 
-let close fd =
-  update_fd_table @@ fun fds ->
-  match Fd_table.find_opt fd fds with
-  | None -> Error.badf ()
-  | Some _ -> Fd_table.remove fd fds
+(* Closing a handle that is already closed does nothing, which is what
+   [Eio.Resource.close] specifies of the operation this implements and what
+   eio's posix backend does -- its close answers a descriptor that has gone
+   with [false] rather than raising. A handle with two owners is the ordinary
+   reason: a caller closing early in front of the switch that would close it
+   anyway, or one open file held through two views. close(2)'s EBADF is about
+   a descriptor number the kernel may since have given to someone else, which
+   is not what an owner of a handle here is asking about.
 
-(* What the switch runs for a handle still open when it finishes. Unlike
-   {!close} it tolerates an fd that has gone, because releasing a handle the
-   caller already closed is the normal way to use [Eio.Resource.close]: closing
-   twice by hand stays an error, as close(2) makes it. *)
-let release fd = update_fd_table @@ fun fds -> Fd_table.remove fd fds
+   The switch's release for a handle still open when it finishes is this same
+   operation, so it is this same function. *)
+let close fd = update_fd_table @@ fun fds -> Fd_table.remove fd fds
 
 (* open(2): opening an existing file requires the permission bits the access
    mode asks for; the mode given at creation does not restrict the creating
@@ -592,7 +593,7 @@ let openat ~mode ~sw dir_fd path flags =
       let r = Filesystem.lookup ~follow dir_fd path in
       check_access path flags r;
       reset_file ~truncate ~append r;
-      Eio.Switch.on_release sw (fun () -> release fd);
+      Eio.Switch.on_release sw (fun () -> close fd);
       (fd, Fd_table.add fd r fds)
   | true -> (
       let () =
@@ -613,12 +614,12 @@ let openat ~mode ~sw dir_fd path flags =
           check_access path flags r;
           let fds = Fd_table.add fd r fds in
           reset_file ~truncate ~append r;
-          Eio.Switch.on_release sw (fun () -> release fd);
+          Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds)
       | None ->
           let file = new_file ~follow ~mode dir_fd path in
           let fds = Fd_table.add fd file fds in
-          Eio.Switch.on_release sw (fun () -> release fd);
+          Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds))
 
 let statat ~follow dir_fd path =
