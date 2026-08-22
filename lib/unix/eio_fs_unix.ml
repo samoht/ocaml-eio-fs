@@ -248,10 +248,26 @@ let open_lock_file ~sw ~name
           | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
               not_a_lock_file name))
 
+(* What is held once the exclusion is taken, whichever locks carry it: the
+   descriptor is weighed against the name it was opened by, the holder's
+   diagnostics are written through it, and the caller runs. *)
+let hold ~name ~opened ~contents ~file path fn =
+  check_locked_file ~name ~opened path;
+  Option.iter (update_lock_contents file) contents;
+  fn ()
+
 (* The rendezvous is opened before the mutex is taken, because the key the
    mutex is found by comes from the opened descriptor. Opening is not holding:
    the exclusion begins at the mutex and, across processes, at the record lock,
-   both of which are taken on the file this open settled. *)
+   both of which are taken on the file this open settled.
+
+   A rendezvous carrying no descriptor has no record lock to take, and the
+   backend that handed it out is the only party that knows what that costs. One
+   whose files no process outside this one can open declares itself
+   process-local, and there the mutex is not the weaker half of the exclusion
+   but the whole of it. Any other backend is refused, since running under the
+   mutex alone would put this caller in a critical section another process can
+   be inside with nothing in either run to say so. *)
 let with_lock ?(block = true)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
@@ -263,11 +279,15 @@ let with_lock ?(block = true)
   use_local_lock ((opened.dev, opened.ino) : lock_key) @@ fun mutex ->
   use_mutex ~block ~path:name mutex @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
-  | None ->
-      invalid_arg "Eio_fs_unix.with_lock: path has no Unix file descriptor"
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
       use_os_lock ~block ~path:name fd @@ fun () ->
-      check_locked_file ~name ~opened path;
-      Option.iter (update_lock_contents file) contents;
-      fn ()
+      hold ~name ~opened ~contents ~file path fn
+  | None ->
+      if Eio_fs_sync.is_process_local (fst path) then
+        hold ~name ~opened ~contents ~file path fn
+      else
+        Fmt.invalid_arg
+          "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
+           descriptor and its backend registers no Eio_fs_sync.Process_local"
+          name

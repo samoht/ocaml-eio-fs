@@ -98,6 +98,18 @@ val with_lock :
     descriptor the lock is held on. The operating-system lock cannot stand in
     for that, POSIX record locks not excluding within a process.
 
+    The record lock is taken on a Unix file descriptor, and a backend that is
+    not the host filesystem hands out files carrying none. Such a rendezvous is
+    refused, unless its backend declares itself process-local
+    ({!Eio_fs_sync.Process_local}), which says no opener of its files exists
+    outside this process -- the in-memory backend's files live in this process's
+    heap, with no name to open them by and no descriptor to inherit. Over such a
+    backend the exclusion is the fiber lock alone, which is the whole exclusion
+    those files admit; over every other one it would be an exclusion in name
+    only, so it is refused instead. The rest of the acquisition is the same
+    either way: the name is weighed, the opened file is checked against it, and
+    [contents] is written through the held handle.
+
     [path] must be the lock's own regular file. A rendezvous sits in a directory
     another party writes, and resolving its name follows a symbolic link left
     there, so a link under that name would send the record lock to whatever the
@@ -121,6 +133,8 @@ val with_lock :
       with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
       is not the lock's own regular file.
     @raise Invalid_argument
-      if the opened rendezvous carries no Unix file descriptor, there being no
-      operating-system lock to take on it.
+      if the opened rendezvous carries no Unix file descriptor and its backend
+      does not register {!Eio_fs_sync.Process_local}: there is no
+      operating-system lock to take on it, and nothing says the fiber lock left
+      excludes every opener. The message names the path.
     @raise Unix.Unix_error as [lockf]. *)

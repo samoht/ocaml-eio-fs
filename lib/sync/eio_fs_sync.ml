@@ -49,6 +49,23 @@ let sync_parent p =
   | Some (parent, _) -> sync_dir parent
   | None -> sync_dir p
 
+(* What a backend admits about the openers of its files. A backend whose files
+   live in this process's heap admits none outside it: there is no name another
+   process can open them by and no descriptor to inherit, so an exclusion taken
+   between the fibers of this process is the whole exclusion those files admit,
+   not a weaker stand-in for one. Such a backend registers [Process_local]; the
+   answer is a function of the resource because a wrapper answers for whatever
+   base it was given. A backend that registers nothing is read as admitting
+   outside openers, so a forgotten registration costs a refusal rather than a
+   critical section two processes enter. *)
+type (_, _, _) Eio.Resource.pi +=
+  | Process_local : ('t, 't -> bool, [> `Process_local ]) Eio.Resource.pi
+
+let is_process_local (Eio.Resource.T (v, ops)) =
+  match Eio.Resource.get_opt ops Process_local with
+  | Some admits -> admits v
+  | None -> false
+
 type config = { durable : bool; perm : Eio.File.Unix_perm.t; max_bytes : int64 }
 
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }

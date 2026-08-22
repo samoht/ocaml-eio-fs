@@ -6,7 +6,11 @@
     {!Dir_sync} in its resource handler: the in-memory backend a no-op (volatile
     storage has nothing to sync), a crash-model wrapper its journal commit, a
     block-device filesystem its flush. A plain POSIX directory needs no
-    registration: it is opened read-only and its handle fsynced. This library
+    registration: it is opened read-only and its handle fsynced.
+
+    {!Process_local} is the other thing a backend declares here: whether any
+    opener of its files can exist outside this process, which is what tells an
+    in-process exclusion apart from a stand-in for a real one. This library
     depends on nothing but eio, so pure Eio adapters that cross-compile to
     unikernels link it freely. *)
 
@@ -49,6 +53,23 @@ val sync_parent : _ Eio.Path.t -> unit
     there is nothing above it a confined path may reach for.
 
     @raise Eio.Io as {!sync_dir}, on the directory the barrier lands on. *)
+
+type (_, _, _) Eio.Resource.pi +=
+  | Process_local : ('t, 't -> bool, [> `Process_local ]) Eio.Resource.pi
+        (** What a backend declares about the openers of its files: [true] when
+            no opener outside this process can reach them, so an exclusion taken
+            between the fibers of this process is the whole exclusion those
+            files admit. The in-memory backend registers it, its files living in
+            the heap with no name to open them by and no descriptor to inherit,
+            as does a unikernel filesystem. A wrapper answers for the base it
+            was given, which is why the answer is a function of the resource. *)
+
+val is_process_local : _ Eio.Resource.t -> bool
+(** [is_process_local res] is what [res] declares through {!Process_local}, and
+    [false] for a resource that declares nothing: a caller weighing whether an
+    in-process exclusion is the whole exclusion must read silence as "an outside
+    opener exists", since the other reading turns a forgotten registration into
+    two processes inside one critical section. *)
 
 type config = {
   durable : bool;

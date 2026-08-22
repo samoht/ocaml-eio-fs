@@ -193,7 +193,10 @@ module Fs = struct
   end
 
   and Handler : sig
-    val v : (Dir.t, [ `Dir | `Close | `Dir_sync ]) Eio.Resource.handler
+    val v :
+      ( Dir.t,
+        [ `Dir | `Close | `Dir_sync | `Process_local ] )
+      Eio.Resource.handler
   end = struct
     let v =
       Eio.Resource.handler
@@ -202,6 +205,11 @@ module Fs = struct
           H (Memfs_dir, Dir.fd);
           (* Volatile storage: the strongest barrier it has is nothing. *)
           H (Eio_fs_sync.Dir_sync, fun _ ~path:_ -> ());
+          (* The tree lives in this process's heap. It answers no native path
+             and hands out no descriptor, so nothing outside this process can
+             reach a file of it: an exclusion between fibers here is the whole
+             exclusion these files admit. *)
+          H (Eio_fs_sync.Process_local, fun _ -> true);
         ]
   end
 
