@@ -1288,6 +1288,48 @@ let test_crash_ignores_a_barrier_through_a_bare_descriptor () =
         "a barrier the model never saw left the write unsynced" "AAAA"
         (Eio.Path.load (post / "img")))
 
+(* The by-name half, and the sharper one: a descriptor the wrapper carried over
+   at least names a file the model is tracking, but a name reaches the tree
+   whether or not the model has ever heard of what it reaches. A crash rebuilds
+   the whole wrapped tree from the model, so an entry made under a native name
+   after the wrap -- by a child process, by a device-image builder, by a test's
+   own setup -- is not in the post-crash image, whatever the policy would have
+   kept. Survive-everything keeps every change the journal holds, so the file
+   that is missing here is missing for having never entered it.
+
+   The boundary is what {!Chaos.Crash.wrap} states; this pins it, because a
+   workload that reaches the tree by name reads a recovered image that never
+   held its bytes and calls that a durability result. A test that must plant
+   something by name plants it before the wrap, where the snapshot picks it
+   up. *)
+let test_crash_drops_an_entry_planted_by_native_name () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  let planted = ref "" in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o600) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file);
+      Crash.sync_metadata ctl;
+      (* by name, as a child process writing into the tree would: the wrapper
+         is not on the path this write takes *)
+      planted := Eio.Path.native_exn (fs / "device.img");
+      let oc = open_out_bin !planted in
+      Fun.protect
+        ~finally:(fun () -> close_out oc)
+        (fun () -> output_string oc "DEVICE");
+      Alcotest.(check bool)
+        "the planted entry is live in the tree" true (Sys.file_exists !planted))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "what the model journalled comes back" "AAAA"
+        (Eio.Path.load (post / "img"));
+      Alcotest.(check bool)
+        "an entry planted by name after the wrap is not in the image" true
+        (absent (post / "device.img")))
+
 (* An [After_write] trigger crashes the moment the covering write commits; the
    next op through the wrapper fails, and the unsynced block is lost. *)
 let test_crash_after_write_trigger () =
@@ -1413,4 +1455,6 @@ let suite =
         `Quick test_crash_omits_a_write_through_a_bare_descriptor;
       Alcotest.test_case "crash: a bare descriptor's barrier is not the model's"
         `Quick test_crash_ignores_a_barrier_through_a_bare_descriptor;
+      Alcotest.test_case "crash: an entry planted by name is not in the image"
+        `Quick test_crash_drops_an_entry_planted_by_native_name;
     ] )
