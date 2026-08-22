@@ -6,6 +6,7 @@
   eio_main
   eio_fs
   eio-fs.sync
+  unix
   alcotest
   fmt
   cstruct

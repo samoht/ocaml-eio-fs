@@ -3,6 +3,9 @@
    without cutting power; what is testable is that the barrier accepts the
    states a commit protocol hands it. *)
 
+module Chaos = Eio_fs.Chaos
+module Crash = Chaos.Crash
+
 let ( / ) = Eio.Path.( / )
 
 let mentions ~needle haystack =
@@ -537,11 +540,15 @@ let test_lock_creates_a_missing_rendezvous_as_a_regular_file () =
    admits. A unikernel filesystem is the same case.
 
    A wrapper over a real host directory is the other case and is nothing like
-   it: the file whose descriptor it keeps to itself is an ordinary host file,
-   which any process opens by name and locks. Running under the mutex alone
-   there puts two processes inside one critical section with nothing in either
-   run to say the exclusion was absent -- the failure this interface exists to
-   prevent.
+   it: the file it hands back is an ordinary host file, which any process opens
+   by name and locks. Running under the mutex alone there puts two processes
+   inside one critical section with nothing in either run to say the exclusion
+   was absent -- the failure this interface exists to prevent. So a wrapper
+   answers for the base it was given: over a host directory it passes that
+   directory's own descriptors through, and the record lock taken under it is
+   the host's; over a backend that admits no outside opener it forwards what
+   the backend declares, and the mutex is the whole exclusion there as it is
+   without the wrapper.
 
    So the missing descriptor is not the question. Whether the backend admits an
    opener outside this process is, and only the backend knows: one that admits
@@ -602,14 +609,178 @@ let test_lock_over_a_process_local_backend_refuses_a_symlink () =
     "the link's target was not written through the link" "target\n"
     (Eio.Path.load (fs / "target"))
 
-(* The other backend with no descriptors, and the one the answer above must not
-   reach: [Eio_fs.Chaos] wraps a real host directory, delegating every operation
-   to it -- the native name included -- while the files it hands back carry no
-   descriptor of their own. The rendezvous is a host file another process is
-   holding the record lock on right here, so the mutex in this process excludes
-   nobody, and a caller let into its critical section would be the second writer
-   of a resource one process already holds. It is refused instead, and the
-   refusal names the interface that made it so a wiring error reads as one. *)
+(* A wrapper over that backend is the same case, and it is the case a store
+   under test is in: [Eio_fs.Chaos] perturbs or crash-models the tree beneath
+   it, and over the in-memory backend the tree it perturbs is still this
+   process's heap. Nothing the wrapper adds gives those files a name to open
+   them by or a descriptor to inherit, so the exclusion they admit is the one
+   the base declares, and the wrapper's business is to say so rather than to
+   answer for a base it did not look at. A wrapper that declares nothing turns
+   a rendezvous this interface holds under the mutex into one it refuses, which
+   is the whole of a fault-injected store's locking gone. *)
+let test_lock_over_a_wrapped_process_local_backend_serializes_fibers () =
+  with_in_memory_fs @@ fun fs ->
+  let wrapped = Chaos.wrap Chaos.Schedule.empty fs in
+  let lock = wrapped / "lock" in
+  Alcotest.(check bool)
+    "the wrapper forwards what its base declares about outside openers" true
+    (Eio_fs_sync.is_process_local (fst lock));
+  Alcotest.(check bool)
+    "no name outside this process reaches the rendezvous" true
+    (Option.is_none (Eio.Path.native lock));
+  let entered, set_entered = Eio.Promise.create () in
+  let first_inside = ref false in
+  let second_ran = ref false in
+  let overlapped = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      first_inside := true;
+      Eio.Promise.resolve set_entered ();
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      first_inside := false)
+    (fun () ->
+      Eio.Promise.await entered;
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      second_ran := true;
+      if !first_inside then overlapped := true);
+  Alcotest.(check bool)
+    "the critical section ran through the wrapper" true !second_ran;
+  Alcotest.(check bool)
+    "same-process critical sections did not overlap" false !overlapped
+
+(* The other side of "a wrapper answers for its base": the crash model wraps a
+   real host directory to put a store's durability under test, and the file it
+   hands back is that directory's own file. Its exclusion is the host's record
+   lock -- any process opens the file by name and takes it -- and the wrapper
+   has none of its own to offer instead, so the descriptor passes through and
+   the lock a store takes under the model is the lock it takes in production.
+
+   Another process holds the record lock on that same host file throughout, so
+   a non-blocking acquisition through the wrapper has one answer, and it names
+   the rendezvous. Being granted the lock would mean the wrapper handed out an
+   exclusion the operating system never gave; being refused for want of a
+   descriptor would mean no crash-modelled store can lock at all. *)
+let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
+      ~ready:(dir / "ready") ~seconds:"0.25"
+  in
+  let wrapped = Crash.wrap (Crash.v ~policy:Drop_unsynced ()) dir in
+  let file =
+    Eio.Path.open_out ~sw ~create:(`If_missing 0o600) (wrapped / "probe")
+  in
+  Alcotest.(check bool)
+    "a file opened through the wrapper carries the host's descriptor" true
+    (Option.is_some (Eio_unix.Resource.fd_opt file));
+  (match
+     Eio_fs_unix.with_lock ~block:false (wrapped / "lock") (fun () -> ())
+   with
+  | () ->
+      Alcotest.fail
+        "a wrapped rendezvous was locked while another process held its file"
+  | exception Eio_fs_unix.Lock_unavailable path ->
+      Alcotest.(check string)
+        "the refusal names the host file the lock is held on"
+        (Eio.Path.native_exn (dir / "lock"))
+        path);
+  await_holder child
+
+(* ---- a backend that hides descriptors and declares nothing ----
+
+   Between the two answers above sits the wiring error they exist to tell
+   apart: a directory whose files carry no descriptor and whose handler says
+   nothing about who else can open them. It is built here rather than borrowed
+   from a wrapper this package ships, because a wrapper that hides descriptors
+   today passes them through tomorrow, and the case has to stay the case.
+
+   Every operation is the host directory's own, the native name included, so
+   the rendezvous is a real host file; only the files handed back are re-boxed
+   behind the read and write operations alone, which is what an adapter written
+   without a thought for descriptors produces. *)
+
+module Hidden_ro = struct
+  type t = Eio.File.ro_ty Eio.Resource.t
+
+  let read_methods = []
+  let single_read t buf = Eio.Flow.single_read t buf
+  let pread t ~file_offset bufs = Eio.File.pread t ~file_offset bufs
+  let stat t = Eio.File.stat t
+  let seek t off cmd = Eio.File.seek t off cmd
+  let close t = Eio.Resource.close t
+end
+
+module Hidden_rw = struct
+  type t = Eio.File.rw_ty Eio.Resource.t
+
+  let read_methods = []
+  let single_read t buf = Eio.Flow.single_read t buf
+  let pread t ~file_offset bufs = Eio.File.pread t ~file_offset bufs
+  let stat t = Eio.File.stat t
+  let seek t off cmd = Eio.File.seek t off cmd
+  let close t = Eio.Resource.close t
+  let single_write t bufs = Eio.Flow.single_write t bufs
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+  let pwrite t ~file_offset bufs = Eio.File.pwrite_single t ~file_offset bufs
+  let sync t = Eio.File.sync t
+  let truncate t len = Eio.File.truncate t len
+end
+
+let hidden_ro base : Eio.File.ro_ty Eio.Resource.t =
+  Eio.Resource.T (base, Eio.File.Pi.ro (module Hidden_ro))
+
+let hidden_rw base : Eio.File.rw_ty Eio.Resource.t =
+  Eio.Resource.T (base, Eio.File.Pi.rw (module Hidden_rw))
+
+module Hide_descriptors = struct
+  type t = Eio.Fs.dir_ty Eio.Resource.t
+
+  let at t path = (t, path)
+  let open_in t ~sw path = hidden_ro (Eio.Path.open_in ~sw (at t path))
+
+  let open_out t ~sw ~append ~create path =
+    hidden_rw (Eio.Path.open_out ~sw ~append ~create (at t path))
+
+  let stat t ~follow path = Eio.Path.stat ~follow (at t path)
+  let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)
+  let read_dir t path = Eio.Path.read_dir (at t path)
+  let with_dir_entries t path fn = Eio.Path.with_dir_entries (at t path) fn
+  let unlink t path = Eio.Path.unlink (at t path)
+  let rmdir t path = Eio.Path.rmdir (at t path)
+  let rename t path dir dst = Eio.Path.rename (at t path) (dir, dst)
+  let read_link t path = Eio.Path.read_link (at t path)
+  let symlink ~link_to t path = Eio.Path.symlink ~link_to (at t path)
+  let chmod t ~follow ~perm path = Eio.Path.chmod ~follow ~perm (at t path)
+
+  let chown ~follow ?uid ?gid t path =
+    Eio.Path.chown ~follow ?uid ?gid (at t path)
+
+  let native t path = Eio.Path.native (at t path)
+  let pp f _ = Format.pp_print_string f "hide-descriptors"
+
+  let open_subtree _ ~sw:_ _ =
+    failwith "Hide_descriptors: the lock opens no subtree"
+end
+
+let hide_descriptors ((base, path) : Eio.Fs.dir_ty Eio.Path.t) :
+    Eio.Fs.dir_ty Eio.Path.t =
+  ( (Eio.Resource.T
+       ( base,
+         Eio.Resource.handler
+           [ Eio.Resource.H (Eio.Fs.Pi.Dir, (module Hide_descriptors)) ] )
+      : Eio.Fs.dir_ty Eio.Resource.t),
+    path )
+
+(* The rendezvous is a host file another process is holding the record lock on
+   right here, so the mutex in this process excludes nobody, and a caller let
+   into its critical section would be the second writer of a resource one
+   process already holds. It is refused instead, and the refusal names both the
+   interface that made it and the rendezvous it was asked for, so a wiring
+   error reads as one. *)
 let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -618,9 +789,9 @@ let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
     hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
       ~ready:(dir / "ready") ~seconds:"0.25"
   in
-  let wrapped = Eio_fs.Chaos.wrap Eio_fs.Chaos.Schedule.empty dir in
+  let hidden = hide_descriptors dir in
   let ran = ref false in
-  (match Eio_fs_unix.with_lock (wrapped / "lock") (fun () -> ran := true) with
+  (match Eio_fs_unix.with_lock (hidden / "lock") (fun () -> ran := true) with
   | () ->
       Alcotest.fail
         "a rendezvous with no descriptor was locked while another process held \
@@ -628,7 +799,10 @@ let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
   | exception Invalid_argument message ->
       Alcotest.(check bool)
         "the refusal names the interface that refused" true
-        (mentions ~needle:"Eio_fs_unix.with_lock" message));
+        (mentions ~needle:"Eio_fs_unix.with_lock" message);
+      Alcotest.(check bool)
+        "the refusal names the rendezvous" true
+        (mentions ~needle:(Eio.Path.native_exn (dir / "lock")) message));
   Alcotest.(check bool)
     "the critical section did not run over the held file" false !ran;
   await_holder child
@@ -748,6 +922,11 @@ let suite =
         `Quick test_lock_over_a_process_local_backend_serializes_fibers;
       Alcotest.test_case "a process-local backend still refuses a symlink"
         `Quick test_lock_over_a_process_local_backend_refuses_a_symlink;
+      Alcotest.test_case
+        "lock serializes fibers over a wrapped process-local backend" `Quick
+        test_lock_over_a_wrapped_process_local_backend_serializes_fibers;
+      Alcotest.test_case "lock through a crash wrapper takes the host lock"
+        `Quick test_lock_through_a_crash_wrapper_takes_the_host_lock;
       Alcotest.test_case "lock refuses a wrapper that hides a host descriptor"
         `Quick test_lock_refuses_a_wrapper_that_hides_a_host_descriptor;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick

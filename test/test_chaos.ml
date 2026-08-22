@@ -1207,6 +1207,86 @@ let test_crash_rename_revert_real () =
         "real fs: final path absent" true
         (absent (post / "final")))
 
+(* {2 The model's authority is the wrapper, not the descriptor}
+
+   Over a host directory the wrapper hands back the base's own file, and a
+   consumer that needs the descriptor underneath -- to take a record lock, to
+   give a launcher a console -- gets the host's. That descriptor names the same
+   bytes the model is tracking, so what it is for has to be settled: it carries
+   the operations the operating system offers on an open file, and it is not a
+   second way into the durability journal. A write issued on it is not a write
+   the model saw; a barrier issued on it is not the model's barrier. The two
+   runs below put a bare descriptor next to the wrapper's own path under the
+   two policies that tell them apart. *)
+
+(* Survive-everything keeps every change the journal holds, so what is missing
+   from the recovered image is exactly what never entered the journal. The live
+   file carries all three writes; the image carries the two that went through
+   the wrapper. *)
+let test_crash_omits_a_write_through_a_bare_descriptor () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o600) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file;
+          Crash.sync_metadata ctl;
+          (* through the wrapper: unsynced, journalled, kept by this policy *)
+          Eio.File.pwrite_all file ~file_offset:(i63 4)
+            [ Cstruct.of_string "BBBB" ];
+          (* through a descriptor of the same host file: never journalled *)
+          let raw =
+            Unix.openfile (Eio.Path.native_exn (fs / "img")) [ Unix.O_WRONLY ] 0
+          in
+          Fun.protect
+            ~finally:(fun () -> Unix.close raw)
+            (fun () ->
+              ignore (Unix.lseek raw 8 Unix.SEEK_SET : int);
+              Alcotest.(check int)
+                "the bare descriptor wrote its bytes" 4
+                (Unix.write_substring raw "XXXX" 0 4)));
+      Alcotest.(check string)
+        "the live file carries all three writes" "AAAABBBBXXXX"
+        (Eio.Path.load (fs / "img")))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "recovery replays the journal, which the bare descriptor never entered"
+        "AAAABBBB"
+        (Eio.Path.load (post / "img")))
+
+(* The barrier half: an fsync on a bare descriptor pushes the host file's bytes
+   to the platter, which is what the model must not read as a sync of its own.
+   What marks a file's writes durable is the wrapper's [sync]; after a barrier
+   the model never saw, the write is still unsynced and a Drop_unsynced crash
+   takes it. *)
+let test_crash_ignores_a_barrier_through_a_bare_descriptor () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o600) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file;
+          Crash.sync_metadata ctl;
+          Eio.File.pwrite_all file ~file_offset:(i63 4)
+            [ Cstruct.of_string "BBBB" ];
+          let raw =
+            Unix.openfile (Eio.Path.native_exn (fs / "img")) [ Unix.O_WRONLY ] 0
+          in
+          Fun.protect
+            ~finally:(fun () -> Unix.close raw)
+            (fun () -> Unix.fsync raw));
+      Alcotest.(check string)
+        "the live file carries the unsynced write" "AAAABBBB"
+        (Eio.Path.load (fs / "img")))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "a barrier the model never saw left the write unsynced" "AAAA"
+        (Eio.Path.load (post / "img")))
+
 (* An [After_write] trigger crashes the moment the covering write commits; the
    next op through the wrapper fails, and the unsynced block is lost. *)
 let test_crash_after_write_trigger () =
@@ -1328,4 +1408,8 @@ let suite =
         test_crash_dir_sync_does_not_reach_a_grandchild;
       Alcotest.test_case "crash: rename revert (real fs)" `Quick
         test_crash_rename_revert_real;
+      Alcotest.test_case "crash: a bare descriptor's write is not journalled"
+        `Quick test_crash_omits_a_write_through_a_bare_descriptor;
+      Alcotest.test_case "crash: a bare descriptor's barrier is not the model's"
+        `Quick test_crash_ignores_a_barrier_through_a_bare_descriptor;
     ] )
