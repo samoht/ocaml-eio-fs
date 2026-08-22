@@ -1,5 +1,20 @@
 (** Internal filesystem and file-descriptor operations. *)
 
+(** Lexical arithmetic on the paths this backend is addressed by. They are Eio
+    paths, whose "directory separator is always "/", even on Windows"
+    ({!Eio.Path}), so the host's own path modules answer about a different
+    language: this is where the rules for these paths live. *)
+module Path : sig
+  val basename : string -> string
+  (** [basename path] is [path]'s last component, ignoring trailing separators,
+      and [""] for a path that has none: a root, [.] or [..]. *)
+
+  val append : string -> string -> string
+  (** [append base path] is [path] resolved against [base]: [path] itself when
+      it is absolute, and [base] and [path] joined by a single separator
+      otherwise. *)
+end
+
 module Open_flags : sig
   val o_rdonly : int
   (** Open for reading. *)

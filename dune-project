@@ -32,7 +32,6 @@
   (ocaml (>= 5.1))
   eio
   fmt
-  fpath
   cstruct
   optint
   console
