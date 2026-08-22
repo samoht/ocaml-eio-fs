@@ -1,4 +1,5 @@
-(** The POSIX durability barrier, at full platform strength.
+(** The POSIX durability barrier at full platform strength, advisory file
+    locking, and filesystem capacity.
 
     The portable machinery lives in {!Eio_fs_sync}: backends with their own
     barrier semantics register {!Eio_fs_sync.Dir_sync}, and a plain POSIX
@@ -6,7 +7,15 @@
     that link unix anyway and want the strongest barrier the platform offers: on
     Darwin {!full_fsync} (F_FULLFSYNC, through to the platter) where the
     portable route's fsync only reaches the drive's cache. Elsewhere the two are
-    the same barrier. *)
+    the same barrier.
+
+    The other two operations are here for the reason the barrier's upgrade is:
+    what they need is the host. {!with_lock} holds an exclusive advisory lock
+    over a rendezvous file -- a POSIX record lock, taken between processes and
+    between the fibers of this one, refusing anything that is not the lock's own
+    regular file ({!Lock_unavailable}, {!Not_a_lock_file}). {!statvfs} reports
+    the capacity of the filesystem a path is on, which is the number a cache
+    watermark or a free-space check is computed from. *)
 
 val full_fsync : Unix.file_descr -> unit
 (** [full_fsync fd] pushes [fd]'s data through to stable storage. On Darwin it

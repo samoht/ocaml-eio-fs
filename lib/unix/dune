@@ -1,4 +1,5 @@
-; eio-fs.unix: the POSIX durability barrier. A separate library so the
+; eio-fs.unix: the POSIX durability barrier at full platform strength,
+; advisory file locking, and filesystem capacity. A separate library so the
 ; portable machinery (eio-fs.sync) and the in-memory backend stay free of
 ; unix.
 

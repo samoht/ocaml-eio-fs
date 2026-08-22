@@ -1,4 +1,5 @@
-(** The directory-durability barrier, portable across backends.
+(** The directory-durability barrier and the atomic publication built on it,
+    portable across backends.
 
     A write-temporary-then-rename commit protocol is durable only once the
     directory entry itself reaches stable storage. {!sync_dir} issues that
@@ -7,6 +8,12 @@
     storage has nothing to sync), a crash-model wrapper its journal commit, a
     block-device filesystem its flush. A plain POSIX directory needs no
     registration: it is opened read-only and its handle fsynced.
+
+    {!publish} is that protocol itself, written once so every store commits the
+    same way: contents streamed into a temporary, the temporary synced, renamed
+    over the target, and the directory holding the target's entry barriered --
+    under a mandatory ceiling on the bytes it will accept ({!type-config},
+    {!Limit_exceeded}), so a producer that never ends fills no disk.
 
     {!Process_local} is the other thing a backend declares here: whether any
     opener of its files can exist outside this process, which is what tells an
