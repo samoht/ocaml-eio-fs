@@ -404,10 +404,48 @@ let test_name_falls_back_to_the_eio_rendering () =
     "the name is what Eio.Path.pp renders the path as" "<fs:hello.txt>"
     (Eio_fs.Path.name path)
 
+(* [Fs.tree] labels every node by the last component of its own path, a
+   symbolic link by that component and its target, and the root by the path the
+   caller handed in -- for the root of this backend, the directory itself. The
+   labels are path arithmetic on the path each node was reached by, and nothing
+   else in the suite renders a tree, so the shapes that arithmetic has to
+   answer for are pinned here: a directory below the root, a name reached
+   through a trailing slash, and the root of the capability, which has no last
+   component to be named by. *)
+(* The glyphs the tree is drawn with, named so the renderings below read as
+   trees: a branch with siblings after it, and the last branch of a level. *)
+let branch = "\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80 "
+let last_branch = "\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80 "
+
+let test_tree_labels_each_node_by_its_last_component () =
+  with_fs @@ fun fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  write fs "d/a" "x";
+  Eio.Path.symlink ~link_to:"a" (fs / "d/l");
+  let render ~depth path = Fmt.str "%a" (Eio_fs.Fs.tree ~depth) path in
+  Alcotest.(check string)
+    "the root of the capability is named as the backend spells it"
+    ("." ^ "\n" ^ last_branch ^ "d")
+    (render ~depth:2 fs);
+  Alcotest.(check string)
+    "a directory is named by its own last component, a link by its target"
+    ("d" ^ "\n" ^ branch ^ "a" ^ "\n" ^ last_branch ^ "l -> a")
+    (render ~depth:2 (fs / "d"));
+  Alcotest.(check string)
+    "a trailing slash names the same directory"
+    (render ~depth:2 (fs / "d"))
+    (render ~depth:2 (fs / "d/"));
+  Alcotest.(check string)
+    "depth 1 is the path alone" "d"
+    (render ~depth:1 (fs / "d"));
+  Alcotest.(check string) "depth 0 prints nothing" "" (render ~depth:0 fs)
+
 let suite =
   ( "eio_fs",
     [
       Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "tree labels each node by its last component" `Quick
+        test_tree_labels_each_node_by_its_last_component;
       Alcotest.test_case "name falls back to the Eio rendering" `Quick
         test_name_falls_back_to_the_eio_rendering;
       Alcotest.test_case "close then switch release" `Quick
