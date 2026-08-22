@@ -650,6 +650,106 @@ let test_lock_over_a_wrapped_process_local_backend_serializes_fibers () =
   Alcotest.(check bool)
     "same-process critical sections did not overlap" false !overlapped
 
+(* ---- the lock is granted in the order callers entered ----
+
+   An acquisition suspends before it takes anything: the rendezvous is opened
+   first, the key the fiber mutex is found by being the opened file's own
+   device and inode, and a backend runs that open off the calling fiber. So the
+   order two fibers reach the mutex in is the order their opens came back in,
+   which is not the order they entered, and a caller cannot repair it from
+   outside: between "I entered" and "I hold" it has no point to stand, short of
+   a gate of its own around the whole call. What that costs is a queue that
+   reorders its own writers -- a spool whose sequence numbers are issued inside
+   the lock publishes them out of the order its callers were served in, which
+   is what caravan's spool measured before it brought its own mutex
+   (42a2799845).
+
+   The suspension belongs to the backend, so a test that wants an exact
+   interleaving brings its own: [Slow_open] delegates every operation to the
+   in-memory backend and yields before an open, as many scheduler turns as the
+   entering fiber asked for. Under [Eio_mock.Backend] the run queue is
+   deterministic, so the fiber that enters first can be made to reach its own
+   open last -- the reversal a real filesystem produces by itself, where the
+   open is a worker thread's round trip and no order is promised at all. *)
+module Slow_open = struct
+  type t = { base : Eio.Fs.dir_ty Eio.Resource.t }
+
+  (* How many scheduler turns the entering fiber spends inside each open. *)
+  let turns : int Eio.Fiber.key = Eio.Fiber.create_key ()
+
+  let dawdle () =
+    match Eio.Fiber.get turns with
+    | None | Some 0 -> ()
+    | Some n ->
+        for _ = 1 to n do
+          Eio.Fiber.yield ()
+        done
+
+  let at t path = (t.base, path)
+
+  let open_out t ~sw ~append ~create path =
+    dawdle ();
+    Eio.Path.open_out ~sw ~append ~create (at t path)
+
+  let open_in t ~sw path =
+    dawdle ();
+    Eio.Path.open_in ~sw (at t path)
+
+  let stat t ~follow path = Eio.Path.stat ~follow (at t path)
+  let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)
+  let read_dir t path = Eio.Path.read_dir (at t path)
+  let with_dir_entries t path fn = Eio.Path.with_dir_entries (at t path) fn
+  let unlink t path = Eio.Path.unlink (at t path)
+  let rmdir t path = Eio.Path.rmdir (at t path)
+  let rename t path dir dst = Eio.Path.rename (at t path) (dir, dst)
+  let read_link t path = Eio.Path.read_link (at t path)
+  let symlink ~link_to t path = Eio.Path.symlink ~link_to (at t path)
+  let chmod t ~follow ~perm path = Eio.Path.chmod ~follow ~perm (at t path)
+
+  let chown ~follow ?uid ?gid t path =
+    Eio.Path.chown ~follow ?uid ?gid (at t path)
+
+  let native t path = Eio.Path.native (at t path)
+  let pp f _ = Format.pp_print_string f "slow-open"
+  let open_subtree _ ~sw:_ _ = failwith "Slow_open: the lock opens no subtree"
+end
+
+let slow_open ((base, path) : Eio.Fs.dir_ty Eio.Path.t) =
+  let dir =
+    Eio.Resource.T
+      ( { Slow_open.base },
+        Eio.Resource.handler
+          [
+            Eio.Resource.H (Eio.Fs.Pi.Dir, (module Slow_open));
+            (* The wrapper answers for the base it was given, as every other
+               wrapper here does: over the in-memory backend the files it hands
+               out are still this process's heap. *)
+            Eio.Resource.H
+              ( Eio_fs_sync.Process_local,
+                fun (t : Slow_open.t) -> Eio_fs_sync.is_process_local t.base );
+          ] )
+  in
+  ((dir :> Eio.Fs.dir_ty Eio.Resource.t), path)
+
+let test_lock_is_granted_in_the_order_fibers_entered () =
+  with_in_memory_fs @@ fun fs ->
+  let lock = slow_open fs / "lock" in
+  let entered = ref [] and held = ref [] in
+  (* Each fiber dawdles for a different number of turns inside its opens, the
+     first to enter for the longest, so entry order and open order are exact
+     reverses of one another. *)
+  let contend name turns () =
+    Eio.Fiber.with_binding Slow_open.turns turns @@ fun () ->
+    entered := name :: !entered;
+    Eio_fs_unix.with_lock lock @@ fun () -> held := name :: !held
+  in
+  Eio.Fiber.all [ contend "a" 4; contend "b" 2; contend "c" 0 ];
+  Alcotest.(check (list string))
+    "the fibers entered in this order" [ "a"; "b"; "c" ] (List.rev !entered);
+  Alcotest.(check (list string))
+    "the lock was granted in the order the fibers entered" [ "a"; "b"; "c" ]
+    (List.rev !held)
+
 (* The other side of "a wrapper answers for its base": the crash model wraps a
    real host directory to put a store's durability under test, and the file it
    hands back is that directory's own file. Its exclusion is the host's record
@@ -958,6 +1058,8 @@ let suite =
       Alcotest.test_case
         "lock serializes fibers over a wrapped process-local backend" `Quick
         test_lock_over_a_wrapped_process_local_backend_serializes_fibers;
+      Alcotest.test_case "lock is granted in the order fibers entered" `Quick
+        test_lock_is_granted_in_the_order_fibers_entered;
       Alcotest.test_case "lock through a crash wrapper takes the host lock"
         `Quick test_lock_through_a_crash_wrapper_takes_the_host_lock;
       Alcotest.test_case "an un-synced crash loses a lock's contents" `Quick
