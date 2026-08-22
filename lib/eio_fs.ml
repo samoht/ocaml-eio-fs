@@ -106,6 +106,20 @@ end
 module Fs = struct
   type dir_fd = Low_level.Dir.fd
 
+  (* Paths reach this backend as strings, from [Eio.Path] and from whatever
+     spelling the caller had, and this is where one becomes a path: the
+     arithmetic below is [Fpath]'s, so a name with a trailing slash, a repeated
+     separator or no last component at all is answered once, by the type,
+     rather than at each call. [Fpath] has no value for the empty string, which
+     is this backend's own name for the directory itself, as
+     [Low_level.check_path] reads it, so that one spelling is settled here. *)
+  let typed_path path = Fpath.v (if String.equal path "" then "." else path)
+
+  (* What a path is called on its own: its last component. A root has none, and
+     is called by the whole of itself -- "/" is called "/". *)
+  let last_component p =
+    match Fpath.basename p with "" -> Fpath.to_string p | base -> base
+
   (* When renaming, we get a plain [Eio.Fs.dir]. We need extra access to check
    that the new location is within its sandbox. *)
   type (_, _, _) Eio.Resource.pi +=
@@ -172,12 +186,12 @@ module Fs = struct
     let open_dir t ~sw path =
       let flags = Low_level.Open_flags.(o_rdonly + o_directory) in
       let fd = Low_level.openat ~sw ~mode:0 t.fd path flags in
-      let label = Filename.basename path in
-      let full_path =
-        if Filename.is_relative path then Filename.concat t.dir_path path
-        else path
+      let rel = typed_path path in
+      let label = last_component rel in
+      let full_path = Fpath.append (typed_path t.dir_path) rel in
+      let d =
+        v ~label ~path:(Fpath.to_string full_path) (Low_level.Dir.Dir_fd fd)
       in
-      let d = v ~label ~path:full_path (Low_level.Dir.Dir_fd fd) in
       (* The upcast drops the barrier tag from the static row to fit
          [Pi.DIR]; the operation itself stays probeable on the resource. *)
       (Eio.Resource.T (d, Handler.v) :> [ `Close | `Dir ] Eio.Resource.t)
@@ -252,7 +266,7 @@ module Fs = struct
     ()
 
   let tree ~depth =
-    let name (_, p) = Filename.basename p in
+    let name (_, p) = last_component (typed_path p) in
     let rec node depth path =
       match Eio.Path.kind ~follow:false path with
       | `Regular_file ->
