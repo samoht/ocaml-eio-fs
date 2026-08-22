@@ -387,6 +387,37 @@ let test_close_in_then_switch_release () =
   let file = Eio.Path.open_in ~sw (fs / "r") in
   Eio.Resource.close file
 
+(* And the same again for the second close a caller makes itself.
+   [Eio.Resource.close] is specified to be idempotent -- "If [t] is already
+   closed then this does nothing (it does not raise an exception)" (eio 1.4,
+   [lib_eio/resource.mli]) -- and eio's own posix backend keeps that promise,
+   its close answering a descriptor that has gone with [false] rather than
+   raising. A double close is the ordinary shape of one handle with two owners:
+   a session closing both views of a file it opened twice, a caller's own close
+   in front of a hook that closes what it registered. Over a real directory
+   that works, so it has to work here, or a store's tests pass against this
+   backend and its production run does something else.
+
+   The file is read back afterwards because "does nothing" is the whole
+   specification: the second close must not raise, and must not take the file
+   with it either. *)
+let test_close_twice_is_not_an_error () =
+  with_fs @@ fun fs ->
+  Eio.Switch.run @@ fun sw ->
+  let out = Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (fs / "w") in
+  Eio.Flow.copy_string "payload" out;
+  Eio.Resource.close out;
+  Eio.Resource.close out;
+  Alcotest.(check string)
+    "a closed file is closed, not lost" "payload"
+    (Eio.Path.load (fs / "w"));
+  let inp = Eio.Path.open_in ~sw (fs / "w") in
+  Eio.Resource.close inp;
+  Eio.Resource.close inp;
+  Alcotest.(check string)
+    "and a read handle closed twice takes nothing with it either" "payload"
+    (Eio.Path.load (fs / "w"))
+
 (* Not every path has a spelling the host would recognise: nothing outside the
    process backs an in-memory tree, so a native name for it would point at an
    unrelated real location. A path still has to be nameable when it is refused,
@@ -452,6 +483,8 @@ let suite =
         test_close_then_switch_release;
       Alcotest.test_case "close read handle then switch release" `Quick
         test_close_in_then_switch_release;
+      Alcotest.test_case "close twice is not an error" `Quick
+        test_close_twice_is_not_an_error;
       Alcotest.test_case "mkdir/read_dir" `Quick test_mkdir_read_dir;
       Alcotest.test_case "read_dir_entries" `Quick test_read_dir_entries;
       Alcotest.test_case "chmod" `Quick test_chmod;
