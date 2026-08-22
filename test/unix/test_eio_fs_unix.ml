@@ -690,6 +690,39 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
         path);
   await_holder child
 
+(* What a lock writes is a write like any other. A holder that publishes its
+   diagnostics through [~contents] writes them through the wrapper's own file,
+   so the crash model sees that write and the policy decides whether it
+   survives the cut -- there is nothing special about a rendezvous once the
+   lock over it is taken. The rendezvous' own entry is committed in both runs
+   below, so what differs between them is only the policy's answer about an
+   un-synced write.
+
+   This is what the refusal used to hide: before the descriptor passed through,
+   the call was refused before it wrote anything, and what a lock journals
+   could not be stated at all. *)
+let crash_after_a_lock_published_its_contents ~policy =
+  with_real_dir_env @@ fun _env dir ->
+  let ctl = Crash.v ~policy () in
+  let wrapped = Crash.wrap ctl dir in
+  Eio_fs_unix.with_lock ~contents:"held\n" (wrapped / "lock") (fun () -> ());
+  Alcotest.(check string)
+    "the live rendezvous carries what the holder published" "held\n"
+    (Eio.Path.load (dir / "lock"));
+  Crash.sync_metadata ctl;
+  Eio.Path.load (Crash.post_crash ctl / "lock")
+
+let test_lock_contents_are_lost_by_an_unsynced_crash () =
+  Alcotest.(check string)
+    "the rendezvous keeps its committed entry and loses the un-synced write" ""
+    (crash_after_a_lock_published_its_contents ~policy:Crash.Drop_unsynced)
+
+let test_lock_contents_survive_a_policy_that_keeps_them () =
+  Alcotest.(check string)
+    "the write went through the wrapper, so the journal holds it" "held\n"
+    (crash_after_a_lock_published_its_contents
+       ~policy:(Crash.Survive (fun _ -> true)))
+
 (* ---- a backend that hides descriptors and declares nothing ----
 
    Between the two answers above sits the wiring error they exist to tell
@@ -927,6 +960,10 @@ let suite =
         test_lock_over_a_wrapped_process_local_backend_serializes_fibers;
       Alcotest.test_case "lock through a crash wrapper takes the host lock"
         `Quick test_lock_through_a_crash_wrapper_takes_the_host_lock;
+      Alcotest.test_case "an un-synced crash loses a lock's contents" `Quick
+        test_lock_contents_are_lost_by_an_unsynced_crash;
+      Alcotest.test_case "a lock's contents survive a policy that keeps them"
+        `Quick test_lock_contents_survive_a_policy_that_keeps_them;
       Alcotest.test_case "lock refuses a wrapper that hides a host descriptor"
         `Quick test_lock_refuses_a_wrapper_that_hides_a_host_descriptor;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick

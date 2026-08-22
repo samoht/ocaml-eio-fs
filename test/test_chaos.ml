@@ -1216,8 +1216,17 @@ let test_crash_rename_revert_real () =
    the operations the operating system offers on an open file, and it is not a
    second way into the durability journal. A write issued on it is not a write
    the model saw; a barrier issued on it is not the model's barrier. The two
-   runs below put a bare descriptor next to the wrapper's own path under the
+   runs below take the descriptor the wrapper carried over -- the same open
+   file its own writes go through -- and put it next to those writes under the
    two policies that tell them apart. *)
+
+(* A file opened through the wrapper over a host directory carries the host's
+   descriptor; a run that could not take it would be testing nothing, so the
+   absence is a failure and not a skip. *)
+let carried_over_fd file =
+  match Eio_unix.Resource.fd_opt file with
+  | Some fd -> fd
+  | None -> Alcotest.fail "the wrapper carried no descriptor over"
 
 (* Survive-everything keeps every change the journal holds, so what is missing
    from the recovered image is exactly what never entered the journal. The live
@@ -1236,13 +1245,9 @@ let test_crash_omits_a_write_through_a_bare_descriptor () =
           (* through the wrapper: unsynced, journalled, kept by this policy *)
           Eio.File.pwrite_all file ~file_offset:(i63 4)
             [ Cstruct.of_string "BBBB" ];
-          (* through a descriptor of the same host file: never journalled *)
-          let raw =
-            Unix.openfile (Eio.Path.native_exn (fs / "img")) [ Unix.O_WRONLY ] 0
-          in
-          Fun.protect
-            ~finally:(fun () -> Unix.close raw)
-            (fun () ->
+          (* on the descriptor the wrapper carried over: never journalled *)
+          Eio_unix.Fd.use_exn "bare descriptor" (carried_over_fd file)
+            (fun raw ->
               ignore (Unix.lseek raw 8 Unix.SEEK_SET : int);
               Alcotest.(check int)
                 "the bare descriptor wrote its bytes" 4
@@ -1256,11 +1261,11 @@ let test_crash_omits_a_write_through_a_bare_descriptor () =
         "AAAABBBB"
         (Eio.Path.load (post / "img")))
 
-(* The barrier half: an fsync on a bare descriptor pushes the host file's bytes
-   to the platter, which is what the model must not read as a sync of its own.
-   What marks a file's writes durable is the wrapper's [sync]; after a barrier
-   the model never saw, the write is still unsynced and a Drop_unsynced crash
-   takes it. *)
+(* The barrier half: an fsync on the carried-over descriptor pushes the host
+   file's bytes to the platter, which is what the model must not read as a sync
+   of its own. What marks a file's writes durable is the wrapper's [sync];
+   after a barrier the model never saw, the write is still unsynced and a
+   Drop_unsynced crash takes it. *)
 let test_crash_ignores_a_barrier_through_a_bare_descriptor () =
   let ctl = Crash.v ~policy:Drop_unsynced () in
   with_real_crash ctl
@@ -1273,12 +1278,8 @@ let test_crash_ignores_a_barrier_through_a_bare_descriptor () =
           Crash.sync_metadata ctl;
           Eio.File.pwrite_all file ~file_offset:(i63 4)
             [ Cstruct.of_string "BBBB" ];
-          let raw =
-            Unix.openfile (Eio.Path.native_exn (fs / "img")) [ Unix.O_WRONLY ] 0
-          in
-          Fun.protect
-            ~finally:(fun () -> Unix.close raw)
-            (fun () -> Unix.fsync raw));
+          Eio_unix.Fd.use_exn "bare descriptor" (carried_over_fd file)
+            Unix.fsync);
       Alcotest.(check string)
         "the live file carries the unsynced write" "AAAABBBB"
         (Eio.Path.load (fs / "img")))
