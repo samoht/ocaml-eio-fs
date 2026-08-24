@@ -181,10 +181,10 @@ let test_full_fsync_surfaces_errors () =
 
    Which descriptor an fsync reached is no more observable from a program than
    which inode a directory barrier reached, so the ordering is pinned the way
-   it can be: this file registers [File_sync] and carries a descriptor of this
-   process that is already closed, which [Eio_unix.Fd.use_exn] refuses.
-   Answering through the registration returns; reaching for the descriptor
-   raises. *)
+   it can be: this file carries a descriptor of this process that is already
+   closed, which [Eio_unix.Fd.use_exn] refuses. Reaching for it raises, and
+   answering elsewhere returns, so the same file tells both halves of the
+   dispatch apart depending on whether it registers [File_sync]. *)
 module Registered_file = struct
   type t = {
     base : Eio.File.rw_ty Eio.Resource.t;
@@ -208,24 +208,30 @@ module Registered_file = struct
   let truncate t len = Eio.File.truncate t.base len
 end
 
-let registered_file ~sw base =
+let registered_file ~sw ~register base =
   let fd =
     Eio_unix.Fd.of_unix ~sw ~close_unix:true
       (Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0)
   in
   Eio_unix.Fd.close fd;
   let state = Registered_file.{ base; fd; calls = ref 0 } in
+  let registration =
+    if register then
+      [
+        Eio.Resource.H
+          (Eio_fs_sync.File_sync, fun (t : Registered_file.t) -> incr t.calls);
+      ]
+    else []
+  in
   let file : Eio.File.rw_ty Eio.Resource.t =
     Eio.Resource.T
       ( state,
         Eio.Resource.handler
-          ([
-             Eio.Resource.H
-               ( Eio_fs_sync.File_sync,
-                 fun (t : Registered_file.t) -> incr t.calls );
-             Eio.Resource.H
-               (Eio_unix.Resource.T, fun (t : Registered_file.t) -> t.fd);
-           ]
+          (registration
+          @ [
+              Eio.Resource.H
+                (Eio_unix.Resource.T, fun (t : Registered_file.t) -> t.fd);
+            ]
           @ Eio.Resource.bindings (Eio.File.Pi.rw (module Registered_file))) )
   in
   (file, state)
@@ -234,7 +240,7 @@ let test_sync_file_asks_the_registration_before_the_descriptor () =
   with_real_dir @@ fun dir ->
   Eio.Switch.run @@ fun sw ->
   let base = Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (dir / "f") in
-  let file, state = registered_file ~sw base in
+  let file, state = registered_file ~sw ~register:true base in
   Alcotest.(check bool)
     "the file carries a descriptor for the barrier to find" true
     (Option.is_some (Eio_unix.Resource.fd_opt file));
@@ -247,6 +253,28 @@ let test_sync_file_asks_the_registration_before_the_descriptor () =
   Alcotest.(check int)
     "the registration answered the barrier" 1
     !(state.Registered_file.calls)
+
+(* The other half, and the reason this entry point exists at all rather than
+   deferring to the portable one. A file that registers no barrier is where the
+   platform's own belongs: on Darwin F_FULLFSYNC, through to the platter, where
+   the file's own sync stops at the drive's cache. That the descriptor is
+   reached for is what the same closed descriptor says here, from the other
+   side -- the barrier must raise. The portable barrier over the same file is
+   what says the raise can only be the descriptor: it takes the file's own
+   sync, which succeeds. So an implementation that quietly deferred to the
+   portable route -- the durability guarantee traded away for a greener suite
+   -- returns here where this one raises. *)
+let test_sync_file_takes_the_descriptor_when_nothing_is_registered () =
+  with_real_dir @@ fun dir ->
+  Eio.Switch.run @@ fun sw ->
+  let base = Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (dir / "f") in
+  let file, _ = registered_file ~sw ~register:false base in
+  Eio_fs_sync.sync_file file;
+  match Eio_fs_unix.sync_file file with
+  | () ->
+      Alcotest.fail
+        "the barrier skipped the descriptor of a file that registers none"
+  | exception Invalid_argument _ -> ()
 
 (* The same ordering in the shape a store publishes in, over the real
    filesystem it runs on. The crash wrapper's file carries the host's own
@@ -1141,6 +1169,8 @@ let suite =
         test_sync_dir_refuses_a_name_a_link_took;
       Alcotest.test_case "file barrier asks the registration first" `Quick
         test_sync_file_asks_the_registration_before_the_descriptor;
+      Alcotest.test_case "file barrier takes an unregistered file's descriptor"
+        `Quick test_sync_file_takes_the_descriptor_when_nothing_is_registered;
       Alcotest.test_case "file barrier survives a modelled cut" `Quick
         test_sync_file_under_the_crash_model_survives_the_cut;
       Alcotest.test_case "file barrier on a plain POSIX file" `Quick
