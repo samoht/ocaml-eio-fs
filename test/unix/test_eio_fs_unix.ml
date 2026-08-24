@@ -455,7 +455,7 @@ let test_lock_excludes_another_name_for_the_locked_file () =
     (fun () ->
       Eio.Promise.await held;
       (match
-         Eio_fs_unix.with_lock ~block:false (dir / "alias") (fun () -> ())
+         Eio_fs_unix.with_lock ~block:`No (dir / "alias") (fun () -> ())
        with
       | () -> granted := true
       | exception Eio_fs_unix.Lock_unavailable _ -> ());
@@ -502,8 +502,65 @@ let test_lock_non_blocking_unavailable () =
     hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
       ~seconds:"0.15"
   in
-  (match Eio_fs_unix.with_lock ~block:false lock (fun () -> ()) with
+  (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "non-blocking lock unexpectedly succeeded"
+  | exception Eio_fs_unix.Lock_unavailable path ->
+      Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
+  await_holder child
+
+(* ---- waiting for this process, answering about every other one ----
+
+   The two halves of the exclusion are two kinds of contention, and a caller
+   can want a different answer to each. The fibers of one program are its own
+   cooperating writers: one that finds another inside wants its turn, because
+   refusing it fails work the program itself asked for and could have waited
+   out. Another process is an independent actor, and how long it holds the
+   rendezvous is not this program's to bound: a command-line tool would rather
+   tell its operator which resource is busy than wait for a holder that may be
+   wedged, with nothing printed and no deadline.
+
+   [`Fibers] is that pair: entering queues behind a fiber of this process, and
+   a hold taken by any other process is answered rather than waited out. *)
+let test_lock_fibers_mode_queues_behind_a_fiber () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  let entered, set_entered = Eio.Promise.create () in
+  let first_inside = ref false in
+  let second_ran = ref false and overlapped = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock ~block:`Fibers lock @@ fun () ->
+      first_inside := true;
+      Eio.Promise.resolve set_entered ();
+      Eio.Fiber.yield ();
+      Eio.Fiber.yield ();
+      first_inside := false)
+    (fun () ->
+      Eio.Promise.await entered;
+      Eio_fs_unix.with_lock ~block:`Fibers lock @@ fun () ->
+      second_ran := true;
+      if !first_inside then overlapped := true);
+  Alcotest.(check bool)
+    "the second fiber took its turn rather than being refused" true !second_ran;
+  Alcotest.(check bool)
+    "same-process critical sections did not overlap" false !overlapped
+
+(* Refusing rather than waiting is what the answer proves: a caller that waited
+   out the holder would be granted the lock once the child exits and return
+   unit, so [Lock_unavailable] can only come from an acquisition that did not
+   wait. *)
+let test_lock_fibers_mode_refuses_another_process () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"1.0"
+  in
+  (match Eio_fs_unix.with_lock ~block:`Fibers lock (fun () -> ()) with
+  | () ->
+      Alcotest.fail "another process's hold was waited out rather than answered"
   | exception Eio_fs_unix.Lock_unavailable path ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   await_holder child
@@ -939,9 +996,7 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
   Alcotest.(check bool)
     "a file opened through the wrapper carries the host's descriptor" true
     (Option.is_some (Eio_unix.Resource.fd_opt file));
-  (match
-     Eio_fs_unix.with_lock ~block:false (wrapped / "lock") (fun () -> ())
-   with
+  (match Eio_fs_unix.with_lock ~block:`No (wrapped / "lock") (fun () -> ()) with
   | () ->
       Alcotest.fail
         "a wrapped rendezvous was locked while another process held its file"
@@ -1208,6 +1263,10 @@ let suite =
         test_lock_updates_contents_in_place;
       Alcotest.test_case "non-blocking lock reports unavailable" `Quick
         test_lock_non_blocking_unavailable;
+      Alcotest.test_case "a fibers-only lock queues behind a fiber" `Quick
+        test_lock_fibers_mode_queues_behind_a_fiber;
+      Alcotest.test_case "a fibers-only lock answers another process" `Quick
+        test_lock_fibers_mode_refuses_another_process;
       Alcotest.test_case "existing-only lock does not create" `Quick
         test_lock_existing_does_not_create;
       Alcotest.test_case "lock refuses a symlink at the lock path" `Quick

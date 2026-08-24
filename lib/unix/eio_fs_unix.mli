@@ -95,9 +95,9 @@ val sync_file : _ Eio.File.rw -> unit
     @raise Unix.Unix_error as [fsync]. *)
 
 exception Lock_unavailable of string
-(** Raised by {!with_lock} in non-blocking mode when the lock is held. The
-    string is the native path of the lock file, or the path as it prints itself
-    on a backend that has no native one. *)
+(** Raised by {!with_lock} when the lock is held and [block] says not to wait
+    for the holder. The string is the native path of the lock file, or the path
+    as it prints itself on a backend that has no native one. *)
 
 type Eio.Exn.Backend.t +=
   | Not_a_lock_file of string
@@ -106,7 +106,7 @@ type Eio.Exn.Backend.t +=
             path as it prints itself on a backend that has no native one. *)
 
 val with_lock :
-  ?block:bool ->
+  ?block:[ `Yes | `No | `Fibers ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
   _ Eio.Path.t ->
@@ -125,8 +125,16 @@ val with_lock :
     the advisory lock is held. This is useful for recording holder diagnostics
     such as a process identifier.
 
-    If [block] is [false] (default [true]), an immediately unavailable lock
-    raises {!Lock_unavailable}.
+    [block] says what a lock another caller already holds does. [`Yes] (the
+    default) waits for it. [`No] raises {!Lock_unavailable} rather than waiting.
+    [`Fibers] waits for a fiber of this process and raises {!Lock_unavailable}
+    for a hold taken by any other process: the fibers of one program are its own
+    cooperating writers, so one that finds another inside wants its turn --
+    refusing it fails work the program itself asked for and could have waited
+    out -- while how long another process holds the rendezvous is not this
+    program's to bound, and a command-line tool would rather name the busy
+    resource to its operator than wait on a holder that may be wedged, with
+    nothing printed and no deadline.
 
     Locks are coordinated both between fibers in this process and between
     processes. The lock is always released when [fn] returns or raises. Between
@@ -143,10 +151,11 @@ val with_lock :
     in would be the order their opens came back in. Being the name's, the queue
     is the name's too -- two names for one file (a hard link, another spelling)
     take one lock but wait in two queues, and which of the two is served first
-    is not ordered. A [block:false] acquisition waits its turn to enter, which
-    is the length of another caller's open and not of any critical section, and
-    then answers about the lock itself. Nothing orders the processes contending
-    for the operating-system lock; that order is the platform's.
+    is not ordered. An acquisition that answers rather than waits still waits
+    its turn to enter, which is the length of another caller's open and not of
+    any critical section, and then answers about the lock itself. Nothing orders
+    the processes contending for the operating-system lock; that order is the
+    platform's.
 
     The record lock is taken on a Unix file descriptor, and a backend that is
     not the host filesystem hands out files carrying none. Such a rendezvous is

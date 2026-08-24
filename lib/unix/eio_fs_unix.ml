@@ -335,9 +335,15 @@ let hold ~name ~opened ~contents ~file path fn =
    but the whole of it. Any other backend is refused, since running under the
    mutex alone would put this caller in a critical section another process can
    be inside with nothing in either run to say so. *)
-let with_lock ?(block = true)
+let with_lock ?(block : [ `Yes | `No | `Fibers ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
+  let block =
+    match block with
+    | `Yes -> true
+    | `No -> false
+    | `Fibers -> failwith "TODO: implement Eio_fs_unix.with_lock ~block:`Fibers"
+  in
   let name = lock_name path in
   Eio.Switch.run @@ fun sw ->
   let file, (opened : Eio.File.Stat.t) =
