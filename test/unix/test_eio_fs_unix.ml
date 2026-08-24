@@ -280,25 +280,39 @@ let test_sync_file_takes_the_descriptor_when_nothing_is_registered () =
    filesystem it runs on. The crash wrapper's file carries the host's own
    descriptor, so a barrier that reached for it would be a real F_FULLFSYNC
    the model never recorded -- and [Drop_unsynced] would then drop the image
-   bytes the store was told had reached the platter. *)
+   bytes the store was told had reached the platter.
+
+   Two files take the same cut, and only one is barriered. The unbarriered one
+   is the control: it says the model still drops what no barrier covered, so
+   the barriered one surviving is the barrier being seen and not the model
+   having gone soft. Both entries are committed, the names being the metadata
+   journal's business, so what differs between the two is the data barrier
+   alone. *)
 let test_sync_file_under_the_crash_model_survives_the_cut () =
   with_real_dir @@ fun dir ->
   let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
   let wdir = Crash.wrap ctl dir in
-  Eio.Switch.run (fun sw ->
-      let file =
-        Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (wdir / "image")
-      in
-      Alcotest.(check bool)
-        "the wrapped file carries the host descriptor" true
-        (Option.is_some (Eio_unix.Resource.fd_opt file));
-      Eio.Flow.copy_string "payload" file;
-      Eio_fs_unix.sync_file file);
+  let write ~barrier name payload =
+    Eio.Switch.run @@ fun sw ->
+    let file =
+      Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (wdir / name)
+    in
+    Alcotest.(check bool)
+      "the wrapped file carries the host descriptor" true
+      (Option.is_some (Eio_unix.Resource.fd_opt file));
+    Eio.Flow.copy_string payload file;
+    if barrier then Eio_fs_unix.sync_file file
+  in
+  write ~barrier:true "barriered" "payload";
+  write ~barrier:false "unbarriered" "payload";
   Eio_fs_unix.sync_dir wdir;
   let post = Crash.post_crash ctl in
   Alcotest.(check string)
     "the barriered bytes survived the cut" "payload"
-    (Eio.Path.load (post / "image"))
+    (Eio.Path.load (post / "barriered"));
+  Alcotest.(check string)
+    "and the unbarriered bytes did not" ""
+    (Eio.Path.load (post / "unbarriered"))
 
 (* A plain POSIX file registers nothing, so the barrier is its descriptor's
    own -- F_FULLFSYNC on Darwin. Power-cut durability is not unit-testable;
