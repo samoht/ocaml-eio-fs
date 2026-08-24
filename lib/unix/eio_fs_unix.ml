@@ -368,3 +368,60 @@ let with_lock ?(block : [ `Yes | `No | `Fibers ] = `Yes)
           "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
            descriptor and its backend registers no Eio_fs_sync.Process_local"
           name
+
+(* ---- the rendezvous, as a section a backend-free component runs inside ----
+
+   A component that keeps files but cannot name a lock library takes its
+   critical section as an [Eio_fs_sync.Lock.t] instead, and this is that
+   section over a rendezvous of this filesystem's. Being the one place that
+   knows both vocabularies, it is where every way [with_lock] can refuse
+   becomes [Eio_fs_sync.Lock.Unavailable] naming what refused: the component on
+   the other side has no other exception it can catch, and one travelling out
+   through an interface whose type promises a result is the exclusion failing
+   silently from that interface's point of view.
+
+   The translation covers only what is raised before the section's body begins.
+   What the body raises is the component's own and travels out as the body
+   raised it: a write that failed under a lock the caller was granted is not
+   the lock refusing, and reporting it as one would send an operator looking
+   for a holder that is not there. *)
+module Rendezvous = struct
+  (* [with_lock] takes a path at whatever capability type the caller holds, so
+     the rendezvous is captured in the closure rather than carried as a value.
+     The explicit [ 'a. ] is what keeps the packed section polymorphic in its
+     result, as [Eio_fs_sync.Lock.Make] requires. *)
+  type t = { enter : 'a. (unit -> 'a) -> 'a }
+
+  let use t f = t.enter f
+end
+
+module Section = Eio_fs_sync.Lock.Make (Rendezvous)
+
+let fail_unavailable fmt =
+  Fmt.kstr (fun m -> raise (Eio_fs_sync.Lock.Unavailable m)) fmt
+
+let enter_lock ?block ?create ?contents path f =
+  let began = ref false in
+  let section () =
+    began := true;
+    f ()
+  in
+  match with_lock ?block ?create ?contents path section with
+  | answer -> answer
+  | exception Lock_unavailable name when not !began ->
+      fail_unavailable "%s is held by another process" name
+  | exception
+      Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied (Not_a_lock_file name)), _)
+    when not !began ->
+      fail_unavailable "%s is not the lock's own regular file" name
+  | exception (Eio.Io _ as e) when not !began ->
+      fail_unavailable "%s cannot be locked: %s" (lock_name path)
+        (Printexc.to_string e)
+  | exception Unix.Unix_error (e, _, _) when not !began ->
+      fail_unavailable "%s cannot be locked: %s" (lock_name path)
+        (Unix.error_message e)
+  | exception Invalid_argument m when not !began -> fail_unavailable "%s" m
+
+let lock_section ?block ?create ?contents path =
+  Section.v
+    { Rendezvous.enter = (fun f -> enter_lock ?block ?create ?contents path f) }

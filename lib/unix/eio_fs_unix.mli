@@ -197,3 +197,39 @@ val with_lock :
       operating-system lock to take on it, and nothing says the fiber lock left
       excludes every opener. The message names the path.
     @raise Unix.Unix_error as [lockf]. *)
+
+val lock_section :
+  ?block:[ `Yes | `No | `Fibers ] ->
+  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+  ?contents:string ->
+  _ Eio.Path.t ->
+  Eio_fs_sync.Lock.t
+(** [lock_section path] is {!with_lock} over the rendezvous [path] as the
+    critical section a component takes from its deployment
+    ({!Eio_fs_sync.Lock.t}): the host answer to that argument, where the
+    process-local one is a mutex the program's writers share.
+
+    [block], [create] and [contents] are {!with_lock}'s and mean the same thing.
+    [block] is worth naming: a component that reaches its section once per
+    operation and can report a missed turn wants [`Fibers], which waits for a
+    fiber of this program and answers about a hold another process took, rather
+    than the default [`Yes] that waits for either.
+
+    Every way {!with_lock} can refuse the rendezvous -- a hold [block] says not
+    to wait for, a name that is not the lock's own regular file, an I/O failure
+    reaching it, a backend with neither a descriptor nor
+    {!Eio_fs_sync.Process_local} -- is raised as
+    {!Eio_fs_sync.Lock.Unavailable}, naming what refused. That translation is
+    the reason to build the section here rather than at the component: the
+    component is backend-free by design, so this library's exceptions are ones
+    it cannot name, and an exception it cannot catch would travel out through an
+    interface whose type promises a result.
+
+    What the section's own body raises is untouched and travels out as the body
+    raised it. A failure under a lock the caller was granted is not the lock
+    refusing, and reporting it as one would send an operator looking for a
+    holder that is not there.
+
+    @raise Eio_fs_sync.Lock.Unavailable
+      from {!Eio_fs_sync.Lock.use}, never from [lock_section] itself: nothing is
+      opened or locked until the section is entered. *)

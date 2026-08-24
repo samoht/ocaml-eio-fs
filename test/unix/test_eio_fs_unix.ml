@@ -1157,6 +1157,114 @@ let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
     "the critical section did not run over the held file" false !ran;
   await_holder child
 
+(* ---- the rendezvous as a section a backend-free component runs inside ----
+
+   [lock_section] hands the lock over as an [Eio_fs_sync.Lock.t], which is the
+   argument a component takes when what exclusion its files admit is the
+   deployment's to say. What it owes that component is the lock's exclusion
+   unchanged, and a refusal in a vocabulary the component can name. *)
+let test_section_excludes_fibers_over_the_rendezvous () =
+  with_real_dir @@ fun dir ->
+  let section = Eio_fs_unix.lock_section ~block:`Fibers (dir / "lock") in
+  let inside = ref 0 and most = ref 0 in
+  let enter () =
+    Eio_fs_sync.Lock.use section (fun () ->
+        incr inside;
+        most := max !most !inside;
+        Eio.Fiber.yield ();
+        decr inside)
+  in
+  Eio.Fiber.both enter enter;
+  Alcotest.(check int) "never two fibers in one section" 1 !most;
+  (* One section value serves sections at every result type, the packed lock
+     inheriting the caller's polymorphism rather than fixing it at the first
+     use. *)
+  Alcotest.(check string)
+    "and answers at another result type" "answer"
+    (Eio_fs_sync.Lock.use section (fun () -> "answer"))
+
+(* A hold another process took is what a component cannot see and cannot name.
+   It reaches the component as [Unavailable], carrying the rendezvous, so an
+   interface whose type promises a result has something to put in it. *)
+let test_section_refusal_reaches_the_component_as_unavailable () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"1.0"
+  in
+  let section = Eio_fs_unix.lock_section ~block:`Fibers lock in
+  let ran = ref false in
+  (match Eio_fs_sync.Lock.use section (fun () -> ran := true) with
+  | () ->
+      Alcotest.fail "another process's hold was waited out rather than answered"
+  | exception Eio_fs_sync.Lock.Unavailable what ->
+      Alcotest.(check bool)
+        "the refusal names the rendezvous" true
+        (mentions ~needle:(Eio.Path.native_exn lock) what);
+      Alcotest.(check bool)
+        "and says another process holds it" true
+        (mentions ~needle:"another process" what));
+  Alcotest.(check bool) "the section did not run" false !ran;
+  await_holder child
+
+(* A name that is not the lock's own regular file is the other refusal, and it
+   is not the ordinary busy one: a component told "held by another process"
+   would wait and retry for ever over a planted directory. *)
+let test_section_refuses_a_name_that_is_not_the_lock_file () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "lock");
+  let section = Eio_fs_unix.lock_section (dir / "lock") in
+  match Eio_fs_sync.Lock.use section (fun () -> ()) with
+  | () -> Alcotest.fail "a directory was locked as a rendezvous"
+  | exception Eio_fs_sync.Lock.Unavailable what ->
+      Alcotest.(check bool)
+        "the refusal names the rendezvous" true
+        (mentions ~needle:(Eio.Path.native_exn (dir / "lock")) what);
+      Alcotest.(check bool)
+        "and says it is not the lock's own file" true
+        (mentions ~needle:"not the lock's own regular file" what)
+
+(* Only a refusal to enter is translated. [Invalid_argument] is in the set the
+   acquisition raises, so a body raising it is the case that separates the two:
+   it must travel out as the body raised it, or a component would report a
+   failure of its own as the section being unavailable. *)
+let test_section_lets_the_body_s_own_raise_out () =
+  with_real_dir @@ fun dir ->
+  let section = Eio_fs_unix.lock_section (dir / "lock") in
+  (match
+     Eio_fs_sync.Lock.use section (fun () -> invalid_arg "the body's own")
+   with
+  | () -> Alcotest.fail "the section swallowed a raise"
+  | exception Eio_fs_sync.Lock.Unavailable what ->
+      Alcotest.failf "the body's raise was reported as a refusal: %s" what
+  | exception Invalid_argument m ->
+      Alcotest.(check string) "raised as thrown" "the body's own" m);
+  Alcotest.(check int)
+    "and the section is still there" 7
+    (Eio_fs_sync.Lock.use section (fun () -> 7))
+
+(* A rendezvous carrying no descriptor over a backend that does not declare
+   itself process-local offers no exclusion between processes at all, and
+   [with_lock] refuses it with [Invalid_argument]. That refusal is an
+   acquisition's, so it reaches the component as [Unavailable] like any other:
+   an exception the component cannot catch would leave the wiring error to
+   surface as a crash somewhere past the interface that promised a result. *)
+let test_section_refuses_a_wrapper_that_hides_a_host_descriptor () =
+  with_real_dir @@ fun dir ->
+  let hidden = hide_descriptors dir in
+  let section = Eio_fs_unix.lock_section (hidden / "lock") in
+  let ran = ref false in
+  (match Eio_fs_sync.Lock.use section (fun () -> ran := true) with
+  | () -> Alcotest.fail "a rendezvous with no descriptor was locked"
+  | exception Eio_fs_sync.Lock.Unavailable what ->
+      Alcotest.(check bool)
+        "the refusal names the interface that refused" true
+        (mentions ~needle:"Eio_fs_unix.with_lock" what));
+  Alcotest.(check bool) "the section did not run" false !ran
+
 let test_path_usage_counts_allocated_tree_without_following_links () =
   with_real_dir @@ fun dir ->
   Eio.Path.mkdir ~perm:0o755 (dir / "sub");
@@ -1297,6 +1405,18 @@ let suite =
         `Quick test_lock_contents_survive_a_policy_that_keeps_them;
       Alcotest.test_case "lock refuses a wrapper that hides a host descriptor"
         `Quick test_lock_refuses_a_wrapper_that_hides_a_host_descriptor;
+      Alcotest.test_case "a lock section excludes fibers over the rendezvous"
+        `Quick test_section_excludes_fibers_over_the_rendezvous;
+      Alcotest.test_case "a lock section's refusal is Unavailable" `Quick
+        test_section_refusal_reaches_the_component_as_unavailable;
+      Alcotest.test_case
+        "a lock section refuses a name that is not the lock file" `Quick
+        test_section_refuses_a_name_that_is_not_the_lock_file;
+      Alcotest.test_case "a lock section lets the body's own raise out" `Quick
+        test_section_lets_the_body_s_own_raise_out;
+      Alcotest.test_case
+        "a lock section refuses a wrapper that hides a descriptor" `Quick
+        test_section_refuses_a_wrapper_that_hides_a_host_descriptor;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick
         test_path_usage_counts_allocated_tree_without_following_links;
     ] )
