@@ -211,3 +211,9 @@ let publish ~config ?tmp:requested_tmp path write =
      cleanup ();
      raise e);
   result
+
+(* The critical section a caller supplies is the other half of what a store
+   needs from its deployment: the barrier above says how a write reaches stable
+   storage, the section says what keeps two of them out of one another's
+   read-modify-write. Neither is the store's to decide. *)
+module Lock = Lock

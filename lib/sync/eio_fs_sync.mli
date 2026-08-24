@@ -27,9 +27,12 @@
 
     {!Process_local} is the other thing a backend declares here: whether any
     opener of its files can exist outside this process, which is what tells an
-    in-process exclusion apart from a stand-in for a real one. This library
-    depends on nothing but eio, so pure Eio adapters that cross-compile to
-    unikernels link it freely. *)
+    in-process exclusion apart from a stand-in for a real one. {!Lock} is the
+    exclusion itself, as the caller hands it over: the section a store runs a
+    read-modify-write inside, a record lock where an outside opener exists and a
+    mutex between this process's fibers where none can. This library depends on
+    nothing but eio, so pure Eio adapters that cross-compile to unikernels link
+    it freely. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
@@ -159,3 +162,9 @@ val publish :
     no fsync, no barrier -- for a store that deliberately trades the power-cut
     window for write speed, as git does for loose objects; say why at the call
     site. *)
+
+module Lock = Lock
+(** The critical section a caller supplies. The barrier above says how a write
+    reaches stable storage; the section says what keeps two writers out of one
+    another's read-modify-write, and, like the barrier, it is the deployment's
+    to name rather than the store's. *)
