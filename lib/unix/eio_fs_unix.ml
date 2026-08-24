@@ -338,11 +338,12 @@ let hold ~name ~opened ~contents ~file path fn =
 let with_lock ?(block : [ `Yes | `No | `Fibers ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
-  let block =
-    match block with
-    | `Yes -> true
-    | `No -> false
-    | `Fibers -> failwith "TODO: implement Eio_fs_unix.with_lock ~block:`Fibers"
+  (* [block] is answered per half, because each half is a different holder. The
+     mutex is held by a fiber of this program, which [`Fibers] waits for; the
+     record lock is held by another process, which it answers about. *)
+  let block_fibers = match block with `Yes | `Fibers -> true | `No -> false in
+  let block_processes =
+    match block with `Yes -> true | `No | `Fibers -> false
   in
   let name = lock_name path in
   Eio.Switch.run @@ fun sw ->
@@ -353,11 +354,11 @@ let with_lock ?(block : [ `Yes | `No | `Fibers ] = `Yes)
     (file, Eio.File.stat file)
   in
   use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
-  use_mutex ~block ~path:name mutex @@ fun () ->
+  use_mutex ~block:block_fibers ~path:name mutex @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~block ~path:name fd @@ fun () ->
+      use_os_lock ~block:block_processes ~path:name fd @@ fun () ->
       hold ~name ~opened ~contents ~file path fn
   | None ->
       if Eio_fs_sync.is_process_local (fst path) then
