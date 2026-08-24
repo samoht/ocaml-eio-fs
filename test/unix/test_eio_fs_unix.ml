@@ -168,6 +168,126 @@ let test_full_fsync_surfaces_errors () =
   | () -> Alcotest.fail "full_fsync accepted a closed descriptor"
   | exception Unix.Unix_error (Unix.EBADF, _, _) -> ()
 
+(* ---- the file barrier asks the registration before the descriptor ----
+
+   A wrapper that models power loss hands out the base's own descriptor, so a
+   store can take a record lock on the file it is publishing or hand it to a
+   launcher. That descriptor is the operations the operating system offers on
+   an open file and not a second way past the wrapper: an fsync issued on it
+   is a barrier the wrapper never saw, so the model records none and drops the
+   bytes at the cut while the store was told they were durable. Reaching for
+   the descriptor before asking the registration is therefore not a shortcut
+   to the strongest barrier, it is the defect.
+
+   Which descriptor an fsync reached is no more observable from a program than
+   which inode a directory barrier reached, so the ordering is pinned the way
+   it can be: this file registers [File_sync] and carries a descriptor of this
+   process that is already closed, which [Eio_unix.Fd.use_exn] refuses.
+   Answering through the registration returns; reaching for the descriptor
+   raises. *)
+module Registered_file = struct
+  type t = {
+    base : Eio.File.rw_ty Eio.Resource.t;
+    fd : Eio_unix.Fd.t;
+    calls : int ref;
+  }
+
+  let read_methods = []
+  let single_read t buf = Eio.Flow.single_read t.base buf
+  let pread t ~file_offset bufs = Eio.File.pread t.base ~file_offset bufs
+  let stat t = Eio.File.stat t.base
+  let seek t off cmd = Eio.File.seek t.base off cmd
+  let close t = Eio.Resource.close t.base
+  let single_write t bufs = Eio.Flow.single_write t.base bufs
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+
+  let pwrite t ~file_offset bufs =
+    Eio.File.pwrite_single t.base ~file_offset bufs
+
+  let sync t = Eio.File.sync t.base
+  let truncate t len = Eio.File.truncate t.base len
+end
+
+let registered_file ~sw base =
+  let fd =
+    Eio_unix.Fd.of_unix ~sw ~close_unix:true
+      (Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0)
+  in
+  Eio_unix.Fd.close fd;
+  let state = Registered_file.{ base; fd; calls = ref 0 } in
+  let file : Eio.File.rw_ty Eio.Resource.t =
+    Eio.Resource.T
+      ( state,
+        Eio.Resource.handler
+          ([
+             Eio.Resource.H
+               ( Eio_fs_sync.File_sync,
+                 fun (t : Registered_file.t) -> incr t.calls );
+             Eio.Resource.H
+               (Eio_unix.Resource.T, fun (t : Registered_file.t) -> t.fd);
+           ]
+          @ Eio.Resource.bindings (Eio.File.Pi.rw (module Registered_file))) )
+  in
+  (file, state)
+
+let test_sync_file_asks_the_registration_before_the_descriptor () =
+  with_real_dir @@ fun dir ->
+  Eio.Switch.run @@ fun sw ->
+  let base = Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (dir / "f") in
+  let file, state = registered_file ~sw base in
+  Alcotest.(check bool)
+    "the file carries a descriptor for the barrier to find" true
+    (Option.is_some (Eio_unix.Resource.fd_opt file));
+  (match Eio_fs_unix.sync_file file with
+  | () -> ()
+  | exception e ->
+      Alcotest.failf
+        "the barrier reached past the registration for the descriptor: %s"
+        (Printexc.to_string e));
+  Alcotest.(check int)
+    "the registration answered the barrier" 1
+    !(state.Registered_file.calls)
+
+(* The same ordering in the shape a store publishes in, over the real
+   filesystem it runs on. The crash wrapper's file carries the host's own
+   descriptor, so a barrier that reached for it would be a real F_FULLFSYNC
+   the model never recorded -- and [Drop_unsynced] would then drop the image
+   bytes the store was told had reached the platter. *)
+let test_sync_file_under_the_crash_model_survives_the_cut () =
+  with_real_dir @@ fun dir ->
+  let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
+  let wdir = Crash.wrap ctl dir in
+  Eio.Switch.run (fun sw ->
+      let file =
+        Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (wdir / "image")
+      in
+      Alcotest.(check bool)
+        "the wrapped file carries the host descriptor" true
+        (Option.is_some (Eio_unix.Resource.fd_opt file));
+      Eio.Flow.copy_string "payload" file;
+      Eio_fs_unix.sync_file file);
+  Eio_fs_unix.sync_dir wdir;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the barriered bytes survived the cut" "payload"
+    (Eio.Path.load (post / "image"))
+
+(* A plain POSIX file registers nothing, so the barrier is its descriptor's
+   own -- F_FULLFSYNC on Darwin. Power-cut durability is not unit-testable;
+   what is pinned here is that the barrier is issued and the file reads back
+   whole after it, the file half of [test_sync_dir_after_rename]. *)
+let test_sync_file_on_a_plain_posix_file () =
+  with_real_dir @@ fun dir ->
+  Eio.Switch.run (fun sw ->
+      let file =
+        Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (dir / "f")
+      in
+      Eio.Flow.copy_string "payload" file;
+      Eio_fs_unix.sync_file file);
+  Alcotest.(check string)
+    "the file reads back whole after its barrier" "payload"
+    (Eio.Path.load (dir / "f"))
+
 let test_statvfs_reports_raw_block_capacity () =
   with_real_dir @@ fun dir ->
   let usage = Eio_fs_unix.statvfs dir in
@@ -1019,6 +1139,12 @@ let suite =
         test_sync_dir_barriers_the_held_directory;
       Alcotest.test_case "barrier refuses a name a link took" `Quick
         test_sync_dir_refuses_a_name_a_link_took;
+      Alcotest.test_case "file barrier asks the registration first" `Quick
+        test_sync_file_asks_the_registration_before_the_descriptor;
+      Alcotest.test_case "file barrier survives a modelled cut" `Quick
+        test_sync_file_under_the_crash_model_survives_the_cut;
+      Alcotest.test_case "file barrier on a plain POSIX file" `Quick
+        test_sync_file_on_a_plain_posix_file;
       Alcotest.test_case "full_fsync on a file" `Quick test_full_fsync_file;
       Alcotest.test_case "full_fsync surfaces errors" `Quick
         test_full_fsync_surfaces_errors;

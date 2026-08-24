@@ -58,7 +58,7 @@ let statvfs path =
    barrier, so it takes the portable one, which syncs the handle itself and
    fails loudly if the backend cannot do that either. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
-  match Eio_fs_sync.find res with
+  match Eio_fs_sync.dir_barrier res with
   | Some barrier -> barrier ~path
   | None -> (
       Eio.Switch.run @@ fun sw ->
@@ -69,6 +69,8 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio_unix.Fd.use_exn "eio-fs-sync-dir" fd @@ fun fd ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
           full_fsync fd)
+
+let sync_file _ = failwith "TODO: implement Eio_fs_unix.sync_file"
 
 exception Lock_unavailable of string
 

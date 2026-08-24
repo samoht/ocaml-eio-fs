@@ -2,12 +2,14 @@
     locking, and filesystem capacity.
 
     The portable machinery lives in {!Eio_fs_sync}: backends with their own
-    barrier semantics register {!Eio_fs_sync.Dir_sync}, and a plain POSIX
-    directory is fsynced through its own handle. This facade is for programs
-    that link unix anyway and want the strongest barrier the platform offers: on
-    Darwin {!full_fsync} (F_FULLFSYNC, through to the platter) where the
-    portable route's fsync only reaches the drive's cache. Elsewhere the two are
-    the same barrier.
+    barrier semantics register {!Eio_fs_sync.Dir_sync} or
+    {!Eio_fs_sync.File_sync}, and a plain POSIX directory or file is fsynced
+    through its own handle. This facade is for programs that link unix anyway
+    and want the strongest barrier the platform offers: on Darwin {!full_fsync}
+    (F_FULLFSYNC, through to the platter) where the portable route's fsync only
+    reaches the drive's cache. Elsewhere the two are the same barrier. Both
+    halves of a commit protocol's durability are here, {!sync_dir} for a
+    directory's entries and {!sync_file} for a file's data.
 
     The other two operations are here for the reason the barrier's upgrade is:
     what they need is the host. {!with_lock} holds an exclusive advisory lock
@@ -64,6 +66,32 @@ val sync_dir : _ Eio.Path.t -> unit
     wrote it.
 
     @raise Eio.Io if [dir] cannot be opened for its barrier.
+    @raise Unix.Unix_error as [fsync]. *)
+
+val sync_file : _ Eio.File.rw -> unit
+(** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
+    issues over the bytes it wrote, before the rename that publishes them. A
+    backend that registers its own barrier ({!Eio_fs_sync.File_sync}) answers
+    through it -- a crash-model wrapper commits that file's data journal -- and
+    a plain POSIX file is {!full_fsync}ed on the descriptor it carries, which on
+    Darwin reaches the platter where [Eio.File.sync] stops at the drive's cache.
+
+    The registration is asked before the descriptor, and that order is what the
+    entry point is for. A descriptor a wrapper carries over is the operations
+    the operating system offers on the open file, not a second way past the
+    wrapper: a barrier taken on it is one the wrapper never saw, so a model of
+    power loss records none and drops at the cut the bytes the caller was told
+    had reached the platter. Reaching for the descriptor first therefore makes
+    the barrier invisible to exactly the wrapper written to observe it, while
+    leaving every real filesystem looking correct.
+
+    A file that registers no barrier and carries no descriptor takes the
+    portable one ({!Eio_fs_sync.sync_file}), which is the file's own sync.
+
+    The barrier is made off the calling fiber's thread, so waiting for the
+    platter suspends only that fiber and not the other fibers of its domain. A
+    registered barrier answers on the calling fiber, as its backend wrote it.
+
     @raise Unix.Unix_error as [fsync]. *)
 
 exception Lock_unavailable of string

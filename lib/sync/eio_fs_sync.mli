@@ -9,6 +9,16 @@
     block-device filesystem its flush. A plain POSIX directory needs no
     registration: it is opened read-only and its handle fsynced.
 
+    The bytes that entry names have a barrier of their own, {!sync_file}, and it
+    dispatches the same way: a backend registers {!File_sync}, a crash-model
+    wrapper committing that file's data journal so a model of power loss sees
+    the barrier the protocol issued. A plain POSIX file needs no registration
+    either, and neither does the in-memory backend, for a reason the directory
+    half did not have: a file's own {!Eio.File.sync} already is its barrier,
+    where a directory's had to be reached by opening the directory read-only and
+    fsyncing that handle. The registration is there so a wrapper can answer for
+    what its base would do, not because the fallback is wrong.
+
     {!publish} is that protocol itself, written once so every store commits the
     same way: contents streamed into a temporary, the temporary synced, renamed
     over the target, and the directory holding the target's entry barriered --
@@ -27,8 +37,8 @@ type (_, _, _) Eio.Resource.pi +=
             handler: make the entries of the directory at [path] (relative to
             the resource, as for every DIR operation) durable. *)
 
-val find : 'a Eio.Resource.t -> (path:string -> unit) option
-(** [find res] is the barrier [res] registers, if any. *)
+val dir_barrier : 'a Eio.Resource.t -> (path:string -> unit) option
+(** [dir_barrier res] is the directory barrier [res] registers, if any. *)
 
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
@@ -60,6 +70,31 @@ val sync_parent : _ Eio.Path.t -> unit
     there is nothing above it a confined path may reach for.
 
     @raise Eio.Io as {!sync_dir}, on the directory the barrier lands on. *)
+
+type (_, _, _) Eio.Resource.pi +=
+  | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
+        (** The operation a file-capable backend registers in its resource
+            handler: make this file's data durable. A file is itself the
+            resource, so the operation carries no name, where {!Dir_sync} takes
+            the [~path] a directory resource is joined with. *)
+
+val file_barrier : 'a Eio.Resource.t -> (unit -> unit) option
+(** [file_barrier res] is the file barrier [res] registers, if any. *)
+
+val sync_file : _ Eio.File.rw -> unit
+(** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
+    issues over the bytes it wrote, before the rename that publishes them.
+    Without it a power cut can leave the published entry naming bytes that never
+    reached stable storage. A backend that registers {!File_sync} answers
+    through it; otherwise the barrier is {!Eio.File.sync}, which is what a plain
+    POSIX file's barrier already is. [Eio_fs_unix.sync_file] upgrades that
+    fallback to platter strength for programs that can link unix.
+
+    A declared barrier is answered whole, never alongside the file's own sync: a
+    backend that registers one owns its semantics, and syncing behind it would
+    hand a wrapper that models power loss a barrier it never recorded.
+
+    @raise Eio.Io as {!Eio.File.sync}, or as the registered barrier raises. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Process_local : ('t, 't -> bool, [> `Process_local ]) Eio.Resource.pi

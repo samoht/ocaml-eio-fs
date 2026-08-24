@@ -12,7 +12,7 @@
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
 
-let find (Eio.Resource.T (v, ops)) =
+let dir_barrier (Eio.Resource.T (v, ops)) =
   Option.map (fun f -> f v) (Eio.Resource.get_opt ops Dir_sync)
 
 (* A directory handle that cannot sync is a wiring error, loudly: silence
@@ -26,7 +26,7 @@ let fsync_handle (Eio.Resource.T (v, ops)) =
          register a Dir_sync barrier on the directory resource"
 
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
-  match find res with
+  match dir_barrier res with
   | Some barrier -> barrier ~path
   | None -> (
       Eio.Switch.run @@ fun sw ->
@@ -48,6 +48,23 @@ let sync_parent p =
   match Eio.Path.split p with
   | Some (parent, _) -> sync_dir parent
   | None -> sync_dir p
+
+(* The file-data barrier: the other half of what a commit protocol makes
+   durable, the bytes the published entry names. A file is itself the resource,
+   so the operation a backend registers takes no name where the directory's
+   takes a [~path]. A backend that registers nothing keeps [Eio.File.sync],
+   which is the barrier a plain POSIX file already has; the registration is
+   there so a wrapper -- a crash model committing this file's data journal --
+   can answer for what its base would do, not because the fallback is wrong. It
+   is answered whole: syncing the file behind a declared barrier would be a
+   barrier that wrapper never recorded. *)
+type (_, _, _) Eio.Resource.pi +=
+  | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
+
+let file_barrier (Eio.Resource.T (v, ops)) =
+  Option.map (fun f () -> f v) (Eio.Resource.get_opt ops File_sync)
+
+let sync_file _ = failwith "TODO: implement Eio_fs_sync.sync_file"
 
 (* What a backend admits about the openers of its files. A backend whose files
    live in this process's heap admits none outside it: there is no name another

@@ -217,6 +217,124 @@ let test_publish_durability_flag () =
     "non-durable publish lost" true
     (Eio.Path.kind ~follow:false Eio.Path.(post / "fast") = `Not_found)
 
+(* ---- the file-data barrier dispatches like the directory one ----
+
+   A commit protocol makes two things durable: the bytes it wrote and the
+   directory entry that names them. [sync_file] is the first half, and it
+   dispatches the way [sync_dir] does -- through the operation the backend
+   registers, [File_sync]. A file is itself the resource, so that operation
+   takes no name where the directory's takes a [~path].
+
+   The registration is what makes the barrier visible to a wrapper, and a
+   wrapper that models power loss has to see the barrier the protocol issued
+   or it drops data the protocol was told was durable. So it is answered
+   whole: a caller that also synced the file behind the registration would
+   hand that model a barrier it never recorded, which is the same defect from
+   the other end.
+
+   One wrapper pins both sides. It counts what the registration was asked and
+   what reached the file underneath it, so a barrier that answers in the wrong
+   place is a count in the wrong counter rather than a silent pass. *)
+module Counting_file = struct
+  type t = {
+    base : Eio.File.rw_ty Eio.Resource.t;
+    registered : int ref;  (** barriers answered through [File_sync]. *)
+    delegated : int ref;  (** barriers that reached the file's own sync. *)
+  }
+
+  let read_methods = []
+  let single_read t buf = Eio.Flow.single_read t.base buf
+  let pread t ~file_offset bufs = Eio.File.pread t.base ~file_offset bufs
+  let stat t = Eio.File.stat t.base
+  let seek t off cmd = Eio.File.seek t.base off cmd
+  let close t = Eio.Resource.close t.base
+  let single_write t bufs = Eio.Flow.single_write t.base bufs
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+
+  let pwrite t ~file_offset bufs =
+    Eio.File.pwrite_single t.base ~file_offset bufs
+
+  let sync t =
+    incr t.delegated;
+    Eio.File.sync t.base
+
+  let truncate t len = Eio.File.truncate t.base len
+end
+
+let counting_file ~register base =
+  let state = Counting_file.{ base; registered = ref 0; delegated = ref 0 } in
+  let registration =
+    if register then
+      [
+        Eio.Resource.H
+          (Eio_fs_sync.File_sync, fun (t : Counting_file.t) -> incr t.registered);
+      ]
+    else []
+  in
+  let file : Eio.File.rw_ty Eio.Resource.t =
+    Eio.Resource.T
+      ( state,
+        Eio.Resource.handler
+          (registration
+          @ Eio.Resource.bindings (Eio.File.Pi.rw (module Counting_file))) )
+  in
+  (file, state)
+
+let with_in_memory_file fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  fn (Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (env#fs / "f"))
+
+let test_sync_file_answers_through_the_registration () =
+  with_in_memory_file @@ fun base ->
+  let file, state = counting_file ~register:true base in
+  Eio_fs_sync.sync_file file;
+  Alcotest.(check int)
+    "the registration answered the barrier" 1
+    !(state.Counting_file.registered);
+  Alcotest.(check int)
+    "and nothing reached the file behind it" 0
+    !(state.Counting_file.delegated)
+
+(* A backend that registers nothing keeps the plain barrier: a file's own sync
+   is what makes its data durable, where a directory's had to be reached by
+   opening the directory read-only and fsyncing that handle. Silence is
+   therefore safe here, and the in-memory backend needs no registration of its
+   own -- its files' sync is already the no-op volatile storage deserves. *)
+let test_sync_file_without_a_registration_syncs_the_file () =
+  with_in_memory_file @@ fun base ->
+  let file, state = counting_file ~register:false base in
+  Eio_fs_sync.sync_file file;
+  Alcotest.(check int)
+    "the file's own sync is the barrier" 1
+    !(state.Counting_file.delegated)
+
+(* What the registration is for. Under the crash model a file's writes stay
+   un-synced until the model sees a barrier on that file, and [Drop_unsynced]
+   loses every un-synced write. Bytes barriered with [sync_file] must survive
+   the cut; had the barrier answered anywhere but through the registration the
+   model would have recorded none and the bytes would be gone. *)
+let test_sync_file_reaches_the_crash_model () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio.Switch.run (fun sw ->
+      let file =
+        Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (fs / "image")
+      in
+      Eio.Flow.copy_string "payload" file;
+      Eio_fs_sync.sync_file file);
+  (* The name the bytes live under is the metadata journal's business, as
+     fsync(2) divides them, so the entry takes the directory barrier. *)
+  Eio_fs_sync.sync_dir fs;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the barriered bytes survived the cut" "payload"
+    (Eio.Path.load Eio.Path.(post / "image"))
+
 let suite =
   ( "eio_fs_sync",
     [
@@ -243,4 +361,10 @@ let suite =
         test_publish_enforces_byte_limit;
       Alcotest.test_case "publish durability flag" `Quick
         test_publish_durability_flag;
+      Alcotest.test_case "file barrier answers through the registration" `Quick
+        test_sync_file_answers_through_the_registration;
+      Alcotest.test_case "file barrier without a registration syncs the file"
+        `Quick test_sync_file_without_a_registration_syncs_the_file;
+      Alcotest.test_case "file barrier reaches the crash model" `Quick
+        test_sync_file_reaches_the_crash_model;
     ] )
