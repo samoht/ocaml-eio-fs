@@ -142,7 +142,10 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     That descriptor is the operations the operating system offers on an open
     file, and not a way past the schedule: a read or write issued on it is not
-    an operation the schedule is consulted about. *)
+    an operation the schedule is consulted about. A file opened read-write also
+    registers {!Eio_fs_sync.File_sync}, so a barrier taken through
+    {!Eio_fs_sync.sync_file} reaches the schedule's own sync rather than the
+    carried descriptor, and a sync fault fires on it as on any other. *)
 
 (** A power-loss durability model layered over a base directory capability.
 
@@ -271,11 +274,15 @@ module Crash : sig
       file, and none of them enter the journal: a write issued on it is not a
       write the model saw and is not in the post-crash image, and a barrier
       issued on it is not the model's barrier -- a file's writes stay un-synced
-      until {!Eio.File.sync} through the wrapper. A crash rebuilds the whole
-      wrapped tree from the model, so a change made to that tree outside the
-      wrapper -- through a carried-over descriptor, by a child process, or by
-      native name -- is gone from the post-crash image whether or not the model
-      would have kept a change of its own. *)
+      until it is synced through the wrapper. Two calls reach it:
+      {!Eio.File.sync}, and {!Eio_fs_sync.sync_file}, which finds the
+      {!Eio_fs_sync.File_sync} operation a wrapped read-write file registers and
+      so commits this file's data rather than fsyncing the descriptor behind the
+      model's back. A crash rebuilds the whole wrapped tree from the model, so a
+      change made to that tree outside the wrapper -- through a carried-over
+      descriptor, by a child process, or by native name -- is gone from the
+      post-crash image whether or not the model would have kept a change of its
+      own. *)
 
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per

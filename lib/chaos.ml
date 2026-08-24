@@ -276,7 +276,11 @@ let close_resource r =
    A descriptor carried over is the operations the operating system offers on
    an open file, and not a second way past the wrapper: a write issued on it is
    not a write the wrapper saw, and a barrier issued on it is not the wrapper's
-   barrier.
+   barrier. So the wrapper registers [Eio_fs_sync.File_sync] as well, bound to
+   its own sync. A caller that wants the platform's strongest file barrier asks
+   that registration first and only reaches for the descriptor when a backend
+   declares none, which is how a barrier issued through [Eio_fs_sync.sync_file]
+   reaches the wrapper rather than going around it.
 
    Only a file opened read-write carries anything over. [Eio.File.Pi.rw]
    implements every interface that reads, writes, syncs or closes the file, so
@@ -306,6 +310,7 @@ let rw_over (type a s) (module X : Eio.File.Pi.WRITE with type t = s)
     ( bv,
       Eio.Resource.handler
         (Eio.Resource.bindings (Eio.File.Pi.rw (module Over))
+        @ [ Eio.Resource.H (Eio_fs_sync.File_sync, fun _ -> X.sync state) ]
         @ Eio.Resource.bindings bops) )
 
 (* {2 File wrappers} *)

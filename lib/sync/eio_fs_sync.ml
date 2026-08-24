@@ -64,7 +64,10 @@ type (_, _, _) Eio.Resource.pi +=
 let file_barrier (Eio.Resource.T (v, ops)) =
   Option.map (fun f () -> f v) (Eio.Resource.get_opt ops File_sync)
 
-let sync_file _ = failwith "TODO: implement Eio_fs_sync.sync_file"
+let sync_file file =
+  match file_barrier file with
+  | Some barrier -> barrier ()
+  | None -> Eio.File.sync file
 
 (* What a backend admits about the openers of its files. A backend whose files
    live in this process's heap admits none outside it: there is no name another
@@ -177,7 +180,7 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
             let result =
               write (bounded_sink ~max_bytes:config.max_bytes sink)
             in
-            if config.durable then Eio.File.sync file;
+            if config.durable then sync_file file;
             result)
       in
       (tmp, owned, cleanup, result)

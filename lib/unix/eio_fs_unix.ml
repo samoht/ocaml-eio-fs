@@ -70,7 +70,32 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
           full_fsync fd)
 
-let sync_file _ = failwith "TODO: implement Eio_fs_unix.sync_file"
+(* The file half of the same barrier, and the registration is asked before the
+   descriptor. That order is the whole of it: a descriptor a wrapper carries
+   over is the operations the operating system offers on the open file, not a
+   second way past the wrapper, so a barrier taken on it is one the wrapper
+   never saw -- a model of power loss records none and drops at the cut the
+   bytes the caller was told had reached the platter, while every real
+   filesystem still looks correct. Reaching for the descriptor first is
+   therefore not the stronger barrier, it is the barrier made invisible to
+   exactly the wrapper written to observe it.
+
+   A backend that declares nothing has its descriptor taken, and there the
+   platform barrier is the right one: on Darwin F_FULLFSYNC, through to the
+   platter, where [Eio.File.sync] stops at the drive's cache. As for the
+   directory barrier it runs on a system thread, a fiber's own thread carrying
+   the domain's scheduler. A file with neither a registration nor a descriptor
+   takes the portable barrier, which is its own sync. *)
+let sync_file file =
+  match Eio_fs_sync.file_barrier file with
+  | Some barrier -> barrier ()
+  | None -> (
+      match Eio_unix.Resource.fd_opt file with
+      | None -> Eio_fs_sync.sync_file file
+      | Some fd ->
+          Eio_unix.Fd.use_exn "eio-fs-sync-file" fd @@ fun fd ->
+          Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
+          full_fsync fd)
 
 exception Lock_unavailable of string
 
