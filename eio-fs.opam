@@ -19,7 +19,7 @@ bug-reports: "https://tangled.org/gazagnaire.org/ocaml-eio-fs/issues"
 depends: [
   "dune" {>= "3.21"}
   "ocaml" {>= "5.1"}
-  "eio"
+  "eio" {>= "1.5"}
   "fmt"
   "cstruct"
   "optint"

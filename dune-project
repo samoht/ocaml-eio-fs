@@ -30,7 +30,7 @@
    from the Eio filesystem interfaces.")
  (depends
   (ocaml (>= 5.1))
-  eio
+  (eio (>= 1.5))
   fmt
   cstruct
   optint

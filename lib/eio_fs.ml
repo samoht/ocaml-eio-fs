@@ -201,6 +201,10 @@ module Fs = struct
        against the process cwd -- so a barrier or lock taken "natively" on an
        in-memory directory would silently hit the real filesystem. *)
     let native _ _ = None
+
+    (* The in-memory tree names its entries the way the POSIX backend does,
+       so it splits and joins paths by the same syntax. *)
+    include Eio_utils.Posix_path
   end
 
   and Handler : sig
@@ -376,8 +380,8 @@ let run ?(cwd = "/") fn =
   Low_level.reset ();
   let o =
     object
-      method fs = ((Fs.fs, "") :> Eio.Fs.dir_ty Eio.Path.t)
-      method cwd = ((Fs.cwd, "") :> Eio.Fs.dir_ty Eio.Path.t)
+      method fs = (Eio.Path.of_dir Fs.fs :> Eio.Fs.dir_ty Eio.Path.t)
+      method cwd = (Eio.Path.of_dir Fs.cwd :> Eio.Fs.dir_ty Eio.Path.t)
     end
   in
   Eio.Fiber.with_binding Low_level.Directory.cwd cwd @@ fun () -> fn o

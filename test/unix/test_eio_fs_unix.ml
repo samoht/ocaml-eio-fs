@@ -684,6 +684,8 @@ module Plant_after_stat = struct
 
   let open_subtree _ ~sw:_ _ =
     failwith "Plant_after_stat: the lock opens no subtree"
+
+  include Eio_utils.Posix_path
 end
 
 let plant_after_stat ~link_to ((base, _) : Eio.Fs.dir_ty Eio.Path.t) =
@@ -931,6 +933,8 @@ module Slow_open = struct
   let native t path = Eio.Path.native (at t path)
   let pp f _ = Format.pp_print_string f "slow-open"
   let open_subtree _ ~sw:_ _ = failwith "Slow_open: the lock opens no subtree"
+
+  include Eio_utils.Posix_path
 end
 
 let slow_open ((base, path) : Eio.Fs.dir_ty Eio.Path.t) =
@@ -1114,6 +1118,8 @@ module Hide_descriptors = struct
 
   let open_subtree _ ~sw:_ _ =
     failwith "Hide_descriptors: the lock opens no subtree"
+
+  include Eio_utils.Posix_path
 end
 
 let hide_descriptors ((base, path) : Eio.Fs.dir_ty Eio.Path.t) :

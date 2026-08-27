@@ -3,6 +3,7 @@
  (libraries
   eio
   eio.mock
+  eio.utils
   eio.unix
   eio_main
   eio_fs
