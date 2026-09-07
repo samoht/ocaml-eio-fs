@@ -17,7 +17,10 @@
     between the fibers of this one, refusing anything that is not the lock's own
     regular file ({!Lock_unavailable}, {!Not_a_lock_file}). {!statvfs} reports
     the capacity of the filesystem a path is on, which is the number a cache
-    watermark or a free-space check is computed from. *)
+    watermark or a free-space check is computed from. {!seek_data}, {!seek_hole}
+    and {!extents} report which bytes of a file are allocated and which physical
+    pieces they are stored in, the questions [Unix] cannot ask about a sparse
+    file. *)
 
 val full_fsync : Unix.file_descr -> unit
 (** [full_fsync fd] pushes [fd]'s data through to stable storage. On Darwin it
@@ -30,18 +33,97 @@ val full_fsync : Unix.file_descr -> unit
 type statvfs = {
   block_size : int64;
   total_blocks : int64;
+  free_blocks : int64;
   available_blocks : int64;
 }
 (** Raw filesystem capacity returned by POSIX [statvfs]. Policy such as free
-    percentages and cache watermarks belongs in the OCaml caller. *)
+    percentages and cache watermarks belongs in the OCaml caller.
+
+    {!field-free_blocks} ([f_bfree]) and {!field-available_blocks} ([f_bavail])
+    are different numbers, and the difference is the reserve a filesystem keeps
+    for the privileged user. Both are here because the percentage [df] prints
+    needs both: used blocks are total minus free, and what an unprivileged
+    writer can still claim is available. A filesystem with nothing but its
+    reserve left is full from where that writer stands, and a caller holding
+    only {!field-available_blocks} cannot say so -- it would report the reserve
+    as headroom. The two are equal on a filesystem that keeps no reserve, APFS
+    among them. *)
 
 val statvfs : _ Eio.Path.t -> statvfs
-(** [statvfs path] reports the fragment size, total blocks and blocks available
-    to an unprivileged process on the filesystem holding [path]. The call is
-    made on a system thread, so it suspends only the calling fiber.
+(** [statvfs path] reports the fragment size, total blocks, free blocks and
+    blocks available to an unprivileged process on the filesystem holding
+    [path]. The call is made on a system thread, so it suspends only the calling
+    fiber.
 
     @raise Unix.Unix_error as POSIX [statvfs].
     @raise Invalid_argument if [path] has no native Unix representation. *)
+
+(** {2 The sparse map} *)
+
+val seek_data : Unix.file_descr -> int64 -> int64 option
+(** [seek_data fd offset] is the next offset at or after [offset] that starts
+    allocated data, and [None] when there is none: a file whose tail is a hole
+    answers so, and so does an offset at or past the end. This is
+    [lseek(SEEK_DATA)], which [Unix.lseek] has no whence for.
+
+    The offset is absolute and the call moves [fd]'s position as [lseek] does,
+    so a walk that keeps its own state may read and write through the same
+    descriptor between two queries without disturbing itself.
+
+    The call is made on a system thread, so it suspends only the calling fiber.
+
+    @raise Unix.Unix_error as [lseek]. *)
+
+val seek_hole : Unix.file_descr -> int64 -> int64 option
+(** [seek_hole fd offset] is {!val-seek_data}'s other half: the next offset at
+    or after [offset] that starts a hole, and [None] when there is none. This is
+    [lseek(SEEK_HOLE)].
+
+    @raise Unix.Unix_error as [lseek]. *)
+
+type extent = { logical : int64; physical : int64; length : int64 }
+(** One physical piece a file's bytes are stored in: [length] bytes of the file
+    starting at [logical] live at [physical] on the device.
+
+    A file's LOGICAL map and its PHYSICAL map are not the same count, and the
+    difference is what fragmentation means: a file written once, sequentially,
+    is a handful of large extents, while the same bytes written over months at
+    offsets an allocator picked can be in hundreds of thousands of pieces inside
+    a couple of allocated ranges. {!seek_data} and {!seek_hole} give the first
+    map; this gives the second. *)
+
+val extents :
+  Unix.file_descr -> offset:int64 -> length:int64 -> max:int -> extent list
+(** [extents fd ~offset ~length ~max] is the physical extents backing
+    [[offset], [offset + length])], in increasing logical order and contiguous
+    in logical space, at most [max] of them. This is [F_LOG2PHYS_EXT] on Darwin
+    and [FS_IOC_FIEMAP] on Linux, neither of which [Unix] binds and neither of
+    which has a portable spelling.
+
+    The answer stops at the first hole, at the end of the range, at [max], or at
+    bytes the filesystem has accepted but not yet placed. A walk therefore steps
+    its offset on past the last extent returned and asks again, and ends when
+    the answer is empty -- which is the same termination a hole gives. Two
+    answers adjacent both logically and physically are one extent this query
+    happened to split; merging them is the caller's, and so is any ceiling on
+    how far a walk goes.
+
+    [max] IS THE BATCH, AND IT IS WHY THIS TAKES ONE. The call runs on a system
+    thread so that walking a fragmented file does not hold the calling domain,
+    and that hop is not free: measured 2026-09-07 on macOS/arm64, a round trip
+    through [Eio_unix.run_in_systhread] costs 9.2 us against 0.31 us for the
+    same [lseek] made directly, a factor of thirty. One hop per extent would
+    therefore spend about 19 s of pure scheduling overhead over two million
+    extents and buy nothing; one hop per thousand spends 19 ms and frees the
+    domain for the rest. On Linux [max] is also the number of extents one
+    [ioctl] returns, so the batch saves the syscalls too.
+
+    @raise Invalid_argument
+      if [max] is not between 1 and 65536, or if [offset] or [length] is
+      negative. The upper bound is on the buffer the extents are collected in,
+      24 bytes each.
+    @raise Unix.Unix_error
+      as the platform call, and with [ENOSYS] on a platform that has neither. *)
 
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol

@@ -341,7 +341,210 @@ let test_statvfs_reports_raw_block_capacity () =
     (Int64.compare usage.total_blocks 0L > 0);
   Alcotest.(check bool)
     "available blocks do not exceed total" true
-    (Int64.compare usage.available_blocks usage.total_blocks <= 0)
+    (Int64.compare usage.available_blocks usage.total_blocks <= 0);
+  (* The four numbers are ordered, and the order is what says each field came
+     from its own member of the struct: available <= free <= total. It catches
+     a stub that drops a field or stores two in the wrong slots -- with one
+     exception, stated here rather than left for a reader to discover. On a
+     filesystem that keeps NO reserve for the privileged user, free and
+     available are equal, so this case cannot tell those two apart there. APFS
+     is such a filesystem: measured 2026-09-07, f_bfree and f_bavail are the
+     same number on it, from the kernel's own statfs as well as from statvfs.
+     So on macOS this case is positive-only about which of those two slots is
+     which; on a filesystem with a reserve it binds. *)
+  Alcotest.(check bool)
+    "free blocks are at least the available ones" true
+    (Int64.compare usage.free_blocks usage.available_blocks >= 0);
+  Alcotest.(check bool)
+    "free blocks do not exceed total" true
+    (Int64.compare usage.free_blocks usage.total_blocks <= 0)
+
+(* ---- the sparse map ----
+
+   A file with a hole in it, built by writing at two offsets far enough apart
+   that no filesystem allocates the span between them. Every assertion below
+   is about a granularity the filesystem chooses, so none of them names a byte
+   count: what is asserted is the ORDER of the answers and which of them
+   exist. *)
+
+(* Far enough apart that every filesystem this runs on leaves the span
+   between the two writes unallocated. It has to be said in bytes rather than
+   in blocks: measured 2026-09-07, APFS allocates a 1 MiB gap rather than
+   leaving a hole in it, so a span chosen from the block size alone gives a
+   file with no hole in it and a case that asserts nothing. Every case below
+   that needs the hole asserts it is there rather than assuming it. *)
+let hole_span = 64 * 1024 * 1024
+
+let with_sparse_file fn =
+  with_real_dir_env @@ fun env dir ->
+  let path = Eio.Path.native_exn (dir / "sparse.bin") in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let block = Bytes.make 4096 'x' in
+  let write_at off =
+    ignore (Unix.LargeFile.lseek fd (Int64.of_int off) Unix.SEEK_SET : int64);
+    let n = Unix.write fd block 0 (Bytes.length block) in
+    Alcotest.(check int) "the whole block was written" (Bytes.length block) n
+  in
+  write_at 0;
+  write_at hole_span;
+  Unix.fsync fd;
+  let size = Int64.of_int (hole_span + Bytes.length block) in
+  fn env fd ~size
+
+let some name = function
+  | Some v -> v
+  | None -> Alcotest.failf "%s answered None" name
+
+(* The offset the file's one hole starts at, asserted to be a real hole rather
+   than the end of the file: a filesystem that allocated the span would answer
+   the size here, and every case that walks the hole would then be walking
+   nothing. *)
+let hole_start fd ~size =
+  let start = some "seek_hole 0" (Eio_fs_unix.seek_hole fd 0L) in
+  Alcotest.(check bool)
+    "the filesystem left a hole between the two writes" true
+    (Int64.compare start 0L > 0 && Int64.compare start size < 0);
+  start
+
+let test_seek_data_and_hole_walk_the_file () =
+  with_sparse_file @@ fun _env fd ~size ->
+  let first_data = some "seek_data 0" (Eio_fs_unix.seek_data fd 0L) in
+  Alcotest.(check int64) "data starts at the first byte" 0L first_data;
+  let first_hole = hole_start fd ~size in
+  Alcotest.(check bool)
+    "the hole starts at or before the second write" true
+    (Int64.compare first_hole (Int64.of_int hole_span) <= 0);
+  let second_data =
+    some "seek_data in the hole" (Eio_fs_unix.seek_data fd first_hole)
+  in
+  Alcotest.(check bool)
+    "the next data starts at or before the second write" true
+    (Int64.compare second_data first_hole > 0
+    && Int64.compare second_data (Int64.of_int hole_span) <= 0);
+  (* Past the last byte there is no next answer, and that is an answer rather
+     than an error. *)
+  Alcotest.(check bool)
+    "no data past the end" true
+    (Option.is_none (Eio_fs_unix.seek_data fd size));
+  Alcotest.(check bool)
+    "no hole past the end" true
+    (Option.is_none (Eio_fs_unix.seek_hole fd size))
+
+let test_extents_report_the_physical_map () =
+  with_sparse_file @@ fun _env fd ~size:_ ->
+  let es = Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:16 in
+  Alcotest.(check bool) "the first block is backed" true (es <> []);
+  let e = List.hd es in
+  Alcotest.(check int64) "the first extent starts where asked" 0L e.logical;
+  Alcotest.(check bool)
+    "the extent has length" true
+    (Int64.compare e.length 0L > 0);
+  Alcotest.(check bool)
+    "the extent does not run past the range asked about" true
+    (Int64.compare (Int64.add e.logical e.length) 4096L <= 0);
+  (* The answers are in increasing logical order and do not overlap. *)
+  ignore
+    (List.fold_left
+       (fun previous (e : Eio_fs_unix.extent) ->
+         Alcotest.(check bool)
+           "extents come back in increasing logical order" true
+           (Int64.compare e.logical previous >= 0);
+         Int64.add e.logical e.length)
+       0L es
+      : int64)
+
+let test_extents_stop_at_a_hole () =
+  with_sparse_file @@ fun _env fd ~size ->
+  (* Inside the hole nothing is allocated, so there is nothing to say. An empty
+     answer is what ends a caller's walk, and it is the only thing that does:
+     the Darwin call SUCCEEDS over a hole and reports a device offset of -1
+     with the hole's own length, so a binding that reads the length alone
+     counts holes as physical pieces. *)
+  let start = hole_start fd ~size in
+  let es = Eio_fs_unix.extents fd ~offset:start ~length:4096L ~max:16 in
+  Alcotest.(check int) "no extents inside a hole" 0 (List.length es);
+  (* And a walk that starts before the hole stops AT it rather than crossing
+     it: every extent it reports lies wholly in the data before the hole. *)
+  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:64 in
+  Alcotest.(check bool)
+    "the walk reported the data before the hole" true (es <> []);
+  List.iter
+    (fun (e : Eio_fs_unix.extent) ->
+      Alcotest.(check bool)
+        "no extent crosses or follows the hole" true
+        (Int64.compare (Int64.add e.logical e.length) start <= 0);
+      Alcotest.(check bool)
+        "every extent has a device address" true
+        (Int64.compare e.physical 0L >= 0))
+    es
+
+let test_extents_honour_max () =
+  with_sparse_file @@ fun _env fd ~size ->
+  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:1 in
+  Alcotest.(check bool)
+    "at most one extent when one was asked for" true
+    (List.length es <= 1)
+
+let test_extents_refuse_a_batch_they_cannot_hold () =
+  with_sparse_file @@ fun _env fd ~size:_ ->
+  let refuses name f =
+    match f () with
+    | (_ : Eio_fs_unix.extent list) -> Alcotest.failf "%s was accepted" name
+    | exception Invalid_argument _ -> ()
+  in
+  refuses "max 0" (fun () ->
+      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:0);
+  refuses "max above the buffer ceiling" (fun () ->
+      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:65537);
+  refuses "a negative offset" (fun () ->
+      Eio_fs_unix.extents fd ~offset:(-1L) ~length:4096L ~max:16);
+  refuses "a negative length" (fun () ->
+      Eio_fs_unix.extents fd ~offset:0L ~length:(-1L) ~max:16)
+
+(* The whole reason these three live in this library rather than beside a
+   caller: they run on a system thread with the runtime system released, so a
+   walk of a fragmented file suspends only the fiber walking it. Without the
+   system thread the loop below has no suspension point in it at all and the
+   ticking fiber cannot run until the walk has finished, which is what this
+   case refutes.
+
+   WHAT IT DOES NOT REFUTE, and the reason is worth a reader's time. The other
+   half -- releasing the runtime system around the syscalls -- is equally
+   load-bearing: eio's pool thread runs the closure as OCaml code and so holds
+   the domain's runtime lock, and a stub that does not release it holds the
+   domain for the whole call while looking exactly like one that does. This
+   case cannot see that, because it makes two thousand short calls and the
+   fiber gets its turn BETWEEN them either way. Refuting it needs one call
+   long enough to observe a fiber running during it, which needs a file in
+   thousands of physical extents; measured 2026-09-07, this filesystem
+   coalesces every cheap way of making one (20 000 blocks written interleaved
+   with another file report 20 extents, and written in a shuffled order, 18).
+   An aged file has them and a test cannot age a file. So: the mutation that
+   drops caml_release_runtime_system stays green here, it is a real defect,
+   and the case that does bind this half of the mechanism for this library is
+   [test_lock_wait_does_not_block_eio], which can hold its call open for a
+   quarter of a second because another process is holding the lock. *)
+let test_sparse_map_does_not_block_eio () =
+  with_sparse_file @@ fun env fd ~size ->
+  let clock = Eio.Stdenv.clock env in
+  let ticks = ref 0 in
+  let walked = ref false in
+  Eio.Switch.run @@ fun sw ->
+  Eio.Fiber.fork ~sw (fun () ->
+      while not !walked do
+        Eio.Time.sleep clock 0.001;
+        incr ticks
+      done);
+  for _ = 1 to 2000 do
+    ignore (Eio_fs_unix.seek_data fd 0L : int64 option);
+    ignore
+      (Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:8
+        : Eio_fs_unix.extent list)
+  done;
+  walked := true;
+  Alcotest.(check bool)
+    "another fiber ran while the map was being walked" true (!ticks > 0)
 
 (* The in-memory backend registers its barrier as a no-op -- volatile storage
    has nothing to sync -- so the platter-strength entry point runs unchanged
@@ -1363,6 +1566,17 @@ let suite =
         test_full_fsync_surfaces_errors;
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
+      Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
+        test_seek_data_and_hole_walk_the_file;
+      Alcotest.test_case "extents report the physical map" `Quick
+        test_extents_report_the_physical_map;
+      Alcotest.test_case "extents stop at a hole" `Quick
+        test_extents_stop_at_a_hole;
+      Alcotest.test_case "extents honour max" `Quick test_extents_honour_max;
+      Alcotest.test_case "extents refuse a batch they cannot hold" `Quick
+        test_extents_refuse_a_batch_they_cannot_hold;
+      Alcotest.test_case "the sparse map does not block Eio" `Quick
+        test_sparse_map_does_not_block_eio;
       Alcotest.test_case "in-memory barrier is a no-op" `Quick
         test_sync_dir_in_memory_no_op;
       Alcotest.test_case "lock wait does not block Eio" `Quick

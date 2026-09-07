@@ -22,6 +22,7 @@ let full_fsync fd =
 type statvfs = {
   block_size : int64;
   total_blocks : int64;
+  free_blocks : int64;
   available_blocks : int64;
 }
 
@@ -31,6 +32,44 @@ let statvfs path =
   let native = Eio.Path.native_exn path in
   Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
   statvfs_native native
+
+type extent = { logical : int64; physical : int64; length : int64 }
+
+external seek_data_native : Unix.file_descr -> int64 -> int64 option
+  = "caml_eio_fs_seek_data"
+
+external seek_hole_native : Unix.file_descr -> int64 -> int64 option
+  = "caml_eio_fs_seek_hole"
+
+external extents_native :
+  Unix.file_descr -> int64 -> int64 -> int -> extent list
+  = "caml_eio_fs_extents"
+
+(* Each of these runs on a system thread, and its stub releases the runtime
+   system around the syscall. Both halves are needed and neither is enough on
+   its own: the systhread takes the call off the thread the domain's scheduler
+   runs on, and the release is what lets that scheduler take the runtime lock
+   back while the call is in flight. The barrier below says the same thing
+   about one fsync; a sparse map says it about millions of calls.
+
+   The hop has a price, and it is why the extent map takes a batch. Measured
+   2026-09-07 on macOS/arm64: 9.2 us for a round trip through
+   [Eio_unix.run_in_systhread] against 0.31 us for the same lseek made
+   directly on the calling thread. One hop per extent over two million extents
+   is 19 s of overhead and nothing else; one hop per batch of a thousand is
+   19 ms. *)
+
+let seek_data fd offset =
+  Eio_unix.run_in_systhread ~label:"eio-fs-seek-data" @@ fun () ->
+  seek_data_native fd offset
+
+let seek_hole fd offset =
+  Eio_unix.run_in_systhread ~label:"eio-fs-seek-hole" @@ fun () ->
+  seek_hole_native fd offset
+
+let extents fd ~offset ~length ~max =
+  Eio_unix.run_in_systhread ~label:"eio-fs-extents" @@ fun () ->
+  extents_native fd offset length max
 
 (* A registered barrier keeps its own semantics (the crash model commits its
    journal, the in-memory backend does nothing); a plain POSIX directory is
