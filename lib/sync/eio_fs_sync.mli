@@ -131,6 +131,21 @@ type config = {
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
 (** Raised before a write that would exceed {!type-config.field-max_bytes}. *)
 
+val fresh_name : string -> string
+(** [fresh_name stem] is [stem] extended so that no other writer produces the
+    same string: a salt drawn once per process and a counter atomic across that
+    process's fibers. It is the name {!publish} stages under when [tmp] is
+    omitted, and it is exported for the store {!publish} cannot serve at all --
+    one whose target name is the digest of bytes it is still reading, so the
+    name to rename into is unknown when the staging file has to be opened. A
+    counter alone is not enough there: a fresh handle starts it at zero, so
+    every writer on a shared directory picks the same first name and one
+    writer's bytes end up under another's.
+
+    The name is not itself the exclusion. Open it with [`Exclusive] so that a
+    collision raises instead of truncating a staging file another writer is
+    still filling. *)
+
 val publish :
   config:config ->
   ?tmp:'a Eio.Path.t ->

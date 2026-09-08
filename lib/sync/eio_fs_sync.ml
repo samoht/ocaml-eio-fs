@@ -143,10 +143,11 @@ let bounded_sink ~max_bytes sink =
 let tmp_salt = Random.State.bits (Random.State.make_self_init ())
 let tmp_sequence = Atomic.make 0
 
-let fresh_tmp (dir, target) =
+let fresh_name stem =
   let n = Atomic.fetch_and_add tmp_sequence 1 in
-  let suffix = ".tmp." ^ string_of_int tmp_salt ^ "." ^ string_of_int n in
-  (dir, target ^ suffix)
+  stem ^ ".tmp." ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+
+let fresh_tmp (dir, target) = (dir, fresh_name target)
 
 let same_file (a : Eio.File.Stat.t) (b : Eio.File.Stat.t) =
   Int64.equal a.dev b.dev && Int64.equal a.ino b.ino
