@@ -145,9 +145,11 @@ module Schedule = struct
         rng : Random.State.t;
         mutable n : int;
       }
+    | Observed of { f : Op.t -> unit; inner : t }
 
   let empty = Empty
   let scripted rules = Scripted { rules; n = 0 }
+  let observing f t = Observed { f; inner = t }
 
   let all_kinds =
     [
@@ -209,9 +211,12 @@ module Schedule = struct
            [applies_to] excludes it, so a seeded schedule never reaches here. *)
         invalid_arg "Chaos: `Swap is scripted-only, not a seeded fault"
 
-  let next t (op : Op.t) =
+  let rec next t (op : Op.t) =
     match t with
     | Empty -> None
+    | Observed { f; inner } ->
+        f op;
+        next inner op
     | Scripted s ->
         s.n <- s.n + 1;
         let rec pick acc = function
@@ -234,10 +239,11 @@ module Schedule = struct
               let k = List.nth ks (Random.State.int s.rng (List.length ks)) in
               Some (build_fault s.rng op k))
 
-  let pp ppf = function
+  let rec pp ppf = function
     | Empty -> Fmt.string ppf "empty"
     | Scripted s -> Fmt.pf ppf "scripted(%d rules)" (List.length s.rules)
     | Seeded s -> Fmt.pf ppf "seeded(seed=%d p=%g)" s.seed s.config.probability
+    | Observed { inner; _ } -> Fmt.pf ppf "observed(%a)" pp inner
 end
 
 (* Take at most [n] bytes from the front of [bufs], sharing the underlying

@@ -106,6 +106,17 @@ module Schedule : sig
       a {!constructor-Torn_write} fault reproduces a torn superblock flush at a
       chosen offset. *)
 
+  val observing : (Op.t -> unit) -> t -> t
+  (** [observing f t] is [t] with [f] called on every operation the wrapper
+      consults the schedule about, before the schedule decides what to inject.
+      It injects nothing of its own, so [observing f empty] is a pass-through
+      wrapper that reports what the code under test asked the filesystem for.
+
+      This is how a caller's cost is asserted in the unit the work is measured
+      in rather than in seconds: how many reads a scan issues over a file is a
+      property of the code, where the wall it takes to issue them is a property
+      of the machine it ran on. *)
+
   val seeded :
     ?probability:float -> ?kinds:Fault.kind list -> seed:int -> unit -> t
   (** [seeded ~seed ()] injects deterministic pseudo-random faults. For each
