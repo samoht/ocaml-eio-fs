@@ -1496,6 +1496,36 @@ let test_path_usage_counts_allocated_tree_without_following_links () =
   Alcotest.(check (float 0.))
     "latest tree mtime" expected_mtime usage.latest_mtime
 
+(* What a copy of a tree will move, asked of the tree before the copy starts.
+
+   The figures are the fixture's own, not a second reading of the same stats:
+   two regular files of one and seven bytes, under a directory, beside a
+   symbolic link whose target is three characters. A walk that counted the link
+   would report three files and eleven bytes, and one that counted the directory
+   would report whatever the filesystem gives a directory entry -- so the tree
+   separates content from the things that carry it. *)
+let test_path_usage_counts_the_files_a_copy_would_move () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "sub");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "a") "a";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "sub/b") "payload";
+  Eio.Path.symlink ~link_to:"sub" (dir / "link");
+  let usage = Eio_fs.Path.usage dir in
+  Alcotest.(check int) "regular files, and nothing else" 2 usage.files;
+  Alcotest.(check int64)
+    "the length of those files, summed" 8L usage.apparent_bytes;
+  Alcotest.(check bool)
+    "which is no more than the tree allocates" true
+    (Int64.compare usage.apparent_bytes usage.allocated_bytes <= 0)
+
+(* An empty tree has nothing to move, and says so rather than reporting the
+   directory that holds nothing as content. *)
+let test_path_usage_of_an_empty_tree_moves_nothing () =
+  with_real_dir @@ fun dir ->
+  let usage = Eio_fs.Path.usage dir in
+  Alcotest.(check int) "no files" 0 usage.files;
+  Alcotest.(check int64) "no bytes to carry" 0L usage.apparent_bytes
+
 (* A path reached straight through the unconfined filesystem is named by the
    spelling the host knows it under, so a message carrying that name hands its
    reader something to open, stat or remove rather than a label private to the
@@ -1639,4 +1669,8 @@ let suite =
         test_section_refuses_a_wrapper_that_hides_a_host_descriptor;
       Alcotest.test_case "path usage is allocated and symlink-safe" `Quick
         test_path_usage_counts_allocated_tree_without_following_links;
+      Alcotest.test_case "path usage counts what a copy would move" `Quick
+        test_path_usage_counts_the_files_a_copy_would_move;
+      Alcotest.test_case "path usage of an empty tree moves nothing" `Quick
+        test_path_usage_of_an_empty_tree_moves_nothing;
     ] )

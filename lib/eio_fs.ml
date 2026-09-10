@@ -17,7 +17,12 @@
 open Eio.Std
 
 module Path = struct
-  type usage = { allocated_bytes : int64; latest_mtime : float }
+  type usage = {
+    allocated_bytes : int64;
+    apparent_bytes : int64;
+    files : int;
+    latest_mtime : float;
+  }
 
   let add_bytes a b =
     if Int64.sub Int64.max_int a < b then Int64.max_int else Int64.add a b
@@ -27,17 +32,31 @@ module Path = struct
     else if blocks > Int64.div Int64.max_int 512L then Int64.max_int
     else Int64.mul blocks 512L
 
+  (* Only a regular file has a length a reader of this record can act on: a
+     directory's own [size] is the space its entries take in it, and a symlink's
+     is the length of its target string. Both are already in
+     {!field-allocated_bytes}, and counting either as content would make the two
+     figures answer different questions about the same tree. *)
   let own stat =
+    let regular = stat.Eio.File.Stat.kind = `Regular_file in
     {
       allocated_bytes = bytes_of_blocks stat.Eio.File.Stat.blocks;
+      apparent_bytes =
+        (if regular then Optint.Int63.to_int64 stat.Eio.File.Stat.size else 0L);
+      files = (if regular then 1 else 0);
       latest_mtime = stat.mtime;
     }
 
   let add a b =
     {
       allocated_bytes = add_bytes a.allocated_bytes b.allocated_bytes;
+      apparent_bytes = add_bytes a.apparent_bytes b.apparent_bytes;
+      files = a.files + b.files;
       latest_mtime = Float.max a.latest_mtime b.latest_mtime;
     }
+
+  let empty =
+    { allocated_bytes = 0L; apparent_bytes = 0L; files = 0; latest_mtime = 0. }
 
   let usage_entry path =
     let stat = Eio.Path.stat ~follow:false path in
@@ -54,7 +73,7 @@ module Path = struct
       (fun (total, next) path ->
         let entry, children = usage_entry path in
         (add total entry, List.rev_append children next))
-      ({ allocated_bytes = 0L; latest_mtime = 0. }, [])
+      (empty, [])
       paths
 
   (* [Fiber.List.map ~max_fibers] creates one fiber per input and parks the
@@ -88,7 +107,7 @@ module Path = struct
           in
           loop total next
     in
-    loop { allocated_bytes = 0L; latest_mtime = 0. } [ path ]
+    loop empty [ path ]
 
   (* A path has two renderings and only one of them names a file to anything
      outside the program. [Eio.Path.pp] prints a path through the label its
