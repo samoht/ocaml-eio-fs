@@ -792,7 +792,7 @@ let test_lock_bounded_wait_answers_at_the_bound () =
   Eio.Switch.run @@ fun sw ->
   let child =
     hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:(Printf.sprintf "%f" held)
+      ~seconds:(string_of_float held)
   in
   let began = Eio.Time.now clock in
   (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
@@ -819,7 +819,7 @@ let test_lock_bounded_wait_takes_the_lock_when_the_holder_releases () =
   Eio.Switch.run @@ fun sw ->
   let child =
     hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:(Printf.sprintf "%f" held)
+      ~seconds:(string_of_float held)
   in
   let began = Eio.Time.now clock in
   let granted = ref false in
@@ -831,6 +831,40 @@ let test_lock_bounded_wait_takes_the_lock_when_the_holder_releases () =
     "and the wait ended on the release rather than at the bound" true
     (waited < bound /. 10.);
   await_holder child
+
+(* The fibers of this process are the other holder a bound has to cover. Here
+   the record lock is free and a fiber of this program is inside, so what the
+   bound answers about is the mutex alone: without it, a caller told "up to a
+   fifth of a second" would wait a fifth for the fiber and a fifth more for the
+   record lock, which is not the number it was told. *)
+let test_lock_bounded_wait_answers_a_fiber_that_holds_it () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  let bound = 0.2 and held = 1.0 in
+  let entered, set_entered = Eio.Promise.create () in
+  let refused = ref false and waited = ref 0. in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      Eio.Promise.resolve set_entered ();
+      Eio.Time.sleep clock held)
+    (fun () ->
+      Eio.Promise.await entered;
+      let began = Eio.Time.now clock in
+      (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
+      | () ->
+          Alcotest.fail "a lock a fiber held for the whole bound was granted"
+      | exception Eio_fs_unix.Lock_unavailable path ->
+          refused := true;
+          Alcotest.(check string)
+            "unavailable path" (Eio.Path.native_exn lock) path);
+      waited := Eio.Time.now clock -. began);
+  Alcotest.(check bool) "the second fiber was answered" true !refused;
+  Alcotest.(check bool)
+    "the bound was waited out before the answer" true (!waited >= bound);
+  Alcotest.(check bool)
+    "and the answer came without waiting out the fiber" true (!waited < held)
 
 (* A holder that dies does not cost the waiter its bound. The record lock is
    the kernel's, held on an open descriptor, so it goes when the last
@@ -1728,6 +1762,8 @@ let suite =
         test_lock_bounded_wait_answers_at_the_bound;
       Alcotest.test_case "a bounded wait takes the lock on the release" `Quick
         test_lock_bounded_wait_takes_the_lock_when_the_holder_releases;
+      Alcotest.test_case "a bounded wait answers a fiber that holds it" `Quick
+        test_lock_bounded_wait_answers_a_fiber_that_holds_it;
       Alcotest.test_case "a bounded wait does not sit out a killed holder"
         `Quick test_lock_bounded_wait_does_not_sit_out_a_killed_holder;
       Alcotest.test_case "existing-only lock does not create" `Quick

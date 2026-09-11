@@ -73,8 +73,7 @@ module Path = struct
       (fun (total, next) path ->
         let entry, children = usage_entry path in
         (add total entry, List.rev_append children next))
-      (empty, [])
-      paths
+      (empty, []) paths
 
   (* [Fiber.List.map ~max_fibers] creates one fiber per input and parks the
      excess on its limiter. Large, flat directories therefore create thousands

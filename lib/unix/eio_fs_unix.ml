@@ -188,17 +188,67 @@ let use_shared_mutex table key fn =
 
 let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
 
-let use_mutex ~block ~path mutex fn =
+(* ---- a bound is one budget, and both halves spend it ----
+
+   The two halves of the exclusion are two holders, and a bound has to cover
+   the pair of them: a caller told "up to fifteen minutes" that waited fifteen
+   for a fiber of this process and fifteen more for the record lock was told
+   the wrong number. So the bound is not a duration each half is handed but a
+   moment both of them watch for.
+
+   The moment is a fiber that sleeps the bound once and resolves [lapsed]. It
+   sleeps on the scheduler's monotonic clock, which is what a bound wants --
+   a wall clock steps under a wait long enough to matter -- and it needs no
+   clock capability from the caller, which a rendezvous taken deep inside a
+   program has no way to pass. It is a daemon of the switch [with_lock]
+   already runs under, so it is cancelled with the acquisition rather than
+   outliving it. *)
+type patience =
+  | Wait  (** wait for the holder, however long it holds *)
+  | Refuse  (** answer at once *)
+  | Until of unit Eio.Promise.t  (** wait until the budget lapses *)
+
+let budget ~sw seconds =
+  let lapsed, set_lapsed = Eio.Promise.create () in
+  Eio.Fiber.fork_daemon ~sw (fun () ->
+      Eio_unix.sleep seconds;
+      Eio.Promise.resolve set_lapsed ();
+      `Stop_daemon);
+  Until lapsed
+
+let use_mutex ~patience ~path mutex fn =
   let locked = ref false in
   Fun.protect
     ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
     (fun () ->
-      if block then begin
-        Eio.Mutex.lock mutex;
-        locked := true
-      end
-      else if Eio.Mutex.try_lock mutex then locked := true
-      else raise (Lock_unavailable path);
+      (match patience with
+      | Wait ->
+          Eio.Mutex.lock mutex;
+          locked := true
+      | Refuse ->
+          if Eio.Mutex.try_lock mutex then locked := true
+          else raise (Lock_unavailable path)
+      | Until lapsed ->
+          (* [Fiber.first] cancels the loser, and a fiber cancelled inside
+             [Eio.Mutex.lock] may have been granted the mutex all the same:
+             the unlocker's wake and the cancellation race for one atomic and
+             either can win. So what was taken is remembered rather than read
+             off which fiber came back, and a mutex granted as the bound
+             lapsed is held -- and released by the [finally] above -- rather
+             than dropped with nobody left to unlock it. *)
+          let taken = ref false in
+          let granted =
+            Eio.Fiber.first
+              (fun () ->
+                Eio.Mutex.lock mutex;
+                taken := true;
+                true)
+              (fun () ->
+                Eio.Promise.await lapsed;
+                false)
+          in
+          if granted || !taken then locked := true
+          else raise (Lock_unavailable path));
       fn ())
 
 (* ---- entering is queued, so the order granted is the order entered ----
@@ -235,7 +285,20 @@ let in_entry_order name fn =
 
 let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
 
-let use_os_lock ~block ~path fd fn =
+(* How often a bounded wait asks again for a record lock it was refused.
+
+   POSIX has no timed record lock that is portable: [F_OFD_SETLKW] under a
+   timer is Linux's, and macOS has nothing, so a wait for another process that
+   can give up is a retry and not a wait. What the interval buys is the
+   handover -- the holder lets go, and the next asker is inside within one of
+   these -- against twenty [lockf] calls a second, which is nothing beside the
+   work a rendezvous of this kind guards. It also answers a holder that dies:
+   the kernel drops the lock with the holder's last descriptor, and the next
+   ask is granted, where reading the lock file's own record would sit out the
+   whole bound behind a process that is gone. *)
+let ask_again_every = 0.05
+
+let use_os_lock ~patience ~path fd fn =
   let acquired = ref false in
   Fun.protect
     ~finally:(fun () ->
@@ -244,14 +307,37 @@ let use_os_lock ~block ~path fd fn =
         Eio_unix.run_in_systhread ~label:"eio-fs-unlock" (fun () ->
             lockf fd Unix.F_ULOCK))
     (fun () ->
-      Eio.Cancel.protect (fun () ->
-          match
-            Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
-                lockf fd (if block then Unix.F_LOCK else Unix.F_TLOCK))
-          with
-          | () -> acquired := true
-          | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) ->
-              raise (Lock_unavailable path));
+      (* The acquiring [lockf] is not cancellable -- it runs in a systhread and
+         a cancellation cannot reach into one -- so a bounded wait never sits
+         in it: it asks with [F_TLOCK], which answers, and does its waiting in
+         a sleep, which cancels. *)
+      let ask command =
+        Eio.Cancel.protect (fun () ->
+            match
+              Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
+                  lockf fd command)
+            with
+            | () -> acquired := true
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) ->
+                ())
+      in
+      (match patience with
+      | Wait -> ask Unix.F_LOCK
+      | Refuse -> ask Unix.F_TLOCK
+      | Until lapsed ->
+          let rec poll () =
+            ask Unix.F_TLOCK;
+            if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+              (* Waking on the lapse rather than sleeping through it is what
+                 keeps the answer inside one further ask of the bound. *)
+              Eio.Fiber.first
+                (fun () -> Eio_unix.sleep ask_again_every)
+                (fun () -> Eio.Promise.await lapsed);
+              poll ()
+            end
+          in
+          poll ());
+      if not !acquired then raise (Lock_unavailable path);
       fn ())
 
 (* ---- the lock path is the lock's own file ----
@@ -380,18 +466,17 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
   (* [block] is answered per half, because each half is a different holder. The
      mutex is held by a fiber of this program, which [`Fibers] waits for; the
      record lock is held by another process, which it answers about. *)
-  let block_fibers, block_processes =
-    match block with
-    | `Yes -> (true, true)
-    | `No -> (false, false)
-    | `Fibers -> (true, false)
-    | `For _ ->
-        failwith
-          "Eio_fs_unix.with_lock: `For: a bounded wait for a held lock is not \
-           implemented"
-  in
   let name = lock_name path in
   Eio.Switch.run @@ fun sw ->
+  let fibers, processes =
+    match block with
+    | `Yes -> (Wait, Wait)
+    | `No -> (Refuse, Refuse)
+    | `Fibers -> (Wait, Refuse)
+    | `For seconds ->
+        let until = budget ~sw seconds in
+        (until, until)
+  in
   let file, (opened : Eio.File.Stat.t) =
     in_entry_order name @@ fun () ->
     check_lock_name ~name path;
@@ -399,11 +484,11 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     (file, Eio.File.stat file)
   in
   use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
-  use_mutex ~block:block_fibers ~path:name mutex @@ fun () ->
+  use_mutex ~patience:fibers ~path:name mutex @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~block:block_processes ~path:name fd @@ fun () ->
+      use_os_lock ~patience:processes ~path:name fd @@ fun () ->
       hold ~name ~opened ~contents ~file path fn
   | None ->
       if Eio_fs_sync.is_process_local (fst path) then
