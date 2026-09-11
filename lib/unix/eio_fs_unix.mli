@@ -188,7 +188,7 @@ type Eio.Exn.Backend.t +=
             path as it prints itself on a backend that has no native one. *)
 
 val with_lock :
-  ?block:[ `Yes | `No | `Fibers ] ->
+  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
   _ Eio.Path.t ->
@@ -216,7 +216,20 @@ val with_lock :
     out -- while how long another process holds the rendezvous is not this
     program's to bound, and a command-line tool would rather name the busy
     resource to its operator than wait on a holder that may be wedged, with
-    nothing printed and no deadline.
+    nothing printed and no deadline. [`For seconds] waits like [`Yes] but
+    answers: once [seconds] have passed without the lock it raises
+    {!Lock_unavailable}, so a caller that cannot go on without the lock can say
+    what it is waiting for and how long it will wait, and act when the wait is
+    over. The bound is one budget for the whole acquisition, the fibers of this
+    process and the operating-system lock together, and it is measured on the
+    scheduler's monotonic clock rather than on a wall clock that steps under a
+    long wait. Since POSIX has no portable timed record lock -- [F_OFD_SETLKW]
+    under a timer is Linux's and macOS has none -- the wait for another process
+    asks again every fifty milliseconds, which is what a handover costs the
+    waiter: the answer comes no sooner than the bound and no later than one
+    further ask. A bound is not a place in a queue, nothing ordering the
+    processes that contend, so a caller whose bound lapses lost no turn it was
+    owed.
 
     Locks are coordinated both between fibers in this process and between
     processes. The lock is always released when [fn] returns or raises. Between
@@ -281,7 +294,7 @@ val with_lock :
     @raise Unix.Unix_error as [lockf]. *)
 
 val lock_section :
-  ?block:[ `Yes | `No | `Fibers ] ->
+  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
   _ Eio.Path.t ->

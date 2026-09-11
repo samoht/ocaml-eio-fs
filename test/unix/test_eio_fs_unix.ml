@@ -768,6 +768,105 @@ let test_lock_fibers_mode_refuses_another_process () =
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   await_holder child
 
+(* ---- a bound is a wait a caller can plan against ----
+
+   [`Yes] and [`No] are the two answers a second writer of a shared store can
+   be given, and where several checkouts of one program publish into one cache
+   neither is the answer it wants: waiting for ever is a run whose window
+   passes with nothing on the screen and no deadline, and refusing at zero is a
+   run that cannot work at all while another holds the store. Measured
+   2026-09-11 on one machine: a publish held its rendezvous for forty-two
+   minutes, and every other checkout was refused for the whole of it.
+
+   [`For seconds] is the third answer. It waits, and it answers: a caller that
+   knows the bound can name it on its terminal before it waits and act when the
+   wait is over. What the bound promises is only that -- nothing orders the
+   processes contending for a record lock -- so the cases say what it promises
+   and no more: the answer comes no sooner than the bound, and it comes without
+   waiting out a holder that is still there. *)
+let test_lock_bounded_wait_answers_at_the_bound () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  let bound = 0.2 and held = 1.0 in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:(Printf.sprintf "%f" held)
+  in
+  let began = Eio.Time.now clock in
+  (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
+  | () -> Alcotest.fail "a lock held for the whole bound was granted"
+  | exception Eio_fs_unix.Lock_unavailable path ->
+      Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
+  let waited = Eio.Time.now clock -. began in
+  Alcotest.(check bool)
+    "the bound was waited out before the answer" true (waited >= bound);
+  Alcotest.(check bool)
+    "and the answer came without waiting out the holder" true (waited < held);
+  await_holder child
+
+(* The other half of the bound: a wait that is a wait. The child says it holds
+   the lock before this fiber runs, so a caller that refused at zero would
+   raise here, and one that comes back having run its section waited the holder
+   out. Coming back in a small share of the bound is what says it woke on the
+   release rather than at the deadline. *)
+let test_lock_bounded_wait_takes_the_lock_when_the_holder_releases () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  let bound = 30.0 and held = 0.3 in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:(Printf.sprintf "%f" held)
+  in
+  let began = Eio.Time.now clock in
+  let granted = ref false in
+  Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> granted := true);
+  let waited = Eio.Time.now clock -. began in
+  Alcotest.(check bool)
+    "the holder was waited out and the section ran" true !granted;
+  Alcotest.(check bool)
+    "and the wait ended on the release rather than at the bound" true
+    (waited < bound /. 10.);
+  await_holder child
+
+(* A holder that dies does not cost the waiter its bound. The record lock is
+   the kernel's, held on an open descriptor, so it goes when the last
+   descriptor to the file closes -- which a killed process does as surely as an
+   exiting one. A waiter that read the rendezvous rather than asking the kernel
+   would sit out the whole bound behind a process that is gone; this one is
+   inside within one ask of the kill. *)
+let test_lock_bounded_wait_does_not_sit_out_a_killed_holder () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  let bound = 30.0 in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"600.0"
+  in
+  let began = Eio.Time.now clock in
+  let granted = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio.Time.sleep clock 0.2;
+      Eio.Process.signal child Sys.sigkill)
+    (fun () ->
+      Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> granted := true));
+  let waited = Eio.Time.now clock -. began in
+  Alcotest.(check bool) "the lock was taken once its holder died" true !granted;
+  Alcotest.(check bool)
+    "and it came free with its holder rather than at the bound" true
+    (waited < bound /. 10.);
+  match Eio.Process.await child with
+  | `Signaled n when Int.equal n Sys.sigkill -> ()
+  | `Exited n ->
+      Alcotest.failf "the holder exited %d rather than being killed" n
+  | `Signaled n -> Alcotest.failf "the holder took signal %d" n
+
 let test_lock_existing_does_not_create () =
   with_real_dir @@ fun dir ->
   let lock = dir / "absent" in
@@ -1625,6 +1724,12 @@ let suite =
         test_lock_fibers_mode_queues_behind_a_fiber;
       Alcotest.test_case "a fibers-only lock answers another process" `Quick
         test_lock_fibers_mode_refuses_another_process;
+      Alcotest.test_case "a bounded wait answers at the bound" `Quick
+        test_lock_bounded_wait_answers_at_the_bound;
+      Alcotest.test_case "a bounded wait takes the lock on the release" `Quick
+        test_lock_bounded_wait_takes_the_lock_when_the_holder_releases;
+      Alcotest.test_case "a bounded wait does not sit out a killed holder"
+        `Quick test_lock_bounded_wait_does_not_sit_out_a_killed_holder;
       Alcotest.test_case "existing-only lock does not create" `Quick
         test_lock_existing_does_not_create;
       Alcotest.test_case "lock refuses a symlink at the lock path" `Quick

@@ -374,15 +374,21 @@ let hold ~name ~opened ~contents ~file path fn =
    but the whole of it. Any other backend is refused, since running under the
    mutex alone would put this caller in a critical section another process can
    be inside with nothing in either run to say so. *)
-let with_lock ?(block : [ `Yes | `No | `Fibers ] = `Yes)
+let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
   (* [block] is answered per half, because each half is a different holder. The
      mutex is held by a fiber of this program, which [`Fibers] waits for; the
      record lock is held by another process, which it answers about. *)
-  let block_fibers = match block with `Yes | `Fibers -> true | `No -> false in
-  let block_processes =
-    match block with `Yes -> true | `No | `Fibers -> false
+  let block_fibers, block_processes =
+    match block with
+    | `Yes -> (true, true)
+    | `No -> (false, false)
+    | `Fibers -> (true, false)
+    | `For _ ->
+        failwith
+          "Eio_fs_unix.with_lock: `For: a bounded wait for a held lock is not \
+           implemented"
   in
   let name = lock_name path in
   Eio.Switch.run @@ fun sw ->
