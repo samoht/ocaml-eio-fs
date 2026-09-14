@@ -87,4 +87,22 @@ let is_rooted ~root path =
 
 type refusal = Not_a_path | Relative | Root | Not_canonical
 
-let canonical _path = failwith "Eio_fs_path.canonical: not implemented"
+let traversal segment = String.equal segment "." || String.equal segment ".."
+
+let canonical path =
+  if String.equal path "" || String.contains path '\000' then Error Not_a_path
+  else if is_rel path then Error Relative
+  else
+    let parts =
+      List.filter (fun segment -> not (String.equal segment "")) (segs path)
+    in
+    if parts = [] then Error Root
+    else if List.exists traversal parts then Error Not_canonical
+      (* The components must rejoin to exactly the string given. This is the
+         whole of the "already canonical" rule and it is one comparison: a
+         trailing separator, a doubled separator and a leading double separator
+         all lose to it, and each of them is a spelling that names the same
+         object as the canonical one while splitting differently. *)
+    else if not (String.equal ("/" ^ String.concat "/" parts) path) then
+      Error Not_canonical
+    else Ok parts
