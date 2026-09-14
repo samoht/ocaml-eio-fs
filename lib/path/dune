@@ -1,0 +1,9 @@
+; eio-fs.path: the lexical arithmetic on the paths this backend is addressed
+; by. A separate library because it is the answer to what a path resolves to,
+; and a caller that needs only that answer -- a launcher validating a declared
+; resource path, a unikernel -- links no filesystem, no terminal and no C
+; stubs to get it.
+
+(library
+ (name eio_fs_path)
+ (public_name eio-fs.path))

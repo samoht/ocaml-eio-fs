@@ -1,98 +1,3 @@
-(* Eio paths always use '/' as their separator, including on Windows. Keep the
-   small amount of lexical path handling needed by the backend here rather than
-   depending on the host-sensitive [Filename] or [Fpath] modules. *)
-module Path = struct
-  let is_abs p = String.length p > 0 && p.[0] = '/'
-  let is_rel p = not (is_abs p)
-  let segs p = String.split_on_char '/' p
-
-  let is_directory_syntax p =
-    let len = String.length p in
-    len > 0
-    && (p.[len - 1] = '/'
-       ||
-       match List.rev (segs p) with
-       | "." :: _ | ".." :: _ -> true
-       | _ -> false)
-
-  let normalize p =
-    let absolute = is_abs p in
-    let rec loop acc = function
-      | [] -> List.rev acc
-      | ("" | ".") :: rest -> loop acc rest
-      | ".." :: rest -> (
-          match acc with
-          | segment :: acc when not (String.equal segment "..") -> loop acc rest
-          | [] when absolute -> loop [] rest
-          | acc -> loop (".." :: acc) rest)
-      | segment :: rest -> loop (segment :: acc) rest
-    in
-    let directory = is_directory_syntax p in
-    let body = String.concat "/" (loop [] (segs p)) in
-    let path =
-      match (absolute, body) with
-      | true, "" -> "/"
-      | true, body -> "/" ^ body
-      | false, "" -> "."
-      | false, body -> body
-    in
-    if directory && not (String.equal path "/") then path ^ "/" else path
-
-  let append base path =
-    if is_abs path then path
-    else
-      let len = String.length base in
-      if len = 0 || base.[len - 1] = '/' then base ^ path else base ^ "/" ^ path
-
-  let to_dir_path path =
-    let len = String.length path in
-    if len > 0 && path.[len - 1] = '/' then path else path ^ "/"
-
-  let without_trailing_slashes path =
-    let rec last_non_slash i =
-      if i <= 0 || path.[i] <> '/' then i else last_non_slash (i - 1)
-    in
-    let last = last_non_slash (String.length path - 1) in
-    if last < 0 then "/" else String.sub path 0 (last + 1)
-
-  let basename path =
-    let path = without_trailing_slashes path in
-    if String.equal path "/" then ""
-    else
-      let name =
-        match String.rindex_opt path '/' with
-        | None -> path
-        | Some index ->
-            String.sub path (index + 1) (String.length path - index - 1)
-      in
-      match name with "." | ".." -> "" | name -> name
-
-  let parent path =
-    let path = without_trailing_slashes path in
-    if String.equal path "/" then path
-    else
-      match String.rindex_opt path '/' with
-      | None -> "./"
-      | Some 0 -> "/"
-      | Some index -> String.sub path 0 (index + 1)
-
-  let components path =
-    normalize path |> segs
-    |> List.filter (fun segment ->
-        not (String.equal segment "" || String.equal segment "."))
-
-  let is_rooted ~root path =
-    if is_abs root <> is_abs path then false
-    else
-      let rec is_prefix prefix items =
-        match (prefix, items) with
-        | [], _ -> true
-        | x :: xs, y :: ys when String.equal x y -> is_prefix xs ys
-        | _ -> false
-      in
-      is_prefix (components root) (components path)
-end
-
 (* The fake file-descriptor table and filesystem. *)
 module Open_flags = struct
   let o_rdonly = 0x0
@@ -112,7 +17,7 @@ type Eio.Exn.Backend.t += Eio_fs of string
 
 (* Eio makes use of the empty string for paths so we can start
    with "no path". Fpath does not allow that. *)
-let check_path p = if String.equal p "" then "." else Path.normalize p
+let check_path p = if String.equal p "" then "." else Eio_fs_path.normalize p
 
 let () =
   let pp_eio_mem ppf = function
@@ -394,10 +299,10 @@ module Filesystem = struct
       loop dir ""
 
   let is_confined ~root p =
-    if Path.is_abs p then Path.is_rooted ~root p
+    if Eio_fs_path.is_abs p then Eio_fs_path.is_rooted ~root p
     else
-      let full_path = Path.append root p in
-      Path.is_rooted ~root full_path
+      let full_path = Eio_fs_path.append root p in
+      Eio_fs_path.is_rooted ~root full_path
 
   let check_confinement ~root p =
     if is_confined ~root p then () else Error.permission_denied p
@@ -410,11 +315,11 @@ module Filesystem = struct
       let path_of_next_item =
         if resource_name = "/" then resource_name
         else begin
-          Path.append parent_path resource_name
+          Eio_fs_path.append parent_path resource_name
         end
       in
       check_confinement ~root:confinement_path
-        (Path.to_dir_path path_of_next_item)
+        (Eio_fs_path.to_dir_path path_of_next_item)
     in
     let rec loop ~parent r = function
       | [] -> (
@@ -429,7 +334,7 @@ module Filesystem = struct
               let resource_name = Resource.name !r in
               if resource_name = "/" then (resource_name, r)
               else begin
-                (Path.append parent_path resource_name, r)
+                (Eio_fs_path.append parent_path resource_name, r)
               end)
       | "" :: segs -> loop ~parent r segs
       | seg :: segs -> (
@@ -458,7 +363,7 @@ module Filesystem = struct
           Entries.find ino fs
       | _ -> assert false
     in
-    loop ~parent dir (Path.segs path)
+    loop ~parent dir (Eio_fs_path.segs path)
 
   and entries_exn ~check ~follow ~parent fs :
       resource ref -> (Inode.t * string) list * resource ref =
@@ -484,12 +389,12 @@ module Filesystem = struct
     read_filesystem @@ fun fs ->
     let root = Entries.find 0L fs in
     (* An absolute path with full access *)
-    if Path.is_abs path && dir_fd = Dir.Fs then
+    if Eio_fs_path.is_abs path && dir_fd = Dir.Fs then
       let _, r = find_entry_relative_to_dir ~check:false ~follow fs root path in
       r (* Relative path with full access *)
-    else if Path.is_rel path && dir_fd = Dir.Fs then
+    else if Eio_fs_path.is_rel path && dir_fd = Dir.Fs then
       let cwd_path = Eio.Fiber.get Directory.cwd |> Option.value ~default:"/" in
-      let path = Path.append cwd_path path in
+      let path = Eio_fs_path.append cwd_path path in
       let _, r = find_entry_relative_to_dir ~check:false ~follow fs root path in
       r
     else
@@ -640,7 +545,7 @@ let chown ~follow ?uid ?gid dir_fd path =
   let gid = Option.value ~default:s.gid gid in
   r := Resource.set_stat !r { s with uid; gid }
 
-let dir_base path = (Path.parent path, Path.basename path)
+let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
 
 let unlink dir_fd path =
   let path = check_path path in

@@ -125,16 +125,13 @@ module Fs = struct
   type dir_fd = Low_level.Dir.fd
 
   (* What a path is called on its own: its last component, by the rules for the
-     paths this backend is addressed by ({!Low_level.Path}). Those are Eio
-     paths, whose separator "is always "/", even on Windows" ({!Eio.Path}), so
-     the host's [Filename] and the host path type [Fpath] both answer about a
-     different language and neither is used here.
+     paths this backend is addressed by ({!Eio_fs_path}).
 
      A path with no last component is called by the whole of itself: "/" is
      called "/" and ".." is called "..", and the empty path, which is this
      backend's own name for the directory itself, is called ".". *)
   let last_component path =
-    match Low_level.Path.basename path with
+    match Eio_fs_path.basename path with
     | "" -> if String.equal path "" then "." else path
     | base -> base
 
@@ -205,7 +202,7 @@ module Fs = struct
       let flags = Low_level.Open_flags.(o_rdonly + o_directory) in
       let fd = Low_level.openat ~sw ~mode:0 t.fd path flags in
       let label = last_component path in
-      let full_path = Low_level.Path.append t.dir_path path in
+      let full_path = Eio_fs_path.append t.dir_path path in
       let d = v ~label ~path:full_path (Low_level.Dir.Dir_fd fd) in
       (* The upcast drops the barrier tag from the static row to fit
          [Pi.DIR]; the operation itself stays probeable on the resource. *)

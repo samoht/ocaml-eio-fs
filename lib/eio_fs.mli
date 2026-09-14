@@ -6,7 +6,9 @@
     ({!Chaos}). There is a single in-memory filesystem per process; {!Fs.v},
     {!Fs.load} and {!Crunch.load} all reset it. *)
 
-(** Helpers over standard {!Eio.Path} values. *)
+(** Helpers over standard {!Eio.Path} values. The lexical arithmetic on the
+    strings those values carry -- what a path's components are, and which
+    spellings name one object -- is {!Eio_fs_path}, in [eio-fs.path]. *)
 module Path : sig
   type usage = {
     allocated_bytes : int64;
