@@ -16,41 +16,27 @@ module Path : sig
     files : int;
     latest_mtime : float;
   }
-  (** What a tree costs, in the two units the question is asked in, how many
-      files carry it, and when one of them last changed.
-
-      {!field-allocated_bytes} is what the device gives up for the tree, which
-      is what a caller reclaiming space asks for. {!field-apparent_bytes} and
-      {!field-files} are what a copy of the tree moves and creates, and what a
-      hash of it reads, which is what a caller pricing either one asks for. All
-      of them come off the one walk: a second walk to count what the first
-      already visited is a second answer to how large the tree is. *)
+  (** What a tree costs in {!field-allocated_bytes} and
+      {!field-apparent_bytes}, how many {!field-files} carry it, and when one
+      last changed. All come off one walk. *)
 
   val usage : ?max_fibers:int -> _ Eio.Path.t -> usage
   (** [usage path] measures [path] and all descendants without following
       symbolic links. {!field-allocated_bytes} is based on allocated 512-byte
-      blocks, not apparent file length, and saturates at [Int64.max_int], as
-      does {!field-apparent_bytes}, which sums the length of the regular files
-      alone: a directory's length is the space its entries take in it and a
-      symbolic link's is the length of its target, and neither is content a copy
-      carries. {!field-files} counts those same regular files. The tree is
-      measured breadth-first by at most [max_fibers] fixed workers per level
-      (default [32]).
+      blocks, not apparent length, and both byte counts saturate at
+      [Int64.max_int]; {!field-apparent_bytes} and {!field-files} count the
+      regular files alone. The walk is breadth-first, at most [max_fibers]
+      workers per level (default [32]).
 
-      Filesystem errors are propagated. This makes a caller deciding whether to
-      remove a tree fail closed instead of acting on a partial measurement.
+      Filesystem errors are propagated, so a caller deciding whether to remove a
+      tree fails closed.
 
       @raise Invalid_argument if [max_fibers] is not positive. *)
 
   val name : _ Eio.Path.t -> string
   (** [name path] is what [path] is called outside the program: its native
-      spelling when the capability it is reached through has one, and the
-      rendering {!Eio.Path.pp} gives it when it has not.
-
-      A path reached through an opened directory is therefore named by its full
-      native path rather than by the capability's label, so a message naming a
-      path this way names something its reader can act on, and something the
-      caller can match against the path it asked for. *)
+      spelling when the capability has one, and the rendering {!Eio.Path.pp}
+      gives it when not. *)
 end
 
 (** An in-memory filesystem for {!Eio}. *)

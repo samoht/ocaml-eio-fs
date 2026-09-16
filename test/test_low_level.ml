@@ -169,19 +169,11 @@ let test_create_under_regular_file () =
   expect_eio_io "creating a file under a regular file" (fun () ->
       Eio.Path.save ~create:(`Or_truncate 0o600) (env#fs / "reg/child") "y")
 
-(* ENOTDIR is an error of the filesystem's own model, not a caller mistake.
-   With a regular file [reg] in the tree, every directory operation that walks
-   through it -- and every directory operation applied to it -- must answer
-   through [Eio.Io], the way a real backend surfaces ENOTDIR, so a caller that
-   handles Eio's error model correctly is not killed by an [Invalid_argument]
-   this backend alone raises.
-
-   The five below are one operation set and must agree. [rmdir] and [read_dir]
-   already answer [Eio.Io (Eio.Fs.E (Not_found _))] on the same tree (measured
-   2026-08-15), so [Not_found] is the constructor pinned here for all five;
-   [mkdir], [unlink] and [symlink] escape it today through
-   [Invalid_argument "as_dir(...)"] (low_level.ml:271, measured 2026-08-15:
-   [as_dir(mkdirat)], [as_dir(unlink)] and [as_dir(symlink)] respectively). *)
+(* ENOTDIR is an error of the filesystem's own model, not a caller mistake:
+   with a regular file in the tree, every directory operation that walks
+   through it must answer through [Eio.Io], not an [Invalid_argument] this
+   backend alone raises. The five below are one operation set and must agree,
+   so [Not_found] is pinned for all five. *)
 let test_dir_ops_under_regular_file () =
   with_env @@ fun env ->
   let fs = env#fs in

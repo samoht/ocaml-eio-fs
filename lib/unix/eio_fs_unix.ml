@@ -45,20 +45,10 @@ external extents_native :
   Unix.file_descr -> int64 -> int64 -> int -> extent list
   = "caml_eio_fs_extents"
 
-(* Each of these runs on a system thread, and its stub releases the runtime
-   system around the syscall. Both halves are needed and neither is enough on
-   its own: the systhread takes the call off the thread the domain's scheduler
-   runs on, and the release is what lets that scheduler take the runtime lock
-   back while the call is in flight. The barrier below says the same thing
-   about one fsync; a sparse map says it about millions of calls.
-
-   The hop has a price, and it is why the extent map takes a batch. Measured
-   2026-09-07 on macOS/arm64: 9.2 us for a round trip through
-   [Eio_unix.run_in_systhread] against 0.31 us for the same lseek made
-   directly on the calling thread. One hop per extent over two million extents
-   is 19 s of overhead and nothing else; one hop per batch of a thousand is
-   19 ms. *)
-
+(* Each runs on a system thread whose stub releases the runtime system around
+   the syscall. The hop has a price, which is why the extent map takes a batch:
+   one hop per batch covers many extents where one hop each would spend the
+   time in scheduling alone. *)
 let seek_data fd offset =
   Eio_unix.run_in_systhread ~label:"eio-fs-seek-data" @@ fun () ->
   seek_data_native fd offset
@@ -71,31 +61,11 @@ let extents fd ~offset ~length ~max =
   Eio_unix.run_in_systhread ~label:"eio-fs-extents" @@ fun () ->
   extents_native fd offset length max
 
-(* A registered barrier keeps its own semantics (the crash model commits its
-   journal, the in-memory backend does nothing); a plain POSIX directory is
-   opened and pushed through to stable storage, which on Darwin means
-   F_FULLFSYNC where the portable fallback's fsync only reaches the drive's
-   cache.
-
-   The open goes through the directory capability the path carries, because
-   the barrier belongs to the directory the caller holds and not to whatever
-   its name resolves to at that instant. Eio says as much of the flattening:
-   [Path.native] "does not check for confinement (the resulting path might not
-   be accessible via [t] itself)", and answers a directory opened with
-   [open_subtree] and later renamed with the old name. [Eio.Path.open_in]
-   instead opens every component beneath that capability, so a name a link has
-   taken is refused rather than fsynced in place of the caller's directory,
-   and a directory whose name is gone is still barriered.
-
-   That barrier is the slowest call the process makes, so it runs on a system
-   thread: a fiber's own thread carries the domain's scheduler, and holding it
-   inside the fsync would stop every other fiber -- the timers, the connections
-   -- for the length of a write to the platter. The open is off that thread
-   already, eio running its own openat in a worker.
-
-   A directory handle carrying no descriptor cannot take the platform-strength
-   barrier, so it takes the portable one, which syncs the handle itself and
-   fails loudly if the backend cannot do that either. *)
+(* A registered barrier keeps its own semantics; a plain POSIX directory is
+   opened through the capability the path carries -- so a name a link has taken
+   is refused rather than fsynced instead of the caller's directory -- and
+   pushed through to stable storage off the calling fiber's thread. A handle
+   with no descriptor takes the portable barrier. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match Eio_fs_sync.dir_barrier res with
   | Some barrier -> barrier ~path
@@ -109,22 +79,10 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
           full_fsync fd)
 
-(* The file half of the same barrier, and the registration is asked before the
-   descriptor. That order is the whole of it: a descriptor a wrapper carries
-   over is the operations the operating system offers on the open file, not a
-   second way past the wrapper, so a barrier taken on it is one the wrapper
-   never saw -- a model of power loss records none and drops at the cut the
-   bytes the caller was told had reached the platter, while every real
-   filesystem still looks correct. Reaching for the descriptor first is
-   therefore not the stronger barrier, it is the barrier made invisible to
-   exactly the wrapper written to observe it.
-
-   A backend that declares nothing has its descriptor taken, and there the
-   platform barrier is the right one: on Darwin F_FULLFSYNC, through to the
-   platter, where [Eio.File.sync] stops at the drive's cache. As for the
-   directory barrier it runs on a system thread, a fiber's own thread carrying
-   the domain's scheduler. A file with neither a registration nor a descriptor
-   takes the portable barrier, which is its own sync. *)
+(* The registration is asked before the descriptor: a descriptor a wrapper
+   carries over is a second way past the wrapper, so a barrier taken on it is
+   one the wrapper never saw. A file with neither a registration nor a
+   descriptor takes the portable barrier, its own sync. *)
 let sync_file file =
   match Eio_fs_sync.file_barrier file with
   | Some barrier -> barrier ()
@@ -138,23 +96,10 @@ let sync_file file =
 
 exception Lock_unavailable of string
 
-(* ---- the exclusion is the file's, not the name's ----
-
-   The mutex two fibers of this process contend for is keyed by the file the
-   record lock is taken on, its device and inode, and not by a name that
-   reaches that file. A name does not identify a file: two of them lead to one
-   file wherever a hard link does, and canonicalising a name does not merge
-   those, [Unix.realpath] resolving symbolic links and a hard link being none
-   of them.
-
-   Nothing else carries this half of the exclusion. POSIX record locks do not
-   exclude within a process -- a second [lockf] over one file, through a second
-   descriptor, is granted to the process that already holds it, and closing any
-   one of those descriptors drops the lock for all of them -- so a key that
-   misses hands one file to two fibers, each believing it holds the lock.
-
-   The file stays open for as long as its key is in use, so no inode number is
-   reused under the table while it names a held lock. *)
+(* The fiber exclusion is keyed by device and inode, not by a name: two names
+   can reach one file (a hard link), and POSIX record locks do not exclude
+   within a process. The file stays open while its key is in use, so no inode
+   number is reused under the table. *)
 type lock_key = int64 * int64
 (** The device and inode a record lock is held on. *)
 
@@ -164,9 +109,7 @@ let local_locks : (lock_key, local_lock) Hashtbl.t = Hashtbl.create 16
 let entry_gates : (string, local_lock) Hashtbl.t = Hashtbl.create 16
 let tables_mutex = Stdlib.Mutex.create ()
 
-(* A mutex per key, kept for as long as a caller is using it. The tables are
-   process-wide, so an entry that outlived its last user would grow with every
-   file a program has ever locked. *)
+(* A mutex per key, kept only while a caller uses it. *)
 let use_shared_mutex table key fn =
   let lock =
     Stdlib.Mutex.protect tables_mutex @@ fun () ->
@@ -188,21 +131,9 @@ let use_shared_mutex table key fn =
 
 let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
 
-(* ---- a bound is one budget, and both halves spend it ----
-
-   The two halves of the exclusion are two holders, and a bound has to cover
-   the pair of them: a caller told "up to fifteen minutes" that waited fifteen
-   for a fiber of this process and fifteen more for the record lock was told
-   the wrong number. So the bound is not a duration each half is handed but a
-   moment both of them watch for.
-
-   The moment is a fiber that sleeps the bound once and resolves [lapsed]. It
-   sleeps on the scheduler's monotonic clock, which is what a bound wants --
-   a wall clock steps under a wait long enough to matter -- and it needs no
-   clock capability from the caller, which a rendezvous taken deep inside a
-   program has no way to pass. It is a daemon of the switch [with_lock]
-   already runs under, so it is cancelled with the acquisition rather than
-   outliving it. *)
+(* One budget covers both halves of the exclusion, so it is a moment both watch
+   for rather than a duration each is handed. A daemon of the switch sleeps it
+   on the scheduler's monotonic clock. *)
 type patience =
   | Wait  (** wait for the holder, however long it holds *)
   | Refuse  (** answer at once *)
@@ -251,28 +182,10 @@ let use_mutex ~patience ~path mutex fn =
           else raise (Lock_unavailable path));
       fn ())
 
-(* ---- entering is queued, so the order granted is the order entered ----
-
-   The exclusion is the file's, and which file a name reaches only the open can
-   say, so the open comes first -- and it suspends, eio running it off the
-   calling fiber. Two fibers entering in order therefore reach the file's mutex
-   in whatever order their opens came back in, which is no order at all. A
-   caller that sequences its work by the order it was served, a spool numbering
-   its writers as it admits them, gets that sequence back scrambled, and it has
-   nowhere of its own to stand between entering and holding.
-
-   So entering is queued as well, on a mutex keyed by the name the caller
-   passed. It is taken before the name is weighed, and left as the file's own
-   mutex is about to be taken, with no suspension in between: the order fibers
-   queue at the file's mutex is then the order they entered.
-
-   The queue is left there rather than held for the length of the critical
-   section, because a name is not a file. Two names reach one file wherever a
-   hard link does, and a backend with no native path names its files as they
-   print, so one name can stand for files of two unrelated filesystems. A gate
-   held across [fn] would let a caller's critical section keep an unrelated
-   lock waiting on a name it happens to share; held only across the open, what
-   a collision costs is one open. *)
+(* Entering is queued too, on a mutex keyed by the caller's name: the open
+   suspends, so without this the order fibers reach the file's mutex is the
+   order their opens came back in. The gate is held only across the open, since
+   a name is not a file. *)
 let in_entry_order name fn =
   use_shared_mutex entry_gates name @@ fun mutex ->
   let entered = ref false in
@@ -285,17 +198,8 @@ let in_entry_order name fn =
 
 let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
 
-(* How often a bounded wait asks again for a record lock it was refused.
-
-   POSIX has no timed record lock that is portable: [F_OFD_SETLKW] under a
-   timer is Linux's, and macOS has nothing, so a wait for another process that
-   can give up is a retry and not a wait. What the interval buys is the
-   handover -- the holder lets go, and the next asker is inside within one of
-   these -- against twenty [lockf] calls a second, which is nothing beside the
-   work a rendezvous of this kind guards. It also answers a holder that dies:
-   the kernel drops the lock with the holder's last descriptor, and the next
-   ask is granted, where reading the lock file's own record would sit out the
-   whole bound behind a process that is gone. *)
+(* POSIX has no portable timed record lock, so a bounded wait asks again; it
+   also answers a holder that died, whose lock the kernel drops. *)
 let ask_again_every = 0.05
 
 let use_os_lock ~patience ~path fd fn =
@@ -340,31 +244,11 @@ let use_os_lock ~patience ~path fd fn =
       if not !acquired then raise (Lock_unavailable path);
       fn ())
 
-(* ---- the lock path is the lock's own file ----
-
-   A rendezvous sits in a directory another party writes, which is exactly
-   where an entry gets planted under the name a locker is about to use.
-   [Eio.Path] resolves a name for its caller and follows a link it finds at the
-   end, so a link left under that name sends the record lock to whatever the
-   link names: two processes then hold two locks over one resource, both read
-   the same state and both publish, with nothing in either run to say the
-   exclusion was absent.
-
-   Two things settle it, and the check of the name is neither of them. Creating
-   the rendezvous is an exclusive open: O_CREAT|O_EXCL refuses a name that
-   exists, and a symbolic link at the last component counts as existing even
-   when it dangles, so a creating open never lands at the far end of one. The
-   descriptor is then weighed once the lock is held, because the open resolves
-   the name a second time and an entry that took it in between would leave the
-   lock on an inode the name no longer reaches. Comparing the descriptor's
-   device and inode with the name's own is what settles that: on a symbolic
-   link the two differ, since the name carries the link's inode and the
-   descriptor the target's.
-
-   Weighing the name before the open is an early refusal and nothing rests on
-   it: it answers the ordinary planted link in the interface's own vocabulary
-   rather than as whichever [open] error the platform picks, but the name can
-   change the moment after it is read. *)
+(* A planted link under the rendezvous name would send the record lock to
+   whatever it names. Creating is an exclusive open (O_CREAT|O_EXCL refuses an
+   existing name, a dangling link included), and the opened descriptor's device
+   and inode are then weighed against the name's own. Weighing the name before
+   the open is only an early refusal. *)
 
 type Eio.Exn.Backend.t += Not_a_lock_file of string
 
@@ -378,9 +262,7 @@ let () =
 let not_a_lock_file name =
   raise (Eio.Fs.err (Eio.Fs.Permission_denied (Not_a_lock_file name)))
 
-(* The name a refusal carries. A backend with no native path is named as it
-   prints itself, rather than taken out through the exception [native_exn]
-   raises for one. *)
+(* A backend with no native path is named as it prints itself. *)
 let lock_name path =
   match Eio.Path.native path with
   | Some native -> native
@@ -419,12 +301,8 @@ let update_lock_contents file contents =
   Eio.File.truncate file (Optint.Int63.of_int (String.length contents))
 
 (* An absent rendezvous is created exclusively, so the kernel refuses the name
-   a link holds rather than following it. A name that is already there is the
-   ordinary second acquisition and is opened without creating, its identity
-   settled afterwards by [check_locked_file]. A name that exists for the
-   exclusive open and is gone for the plain one is whatever took it in between
-   -- a dangling link, or an entry another party removed -- and is not the
-   lock's own regular file. *)
+   a link holds rather than following it; an existing one is opened without
+   creating and its identity settled by [check_locked_file]. *)
 let open_lock_file ~sw ~name
     ~(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ]) path =
   match create with
@@ -446,26 +324,15 @@ let hold ~name ~opened ~contents ~file path fn =
   Option.iter (update_lock_contents file) contents;
   fn ()
 
-(* The rendezvous is opened before the mutex is taken, because the key the
-   mutex is found by comes from the opened descriptor. Opening is not holding:
-   the exclusion begins at the mutex and, across processes, at the record lock,
-   both of which are taken on the file this open settled. What the open does
-   settle is the caller's turn: it is made inside the name's entry queue, so a
-   fiber that entered earlier reaches the file's mutex earlier.
-
-   A rendezvous carrying no descriptor has no record lock to take, and the
-   backend that handed it out is the only party that knows what that costs. One
-   whose files no process outside this one can open declares itself
-   process-local, and there the mutex is not the weaker half of the exclusion
-   but the whole of it. Any other backend is refused, since running under the
-   mutex alone would put this caller in a critical section another process can
-   be inside with nothing in either run to say so. *)
+(* The rendezvous is opened before the mutex is taken, the mutex key coming
+   from the opened descriptor. A rendezvous with no descriptor has no record
+   lock to take: a process-local backend makes the mutex the whole exclusion,
+   and any other is refused. *)
 let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents path fn =
-  (* [block] is answered per half, because each half is a different holder. The
-     mutex is held by a fiber of this program, which [`Fibers] waits for; the
-     record lock is held by another process, which it answers about. *)
+  (* [block] is answered per half: the mutex is held by a fiber, the record
+     lock by another process. *)
   let name = lock_name path in
   Eio.Switch.run @@ fun sw ->
   let fibers, processes =
@@ -499,27 +366,13 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
            descriptor and its backend registers no Eio_fs_sync.Process_local"
           name
 
-(* ---- the rendezvous, as a section a backend-free component runs inside ----
-
-   A component that keeps files but cannot name a lock library takes its
-   critical section as an [Eio_fs_sync.Lock.t] instead, and this is that
-   section over a rendezvous of this filesystem's. Being the one place that
-   knows both vocabularies, it is where every way [with_lock] can refuse
-   becomes [Eio_fs_sync.Lock.Unavailable] naming what refused: the component on
-   the other side has no other exception it can catch, and one travelling out
-   through an interface whose type promises a result is the exclusion failing
-   silently from that interface's point of view.
-
-   The translation covers only what is raised before the section's body begins.
-   What the body raises is the component's own and travels out as the body
-   raised it: a write that failed under a lock the caller was granted is not
-   the lock refusing, and reporting it as one would send an operator looking
-   for a holder that is not there. *)
+(* A backend-free component takes its critical section as an
+   [Eio_fs_sync.Lock.t]; this is that section over a rendezvous of this
+   filesystem's. Everything [with_lock] raises before the body begins becomes
+   [Eio_fs_sync.Lock.Unavailable]; what the body raises travels out untouched. *)
 module Rendezvous = struct
-  (* [with_lock] takes a path at whatever capability type the caller holds, so
-     the rendezvous is captured in the closure rather than carried as a value.
-     The explicit [ 'a. ] is what keeps the packed section polymorphic in its
-     result, as [Eio_fs_sync.Lock.Make] requires. *)
+  (* The rendezvous is captured in the closure, keeping the section
+     polymorphic in its result. *)
   type t = { enter : 'a. (unit -> 'a) -> 'a }
 
   let use t f = t.enter f

@@ -1,24 +1,9 @@
-(** Fuzz tests for {!Eio_fs.Chaos}.
-
-    Properties tested:
-
-    + {b Crash-safety.} Over an arbitrary seed, fault probability and workload
-      -- including read-only files and files staged through short-lived subtrees
-      -- the wrapper only ever surfaces [Eio.Io] or [End_of_file], never an
-      assertion failure, [Invalid_argument], or any other escape. Any such
-      escape propagates out of the property and fails the run.
-    + {b Determinism.} A seeded schedule replayed with the same seed drives the
-      exact same success/failure outcome and the exact same committed bytes.
-    + {b Barrier invariant.} Under [Drop_unsynced] the post-crash image is
-      exactly the synced prefix, and the file keeps its mode -- whatever the
-      file's mode, staging subtree, or truncating reopens after the barrier. The
-      name is pinned separately, by the directory barrier.
-    + {b Reference model.} An arbitrary operation tape -- creates, writes,
-      syncs, unlinks, mkdirs, rmdirs, symlinks, renames, metadata barriers --
-      drives a crash-wrapped tree in lockstep with a pure model of the journal
-      semantics; the recovered tree must equal the model's post-crash tree byte
-      for byte, and the seeded reorder policy must reproduce the same recovered
-      tree for the same seed. *)
+(** Fuzz tests for {!Eio_fs.Chaos}: crash-safety (only [Eio.Io] or
+    [End_of_file] ever escapes), determinism (a seeded schedule replays the same
+    outcome and bytes), the [Drop_unsynced] barrier invariant (the post-crash
+    image is the synced prefix and keeps its mode), and a reference model (an
+    arbitrary operation tape drives a crash-wrapped tree in lockstep with a pure
+    model of the journal, byte for byte). *)
 
 open Alcobar
 module Chaos = Eio_fs.Chaos
@@ -101,14 +86,10 @@ let test_crash_safety_and_determinism seed prob_pct nblocks block access
 
 module Crash = Chaos.Crash
 
-(* Write [nblocks] contiguous [block]-byte blocks (block [i] filled with byte
-   [i]), syncing once right after writing block [sync_after] (a barrier), then
-   crash under [policy] and return the post-crash image and file mode. The
-   adversarial dimensions of a release store: the file is created read-only
-   (0o444) or writable, staged directly or through a short-lived subtree that
-   closes before the crash fires, and -- for writable files -- reopened
-   [Or_truncate] after the writer closed, followed by one more unsynced
-   overwrite. A fresh tree each run ([Eio_fs.run] resets it). *)
+(* Write [nblocks] contiguous [block]-byte blocks, syncing once after block
+   [sync_after], then crash under [policy] and return the post-crash image and
+   mode. The file may be read-only or writable, staged directly or through a
+   short-lived subtree, and reopened [Or_truncate] after the writer closed. *)
 let post_crash_image ~policy ~nblocks ~block ~sync_after ~read_only ~via_subtree
     ~trunc_reopen =
   Eio_mock.Backend.run @@ fun () ->
@@ -188,11 +169,8 @@ let test_crash_barrier _seed nblocks block sync_after access placement reopen =
 (* {2 Reference-model oracle}
 
    A pure model of the durability contract runs an arbitrary operation tape in
-   lockstep with a crash-wrapped in-memory tree. At the crash the model
-   computes the exact post-crash tree -- committed metadata shapes over
-   per-file durable contents -- and the recovered tree must match it byte for
-   byte. This is the widest net: any divergence between the implementation and
-   the journal semantics in chaos.mli fails the run, anticipated or not. *)
+   lockstep with a crash-wrapped tree; the recovered tree must equal the
+   model's post-crash tree byte for byte. *)
 
 module Model = struct
   module SM = Map.Make (String)
@@ -510,18 +488,11 @@ let test_crash_determinism seed nblocks block sync_after access placement reopen
   in
   check_eq ~pp:image_and_mode ~eq:( = ) a b
 
-(* ── [Eio_fs_sync.publish] under crash and fault ──────────────────── *)
+(* [Eio_fs_sync.publish] under crash and fault.
 
-(* [publish] is the durability primitive the storage packages in this tree are
-   built on: irmin's car, git and parquet stores, gauth's credential file, and
-   the OCI registry all commit through it. Its guarantee is worth fuzzing
-   directly rather than five times over in the consumers.
-
-   The guarantee is atomic replacement: after a crash the target holds either
-   the old content or the new one, never a splice of the two and never a
-   truncated prefix. A credential file, a store snapshot or a manifest that
-   comes back half-written is worse than one that never changed -- the old
-   content was valid, and the caller has no way to tell the difference. *)
+   [publish] is the durability primitive the storage packages here build on.
+   After a crash the target holds the old content or the new one, never a
+   splice and never a truncated prefix. *)
 
 let publish_string path data =
   let config =

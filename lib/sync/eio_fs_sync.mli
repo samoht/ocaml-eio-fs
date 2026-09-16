@@ -1,38 +1,16 @@
 (** The directory-durability barrier and the atomic publication built on it,
     portable across backends.
 
-    A write-temporary-then-rename commit protocol is durable only once the
-    directory entry itself reaches stable storage. {!sync_dir} issues that
-    barrier over any backend. A backend with its own barrier semantics registers
-    {!Dir_sync} in its resource handler: the in-memory backend a no-op (volatile
-    storage has nothing to sync), a crash-model wrapper its journal commit, a
-    block-device filesystem its flush. A plain POSIX directory needs no
-    registration: it is opened read-only and its handle fsynced.
+    {!sync_dir} issues the barrier a write-temporary-then-rename protocol needs;
+    a backend with its own semantics registers {!Dir_sync}, and a plain POSIX
+    directory is opened read-only and fsynced. {!sync_file} is the same for the
+    bytes an entry names: a backend registers {!File_sync}, otherwise the
+    barrier is {!Eio.File.sync}. {!publish} is the protocol itself, under a
+    mandatory byte ceiling ({!type-config}, {!Limit_exceeded}).
 
-    The bytes that entry names have a barrier of their own, {!sync_file}, and it
-    dispatches the same way: a backend registers {!File_sync}, a crash-model
-    wrapper committing that file's data journal so a model of power loss sees
-    the barrier the protocol issued. A plain POSIX file needs no registration
-    either, and neither does the in-memory backend, for a reason the directory
-    half did not have: a file's own {!Eio.File.sync} already is its barrier,
-    where a directory's had to be reached by opening the directory read-only and
-    fsyncing that handle. The registration is there so a wrapper can answer for
-    what its base would do, not because the fallback is wrong.
-
-    {!publish} is that protocol itself, written once so every store commits the
-    same way: contents streamed into a temporary, the temporary synced, renamed
-    over the target, and the directory holding the target's entry barriered --
-    under a mandatory ceiling on the bytes it will accept ({!type-config},
-    {!Limit_exceeded}), so a producer that never ends fills no disk.
-
-    {!Process_local} is the other thing a backend declares here: whether any
-    opener of its files can exist outside this process, which is what tells an
-    in-process exclusion apart from a stand-in for a real one. {!Lock} is the
-    exclusion itself, as the caller hands it over: the section a store runs a
-    read-modify-write inside, a record lock where an outside opener exists and a
-    mutex between this process's fibers where none can. This library depends on
-    nothing but eio, so pure Eio adapters that cross-compile to unikernels link
-    it freely. *)
+    {!Process_local} declares whether any opener of a backend's files can exist
+    outside this process, and {!Lock} is the exclusion a caller supplies. This
+    library depends on nothing but eio. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
@@ -45,32 +23,21 @@ val dir_barrier : 'a Eio.Resource.t -> (path:string -> unit) option
 
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
-    issues after renaming a file into place, without which a power cut can
-    revert the rename to the prior entry. A backend that registers {!Dir_sync}
-    answers through it; otherwise [dir] is opened read-only and its handle
-    fsynced, which is the POSIX directory barrier. On Darwin that fsync reaches
-    the drive's cache, the same strength Eio gives file data;
-    [Eio_fs_unix.sync_dir] upgrades the barrier to platter strength for programs
-    that can link unix.
+    issues after renaming a file into place. A backend that registers
+    {!Dir_sync} answers through it; otherwise [dir] is opened read-only and its
+    handle fsynced. [Eio_fs_unix.sync_dir] upgrades that to platter strength for
+    programs that link unix.
 
     @raise Eio.Io
-      if the directory cannot be opened for its barrier or the sync itself
-      fails; the error carries context naming the missing {!Dir_sync}
-      registration.
+      if the directory cannot be opened or the sync fails.
     @raise Failure
-      if the backend registers no barrier and its directory handles expose no
-      sync operation -- a wiring error, since silence would silently lose
-      durability. *)
+      if the backend registers no barrier and its handles expose no sync
+      operation. *)
 
 val sync_parent : _ Eio.Path.t -> unit
-(** [sync_parent p] makes the directory that holds [p]'s entry durable: the
-    typed answer to "barrier the directory this name lives in", the barrier a
-    commit protocol issues after creating or renaming [p]. The parent comes from
-    {!Eio.Path.split}, so it keeps the directory capability [p] was expressed
-    against, where taking the parent through the path's string half
-    ([Filename.dirname]) drops that confinement. A path with no parent is the
-    root of the capability itself, and its barrier is {!sync_dir} of that path:
-    there is nothing above it a confined path may reach for.
+(** [sync_parent p] makes the directory holding [p]'s entry durable. The parent
+    comes from {!Eio.Path.split}, so it keeps [p]'s directory capability; a path
+    with no parent is the root of that capability.
 
     @raise Eio.Io as {!sync_dir}, on the directory the barrier lands on. *)
 
@@ -86,35 +53,23 @@ val file_barrier : 'a Eio.Resource.t -> (unit -> unit) option
 
 val sync_file : _ Eio.File.rw -> unit
 (** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
-    issues over the bytes it wrote, before the rename that publishes them.
-    Without it a power cut can leave the published entry naming bytes that never
-    reached stable storage. A backend that registers {!File_sync} answers
-    through it; otherwise the barrier is {!Eio.File.sync}, which is what a plain
-    POSIX file's barrier already is. [Eio_fs_unix.sync_file] upgrades that
-    fallback to platter strength for programs that can link unix.
-
-    A declared barrier is answered whole, never alongside the file's own sync: a
-    backend that registers one owns its semantics, and syncing behind it would
-    hand a wrapper that models power loss a barrier it never recorded.
+    issues over the bytes it wrote. A backend that registers {!File_sync}
+    answers through it, whole and never alongside the file's own sync; otherwise
+    the barrier is {!Eio.File.sync}. [Eio_fs_unix.sync_file] upgrades that to
+    platter strength for programs that link unix.
 
     @raise Eio.Io as {!Eio.File.sync}, or as the registered barrier raises. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Process_local : ('t, 't -> bool, [> `Process_local ]) Eio.Resource.pi
-        (** What a backend declares about the openers of its files: [true] when
-            no opener outside this process can reach them, so an exclusion taken
-            between the fibers of this process is the whole exclusion those
-            files admit. The in-memory backend registers it, its files living in
-            the heap with no name to open them by and no descriptor to inherit,
-            as does a unikernel filesystem. A wrapper answers for the base it
-            was given, which is why the answer is a function of the resource. *)
+        (** What a backend declares about its files' openers: [true] when no
+            opener outside this process can reach them, so an in-process
+            exclusion is the whole exclusion. A wrapper answers for its base. *)
 
 val is_process_local : _ Eio.Resource.t -> bool
 (** [is_process_local res] is what [res] declares through {!Process_local}, and
-    [false] for a resource that declares nothing: a caller weighing whether an
-    in-process exclusion is the whole exclusion must read silence as "an outside
-    opener exists", since the other reading turns a forgotten registration into
-    two processes inside one critical section. *)
+    [false] when it declares nothing: silence must read as "an outside opener
+    exists". *)
 
 type config = {
   durable : bool;
@@ -132,19 +87,10 @@ exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
 (** Raised before a write that would exceed {!type-config.field-max_bytes}. *)
 
 val fresh_name : string -> string
-(** [fresh_name stem] is [stem] extended so that no other writer produces the
-    same string: a salt drawn once per process and a counter atomic across that
-    process's fibers. It is the name {!publish} stages under when [tmp] is
-    omitted, and it is exported for the store {!publish} cannot serve at all --
-    one whose target name is the digest of bytes it is still reading, so the
-    name to rename into is unknown when the staging file has to be opened. A
-    counter alone is not enough there: a fresh handle starts it at zero, so
-    every writer on a shared directory picks the same first name and one
-    writer's bytes end up under another's.
-
-    The name is not itself the exclusion. Open it with [`Exclusive] so that a
-    collision raises instead of truncating a staging file another writer is
-    still filling. *)
+(** [fresh_name stem] is [stem] extended with a per-process salt and a
+    fiber-atomic counter, so no other writer produces the same string. It is
+    exported for a store whose target name is unknown until its bytes are read.
+    The name is not itself the exclusion: open it with [`Exclusive]. *)
 
 val publish :
   config:config ->
@@ -153,33 +99,16 @@ val publish :
   (Eio.Flow.sink_ty Eio.Resource.t -> 'b) ->
   'b
 (** [publish ~config path write] replaces [path]'s contents atomically and
-    durably. [write file] streams the new contents into a temporary Eio file;
-    after it returns, the temporary is fsynced, renamed over [path] -- a reader
-    or a crash sees the old file or the whole new one, never a torn or empty
-    file -- and the directory holding [path]'s entry is barriered with
-    {!sync_parent}. The callback's result is returned only after publication
-    completes.
+    durably: [write] streams into a temporary, which is fsynced, renamed over
+    [path], and whose directory is barriered with {!sync_parent}.
 
-    When [tmp] is omitted, a fresh sibling name is opened exclusively. An
-    explicit [tmp] is also opened exclusively, must not exist, must be distinct
-    from [path], and must live on the same filesystem (rename cannot cross
-    devices), but need not share its directory. Only [path]'s directory is
-    barriered; a stale temporary resurrected by a power cut is garbage for the
-    store's usual cleanup, never served state.
-
-    {!type-config.field-max_bytes} is enforced by the sink before each write. If
-    [write], the temporary sync, or the rename fails, the owned temporary is
-    removed and the old [path] remains intact. A directory-barrier failure is
-    reported after the rename: the new file is visible but its power-cut
-    durability is uncertain.
-
-    Setting {!type-config.field-durable} to [false] keeps only the atomicity --
-    no fsync, no barrier -- for a store that deliberately trades the power-cut
-    window for write speed, as git does for loose objects; say why at the call
-    site. *)
+    An omitted [tmp] is a fresh sibling name, opened exclusively; an explicit
+    one is also exclusive, must not exist, must differ from [path] and live on
+    the same filesystem. On a failure of [write], the sync or the rename, the
+    temporary is removed and [path] stays intact; a barrier failure is reported
+    after the rename, the new file visible with uncertain durability.
+    {!type-config.field-durable} [false] keeps only the atomicity. *)
 
 module Lock = Lock
-(** The critical section a caller supplies. The barrier above says how a write
-    reaches stable storage; the section says what keeps two writers out of one
-    another's read-modify-write, and, like the barrier, it is the deployment's
-    to name rather than the store's. *)
+(** The critical section a caller supplies: what keeps two writers out of one
+    another's read-modify-write, named by the deployment rather than the store. *)

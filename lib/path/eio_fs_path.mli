@@ -1,17 +1,9 @@
-(** Lexical arithmetic on the paths an {!Eio} filesystem is addressed by.
-
-    They are Eio paths, whose "directory separator is always ["/"], even on
-    Windows" ({!Eio.Path}), so the host's own path modules answer about a
-    different language: to them a ["\\"] may be a separator and a leading ["c:"]
-    a volume, and here both are ordinary characters in an ordinary component.
-    This is where the rules for these paths live, so that what a path resolves
-    to has one producer.
-
-    Everything here is lexical: nothing opens a file, follows a link or asks the
-    filesystem anything. {!normalize} and {!components} therefore rewrite a
-    [".."], which is sound only where the component before it is not a symbolic
-    link; {!canonical} refuses one instead, for a caller that cannot assume
-    that. *)
+(** Lexical arithmetic on the paths an {!Eio} filesystem is addressed by: Eio
+    paths, whose separator is always ["/"] even on Windows, so the host's own
+    path modules answer about a different language. Everything here is lexical;
+    nothing opens a file or asks the filesystem anything. {!normalize} rewrites
+    a [".."], sound only where the component before it is not a link;
+    {!canonical} refuses one instead. *)
 
 val is_abs : string -> bool
 (** [is_abs path] is whether [path] starts at the root, which is whether it
@@ -71,20 +63,10 @@ type refusal =
   | Not_canonical  (** Names something, by a spelling that is not its own. *)
 
 val canonical : string -> (string list, refusal) result
-(** [canonical path] are the components of [path] when [path] is an absolute
-    path already written in canonical form, and why it is not otherwise.
-
-    It refuses rather than rewrites, which is what a caller resolving the
-    components one at a time under [O_NOFOLLOW] needs: rewriting [a/b/..] to [a]
-    names a different directory wherever [b] is a symbolic link, and such a
-    caller exists precisely because it cannot assume [b] is not. So a [path]
-    carrying a ["."] or a [".."] is {!Not_canonical} here rather than resolved,
-    and so is every spelling whose components do not rejoin to exactly the
-    string given -- a trailing separator, a doubled separator, a leading double
-    separator. What comes back is the components of a path that already was
-    canonical, so the caller's own name for it and the filesystem's are the same
-    string.
-
-    A NUL byte is {!Not_a_path} rather than a component boundary. Every layer
-    below this one takes it for the end of the string, so a path carrying one is
-    refused where the refusal can still name the whole of it. *)
+(** [canonical path] are the components of [path] when it is absolute and
+    already canonical, and why it is not otherwise. It refuses rather than
+    rewrites: rewriting [a/b/..] to [a] names a different directory wherever
+    [b] is a symbolic link, so a caller resolving components under [O_NOFOLLOW]
+    needs the refusal. A ["."], [".."] or any spelling whose components do not
+    rejoin to exactly the string given is {!Not_canonical}; a NUL byte is
+    {!Not_a_path}. *)

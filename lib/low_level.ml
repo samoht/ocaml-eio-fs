@@ -173,12 +173,9 @@ end
 
 type resource = Resource.t
 
-(* A path component that had to be a directory and is not. POSIX answers
-   ENOTDIR and every real Eio backend surfaces that as an [Eio.Io], so raising
-   [Invalid_argument] would make this backend the only one a caller written
-   correctly against Eio's error model dies on. Eio.Fs has no ENOTDIR
-   constructor, so report what the walk in [entries_exn] already reports: the
-   path does not resolve. [label] names the operation that resolved it. *)
+(* A component that had to be a directory and is not: POSIX answers ENOTDIR,
+   which every real Eio backend surfaces as an [Eio.Io]. Eio.Fs has no ENOTDIR
+   constructor, so report the path does not resolve. *)
 let as_dir ~label = function
   | Resource.Dir dir -> dir
   | r ->
@@ -377,12 +374,8 @@ module Filesystem = struct
             parent sym.link_to
         in
         entries_exn ~check ~follow ~parent fs r
-    (* Walking *through* something that is not a directory: POSIX answers
-       ENOTDIR, which every real Eio backend surfaces as an [Eio.Io]. Raise the
-       same shape rather than a bare [Failure], or this backend is not
-       substitutable for a real one -- a caller that correctly handles Eio's
-       error model would still crash, and only here. Eio.Fs has no ENOTDIR
-       constructor, so the path simply does not resolve. *)
+    (* Walking through a non-directory: POSIX ENOTDIR, surfaced as an [Eio.Io]
+         rather than a bare [Failure]. *)
     | r -> Fmt.kstr Error.not_found "not a directory: %a" Resource.pp r
 
   let lookup ~follow dir_fd path =
@@ -434,17 +427,9 @@ module Filesystem = struct
           else Error.permission_denied resource_path
 end
 
-(* Closing a handle that is already closed does nothing, which is what
-   [Eio.Resource.close] specifies of the operation this implements and what
-   eio's posix backend does -- its close answers a descriptor that has gone
-   with [false] rather than raising. A handle with two owners is the ordinary
-   reason: a caller closing early in front of the switch that would close it
-   anyway, or one open file held through two views. close(2)'s EBADF is about
-   a descriptor number the kernel may since have given to someone else, which
-   is not what an owner of a handle here is asking about.
-
-   The switch's release for a handle still open when it finishes is this same
-   operation, so it is this same function. *)
+(* Closing an already-closed handle does nothing, as [Eio.Resource.close]
+   specifies and eio's posix backend does. A handle with two owners, a caller
+   closing early in front of its switch, is the ordinary reason. *)
 let close fd = update_fd_table @@ fun fds -> Fd_table.remove fd fds
 
 (* open(2): opening an existing file requires the permission bits the access
@@ -685,13 +670,9 @@ let rename dir_fd old_path new_dir new_path =
   let without name entries =
     List.filter (fun (_, n) -> not (String.equal n name)) entries
   in
-  (* [rename] MOVES: the source directory loses [old_name] and the target gains
-     [new_name] (replacing any prior entry of that name) pointing at [ino]. The
-     source path no longer resolves afterwards, so a file later created there
-     gets a fresh inode and shares no storage with the target. When both parents
-     are the same directory they resolve to the same ref, so apply both edits to
-     one entries list; otherwise write each parent in turn. No fiber yields
-     between the reads and the writes, so the move is atomic. *)
+  (* A rename MOVES: the source loses [old_name] and the target gains
+     [new_name] pointing at [ino]. Same-parent edits go to one entries list, so
+     the move is atomic. *)
   if old_parent == new_parent then begin
     let d = as_dir ~label:"rename" !new_parent in
     let entries =
@@ -733,13 +714,10 @@ let blit_and_grow ~src ~dst ~off =
     new_dst
   end
 
-(* A descriptor open on something other than a regular file still answers the
-   whole file interface: [Eio.Path.open_in] on a directory is legal, and the
-   portable directory barrier in eio-fs.sync depends on it. So the operations
-   below have to refuse one the way a real backend does, with the EISDIR that
-   read(2) and write(2) answer on a directory descriptor. Eio leaves that
-   unclassified, which is an [Eio.Io] a caller can match on, unlike a bare
-   [Failure]. *)
+(* A descriptor open on a non-regular file still answers the file interface --
+   [Eio.Path.open_in] on a directory is legal and the portable directory
+   barrier depends on it -- so the operations below refuse one with EISDIR, as
+   read(2) and write(2) do. *)
 let writev fd bufs =
   update_fd_table_with_result @@ fun fds ->
   let () =

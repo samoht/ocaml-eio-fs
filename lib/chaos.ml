@@ -269,20 +269,11 @@ let close_resource r =
 
 (* {2 What a wrapped file carries over}
 
-   A wrapper answers for the base it was given, so a file it hands back keeps
-   the base's own value and puts the wrapper's read, write, sync and close in
-   front of the base's bindings. Eio resolves an interface through the first
-   binding that answers for it, so every operation the wrapper implements
-   reaches the wrapper, and what stays reachable is what the base offers and
-   the wrapper has no answer for: over a real directory that is the Unix
-   descriptor of the file, which a caller takes a record lock on or hands to a
-   launcher, and over the in-memory backend nothing, its files having no
-   descriptor to carry.
-
-   A descriptor carried over is the operations the operating system offers on
-   an open file, and not a second way past the wrapper: a write issued on it is
-   not a write the wrapper saw, and a barrier issued on it is not the wrapper's
-   barrier. So the wrapper registers [Eio_fs_sync.File_sync] as well, bound to
+   A wrapped file keeps the base's value with the wrapper's read, write, sync
+   and close in front, so what stays reachable is what the base offers and the
+   wrapper has no answer for -- over a real directory the Unix descriptor, over
+   the in-memory backend nothing. A carried descriptor is not a second way past
+   the wrapper, so the wrapper also registers [Eio_fs_sync.File_sync], bound to
    its own sync. A caller that wants the platform's strongest file barrier asks
    that registration first and only reaches for the descriptor when a backend
    declares none, which is how a barrier issued through [Eio_fs_sync.sync_file]
@@ -468,12 +459,9 @@ let wrap_dir_hook :
     ref =
   ref (fun ~base:_ ~sched:_ -> assert false)
 
-(* Free the name at [path], whatever kind of entry holds it. Unlinking a
-   directory is EPERM on Darwin and EISDIR on Linux, so a name that may be a
-   directory is emptied first and then removed with [rmdir]; anything else is
-   unlinked. The two wrappers that free a name -- the scripted swap below and
-   the crash model rebuilding its post-crash image -- both go through here, so
-   what a name may be replaced by is decided in one place. *)
+(* Free the name at [path], whatever holds it. A directory is emptied first and
+   removed with [rmdir]; anything else is unlinked. Both wrappers that free a
+   name go through here. *)
 let rec remove_at (Base_dir ((module B), bv) as owner) path =
   match B.stat bv ~follow:false path with
   | exception Eio.Io _ -> ()
@@ -501,12 +489,9 @@ let rec remove_at (Base_dir ((module B), bv) as owner) path =
         try B.rmdir bv path with Eio.Io _ -> B.unlink bv path)
   | _ -> B.unlink bv path
 
-(* A swap fires AFTER the operation it was scheduled on: the operation sees the
-   original file, then the name is unlinked and re-created as a symlink to the
-   target, so everything that resolves the path afterwards reaches the target
-   instead -- the check-to-use window a TOCTOU exploits. On a stat the check is
-   the metadata the caller was handed; on an open it is the descriptor, which
-   keeps the original file while its name goes on to mean another. *)
+(* A swap fires AFTER the scheduled operation: the name is unlinked and made a
+   symlink to the target, so everything resolving the path afterwards reaches
+   the target -- the check-to-use window a TOCTOU exploits. *)
 let swap_after boxed fault path =
   match fault with
   | Some (Fault.Swap_symlink target) ->
@@ -659,15 +644,10 @@ let wrap sched (base, path) =
 
 (* {2 Crash / durability model} *)
 
-(* A companion to the schedule-driven wrapper that models power-loss durability.
-   Every write is tracked as "un-synced" until a successful [sync] on that file
-   marks all its prior writes durable. A crash produces a post-crash view of the
-   backing store where un-synced writes may be dropped and/or reordered relative
-   to each other, while synced writes are always durable and never move past
-   their barrier. Unlike the perturbing wrapper, this one delegates writes and
-   reads to the base unchanged (so the live view stays consistent while the
-   workload runs) and only rewrites the base at crash time to the reconstructed
-   image. *)
+(* A companion to the schedule-driven wrapper that models power-loss durability:
+   a write is un-synced until a [sync] on its file, and a crash may drop or
+   reorder un-synced writes. Writes and reads are delegated unchanged while the
+   workload runs; the base is rewritten only at crash time. *)
 module Crash = struct
   type boxed = base_dir
   (* Reuse the boxed base directory from the perturbing wrapper. *)
@@ -784,18 +764,14 @@ module Crash = struct
         with Eio.Io _ -> Cstruct.empty)
     | _ -> Cstruct.empty
 
-  (* A single durability-relevant change on a file. [Truncate] models an
-     unsynced resize; [Write] carries an independent copy of the committed
-     bytes so a crash can replay the survivors onto the durable baseline. *)
+  (* [Write] carries a copy of the committed bytes so a crash can replay the
+     survivors onto the durable baseline. *)
   type change = Write of { offset : int; data : Cstruct.t } | Truncate of int
 
-  (* Per-file durability state. [durable] is the content as of the last
-     successful [sync] (empty for a never-synced file); the pending changes for
-     the file live in the controller's global log. [owner] is the boxed
-     directory the controller was wrapped over -- long-lived, unlike a staging
-     subtree the file may have been opened through -- and [rel] the path from
-     it, so a crash can rewrite the file after intermediate subtrees close.
-     Both move when the file is renamed. *)
+  (* [durable] is the content as of the last [sync]; the pending changes live in
+     the controller's log. [owner] and [rel] locate the file under the wrapped
+     root so a crash can rewrite it after intermediate subtrees close; both move
+     on rename. *)
   type fstate = {
     mutable owner : boxed;
     mutable rel : string;
@@ -834,12 +810,8 @@ module Crash = struct
   }
   (* An un-synced change, as seen by a scripted survival predicate. *)
 
-  (* Directory durability is represented by snapshots of the wrapped tree.
-     This deliberately favours a small, exact reference model over efficiency:
-     metadata operations are rare in the workloads this wrapper tests, and a
-     complete snapshot makes rename rollback (including replaced subtrees)
-     atomic and unambiguous. File contents are normalised separately from the
-     per-file durability log below. *)
+  (* Directory durability uses whole-tree snapshots: metadata operations are
+     rare, and a snapshot makes rename rollback atomic and unambiguous. *)
   type tree =
     | File of { data : Cstruct.t; perm : int }
     | Dir of { perm : int; entries : (string * tree) list }
@@ -847,13 +819,10 @@ module Crash = struct
 
   type location = fstate * boxed * string
   type delta = (string list * tree option) list
-  (* The namespace effect of one directory operation: each path it touched, in
-     the durable image's own coordinates, and the node that path holds
-     afterwards -- [None] for a name it freed. Captured from the same snapshot
-     the entry carries, so replaying the deltas of a set of entries in program
-     order onto the durable image reproduces exactly those operations and no
-     others, which a whole-tree snapshot cannot do once the set is no longer a
-     prefix of the journal. *)
+  (* The namespace effect of one directory operation: each path it touched and
+     the node it holds afterwards, [None] for a name it freed. Replaying a
+     set's deltas in program order reproduces those operations alone, which a
+     whole-tree snapshot cannot do once the set is not a journal prefix. *)
 
   type metadata_entry = {
     meta : unsynced;
@@ -1146,18 +1115,13 @@ module Crash = struct
     ctl.metadata <- []
 
   (* fsync(2) on a directory commits that directory's entries and nothing else:
-     the journal entries whose recorded path names a child of [dir], in program
-     order. It says nothing about [dir]'s own entry in its parent, about a
-     sibling of [dir], or about an entry one level further down. A model that
-     commits the journal whole cannot tell a store that barriered the directory
-     holding the entry it cares about from one that barriered any directory at
-     all.
+     the journal entries whose recorded path names a child of [dir]. A model
+     that commits the journal whole cannot tell the two apart.
 
-     The entries a barrier commits are not in general a prefix of the journal --
-     a barrier on one directory leaves an older operation on another pending --
-     so no entry's whole-tree snapshot can become the durable image. The image
-     advances by replaying the committed entries' deltas onto it, and the
-     entries left pending are rebased onto the result: [do_crash] reads the last
+     Those entries are not in general a journal prefix, so no snapshot can
+     become the durable image. The image advances by replaying the committed
+     entries' deltas, and the entries left pending are rebased onto the result:
+     [do_crash] reads the last
      surviving entry's snapshot, so that snapshot must hold everything already
      durable at the moment of the crash.
 
@@ -1283,13 +1247,9 @@ module Crash = struct
     in
     if fire && not ctl.crashed then do_crash ctl
 
-  (* A directory operation has just entered the journal. [After_dir_op] fires
-     here -- after [record_metadata], before anything that could commit the
-     entry -- so the crash lands inside the window an operation with no barrier
-     of its own leaves open, which is one statement wide and is the only place
-     it can be seen from. Kind and path are matched exactly as the journal
-     records them, so a rename must spell its destination and a symlink its
-     target. *)
+  (* [After_dir_op] fires here -- after [record_metadata], before anything can
+     commit the entry -- inside the window a directory operation with no barrier
+     leaves open. Kind and path are matched as the journal records them. *)
   let bump_metadata ctl ~path ~kind =
     ctl.ops <- ctl.ops + 1;
     let fire =

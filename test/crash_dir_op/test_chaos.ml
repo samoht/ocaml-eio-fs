@@ -1,25 +1,12 @@
-(* [Crash.After_dir_op { kind; path }] fires the crash once that directory
-   operation -- matched by kind and path exactly as the metadata journal
-   records them -- has entered the journal, and before any following operation
-   can commit it. It is the only way to look inside the window a directory
-   operation with no barrier of its own leaves open.
+(* [Crash.After_dir_op { kind; path }] crashes once that directory operation,
+   matched by kind and path as the metadata journal records them, has entered
+   the journal and before anything can commit it. It is the only way to look
+   inside the window a directory operation with no barrier of its own leaves
+   open.
 
-   The window is real and it is one statement wide. ocaml-sqlite's
-   [relay_at_page_size] (lib/session.ml:287-296) removes a write-ahead log and
-   syncs the pager, never the directory. The removal sits uncommitted until the
-   next commit, which creates a fresh log and barriers THAT creation -- and a
-   directory fsync commits the directory, not one entry of it, so the same
-   barrier commits the pending removal incidentally. A crash at the end of the
-   workload therefore finds nothing left to roll back and the missing barrier
-   reads as durable; measured 2026-08-15, see "relay_at_page_size removes the
-   log with no directory barrier" in ocaml-sqlite/TODO.md.
-
-   The three triggers that exist do not reach it. [Manual] fires after the
-   workload, which is what measured green. [After_write] keys on a byte range
-   of a file and an unlink writes no bytes. [Nth_op] reaches it only as a magic
-   number counting every durability op in the workload, which a refactor of the
-   store's commit path moves silently while the test goes on passing -- worse
-   than no test. *)
+   The other triggers cannot reach it: [Manual] fires after the workload,
+   [After_write] keys on a byte range an unlink never writes, and [Nth_op] is a
+   magic number a refactor of the commit path moves silently. *)
 
 module Crash = Eio_fs.Chaos.Crash
 
@@ -75,10 +62,9 @@ let test_after_unlink () =
     "the barrier that would have committed the removal never ran" true
     (absent (post / "c"))
 
-(* The same workload under [Manual], which is where the trigger's absence was
-   measured: the crash at the end of it sees a journal the following barrier
-   already committed, so the removal is durable and the missing barrier is
-   invisible. *)
+(* The same workload under [Manual]: the crash at the end sees a journal the
+   following barrier already committed, so the removal is durable and the
+   missing barrier is invisible. *)
 let test_manual_cannot_see_the_window () =
   let ctl = Crash.v ~policy:Drop_unsynced () in
   with_crash ctl @@ fun fs ->

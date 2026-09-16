@@ -342,16 +342,10 @@ let test_statvfs_reports_raw_block_capacity () =
   Alcotest.(check bool)
     "available blocks do not exceed total" true
     (Int64.compare usage.available_blocks usage.total_blocks <= 0);
-  (* The four numbers are ordered, and the order is what says each field came
-     from its own member of the struct: available <= free <= total. It catches
-     a stub that drops a field or stores two in the wrong slots -- with one
-     exception, stated here rather than left for a reader to discover. On a
-     filesystem that keeps NO reserve for the privileged user, free and
-     available are equal, so this case cannot tell those two apart there. APFS
-     is such a filesystem: measured 2026-09-07, f_bfree and f_bavail are the
-     same number on it, from the kernel's own statfs as well as from statvfs.
-     So on macOS this case is positive-only about which of those two slots is
-     which; on a filesystem with a reserve it binds. *)
+  (* The order available <= free <= total says each field came from its own
+     struct member. On a filesystem that keeps no reserve for the privileged
+     user, free and available are equal, so this case cannot tell those two
+     apart there. *)
   Alcotest.(check bool)
     "free blocks are at least the available ones" true
     (Int64.compare usage.free_blocks usage.available_blocks >= 0);
@@ -367,12 +361,10 @@ let test_statvfs_reports_raw_block_capacity () =
    count: what is asserted is the ORDER of the answers and which of them
    exist. *)
 
-(* Far enough apart that every filesystem this runs on leaves the span
-   between the two writes unallocated. It has to be said in bytes rather than
-   in blocks: measured 2026-09-07, APFS allocates a 1 MiB gap rather than
-   leaving a hole in it, so a span chosen from the block size alone gives a
-   file with no hole in it and a case that asserts nothing. Every case below
-   that needs the hole asserts it is there rather than assuming it. *)
+(* Far enough apart that every filesystem this runs on leaves the span between
+   the two writes unallocated, said in bytes rather than blocks since a
+   filesystem may allocate a gap rather than leave a hole. Every case that
+   needs the hole asserts it is there rather than assuming it. *)
 let hole_span = 64 * 1024 * 1024
 
 let with_sparse_file fn =
@@ -509,22 +501,11 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
    ticking fiber cannot run until the walk has finished, which is what this
    case refutes.
 
-   WHAT IT DOES NOT REFUTE, and the reason is worth a reader's time. The other
-   half -- releasing the runtime system around the syscalls -- is equally
-   load-bearing: eio's pool thread runs the closure as OCaml code and so holds
-   the domain's runtime lock, and a stub that does not release it holds the
-   domain for the whole call while looking exactly like one that does. This
-   case cannot see that, because it makes two thousand short calls and the
-   fiber gets its turn BETWEEN them either way. Refuting it needs one call
-   long enough to observe a fiber running during it, which needs a file in
-   thousands of physical extents; measured 2026-09-07, this filesystem
-   coalesces every cheap way of making one (20 000 blocks written interleaved
-   with another file report 20 extents, and written in a shuffled order, 18).
-   An aged file has them and a test cannot age a file. So: the mutation that
-   drops caml_release_runtime_system stays green here, it is a real defect,
-   and the case that does bind this half of the mechanism for this library is
-   [test_lock_wait_does_not_block_eio], which can hold its call open for a
-   quarter of a second because another process is holding the lock. *)
+   WHAT IT DOES NOT REFUTE: releasing the runtime system around the syscalls.
+   That half is load-bearing, but this case makes short calls and the fiber
+   gets its turn between them either way, so it cannot see a stub that holds
+   the domain for each whole call. [test_lock_wait_does_not_block_eio] binds
+   that half, holding its call open while another process holds the lock. *)
 let test_sparse_map_does_not_block_eio () =
   with_sparse_file @@ fun env fd ~size ->
   let clock = Eio.Stdenv.clock env in
@@ -771,19 +752,11 @@ let test_lock_fibers_mode_refuses_another_process () =
 (* ---- a bound is a wait a caller can plan against ----
 
    [`Yes] and [`No] are the two answers a second writer of a shared store can
-   be given, and where several checkouts of one program publish into one cache
-   neither is the answer it wants: waiting for ever is a run whose window
-   passes with nothing on the screen and no deadline, and refusing at zero is a
-   run that cannot work at all while another holds the store. Measured
-   2026-09-11 on one machine: a publish held its rendezvous for forty-two
-   minutes, and every other checkout was refused for the whole of it.
-
-   [`For seconds] is the third answer. It waits, and it answers: a caller that
-   knows the bound can name it on its terminal before it waits and act when the
-   wait is over. What the bound promises is only that -- nothing orders the
-   processes contending for a record lock -- so the cases say what it promises
-   and no more: the answer comes no sooner than the bound, and it comes without
-   waiting out a holder that is still there. *)
+   be given, and neither suits several checkouts publishing into one cache.
+   [`For seconds] waits and answers: a caller that knows the bound can name it
+   before it waits and act when the wait is over. Nothing orders the processes
+   contending for a record lock, so the answer comes no sooner than the bound
+   and does not wait out a holder that is still there. *)
 let test_lock_bounded_wait_answers_at_the_bound () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -1214,12 +1187,10 @@ let test_lock_over_a_wrapped_process_local_backend_serializes_fibers () =
    device and inode, and a backend runs that open off the calling fiber. So the
    order two fibers reach the mutex in is the order their opens came back in,
    which is not the order they entered, and a caller cannot repair it from
-   outside: between "I entered" and "I hold" it has no point to stand, short of
-   a gate of its own around the whole call. What that costs is a queue that
-   reorders its own writers -- a spool whose sequence numbers are issued inside
-   the lock publishes them out of the order its callers were served in, which
-   is what caravan's spool measured before it brought its own mutex
-   (42a2799845).
+   outside: between "I entered" and "I hold" it has no point to stand. What
+   that costs is a queue that reorders its own writers -- a spool whose
+   sequence numbers are issued inside the lock publishes them out of the order
+   its callers were served in.
 
    The suspension belongs to the backend, so a test that wants an exact
    interleaving brings its own: [Slow_open] delegates every operation to the
@@ -1347,17 +1318,11 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
         path);
   await_holder child
 
-(* What a lock writes is a write like any other. A holder that publishes its
-   diagnostics through [~contents] writes them through the wrapper's own file,
-   so the crash model sees that write and the policy decides whether it
-   survives the cut -- there is nothing special about a rendezvous once the
-   lock over it is taken. The rendezvous' own entry is committed in both runs
-   below, so what differs between them is only the policy's answer about an
-   un-synced write.
-
-   This is what the refusal used to hide: before the descriptor passed through,
-   the call was refused before it wrote anything, and what a lock journals
-   could not be stated at all. *)
+(* What a lock writes is a write like any other: [~contents] goes through the
+   wrapper's own file, so the crash model sees it and the policy decides
+   whether it survives the cut. The rendezvous' own entry is committed in both
+   runs below, so what differs is only the policy's answer about an un-synced
+   write. *)
 let crash_after_a_lock_published_its_contents ~policy =
   with_real_dir_env @@ fun _env dir ->
   let ctl = Crash.v ~policy () in

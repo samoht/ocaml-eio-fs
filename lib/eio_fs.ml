@@ -32,11 +32,8 @@ module Path = struct
     else if blocks > Int64.div Int64.max_int 512L then Int64.max_int
     else Int64.mul blocks 512L
 
-  (* Only a regular file has a length a reader of this record can act on: a
-     directory's own [size] is the space its entries take in it, and a symlink's
-     is the length of its target string. Both are already in
-     {!field-allocated_bytes}, and counting either as content would make the two
-     figures answer different questions about the same tree. *)
+  (* Only a regular file has a length a reader can act on: a directory's [size]
+     is the space its entries take and a symlink's is its target. *)
   let own stat =
     let regular = stat.Eio.File.Stat.kind = `Regular_file in
     {
@@ -75,10 +72,7 @@ module Path = struct
         (add total entry, List.rev_append children next))
       (empty, []) paths
 
-  (* [Fiber.List.map ~max_fibers] creates one fiber per input and parks the
-     excess on its limiter. Large, flat directories therefore create thousands
-     of short-lived fibers even though only [max_fibers] can do useful work.
-     Partition the level first so the number of fibers is bounded structurally;
+  (* Partition the level first so the number of fibers is bounded structurally;
      each worker then performs its share sequentially. *)
   let usage_level ~max_fibers paths =
     let worker_count = Int.min max_fibers (List.length paths) in
@@ -108,13 +102,8 @@ module Path = struct
     in
     loop empty [ path ]
 
-  (* A path has two renderings and only one of them names a file to anything
-     outside the program. [Eio.Path.pp] prints a path through the label its
-     capability was opened under -- a member of an opened subtree comes out as
-     "<label:member>" -- which picks out no file on the host and matches no
-     path the caller asked for. The native spelling does both, and every path a
-     real filesystem backs has one, so the rendering is what is left for the
-     paths that have none, such as a member of an in-memory tree. *)
+  (* The native spelling names a host file; [Eio.Path.pp] renders through the
+     capability label, which is all an in-memory path has. *)
   let name path =
     match Eio.Path.native path with
     | Some native -> native
@@ -124,19 +113,15 @@ end
 module Fs = struct
   type dir_fd = Low_level.Dir.fd
 
-  (* What a path is called on its own: its last component, by the rules for the
-     paths this backend is addressed by ({!Eio_fs_path}).
-
-     A path with no last component is called by the whole of itself: "/" is
-     called "/" and ".." is called "..", and the empty path, which is this
-     backend's own name for the directory itself, is called ".". *)
+  (* A path with no last component is called by the whole of itself: "/" is
+     "/", ".." is "..", and the empty path is ".". *)
   let last_component path =
     match Eio_fs_path.basename path with
     | "" -> if String.equal path "" then "." else path
     | base -> base
 
-  (* When renaming, we get a plain [Eio.Fs.dir]. We need extra access to check
-   that the new location is within its sandbox. *)
+  (* A rename hands back a plain [Eio.Fs.dir]; this checks the new location is
+     within its sandbox. *)
   type (_, _, _) Eio.Resource.pi +=
     | Memfs_dir : ('t, 't -> dir_fd, [> `Memfs_dir ]) Eio.Resource.pi
 

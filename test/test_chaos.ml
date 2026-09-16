@@ -296,23 +296,12 @@ let test_swap_symlink_on_open_subtree () =
 
 (* {2 A swap over a real POSIX filesystem}
 
-   The in-memory runs above pin the window; the kernel is the authority on what
-   a name may be replaced by. [swap_after] (chaos.ml:419) frees the name with a
-   plain [B.unlink], which is portable for a symlink name and for a regular
-   file and for nothing else: unlinking a directory is EPERM on Darwin and
-   EISDIR on Linux, so a swap scripted on [open_subtree] of a TRUE directory
-   fails where the contract says it fires. Measured 2026-08-15 on Darwin, on
-   the populated case below:
-   [Eio.Io (Eio.Fs.E (Permission_denied (Unix_error (Operation not permitted,
-   "unlinkat", "current"))))], with the name still a directory afterwards.
-
-   The Crash module already frees a name kind-aware -- [remove_at]
-   (chaos.ml:866-892) clears the entries first, then
-   [try rmdir with Eio.Io _ -> unlink] -- and the swap must free its name the
-   same way. The two directory cases are separate on purpose: the bare
-   [try rmdir with unlink] idiom answers the empty one and still leaves the
-   populated one raising ENOTEMPTY, and a staging directory a store swaps under
-   a caller is never empty. *)
+   Unlinking a directory is EPERM on Darwin and EISDIR on Linux, so freeing a
+   name with a plain unlink is portable for a symlink and a regular file and
+   nothing else. The swap must free its name kind-aware: clear the entries,
+   then [try rmdir with Eio.Io _ -> unlink]. The two directory cases are
+   separate on purpose, since a staging directory a store swaps under a caller
+   is never empty. *)
 
 (* Run [fn] over a private temp directory on the real filesystem, opened as a
    subtree so the paths the schedule matches are relative to it. *)

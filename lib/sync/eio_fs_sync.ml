@@ -1,13 +1,8 @@
-(* The directory-durability barrier. A backend with its own barrier
-   semantics registers [Dir_sync] in its resource handler: the in-memory
-   backend a no-op (volatile storage has nothing to sync), a crash-model
-   wrapper its journal commit, a fault-injecting wrapper its faultable sync.
-   A backend that registers nothing gets the POSIX route: the directory is
-   opened read-only and its handle fsynced, the barrier POSIX defines for
-   directory entries. Eio types [File.sync] as write-only, but the POSIX
-   backends build every descriptor from one read-write implementation, so
-   the operation is probed from the handle. This library uses only portable Eio
-   interfaces, so unikernel targets link it freely. *)
+(* The directory-durability barrier. A backend with its own semantics registers
+   [Dir_sync]; one that registers nothing gets the POSIX route, the directory
+   opened read-only and its handle fsynced. Eio types [File.sync] as write-only
+   but the POSIX backends build every descriptor from one read-write
+   implementation, so the operation is probed from the handle. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
@@ -37,27 +32,17 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
           Eio.Exn.reraise_with_context ex bt
             "syncing directory (backend registers no Dir_sync barrier)")
 
-(* The barrier on the directory that holds a path's entry. [Eio.Path.split]
-   answers the parent with the directory capability still attached, where
-   taking it through the path's string half ([Filename.dirname]) would pair a
-   fresh string with the capability and drop the confinement that made the
-   original path safe. A path with no parent is the root of the capability
-   itself: there is nothing above it a confined path may reach for, so its
-   barrier is its own. *)
+(* [Eio.Path.split] keeps the directory capability attached, where
+   [Filename.dirname] would drop the confinement. A path with no parent is the
+   root of the capability, so its barrier is its own. *)
 let sync_parent p =
   match Eio.Path.split p with
   | Some (parent, _) -> sync_dir parent
   | None -> sync_dir p
 
-(* The file-data barrier: the other half of what a commit protocol makes
-   durable, the bytes the published entry names. A file is itself the resource,
-   so the operation a backend registers takes no name where the directory's
-   takes a [~path]. A backend that registers nothing keeps [Eio.File.sync],
-   which is the barrier a plain POSIX file already has; the registration is
-   there so a wrapper -- a crash model committing this file's data journal --
-   can answer for what its base would do, not because the fallback is wrong. It
-   is answered whole: syncing the file behind a declared barrier would be a
-   barrier that wrapper never recorded. *)
+(* The file-data barrier. A file is itself the resource, so its operation takes
+   no name. A registered barrier is answered whole: syncing the file behind it
+   would be a barrier the wrapper never recorded. *)
 type (_, _, _) Eio.Resource.pi +=
   | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
 
@@ -69,15 +54,9 @@ let sync_file file =
   | Some barrier -> barrier ()
   | None -> Eio.File.sync file
 
-(* What a backend admits about the openers of its files. A backend whose files
-   live in this process's heap admits none outside it: there is no name another
-   process can open them by and no descriptor to inherit, so an exclusion taken
-   between the fibers of this process is the whole exclusion those files admit,
-   not a weaker stand-in for one. Such a backend registers [Process_local]; the
-   answer is a function of the resource because a wrapper answers for whatever
-   base it was given. A backend that registers nothing is read as admitting
-   outside openers, so a forgotten registration costs a refusal rather than a
-   critical section two processes enter. *)
+(* A backend whose files live in this process's heap admits no outside opener,
+   so an in-process exclusion is the whole exclusion; it registers
+   [Process_local]. Silence reads as admitting outside openers. *)
 type (_, _, _) Eio.Resource.pi +=
   | Process_local : ('t, 't -> bool, [> `Process_local ]) Eio.Resource.pi
 
@@ -119,9 +98,7 @@ module Bounded_sink = struct
     count
 
   let copy t ~src =
-    (* Eio's generic fallback uses 4 KiB. Publication commonly carries archives
-       and upload bodies, so amortise the read/write and budget checks without
-       buffering the value as a whole. *)
+    (* Larger than Eio's 4 KiB fallback, without buffering the value whole. *)
     let buf = Cstruct.create 131_072 in
     let rec write_all chunk =
       if not (Cstruct.is_empty chunk) then
@@ -195,10 +172,8 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
   in
   produce 0
 
-(* The durable-publication protocol shared by every store in the tree: write
-   a temporary, push its bytes to stable storage, rename it over the target
-   (atomic: readers see the old or the new file, never a torn one), and barrier
-   the target's directory so a power cut cannot revert the publication. *)
+(* Write a temporary, push its bytes to stable storage, rename it over the
+   target, and barrier the target's directory. *)
 let publish ~config ?tmp:requested_tmp path write =
   if Int64.compare config.max_bytes 0L < 0 then
     invalid_arg "Eio_fs_sync.publish: max_bytes must be non-negative";
@@ -213,8 +188,4 @@ let publish ~config ?tmp:requested_tmp path write =
      raise e);
   result
 
-(* The critical section a caller supplies is the other half of what a store
-   needs from its deployment: the barrier above says how a write reaches stable
-   storage, the section says what keeps two of them out of one another's
-   read-modify-write. Neither is the store's to decide. *)
 module Lock = Lock
