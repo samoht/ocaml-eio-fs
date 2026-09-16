@@ -117,13 +117,10 @@ CAMLprim value caml_eio_fs_statvfs(value path_v)
    disk image is millions of these calls, and on the caller's own thread it
    holds the scheduler for every one of them. */
 
-/* A batch is one systhread hop, and the hop is what these calls are being
-   spared. Measured 2026-09-07 on macOS/arm64: a round trip through
-   Eio_unix.run_in_systhread costs 9.2 us against 0.31 us for the same lseek
-   made directly, so a per-call binding would spend about 19 s of pure hop
-   overhead over two million extents. The caller says how many answers it
-   wants per hop; this is the ceiling on the buffer that holds them, 1.5 MB at
-   24 bytes an extent. */
+/* A batch is one systhread hop, and the hop is what these calls are spared: a
+   per-call binding would pay the hop once per extent. The caller says how many
+   answers it wants per hop; this is the ceiling on the buffer that holds
+   them. */
 #define EIO_FS_EXTENTS_MAX 65536
 
 struct eio_fs_extent {
@@ -198,9 +195,8 @@ static long eio_fs_extents_fill(int fd, int64_t offset, int64_t length,
       *what = "F_LOG2PHYS_EXT";
       return -1;
     }
-    /* A hole is not an error here: the call SUCCEEDS over one and reports a
-       device offset of -1 with the hole's own length. Measured 2026-09-07 on
-       APFS, walking a file with a 64 MiB gap in it. A caller that only reads
+    /* A hole is not an error here: the call succeeds over one and reports a
+       device offset of -1 with the hole's own length. A caller that only reads
        l2p_contigbytes therefore counts holes as physical pieces and reads a
        negative device address, so the offset is what says whether there is an
        answer. */
