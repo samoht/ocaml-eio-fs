@@ -31,6 +31,7 @@
  (depends
   (ocaml (>= 5.1))
   (eio (>= 1.5))
+  (eio_posix (>= 1.0))
   fmt
   cstruct
   optint

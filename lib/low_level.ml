@@ -476,11 +476,17 @@ let openat ~mode ~sw dir_fd path flags =
   let truncate = Open_flags.(mem o_trunc flags) in
   let nofollow = Open_flags.(mem o_nofollow flags) in
   let follow = not nofollow in
+  let refuse_link r =
+    match !r with
+    | Resource.Symlink _ when nofollow -> Error.permission_denied path
+    | _ -> ()
+  in
   match is_create || is_excl with
   | false ->
       update_fd_table_with_result @@ fun fds ->
       let fd = next_fd_of_fds fds in
       let r = Filesystem.lookup ~follow dir_fd path in
+      refuse_link r;
       check_access path flags r;
       reset_file ~truncate ~append r;
       Eio.Switch.on_release sw (fun () -> close fd);
@@ -501,6 +507,7 @@ let openat ~mode ~sw dir_fd path flags =
       in
       match r with
       | Some r ->
+          refuse_link r;
           check_access path flags r;
           let fds = Fd_table.add fd r fds in
           reset_file ~truncate ~append r;

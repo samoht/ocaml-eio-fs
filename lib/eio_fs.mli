@@ -6,6 +6,36 @@
     ({!Chaos}). There is a single in-memory filesystem per process; {!Fs.v},
     {!Fs.load} and {!Crunch.load} all reset it. *)
 
+(** Backend support for descriptor-bound, bounded reads that refuse a symbolic
+    link at the final path component. The user-facing POSIX operation is
+    {!Eio_fs_unix.read_file_nofollow}; this module lets another directory
+    backend provide the same operation without exposing its descriptor. *)
+module Nofollow : sig
+  type error = [ `Invalid of string | `Too_large ]
+  type result = (Cstruct.t, error) Stdlib.result
+
+  type reader =
+    sw:Eio.Switch.t ->
+    path:string ->
+    max_bytes:int ->
+    validate:(Eio.File.Stat.t -> (unit, string) Stdlib.result) ->
+    result
+
+  val find : _ Eio.Resource.t -> reader option
+  (** [find dir] is the no-follow reader registered by [dir]'s backend. *)
+
+  val run :
+    max_bytes:int ->
+    validate:(Eio.File.Stat.t -> (unit, string) Stdlib.result) ->
+    stat:Eio.File.Stat.t ->
+    read:(Cstruct.t -> int) ->
+    result
+  (** [run] validates [stat] before asking [read] for bytes and reads through
+      end-of-file with one byte of lookahead past [max_bytes]. A rejected or
+      partially read buffer is overwritten before the function returns or
+      raises. This is the common implementation for directory backends. *)
+end
+
 (** Helpers over standard {!Eio.Path} values. The lexical arithmetic on the
     strings those values carry -- what a path's components are, and which
     spellings name one object -- is {!Eio_fs_path}, in [eio-fs.path]. *)
@@ -16,9 +46,9 @@ module Path : sig
     files : int;
     latest_mtime : float;
   }
-  (** What a tree costs in {!field-allocated_bytes} and
-      {!field-apparent_bytes}, how many {!field-files} carry it, and when one
-      last changed. All come off one walk. *)
+  (** What a tree costs in {!field-allocated_bytes} and {!field-apparent_bytes},
+      how many {!field-files} carry it, and when one last changed. All come off
+      one walk. *)
 
   val usage : ?max_fibers:int -> _ Eio.Path.t -> usage
   (** [usage path] measures [path] and all descendants without following

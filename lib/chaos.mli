@@ -46,9 +46,9 @@ module Fault : sig
     | Swap_symlink of string
         (** Perform the operation, then replace its path with a symlink to the
             given target: the check-to-use window a TOCTOU exploits. On a stat,
-            the stat sees the original file while the following open resolves
-            to the symlink; on an open, the caller keeps its handle while the
-            path afterwards answers about the target. *)
+            the stat sees the original file while the following open resolves to
+            the symlink; on an open, the caller keeps its handle while the path
+            afterwards answers about the target. *)
 
   val equal : t -> t -> bool
   (** [equal a b] is [true] when [a] and [b] are the same fault. *)
@@ -138,6 +138,11 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     schedule, and the file also registers {!Eio_fs_sync.File_sync} so a barrier
     through {!Eio_fs_sync.sync_file} reaches the schedule's own sync. *)
 
+val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
+(** [base_dir dir] is the directory wrapped by {!wrap}, when [dir] is such a
+    wrapper. Backend extensions use it only after the wrapper has observed the
+    path operation that precedes their own operation. *)
+
 (** A power-loss durability model over a base directory capability.
 
     Every write is tracked as un-synced until a successful {!Eio.File.sync}
@@ -226,8 +231,8 @@ module Crash : sig
   (** [wrap t base] is [base] with durability tracked by [t]; files and
       subdirectories opened through it stay wrapped and share [t].
 
-      The model's authority is the wrapper, not a carried descriptor: a write
-      or barrier issued on the descriptor is not in the journal. A file's writes
+      The model's authority is the wrapper, not a carried descriptor: a write or
+      barrier issued on the descriptor is not in the journal. A file's writes
       stay un-synced until {!Eio.File.sync} or {!Eio_fs_sync.sync_file} reaches
       it through the wrapper. A crash rebuilds the tree from the model, so a
       change made outside the wrapper is gone from the post-crash image. *)

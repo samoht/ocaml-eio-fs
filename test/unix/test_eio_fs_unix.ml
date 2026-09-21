@@ -27,6 +27,84 @@ let with_real_dir_env fn =
 
 let with_real_dir fn = with_real_dir_env (fun _env dir -> fn dir)
 
+let with_in_memory_fs fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env -> fn env#fs
+
+let regular_file (stat : Eio.File.Stat.t) =
+  match stat.kind with
+  | `Regular_file -> Ok ()
+  | _ -> Error "not a regular file"
+
+let test_read_nofollow_reads_a_bounded_regular_file () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "secret";
+  match
+    Eio_fs_unix.read_file_nofollow ~max_bytes:6 ~validate:regular_file
+      (dir / "private")
+  with
+  | Error _ -> Alcotest.fail "a private regular file was refused"
+  | Ok bytes ->
+      Alcotest.(check string)
+        "descriptor bytes" "secret" (Cstruct.to_string bytes);
+      Cstruct.memset bytes 0
+
+let test_read_nofollow_refuses_the_final_link () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "target") "target";
+  Eio.Path.symlink ~link_to:"target" (dir / "private");
+  match
+    Eio_fs_unix.read_file_nofollow ~max_bytes:16 ~validate:regular_file
+      (dir / "private")
+  with
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "a final-component symlink was read"
+  | Error _ -> Alcotest.fail "a symlink reached validation instead of open"
+  | exception Eio.Io _ -> ()
+
+let test_read_nofollow_enforces_the_bound () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "three";
+  match
+    Eio_fs_unix.read_file_nofollow ~max_bytes:2 ~validate:regular_file
+      (dir / "private")
+  with
+  | Error `Too_large -> ()
+  | Error (`Invalid reason) -> Alcotest.fail reason
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "an over-bound file was returned"
+
+let test_read_nofollow_returns_descriptor_validation () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "secret";
+  match
+    Eio_fs_unix.read_file_nofollow ~max_bytes:6
+      ~validate:(fun _ -> Error "descriptor policy")
+      (dir / "private")
+  with
+  | Error (`Invalid reason) ->
+      Alcotest.(check string) "validation reason" "descriptor policy" reason
+  | Error `Too_large -> Alcotest.fail "validation was skipped for the bound"
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "descriptor validation was ignored"
+
+let test_read_nofollow_uses_the_in_memory_backend () =
+  with_in_memory_fs @@ fun fs ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (fs / "target") "target";
+  Eio.Path.symlink ~link_to:"target" (fs / "private");
+  match
+    Eio_fs_unix.read_file_nofollow ~max_bytes:16 ~validate:regular_file
+      (fs / "private")
+  with
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "the in-memory backend followed a final link"
+  | Error _ -> Alcotest.fail "an in-memory link reached validation"
+  | exception Eio.Io _ -> ()
+
 (* The commit-protocol shape: write a temporary, fsync it, rename it into
    place, barrier the directory. Every step must succeed and the published
    file must read back whole. *)
@@ -1087,10 +1165,6 @@ let test_lock_creates_a_missing_rendezvous_as_a_regular_file () =
    refuses a backend that registers none -- rather than locked in name only,
    silence being what turns a missing exclusion into a bug nobody sees. *)
 
-let with_in_memory_fs fn =
-  Eio_mock.Backend.run @@ fun () ->
-  Eio_fs.run @@ fun env -> fn env#fs
-
 let test_lock_over_a_process_local_backend_serializes_fibers () =
   with_in_memory_fs @@ fun fs ->
   let lock = fs / "lock" in
@@ -1671,6 +1745,16 @@ let suite =
         test_name_is_the_host_spelling;
       Alcotest.test_case "name of a member of an opened subtree" `Quick
         test_name_of_a_member_of_an_opened_subtree;
+      Alcotest.test_case "bounded no-follow read" `Quick
+        test_read_nofollow_reads_a_bounded_regular_file;
+      Alcotest.test_case "no-follow read refuses the final link" `Quick
+        test_read_nofollow_refuses_the_final_link;
+      Alcotest.test_case "no-follow read enforces the bound" `Quick
+        test_read_nofollow_enforces_the_bound;
+      Alcotest.test_case "no-follow read returns descriptor validation" `Quick
+        test_read_nofollow_returns_descriptor_validation;
+      Alcotest.test_case "no-follow read uses the in-memory backend" `Quick
+        test_read_nofollow_uses_the_in_memory_backend;
       Alcotest.test_case "barrier after rename" `Quick
         test_sync_dir_after_rename;
       Alcotest.test_case "barrier empty and repeated" `Quick

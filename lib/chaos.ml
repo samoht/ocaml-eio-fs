@@ -454,6 +454,11 @@ type dir = { base : Eio.Fs.dir_ty r; boxed : base_dir; sched : Schedule.t }
 type (_, _, _) Eio.Resource.pi +=
   | Chaos_base : ('t, 't -> Eio.Fs.dir_ty r, [> `Chaos ]) Eio.Resource.pi
 
+let base_dir (Eio.Resource.T (t, ops)) =
+  match Eio.Resource.get_opt ops Chaos_base with
+  | None -> None
+  | Some get -> Some (get t)
+
 let wrap_dir_hook :
     (base:Eio.Fs.dir_ty r -> sched:Schedule.t -> [ `Close | Eio.Fs.dir_ty ] r)
     ref =

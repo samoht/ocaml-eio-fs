@@ -11,4 +11,13 @@
   (names eio_fs_unix_stubs)
   (flags
    (:standard -std=gnu11 -Wall -Wextra -Werror)))
- (libraries eio eio.unix eio-fs.sync fmt optint unix))
+ (libraries
+  eio
+  eio.unix
+  eio_posix
+  eio-fs
+  eio-fs.sync
+  cstruct
+  fmt
+  optint
+  unix))

@@ -2,8 +2,8 @@
     locking, filesystem capacity, and the sparse map.
 
     The portable machinery lives in {!Eio_fs_sync}; this facade is for programs
-    that link unix anyway and want the strongest barrier the platform offers:
-    on Darwin {!full_fsync} reaches the platter where the portable route's fsync
+    that link unix anyway and want the strongest barrier the platform offers: on
+    Darwin {!full_fsync} reaches the platter where the portable route's fsync
     stops at the drive's cache. {!with_lock} takes an exclusive advisory lock
     over a rendezvous file, and {!statvfs}, {!seek_data}, {!seek_hole} and
     {!extents} answer the questions about capacity and sparseness that [Unix]
@@ -94,6 +94,29 @@ val sync_file : _ Eio.File.rw -> unit
 
     @raise Unix.Unix_error as [fsync]. *)
 
+val read_file_nofollow :
+  max_bytes:int ->
+  validate:(Eio.File.Stat.t -> (unit, string) result) ->
+  _ Eio.Path.t ->
+  Eio_fs.Nofollow.result
+(** [read_file_nofollow ~max_bytes ~validate path] opens [path] through its
+    directory capability while refusing a symbolic link at the final component,
+    validates the opened descriptor with [validate], and reads through
+    end-of-file with a one-byte bound lookahead. Validation happens before any
+    byte is read. The returned [Cstruct.t] belongs to the caller and can be
+    overwritten after use.
+
+    Prefix components retain ordinary {!Eio.Path} resolution and confinement;
+    only the final component is opened with [O_NOFOLLOW].
+
+    @raise Invalid_argument
+      if [max_bytes] is negative or [max_int], [path] names no final component,
+      or the directory backend provides neither the registered operation nor a
+      POSIX descriptor.
+    @raise Eio.Io
+      when the open or read fails, including when the final component is a
+      symbolic link. *)
+
 exception Lock_unavailable of string
 (** Raised by {!with_lock} when the lock is held and [block] says not to wait
     for the holder. The string is the native path of the lock file. *)
@@ -127,8 +150,7 @@ val with_lock :
     [path] must be the lock's own regular file: a link, a directory, a FIFO, or
     a name that took the entry between resolution and open is refused with
     {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file}. A backend with no
-    Unix descriptor is refused unless it registers
-    {!Eio_fs_sync.Process_local}.
+    Unix descriptor is refused unless it registers {!Eio_fs_sync.Process_local}.
 
     @raise Lock_unavailable as described above.
     @raise Eio.Io
@@ -154,5 +176,5 @@ val lock_section :
     {!Eio_fs_sync.Lock.Unavailable}; what the section's body raises travels out
     untouched.
 
-    @raise Eio_fs_sync.Lock.Unavailable from {!Eio_fs_sync.Lock.use}, never from
-      [lock_section] itself. *)
+    @raise Eio_fs_sync.Lock.Unavailable
+      from {!Eio_fs_sync.Lock.use}, never from [lock_section] itself. *)

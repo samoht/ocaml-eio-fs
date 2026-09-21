@@ -9,5 +9,6 @@
   eio_fs
   eio-fs.sync
   eio-fs.unix
+  cstruct
   unix
   alcotest))

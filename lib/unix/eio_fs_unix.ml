@@ -94,6 +94,91 @@ let sync_file file =
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
           full_fsync fd)
 
+let float_of_time seconds nanoseconds =
+  let seconds = Int64.to_float seconds in
+  let value = seconds +. (float nanoseconds /. 1e9) in
+  if floor value = seconds then value else Float.pred value
+
+let stat_of_fd fd =
+  let stat = Eio_posix.Low_level.create_stat () in
+  Eio_posix.Low_level.fstat ~buf:stat fd;
+  Eio.File.Stat.
+    {
+      dev = Eio_posix.Low_level.dev stat;
+      ino = Eio_posix.Low_level.ino stat;
+      kind = Eio_posix.Low_level.kind stat;
+      perm = Eio_posix.Low_level.perm stat;
+      nlink = Eio_posix.Low_level.nlink stat;
+      uid = Eio_posix.Low_level.uid stat;
+      gid = Eio_posix.Low_level.gid stat;
+      rdev = Eio_posix.Low_level.rdev stat;
+      size = Eio_posix.Low_level.size stat |> Optint.Int63.of_int64;
+      blksize = Eio_posix.Low_level.blksize stat;
+      blocks = Eio_posix.Low_level.blocks stat;
+      atime =
+        float_of_time
+          (Eio_posix.Low_level.atime_sec stat)
+          (Eio_posix.Low_level.atime_nsec stat);
+      mtime =
+        float_of_time
+          (Eio_posix.Low_level.mtime_sec stat)
+          (Eio_posix.Low_level.mtime_nsec stat);
+      ctime =
+        float_of_time
+          (Eio_posix.Low_level.ctime_sec stat)
+          (Eio_posix.Low_level.ctime_nsec stat);
+    }
+
+let rec unwrapped_dir dir =
+  match Eio_fs.Chaos.base_dir dir with
+  | Some base -> unwrapped_dir base
+  | None -> dir
+
+let unwrapped_path ((dir, path) : [> Eio.Fs.dir_ty ] Eio.Path.t) =
+  (unwrapped_dir (dir :> Eio.Fs.dir_ty Eio.Resource.t), path)
+
+let eio_unix_errors fn =
+  match fn () with
+  | value -> value
+  | exception Unix.Unix_error (code, operation, argument) ->
+      raise (Eio_unix.Err.v code operation argument)
+
+let read_file_nofollow ~max_bytes ~validate path =
+  if max_bytes < 0 || max_bytes = max_int then
+    invalid_arg "Eio_fs_unix.read_file_nofollow: invalid byte bound";
+  match Eio.Path.split (unwrapped_path path) with
+  | None ->
+      invalid_arg "Eio_fs_unix.read_file_nofollow: path has no final component"
+  | Some (parent, name) -> (
+      if String.equal name "." || String.equal name ".." then
+        invalid_arg
+          "Eio_fs_unix.read_file_nofollow: final component is not a file name";
+      Eio.Switch.run @@ fun sw ->
+      let opened_parent = Eio.Path.open_dir ~sw parent in
+      let dir, relative = Eio.Path.(opened_parent / name) in
+      match Eio_fs.Nofollow.find dir with
+      | Some reader -> reader ~sw ~path:relative ~max_bytes ~validate
+      | None -> (
+          let parent_file = Eio.Path.open_in ~sw parent in
+          if (Eio.File.stat parent_file).kind <> `Directory then
+            invalid_arg
+              "Eio_fs_unix.read_file_nofollow: parent is not a directory";
+          match Eio_unix.Resource.fd_opt parent_file with
+          | None ->
+              invalid_arg
+                "Eio_fs_unix.read_file_nofollow: unsupported directory backend"
+          | Some parent_fd ->
+              eio_unix_errors @@ fun () ->
+              let flags = Eio_posix.Low_level.Open_flags.(rdonly + nofollow) in
+              let fd =
+                Eio_posix.Low_level.Resolve.open_unconfined ~sw ~mode:0
+                  (Some parent_fd) relative flags
+              in
+              let stat = stat_of_fd fd in
+              Eio_fs.Nofollow.run ~max_bytes ~validate ~stat
+                ~read:(fun buffer -> Eio_posix.Low_level.readv fd [| buffer |]))
+      )
+
 exception Lock_unavailable of string
 
 (* The fiber exclusion is keyed by device and inode, not by a name: two names

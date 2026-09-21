@@ -19,6 +19,9 @@ module Open_flags : sig
   val o_excl : int
   (** Fail creation when the path already exists. *)
 
+  val o_nofollow : int
+  (** Refuse a symbolic link at the final path component. *)
+
   val o_trunc : int
   (** Truncate an existing file. *)
 
