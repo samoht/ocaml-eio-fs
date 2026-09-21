@@ -663,7 +663,7 @@ let rmdir dir_fd path =
       end
   | _ -> Error.err "Not a directory"
 
-let rename dir_fd old_path new_dir new_path =
+let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let old_path = check_path old_path in
   let new_path = check_path new_path in
   (* Rename the directory entry itself. In particular, a symlink's target need
@@ -674,6 +674,11 @@ let rename dir_fd old_path new_dir new_path =
   let new_parent_path, new_name = dir_base new_path in
   let old_parent = Filesystem.lookup ~follow:true dir_fd old_parent_path in
   let new_parent = Filesystem.lookup ~follow:true new_dir new_parent_path in
+  if not replace then begin
+    let dst = as_dir ~label:"rename-dst" !new_parent in
+    if List.exists (fun (_, name) -> String.equal name new_name) dst.entries
+    then Error.already_exists new_path
+  end;
   let without name entries =
     List.filter (fun (_, n) -> not (String.equal n name)) entries
   in

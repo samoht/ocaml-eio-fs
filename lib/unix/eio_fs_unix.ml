@@ -181,6 +181,49 @@ let read_file_nofollow ~max_bytes ~validate path =
                 ~read:(fun buffer -> Eio_posix.Low_level.readv fd [| buffer |]))
       )
 
+external rename_exclusive_at :
+  Unix.file_descr -> string -> Unix.file_descr -> string -> unit
+  = "caml_eio_fs_rename_exclusive"
+
+module Exclusive_rename = struct
+  type t = unit
+
+  let parent path =
+    match Eio.Path.split path with
+    | Some (parent, name) when name <> "" && name <> "." && name <> ".." ->
+        (parent, name)
+    | _ -> invalid_arg "Eio_fs_unix.exclusive_rename: expected a file name"
+
+  let descriptor file =
+    match Eio_unix.Resource.fd_opt file with
+    | Some fd -> fd
+    | None ->
+        invalid_arg
+          "Eio_fs_unix.exclusive_rename: unsupported directory backend"
+
+  let rename () source target =
+    let source_parent, source_name = parent source in
+    let target_parent, target_name = parent target in
+    Eio.Switch.run @@ fun sw ->
+    (* Resolve each parent through its capability once, then keep that open
+       directory as the authority for the atomic operation on its basename. *)
+    let source_dir = Eio.Path.open_dir ~sw source_parent in
+    let target_dir = Eio.Path.open_dir ~sw target_parent in
+    let source_file = Eio.Path.open_in ~sw source_dir in
+    let target_file = Eio.Path.open_in ~sw target_dir in
+    let source_fd = descriptor source_file in
+    let target_fd = descriptor target_file in
+    eio_unix_errors @@ fun () ->
+    Eio_unix.Fd.use_exn "exclusive rename source" source_fd @@ fun source_fd ->
+    Eio_unix.Fd.use_exn "exclusive rename target" target_fd @@ fun target_fd ->
+    Eio_unix.run_in_systhread ~label:"exclusive rename" @@ fun () ->
+    rename_exclusive_at source_fd source_name target_fd target_name
+end
+
+module Rename_backend = Eio_fs_sync.Rename.Make (Exclusive_rename)
+
+let exclusive_rename = Rename_backend.v ()
+
 exception Lock_unavailable of string
 
 (* The fiber exclusion is keyed by device and inode, not by a name: two names

@@ -578,6 +578,12 @@ module Dir_impl = struct
     let (Base_dir ((module B), bv)) = t.boxed in
     B.rename bv old_path target new_path
 
+  let rename_exclusive t backend ~source ~target:(new_dir, new_path) =
+    let target =
+      match base_dir new_dir with Some base -> base | None -> new_dir
+    in
+    Eio_fs_sync.Rename.exclusive backend (t.base, source) (target, new_path)
+
   let read_link t path =
     let (Base_dir ((module B), bv)) = t.boxed in
     B.read_link bv path
@@ -617,6 +623,7 @@ let dir_handler :
       H (Eio.Fs.Pi.Dir, (module Dir_impl));
       H (Eio.Resource.Close, fun t -> close_resource t.base);
       H (Chaos_base, fun t -> t.base);
+      H (Eio_fs_sync.Rename.Exclusive, Dir_impl.rename_exclusive);
       (* Who can open these files is the base's to say, and the wrapper adds
          no opener of its own: it gives a file no name outside this process
          and no descriptor it did not already have. One binding serves every
@@ -1537,7 +1544,7 @@ module Crash = struct
       record_metadata d.dctl ~path:rel ~kind:Rmdir;
       bump_metadata d.dctl ~path:rel ~kind:Rmdir
 
-    let rename d old_path new_dir new_path =
+    let rename_with exclusive d old_path new_dir new_path =
       let (Eio.Resource.T (nv, nops)) = new_dir in
       let target_cdir =
         Option.map (fun f -> f nv) (Eio.Resource.get_opt nops Crash_dir)
@@ -1556,7 +1563,11 @@ module Crash = struct
         | Some cd -> (cd.droot, at cd.dprefix new_path)
         | None -> (box_dir target, new_path)
       in
-      B.rename bv old_path target new_path;
+      (match exclusive with
+      | None -> B.rename bv old_path target new_path
+      | Some backend ->
+          Eio_fs_sync.Rename.exclusive backend (d.dbase, old_path)
+            (target, new_path));
       (* A successful rename moves the durability identity with the file. If a
          tracked target was replaced, its pending writes no longer describe a
          reachable file and must not be replayed after a crash. *)
@@ -1565,6 +1576,13 @@ module Crash = struct
       let kind = Rename { dest = rel } in
       record_metadata d.dctl ~path:old_rel ~kind;
       bump_metadata d.dctl ~path:old_rel ~kind
+
+    let rename d old_path new_dir new_path =
+      rename_with None d old_path new_dir new_path
+
+    let rename_exclusive d backend ~source ~target:(new_dir, new_path) =
+      if d.dctl.crashed then raise_power_lost ();
+      rename_with (Some backend) d source new_dir new_path
 
     let read_link d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1606,6 +1624,7 @@ module Crash = struct
         H (Eio.Fs.Pi.Dir, (module Cdir_impl));
         H (Eio.Resource.Close, fun d -> close_resource d.dbase);
         H (Crash_dir, fun d -> d);
+        H (Eio_fs_sync.Rename.Exclusive, Cdir_impl.rename_exclusive);
         (* Who can open these files is the base's to say: the model tracks
            what is written through it and adds no opener of its own, so a
            caller weighing whether an in-process exclusion is the whole

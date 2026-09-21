@@ -28,8 +28,7 @@ val sync_dir : _ Eio.Path.t -> unit
     handle fsynced. [Eio_fs_unix.sync_dir] upgrades that to platter strength for
     programs that link unix.
 
-    @raise Eio.Io
-      if the directory cannot be opened or the sync fails.
+    @raise Eio.Io if the directory cannot be opened or the sync fails.
     @raise Failure
       if the backend registers no barrier and its handles expose no sync
       operation. *)
@@ -92,15 +91,25 @@ val fresh_name : string -> string
     exported for a store whose target name is unknown until its bytes are read.
     The name is not itself the exclusion: open it with [`Exclusive]. *)
 
+module Rename = Rename
+(** Capability-dispatched exclusive rename and backend construction. *)
+
 val publish :
   config:config ->
+  ?mode:[ `Replace | `Exclusive ] ->
+  ?rename:Rename.t ->
   ?tmp:'a Eio.Path.t ->
   'a Eio.Path.t ->
   (Eio.Flow.sink_ty Eio.Resource.t -> 'b) ->
   'b
-(** [publish ~config path write] replaces [path]'s contents atomically and
-    durably: [write] streams into a temporary, which is fsynced, renamed over
-    [path], and whose directory is barriered with {!sync_parent}.
+(** [publish ~config ~mode ~rename path write] publishes [path]'s contents
+    atomically and durably: [write] streams into a temporary, which is fsynced,
+    moved to [path], and whose directory is barriered with {!sync_parent}.
+
+    [mode] defaults to [`Replace]. [`Exclusive] refuses an existing target
+    atomically, using [rename] for directory backends without a registered
+    operation. [rename] defaults to {!Rename.capability}; POSIX callers use the
+    backend provided by [Eio_fs_unix.exclusive_rename].
 
     An omitted [tmp] is a fresh sibling name, opened exclusively; an explicit
     one is also exclusive, must not exist, must differ from [path] and live on
@@ -111,4 +120,5 @@ val publish :
 
 module Lock = Lock
 (** The critical section a caller supplies: what keeps two writers out of one
-    another's read-modify-write, named by the deployment rather than the store. *)
+    another's read-modify-write, named by the deployment rather than the store.
+*)

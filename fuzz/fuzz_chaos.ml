@@ -1,9 +1,9 @@
-(** Fuzz tests for {!Eio_fs.Chaos}: crash-safety (only [Eio.Io] or
-    [End_of_file] ever escapes), determinism (a seeded schedule replays the same
-    outcome and bytes), the [Drop_unsynced] barrier invariant (the post-crash
-    image is the synced prefix and keeps its mode), and a reference model (an
-    arbitrary operation tape drives a crash-wrapped tree in lockstep with a pure
-    model of the journal, byte for byte). *)
+(** Fuzz tests for {!Eio_fs.Chaos}: crash-safety (only [Eio.Io] or [End_of_file]
+    ever escapes), determinism (a seeded schedule replays the same outcome and
+    bytes), the [Drop_unsynced] barrier invariant (the post-crash image is the
+    synced prefix and keeps its mode), and a reference model (an arbitrary
+    operation tape drives a crash-wrapped tree in lockstep with a pure model of
+    the journal, byte for byte). *)
 
 open Alcobar
 module Chaos = Eio_fs.Chaos

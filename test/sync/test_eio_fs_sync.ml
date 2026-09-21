@@ -335,9 +335,51 @@ let test_sync_file_reaches_the_crash_model () =
     "the barriered bytes survived the cut" "payload"
     (Eio.Path.load Eio.Path.(post / "image"))
 
+(* An exclusive publication follows renameat2's RENAME_NOREPLACE contract:
+   an existing name is never overwritten, including a dangling symlink. *)
+let test_exclusive_publication () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let path = env#fs / "state" in
+  let publish path text =
+    Eio_fs_sync.publish ~config:(config 3L) ~mode:`Exclusive path
+      (Eio.Flow.copy_string text)
+  in
+  publish path "old";
+  (match publish path "new" with
+  | () -> Alcotest.fail "exclusive publication replaced a file"
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+  Alcotest.(check string) "old contents retained" "old" (Eio.Path.load path);
+  let link = env#fs / "link" in
+  Eio.Path.symlink ~link_to:"missing" link;
+  (match publish link "new" with
+  | () -> Alcotest.fail "exclusive publication replaced a dangling link"
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+  Alcotest.(check string) "link retained" "missing" (Eio.Path.read_link link);
+  Alcotest.(check (list string))
+    "temporary files removed" [ "link"; "state" ]
+    (List.sort String.compare (Eio.Path.read_dir env#fs))
+
+let test_exclusive_publication_survives_crash () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio_fs_sync.publish ~config:(config 7L) ~mode:`Exclusive (fs / "state")
+    (Eio.Flow.copy_string "payload");
+  Crash.crash ctl;
+  Alcotest.(check string)
+    "published data survives its barriers" "payload"
+    (Eio.Path.load (Crash.post_crash ctl / "state"))
+
 let suite =
   ( "eio_fs_sync",
     [
+      Alcotest.test_case "exclusive publication refuses existing names" `Quick
+        test_exclusive_publication;
+      Alcotest.test_case "exclusive publication survives crash" `Quick
+        test_exclusive_publication_survives_crash;
       Alcotest.test_case "registered backend" `Quick test_registered_backend;
       Alcotest.test_case "posix needs no registration" `Quick
         test_posix_needs_no_registration;

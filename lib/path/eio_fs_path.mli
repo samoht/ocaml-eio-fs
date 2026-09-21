@@ -65,8 +65,8 @@ type refusal =
 val canonical : string -> (string list, refusal) result
 (** [canonical path] are the components of [path] when it is absolute and
     already canonical, and why it is not otherwise. It refuses rather than
-    rewrites: rewriting [a/b/..] to [a] names a different directory wherever
-    [b] is a symbolic link, so a caller resolving components under [O_NOFOLLOW]
+    rewrites: rewriting [a/b/..] to [a] names a different directory wherever [b]
+    is a symbolic link, so a caller resolving components under [O_NOFOLLOW]
     needs the refusal. A ["."], [".."] or any spelling whose components do not
     rejoin to exactly the string given is {!Not_canonical}; a NUL byte is
     {!Not_a_path}. *)

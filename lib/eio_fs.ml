@@ -182,6 +182,13 @@ module Fs = struct
 
     val v : label:string -> path:string -> dir_fd -> t
     val fd : t -> dir_fd
+
+    val rename_exclusive :
+      t ->
+      Eio_fs_sync.Rename.t ->
+      source:string ->
+      target:Eio_fs_sync.Rename.path ->
+      unit
   end = struct
     type t = { fd : dir_fd; dir_path : string; label : string }
 
@@ -228,6 +235,12 @@ module Fs = struct
       | None -> invalid_arg "Target is not an eio_mem directory"
       | Some new_dir -> Low_level.rename t.fd old_path new_dir new_path
 
+    let rename_exclusive t _backend ~source ~target:(new_dir, new_path) =
+      match as_memfs_dir new_dir with
+      | None -> invalid_arg "Target is not an eio_mem directory"
+      | Some new_dir ->
+          Low_level.rename ~replace:false t.fd source new_dir new_path
+
     let symlink ~link_to t path = Low_level.symlinkat ~link_to t.fd path
 
     let open_dir t ~sw path =
@@ -265,6 +278,7 @@ module Fs = struct
         [
           H (Eio.Fs.Pi.Dir, (module Dir));
           H (Memfs_dir, Dir.fd);
+          H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
           H
             ( Nofollow.Read,
               fun (t : Dir.t) ~sw ~path ~max_bytes ~validate ->

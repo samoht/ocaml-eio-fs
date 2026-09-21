@@ -31,8 +31,8 @@ module type S = sig
 
   val use : t -> (unit -> 'a) -> 'a
   (** [use t f] runs [f] under [t], holding [t] for the whole call. A component
-      enters the section once per operation and takes none of its own inside
-      it, so a non-re-entrant lock is enough.
+      enters the section once per operation and takes none of its own inside it,
+      so a non-re-entrant lock is enough.
 
       @raise Unavailable
         rather than an exception of the lock's own when [t] cannot be taken,

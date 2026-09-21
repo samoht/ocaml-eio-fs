@@ -117,6 +117,13 @@ val read_file_nofollow :
       when the open or read fails, including when the final component is a
       symbolic link. *)
 
+val exclusive_rename : Eio_fs_sync.Rename.t
+(** The POSIX backend for atomic no-replace publication. Directory wrappers are
+    consulted before resolving the source and target parents through their
+    capabilities. Linux uses [renameat2(RENAME_NOREPLACE)], Darwin uses
+    [renameatx_np(RENAME_EXCL)]; unsupported platforms or filesystems refuse. An
+    existing target, including a symbolic link, is never overwritten. *)
+
 exception Lock_unavailable of string
 (** Raised by {!with_lock} when the lock is held and [block] says not to wait
     for the holder. The string is the native path of the lock file. *)

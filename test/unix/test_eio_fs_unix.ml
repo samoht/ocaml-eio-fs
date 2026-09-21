@@ -1793,9 +1793,111 @@ let test_name_of_a_member_of_an_opened_subtree () =
     (Eio_fs.Path.name (dir / "shadow"))
     name
 
+(* Linux renameat2(RENAME_NOREPLACE) and Darwin renameatx_np(RENAME_EXCL)
+   require refusal when the destination already exists. The source survives. *)
+let test_exclusive_rename_refuses_existing_names () =
+  with_real_dir @@ fun dir ->
+  let source = dir / "source" and target = dir / "target" in
+  Eio.Path.save ~create:(`Exclusive 0o600) source "new";
+  Eio.Path.save ~create:(`Exclusive 0o600) target "old";
+  let rename () =
+    Eio_fs_sync.Rename.exclusive Eio_fs_unix.exclusive_rename source target
+  in
+  (match rename () with
+  | () -> Alcotest.fail "exclusive rename replaced a file"
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+  Alcotest.(check string) "target retained" "old" (Eio.Path.load target);
+  Eio.Path.unlink target;
+  Eio.Path.symlink ~link_to:"missing" target;
+  (match rename () with
+  | () -> Alcotest.fail "exclusive rename replaced a dangling link"
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+  Alcotest.(check string) "link retained" "missing" (Eio.Path.read_link target);
+  Alcotest.(check string) "source retained" "new" (Eio.Path.load source)
+
+let test_exclusive_rename_refuses_embedded_nul () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "source") "payload";
+  List.iter
+    (fun (source, target) ->
+      (match
+         Eio_fs_sync.Rename.exclusive Eio_fs_unix.exclusive_rename
+           (dir / source) (dir / target)
+       with
+      | () -> Alcotest.fail "an embedded NUL reached the filesystem"
+      | exception Eio.Io _ -> ());
+      Alcotest.(check string)
+        "source unchanged" "payload"
+        (Eio.Path.load (dir / "source"));
+      Alcotest.(check bool)
+        "truncated target absent" true
+        (Eio.Path.kind ~follow:false (dir / "target") = `Not_found))
+    [ ("source\000suffix", "target"); ("source", "target\000suffix") ]
+
+let test_exclusive_publication_reaches_crash_model () =
+  with_real_dir @@ fun dir ->
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl dir in
+  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 7L } in
+  Eio_fs_sync.publish ~config ~mode:`Exclusive
+    ~rename:Eio_fs_unix.exclusive_rename (fs / "state")
+    (Eio.Flow.copy_string "payload");
+  Crash.crash ctl;
+  Alcotest.(check string)
+    "published bytes survive" "payload"
+    (Eio.Path.load (Crash.post_crash ctl / "state"))
+
+let test_concurrent_exclusive_publications_have_one_winner () =
+  with_real_dir @@ fun dir ->
+  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 3L } in
+  let save text () =
+    match
+      Eio_fs_sync.publish ~config ~mode:`Exclusive
+        ~rename:Eio_fs_unix.exclusive_rename (dir / "winner")
+        (Eio.Flow.copy_string text)
+    with
+    | () -> Some text
+    | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> None
+  in
+  let first, second = Eio.Fiber.pair (save "one") (save "two") in
+  match (first, second) with
+  | Some expected, None | None, Some expected ->
+      Alcotest.(check string)
+        "the winner owns the target" expected
+        (Eio.Path.load (dir / "winner"))
+  | _ -> Alcotest.fail "exactly one exclusive publication must succeed"
+
+let test_exclusive_rename_keeps_open_parent () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o700 (dir / "parent");
+  Eio.Path.mkdir ~perm:0o700 (dir / "elsewhere");
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "parent" / "source") "payload";
+  Eio.Switch.run @@ fun sw ->
+  let parent = Eio.Path.open_dir ~sw (dir / "parent") in
+  Eio.Path.rename (dir / "parent") (dir / "moved");
+  Eio.Path.symlink ~link_to:"elsewhere" (dir / "parent");
+  Eio_fs_sync.Rename.exclusive Eio_fs_unix.exclusive_rename (parent / "source")
+    (parent / "target");
+  Alcotest.(check string)
+    "original directory holds the move" "payload"
+    (Eio.Path.load (dir / "moved" / "target"));
+  Alcotest.(check (list string))
+    "replacement directory untouched" []
+    (Eio.Path.read_dir (dir / "elsewhere"))
+
 let suite =
   ( "eio_fs_unix",
     [
+      Alcotest.test_case "exclusive rename refuses existing names" `Quick
+        test_exclusive_rename_refuses_existing_names;
+      Alcotest.test_case "exclusive rename refuses embedded NUL" `Quick
+        test_exclusive_rename_refuses_embedded_nul;
+      Alcotest.test_case "exclusive publication reaches crash model" `Quick
+        test_exclusive_publication_reaches_crash_model;
+      Alcotest.test_case "concurrent exclusive publications have one winner"
+        `Quick test_concurrent_exclusive_publications_have_one_winner;
+      Alcotest.test_case "exclusive rename keeps its open parent" `Quick
+        test_exclusive_rename_keeps_open_parent;
       Alcotest.test_case "name is the host's spelling of the path" `Quick
         test_name_is_the_host_spelling;
       Alcotest.test_case "name of a member of an opened subtree" `Quick

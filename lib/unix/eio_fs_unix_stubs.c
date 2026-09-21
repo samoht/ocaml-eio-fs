@@ -29,6 +29,7 @@
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #endif
 
 CAMLprim value caml_eio_fs_is_darwin(value unit)
@@ -327,4 +328,36 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
   }
   free(out);
   CAMLreturn(list);
+}
+
+/* Linux renameat2(RENAME_NOREPLACE), Darwin renameatx_np(RENAME_EXCL).
+   Both names are basenames under already-open directory descriptors. */
+CAMLprim value caml_eio_fs_rename_exclusive(value srcfd_v, value src_v,
+                                          value dstfd_v, value dst_v)
+{
+  CAMLparam4(srcfd_v, src_v, dstfd_v, dst_v);
+  caml_unix_check_path(src_v, "rename_exclusive");
+  caml_unix_check_path(dst_v, "rename_exclusive");
+  int srcfd = Int_val(srcfd_v), dstfd = Int_val(dstfd_v);
+  char *src = caml_stat_strdup(String_val(src_v));
+  char *dst = caml_stat_strdup(String_val(dst_v));
+  int r;
+  caml_release_runtime_system();
+  do {
+#if defined(__APPLE__)
+    r = renameatx_np(srcfd, src, dstfd, dst, RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+    r = syscall(SYS_renameat2, srcfd, src, dstfd, dst, RENAME_NOREPLACE);
+#else
+    errno = ENOSYS;
+    r = -1;
+#endif
+  } while (r == -1 && errno == EINTR);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(src);
+  caml_stat_free(dst);
+  if (r == -1)
+    caml_unix_error(saved_errno, "rename_exclusive", dst_v);
+  CAMLreturn(Val_unit);
 }

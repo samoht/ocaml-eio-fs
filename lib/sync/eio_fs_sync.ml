@@ -1,3 +1,5 @@
+module Rename = Rename
+
 (* The directory-durability barrier. A backend with its own semantics registers
    [Dir_sync]; one that registers nothing gets the POSIX route, the directory
    opened read-only and its handle fsynced. Eio types [File.sync] as write-only
@@ -174,13 +176,16 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
 
 (* Write a temporary, push its bytes to stable storage, rename it over the
    target, and barrier the target's directory. *)
-let publish ~config ?tmp:requested_tmp path write =
+let publish ~config ?(mode = `Replace) ?(rename = Rename.capability)
+    ?tmp:requested_tmp path write =
   if Int64.compare config.max_bytes 0L < 0 then
     invalid_arg "Eio_fs_sync.publish: max_bytes must be non-negative";
   let tmp, owned, cleanup, result = produce ~config ~requested_tmp path write in
   (try
      Eio.Cancel.protect @@ fun () ->
-     Eio.Path.rename tmp path;
+     (match mode with
+     | `Replace -> Eio.Path.rename tmp path
+     | `Exclusive -> Rename.exclusive rename tmp path);
      owned := false;
      if config.durable then sync_parent path
    with e ->

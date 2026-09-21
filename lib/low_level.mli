@@ -81,7 +81,7 @@ val chmod : follow:bool -> Dir.fd -> perm:int -> string -> unit
 val chown : follow:bool -> ?uid:int64 -> ?gid:int64 -> Dir.fd -> string -> unit
 (** Change path ownership, optionally following a symbolic link. *)
 
-val rename : Dir.fd -> string -> Dir.fd -> string -> unit
+val rename : ?replace:bool -> Dir.fd -> string -> Dir.fd -> string -> unit
 (** Rename a path between two directory descriptors. *)
 
 val symlinkat : link_to:string -> Dir.fd -> string -> unit
