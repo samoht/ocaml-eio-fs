@@ -134,9 +134,6 @@ let rec unwrapped_dir dir =
   | Some base -> unwrapped_dir base
   | None -> dir
 
-let unwrapped_path ((dir, path) : [> Eio.Fs.dir_ty ] Eio.Path.t) =
-  (unwrapped_dir (dir :> Eio.Fs.dir_ty Eio.Resource.t), path)
-
 let eio_unix_errors fn =
   match fn () with
   | value -> value
@@ -146,7 +143,7 @@ let eio_unix_errors fn =
 let read_file_nofollow ~max_bytes ~validate path =
   if max_bytes < 0 || max_bytes = max_int then
     invalid_arg "Eio_fs_unix.read_file_nofollow: invalid byte bound";
-  match Eio.Path.split (unwrapped_path path) with
+  match Eio.Path.split path with
   | None ->
       invalid_arg "Eio_fs_unix.read_file_nofollow: path has no final component"
   | Some (parent, name) -> (
@@ -155,14 +152,19 @@ let read_file_nofollow ~max_bytes ~validate path =
           "Eio_fs_unix.read_file_nofollow: final component is not a file name";
       Eio.Switch.run @@ fun sw ->
       let opened_parent = Eio.Path.open_dir ~sw parent in
-      let dir, relative = Eio.Path.(opened_parent / name) in
+      let wrapped_dir, relative = Eio.Path.(opened_parent / name) in
+      (* Opening the parent through the supplied capability is the path
+         operation a wrapper must observe. Only then unwrap its already-open
+         directory so a backend extension or POSIX descriptor can open the
+         final basename without resolving the parent a second time. *)
+      let dir = unwrapped_dir wrapped_dir in
       match Eio_fs.Nofollow.find dir with
       | Some reader -> reader ~sw ~path:relative ~max_bytes ~validate
       | None -> (
-          let parent_file = Eio.Path.open_in ~sw parent in
-          if (Eio.File.stat parent_file).kind <> `Directory then
-            invalid_arg
-              "Eio_fs_unix.read_file_nofollow: parent is not a directory";
+          (* Eio's directory resource does not export its POSIX descriptor.
+             Open that already-resolved directory as a file to obtain one;
+             this duplicates the handle without resolving [parent] again. *)
+          let parent_file = Eio.Path.open_in ~sw (Eio.Path.of_dir dir) in
           match Eio_unix.Resource.fd_opt parent_file with
           | None ->
               invalid_arg

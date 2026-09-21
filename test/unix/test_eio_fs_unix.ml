@@ -36,6 +36,8 @@ let regular_file (stat : Eio.File.Stat.t) =
   | `Regular_file -> Ok ()
   | _ -> Error "not a regular file"
 
+exception Cancelled_read
+
 let test_read_nofollow_reads_a_bounded_regular_file () =
   with_real_dir @@ fun dir ->
   Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "secret";
@@ -104,6 +106,59 @@ let test_read_nofollow_uses_the_in_memory_backend () =
       Alcotest.fail "the in-memory backend followed a final link"
   | Error _ -> Alcotest.fail "an in-memory link reached validation"
   | exception Eio.Io _ -> ()
+
+let test_read_nofollow_opens_the_parent_through_its_wrapper () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "secret";
+  Eio.Path.with_open_dir dir @@ fun base ->
+  let observed = ref [] in
+  let schedule =
+    Chaos.Schedule.observing
+      (fun operation -> observed := operation :: !observed)
+      Chaos.Schedule.empty
+  in
+  let wrapped = Chaos.wrap schedule base in
+  (match
+     Eio_fs_unix.read_file_nofollow ~max_bytes:6 ~validate:regular_file
+       (wrapped / "private")
+   with
+  | Error _ -> Alcotest.fail "the wrapped private file was refused"
+  | Ok bytes -> Cstruct.memset bytes 0);
+  let opens =
+    List.filter
+      (fun (operation : Chaos.Op.t) -> operation.kind = `Open)
+      !observed
+  in
+  Alcotest.(check int)
+    "the supplied wrapper observes the one parent capability open" 1
+    (List.length opens)
+
+let test_read_nofollow_wipes_a_failed_read () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "private") "secret";
+  let stat = Eio.Path.stat ~follow:false (dir / "private") in
+  let exposed = ref None in
+  (match
+     Eio_fs.Nofollow.run ~max_bytes:6 ~validate:regular_file ~stat
+       ~read:(fun buffer ->
+         Cstruct.blit_from_string "secret" 0 buffer 0 6;
+         exposed := Some buffer;
+         raise Cancelled_read)
+   with
+  | exception Cancelled_read -> ()
+  | exception failure -> raise failure
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "the failed read returned bytes"
+  | Error _ -> Alcotest.fail "the fixture did not enter its read");
+  match !exposed with
+  | None -> Alcotest.fail "the fixture exposed no partial buffer"
+  | Some buffer ->
+      let wiped = Cstruct.to_string buffer in
+      Alcotest.(check string)
+        "every byte read before cancellation is wiped"
+        (String.make (String.length wiped) '\000')
+        wiped
 
 (* The commit-protocol shape: write a temporary, fsync it, rename it into
    place, barrier the directory. Every step must succeed and the published
@@ -1755,6 +1810,10 @@ let suite =
         test_read_nofollow_returns_descriptor_validation;
       Alcotest.test_case "no-follow read uses the in-memory backend" `Quick
         test_read_nofollow_uses_the_in_memory_backend;
+      Alcotest.test_case "no-follow read opens the parent through wrappers"
+        `Quick test_read_nofollow_opens_the_parent_through_its_wrapper;
+      Alcotest.test_case "no-follow read wipes a failed read" `Quick
+        test_read_nofollow_wipes_a_failed_read;
       Alcotest.test_case "barrier after rename" `Quick
         test_sync_dir_after_rename;
       Alcotest.test_case "barrier empty and repeated" `Quick
