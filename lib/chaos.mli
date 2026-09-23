@@ -1,8 +1,8 @@
 (** An adversarial {!Eio.Fs.dir} wrapper for fault-injection testing.
 
-    {!wrap} composes with any base directory capability -- the in-memory backend
-    from {!Eio_fs.Fs} or a real filesystem -- and perturbs reads, writes, syncs,
-    opens and stats according to a {!Schedule.t}. A schedule is either
+    {!wrap} composes with any base directory capability, such as the in-memory
+    backend from {!Eio_fs.Fs} or a real filesystem, and perturbs reads, writes,
+    syncs, opens and stats according to a {!Schedule.t}. A schedule is either
     {e seeded} (deterministic pseudo-random faults, for fuzzing) or {e scripted}
     (an inspectable list of rules, for pinning an exact scenario such as a torn
     write during a superblock flush).
@@ -38,7 +38,7 @@ module Fault : sig
             the caller to loop. *)
     | Torn_write of int
         (** Commit [n] bytes to the base, then raise: bytes reach the store but
-            the operation reports failure -- the durability hazard. *)
+            the operation reports failure. *)
     | Write_error of code  (** Commit nothing, raise a write error (ENOSPC). *)
     | Sync_error of code  (** Fail a flush/sync. *)
     | Open_error of code  (** Fail an open/open_dir. *)
@@ -95,8 +95,8 @@ module Schedule : sig
   val scripted : rule list -> t
   (** [scripted rules] fires each rule the first time an operation matches its
       trigger. A fired rule is consumed; unmatched rules never fire. This pins
-      an exact scenario -- for example, a single {!Write_covering} rule carrying
-      a {!constructor-Torn_write} fault reproduces a torn superblock flush at a
+      an exact scenario: for example, a single {!Write_covering} rule carrying a
+      {!constructor-Torn_write} fault reproduces a torn superblock flush at a
       chosen offset. *)
 
   val observing : (Op.t -> unit) -> t -> t
@@ -119,9 +119,9 @@ module Schedule : sig
       sequence always yield the same fault sequence. *)
 
   val next : t -> Op.t -> Fault.t option
-  (** [next t op] advances the schedule by one operation and returns the fault
-      to inject, if any. Called internally by {!wrap}; exposed for testing a
-      schedule in isolation. *)
+  (** [next t op] advances the schedule by one operation and is the fault to
+      inject, if any. {!wrap} calls it; it is exported to test a schedule in
+      isolation. *)
 
   val pp : t Fmt.t
   (** [pp] formats a schedule for logs (a seed or the count of pending rules).
@@ -188,16 +188,16 @@ module Crash : sig
         (** Seeded: each un-synced write survives on an even coin and the
             survivors are applied in a seeded-shuffled order, so a later write
             may land while an earlier one is lost. Uncommitted directory
-            operations survive as a seeded-length prefix of program order --
+            operations survive as a seeded-length prefix of program order:
             metadata never reorders. The [int] is the seed; the same seed and
             workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
             survivors keep program order. An uncommitted directory operation
             survives iff the predicate holds for it {e and} every earlier
-            uncommitted directory operation survived (the prefix rule). Pins an
-            exact scenario -- for example keep a generation pointer but drop the
-            data block it references. *)
+            uncommitted directory operation survived (the prefix rule). It pins
+            an exact scenario, for example keeping a generation pointer but
+            dropping the data block it references. *)
 
   (** When a crash fires while the workload runs. *)
   type trigger =
@@ -239,19 +239,19 @@ module Crash : sig
 
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per
-      {!policy} and rewrites the base to it. Idempotent -- a second call is a
-      no-op. After a crash, reads, writes and syncs through the wrapper fail
-      with an {!Eio.Io} exception ("power lost"); re-read through {!post_crash}.
-  *)
+      {!policy} and rewrites the base to it. A second call does nothing. After a
+      crash, reads, writes and syncs through the wrapper fail with an {!Eio.Io}
+      exception ("power lost"); re-read through {!post_crash}. *)
 
   val is_crashed : t -> bool
   (** [is_crashed t] is [true] once a crash has fired. *)
 
   val post_crash : t -> base_dir
-  (** [post_crash t] crashes [t] if it has not already, then returns the base
-      directory over the crashed image -- a fresh, un-perturbed handle a test
-      re-mounts and re-reads through. Raises [Invalid_argument] if [t] was never
-      {!wrap}ped. *)
+  (** [post_crash t] crashes [t] if it has not already crashed, and is the base
+      directory over the crashed image: a fresh, unperturbed handle that a test
+      re-mounts and re-reads through.
+
+      @raise Invalid_argument if [t] was never {!wrap}ped. *)
 
   val sync_metadata : t -> unit
   (** [sync_metadata t] commits the metadata journal: every pending directory

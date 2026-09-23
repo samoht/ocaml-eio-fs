@@ -21,8 +21,8 @@ module Make (B : S) : sig
 end
 
 val capability : t
-(** Dispatch only through registered directory operations; an unregistered
-    backend is refused. *)
+(** [capability] dispatches only through registered directory operations and
+    refuses an unregistered backend. *)
 
 val exclusive : t -> _ Eio.Path.t -> _ Eio.Path.t -> unit
 (** [exclusive backend source target] moves [source] atomically without

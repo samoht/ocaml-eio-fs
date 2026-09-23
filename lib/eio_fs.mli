@@ -37,8 +37,8 @@ module Nofollow : sig
 end
 
 (** Helpers over standard {!Eio.Path} values. The lexical arithmetic on the
-    strings those values carry -- what a path's components are, and which
-    spellings name one object -- is {!Eio_fs_path}, in [eio-fs.path]. *)
+    strings those values carry (what a path's components are, and which
+    spellings name one object) is {!Eio_fs_path}, in [eio-fs.path]. *)
 module Path : sig
   type usage = {
     allocated_bytes : int64;
@@ -110,8 +110,7 @@ module Crunch : sig
 
   val load : t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [load entries] resets the in-memory filesystem, populates it with
-      [entries] -- preserving permissions and symbolic links -- and returns its
-      root. *)
+      [entries] (preserving permissions and symbolic links) and is its root. *)
 
   val source : t Fmt.t
   (** [source] prints a standalone OCaml module embedding the entries. The
