@@ -701,6 +701,74 @@ let await_holder child =
   | `Exited n -> Alcotest.failf "lock holder exited %d" n
   | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
 
+let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lease" in
+  let ready = dir / "lease-ready" in
+  let wait_child pid =
+    let rec loop () =
+      match Unix.waitpid [] pid with
+      | answer -> answer
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
+    in
+    loop ()
+  in
+  let child =
+    Eio_fs_unix.Lease.with_exclusive lock @@ fun lease ->
+    let fd =
+      Eio_unix.Fd.use_exn "test inherited lease"
+        (Eio_fs_unix.Lease.fd lease)
+        Fun.id
+    in
+    Unix.clear_close_on_exec fd;
+    let pid =
+      Fun.protect
+        ~finally:(fun () -> Unix.set_close_on_exec fd)
+        (fun () ->
+          Unix.create_process Sys.executable_name
+            [|
+              Sys.executable_name;
+              "--hold-eio-fs-lease";
+              Eio.Path.native_exn ready;
+            |]
+            Unix.stdin Unix.stdout Unix.stderr)
+    in
+    let rec await_ready attempts =
+      if Eio.Path.is_file ready then pid
+      else if attempts = 0 then begin
+        (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+        ignore (wait_child pid);
+        Alcotest.fail "lease child did not start within one second"
+      end
+      else begin
+        Eio.Time.sleep clock 0.01;
+        await_ready (attempts - 1)
+      end
+    in
+    await_ready 100
+  in
+  let reaped = ref false in
+  Fun.protect
+    ~finally:(fun () ->
+      if not !reaped then begin
+        (try Unix.kill child Sys.sigterm with Unix.Unix_error _ -> ());
+        ignore (wait_child child)
+      end)
+    (fun () ->
+      (match Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()) with
+      | () -> Alcotest.fail "inherited descriptor did not retain the lease"
+      | exception Eio_fs_unix.Lock_unavailable _ -> ());
+      Unix.kill child Sys.sigterm;
+      let _, status = wait_child child in
+      reaped := true;
+      (match status with
+      | Unix.WSIGNALED n when n = Sys.sigterm -> ()
+      | Unix.WEXITED n -> Alcotest.failf "lease child exited %d" n
+      | Unix.WSIGNALED n -> Alcotest.failf "lease child took signal %d" n
+      | Unix.WSTOPPED n -> Alcotest.failf "lease child stopped by %d" n);
+      Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()))
+
 let test_lock_wait_does_not_block_eio () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -1922,6 +1990,12 @@ let test_xattr_does_not_follow () =
     "the link does not report its target's attribute" None
     (List.assoc_opt "user.a" (Eio_fs_unix.xattrs link))
 
+let lease_test_case =
+  Alcotest.test_case "a lease follows its inherited descriptor" `Quick
+    test_lease_survives_owner_close_until_inherited_descriptor_closes
+
+let lease_suite = ("lease", [ lease_test_case ])
+
 let suite =
   ( "eio_fs_unix",
     [
@@ -1991,6 +2065,7 @@ let suite =
         test_sync_dir_in_memory_no_op;
       Alcotest.test_case "lock wait does not block Eio" `Quick
         test_lock_wait_does_not_block_eio;
+      lease_test_case;
       Alcotest.test_case "lock serializes fibers" `Quick
         test_lock_serializes_fibers;
       Alcotest.test_case "lock excludes another name for its file" `Quick
