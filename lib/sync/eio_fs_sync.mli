@@ -74,8 +74,8 @@ type config = {
   durable : bool;
       (** Push the temporary and target directory to stable storage. *)
   perm : Eio.File.Unix_perm.t;
-      (** Permissions used when creating the temporary, and therefore the
-          published file. *)
+      (** The mode of the temporary, and therefore of the published file:
+          exactly this, whatever the process umask. *)
   max_bytes : int64;  (** Hard ceiling on bytes accepted from the producer. *)
 }
 (** Publication policy. A finite {!type-config.field-max_bytes} is mandatory:

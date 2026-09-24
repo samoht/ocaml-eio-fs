@@ -156,6 +156,10 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
                   "Eio_fs_sync.publish: temporary and target are the same file"
             | _ -> ()
             | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> ());
+            (* The create's mode is narrowed by the umask; the published file
+               carries exactly [config.perm]. *)
+            if not (Int.equal (tmp_stat.perm land 0o7777) config.perm) then
+              Eio.Path.chmod ~follow:false ~perm:config.perm tmp;
             let sink = (file :> Eio.Flow.sink_ty Eio.Resource.t) in
             let result =
               write (bounded_sink ~max_bytes:config.max_bytes sink)
