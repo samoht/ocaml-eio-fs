@@ -538,3 +538,27 @@ let enter_lock ?block ?create ?contents path f =
 let lock_section ?block ?create ?contents path =
   Section.v
     { Rendezvous.enter = (fun f -> enter_lock ?block ?create ?contents path f) }
+
+(* {1 Extended attributes} *)
+
+external llistxattr : string -> string = "caml_eio_fs_llistxattr"
+external lgetxattr : string -> string -> string = "caml_eio_fs_lgetxattr"
+
+external lsetxattr : string -> string -> string -> unit
+  = "caml_eio_fs_lsetxattr"
+
+(* The kernel lists names as a run of NUL-terminated strings. *)
+let names_of_list s =
+  String.split_on_char '\000' s |> List.filter (fun n -> n <> "")
+
+let xattrs path =
+  let native = Eio.Path.native_exn path in
+  Eio_unix.run_in_systhread ~label:"eio-fs-xattrs" @@ fun () ->
+  names_of_list (llistxattr native)
+  |> List.sort String.compare
+  |> List.map (fun name -> (name, lgetxattr native name))
+
+let set_xattr path name v =
+  let native = Eio.Path.native_exn path in
+  Eio_unix.run_in_systhread ~label:"eio-fs-set-xattr" @@ fun () ->
+  lsetxattr native name v

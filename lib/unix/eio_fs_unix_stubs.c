@@ -361,3 +361,161 @@ CAMLprim value caml_eio_fs_rename_exclusive(value srcfd_v, value src_v,
     caml_unix_error(saved_errno, "rename_exclusive", dst_v);
   CAMLreturn(Val_unit);
 }
+
+/* --- Extended attributes ---
+
+   POSIX has no extended-attribute call; Linux and Darwin each have one family
+   with different spellings. Linux names the no-follow form with an [l]
+   prefix (llistxattr(2), lgetxattr(2), lsetxattr(2)); Darwin passes
+   XATTR_NOFOLLOW to listxattr(2), getxattr(2) and setxattr(2), which also take
+   a resource-fork position, always 0 here. Every call acts on the named entry
+   itself, a symbolic link included, never on what it points to. */
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
+
+static char *eio_fs_cstring(value v, const char *what)
+{
+  mlsize_t len = caml_string_length(v);
+  const char *s = String_val(v);
+  if (memchr(s, '\0', len) != NULL)
+    caml_invalid_argument(what);
+  char *c = malloc(len + 1);
+  if (c == NULL)
+    caml_raise_out_of_memory();
+  memcpy(c, s, len);
+  c[len] = '\0';
+  return c;
+}
+
+static ssize_t eio_fs_llistxattr(const char *path, char *buf, size_t size)
+{
+#if defined(__linux__)
+  return llistxattr(path, buf, size);
+#elif defined(__APPLE__)
+  return listxattr(path, buf, size, XATTR_NOFOLLOW);
+#else
+  (void)path; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static ssize_t eio_fs_lgetxattr(const char *path, const char *name, void *buf,
+                                size_t size)
+{
+#if defined(__linux__)
+  return lgetxattr(path, name, buf, size);
+#elif defined(__APPLE__)
+  return getxattr(path, name, buf, size, 0, XATTR_NOFOLLOW);
+#else
+  (void)path; (void)name; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static int eio_fs_lsetxattr(const char *path, const char *name,
+                            const void *buf, size_t size)
+{
+#if defined(__linux__)
+  return lsetxattr(path, name, buf, size, 0);
+#elif defined(__APPLE__)
+  return setxattr(path, name, buf, size, 0, XATTR_NOFOLLOW);
+#else
+  (void)path; (void)name; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+/* The size query and the read are two calls, and an attribute can grow in
+   between: ERANGE on the read asks again. The result is the raw bytes the
+   kernel returns, which the OCaml side cuts. */
+static value eio_fs_read_sized(value path_v, value name_v, const char *what)
+{
+  CAMLparam2(path_v, name_v);
+  CAMLlocal1(result);
+  char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
+  char *name = NULL;
+  if (Is_block(name_v))
+    name = eio_fs_cstring(Field(name_v, 0), "Eio_fs_unix: NUL byte in name");
+  char *buf = NULL;
+  ssize_t n;
+  int saved_errno;
+  for (;;) {
+    caml_release_runtime_system();
+    n = name ? eio_fs_lgetxattr(path, name, NULL, 0)
+             : eio_fs_llistxattr(path, NULL, 0);
+    saved_errno = errno;
+    if (n > 0) {
+      buf = malloc((size_t)n);
+      if (buf == NULL) {
+        caml_acquire_runtime_system();
+        free(path);
+        free(name);
+        caml_raise_out_of_memory();
+      }
+      ssize_t m = name ? eio_fs_lgetxattr(path, name, buf, (size_t)n)
+                       : eio_fs_llistxattr(path, buf, (size_t)n);
+      saved_errno = errno;
+      if (m == -1 && saved_errno == ERANGE) {
+        free(buf);
+        buf = NULL;
+        caml_acquire_runtime_system();
+        continue;
+      }
+      n = m;
+    }
+    caml_acquire_runtime_system();
+    break;
+  }
+  free(path);
+  free(name);
+  if (n == -1) {
+    free(buf);
+    caml_unix_error(saved_errno, (char *)what, path_v);
+  }
+  result = caml_alloc_initialized_string((mlsize_t)n, n > 0 ? buf : "");
+  free(buf);
+  CAMLreturn(result);
+}
+
+CAMLprim value caml_eio_fs_llistxattr(value path_v)
+{
+  return eio_fs_read_sized(path_v, Val_none, "llistxattr");
+}
+
+CAMLprim value caml_eio_fs_lgetxattr(value path_v, value name_v)
+{
+  CAMLparam2(path_v, name_v);
+  CAMLlocal1(some);
+  some = caml_alloc_some(name_v);
+  CAMLreturn(eio_fs_read_sized(path_v, some, "lgetxattr"));
+}
+
+CAMLprim value caml_eio_fs_lsetxattr(value path_v, value name_v, value data_v)
+{
+  CAMLparam3(path_v, name_v, data_v);
+  char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
+  char *name = eio_fs_cstring(name_v, "Eio_fs_unix: NUL byte in name");
+  size_t len = caml_string_length(data_v);
+  char *data = malloc(len > 0 ? len : 1);
+  if (data == NULL) {
+    free(path);
+    free(name);
+    caml_raise_out_of_memory();
+  }
+  memcpy(data, String_val(data_v), len);
+  caml_release_runtime_system();
+  int r = eio_fs_lsetxattr(path, name, data, len);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  free(path);
+  free(name);
+  free(data);
+  if (r == -1)
+    caml_unix_error(saved_errno, "lsetxattr", path_v);
+  CAMLreturn(Val_unit);
+}

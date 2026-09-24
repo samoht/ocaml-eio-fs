@@ -186,3 +186,34 @@ val lock_section :
 
     @raise Eio_fs_sync.Lock.Unavailable
       from {!Eio_fs_sync.Lock.use}, never from [lock_section] itself. *)
+
+(** {1:xattrs Extended attributes}
+
+    The name-value pairs a filesystem keeps beside a file's data
+    ({{:https://man7.org/linux/man-pages/man7/xattr.7.html}xattr(7)}), which
+    [Unix] does not bind. Both calls act on the entry [path] names, a symbolic
+    link included, and never follow it: [llistxattr], [lgetxattr] and
+    [lsetxattr] on Linux, [XATTR_NOFOLLOW] on Darwin. Each call is made on a
+    system thread. *)
+
+val xattrs : _ Eio.Path.t -> (string * string) list
+(** [xattrs path] is every extended attribute of [path] as [(name, value)]
+    pairs, in ascending byte order of name. A value is the attribute's bytes,
+    NUL bytes included.
+
+    @raise Unix.Unix_error
+      as the platform call: [ENOTSUP] where the filesystem keeps none, [ENOSYS]
+      on a platform with neither family.
+    @raise Invalid_argument if [path] has no native Unix representation. *)
+
+val set_xattr : _ Eio.Path.t -> string -> string -> unit
+(** [set_xattr path name value] sets the extended attribute [name] of [path] to
+    [value], creating it or replacing it.
+
+    @raise Unix.Unix_error
+      as the platform call: [ENOTSUP] where the filesystem keeps none, [EPERM]
+      for a namespace the process may not write ([security.*] and [trusted.*]
+      without privilege on Linux), [ENOSYS] on a platform with neither family.
+    @raise Invalid_argument
+      if [path] has no native Unix representation or [path] or [name] holds a
+      NUL byte. *)
