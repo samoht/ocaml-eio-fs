@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -41,6 +42,22 @@ CAMLprim value caml_eio_fs_is_darwin(value unit)
   (void)unit;
   return Val_false;
 #endif
+}
+
+/* Acquire an exclusive BSD flock. The opened file description owns this
+   lock, so a descriptor inherited by an execed supervisor keeps it held when
+   the acquiring process closes its copy. */
+CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
+{
+  int fd = Int_val(fd_v);
+  int operation = LOCK_EX | (Bool_val(nonblocking_v) ? LOCK_NB : 0);
+  caml_release_runtime_system();
+  int r = flock(fd, operation);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  if (r == -1)
+    caml_unix_error(saved_errno, "flock", Nothing);
+  return Val_unit;
 }
 
 /* One Darwin F_FULLFSYNC call. Retry and fallback policy lives in OCaml. */

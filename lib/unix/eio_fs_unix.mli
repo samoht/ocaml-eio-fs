@@ -172,6 +172,55 @@ val with_lock :
       {!Eio_fs_sync.Process_local}.
     @raise Unix.Unix_error as [lockf]. *)
 
+module Lease : sig
+  type t
+
+  val fd : t -> Eio_unix.Fd.t
+  (** [fd lease] is the descriptor whose open file description owns the lease. A
+      supervisor can inherit it before the callback returns. Closing the
+      parent's descriptor does not release the lease while an inherited
+      descriptor remains open. The descriptor must be closed to release the
+      lease; do not unlock it explicitly. *)
+
+  val with_exclusive :
+    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?contents:string ->
+    _ Eio.Path.t ->
+    (t -> 'a) ->
+    'a
+  (** [with_exclusive path fn] opens or creates [path], takes an exclusive BSD
+      [flock], and calls [fn] with the descriptor that owns it. The lease is
+      released when the last copy of that descriptor closes. The callback's
+      descriptor is closed when the callback returns unless another process
+      inherited it.
+
+      [create] controls whether an absent rendezvous is created; the default,
+      [`If_missing 0o600], creates it owner-only, and [`Never] raises
+      {!Eio.Fs.Not_found} when absent. [contents], when present, replaces the
+      rendezvous contents while the lease is held. [block] selects the wait
+      policy used by {!with_lock}.
+
+      Only a path backed by a native Unix descriptor can hold a lease. The path
+      must name its own regular file; a link, directory, FIFO, or name changed
+      between resolution and open is refused with {!Eio.Fs.Permission_denied}
+      carrying {!Not_a_lock_file}.
+
+      Unlike {!with_lock}, this operation does not unlock when [fn] returns.
+      Closing the callback's descriptor releases the lock only when it was the
+      last open descriptor referring to the same open file description.
+
+      @raise Lock_unavailable when a hold is refused or exceeds its bound.
+      @raise Eio.Io
+        with {!Eio.Fs.Not_found} when the rendezvous is absent and [create] is
+        [`Never].
+      @raise Eio.Io
+        with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when the
+        path is not its own regular file.
+      @raise Invalid_argument when the filesystem provides no Unix descriptor.
+      @raise Unix.Unix_error as [flock]. *)
+end
+
 val lock_section :
   ?block:[ `Yes | `No | `Fibers | `For of float ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->

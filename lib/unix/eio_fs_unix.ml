@@ -1,5 +1,8 @@
 external is_darwin : unit -> bool = "caml_eio_fs_is_darwin"
 
+external flock_exclusive_native : Unix.file_descr -> bool -> unit
+  = "caml_eio_fs_flock_exclusive"
+
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
 
@@ -495,6 +498,82 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
           "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
            descriptor and its backend registers no Eio_fs_sync.Process_local"
           name
+
+module Lease = struct
+  type t = { fd : Eio_unix.Fd.t }
+
+  let fd t = t.fd
+
+  let flock fd ~nonblocking =
+    let rec acquire () =
+      match flock_exclusive_native fd nonblocking with
+      | () -> ()
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire ()
+    in
+    Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" acquire
+
+  let use_os_lock ~patience ~path fd fn =
+    let acquired = ref false in
+    let ask ~nonblocking =
+      Eio.Cancel.protect @@ fun () ->
+      match flock fd ~nonblocking with
+      | () -> acquired := true
+      | exception
+          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
+        ->
+          ()
+    in
+    (match patience with
+    | Wait -> ask ~nonblocking:false
+    | Refuse -> ask ~nonblocking:true
+    | Until lapsed ->
+        let rec poll () =
+          ask ~nonblocking:true;
+          if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+            Eio.Fiber.first
+              (fun () -> Eio_unix.sleep ask_again_every)
+              (fun () -> Eio.Promise.await lapsed);
+            poll ()
+          end
+        in
+        poll ());
+    if not !acquired then raise (Lock_unavailable path);
+    fn ()
+
+  let with_exclusive ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
+      ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
+        `If_missing 0o600) ?contents path fn =
+    let name = lock_name path in
+    Eio.Switch.run @@ fun sw ->
+    let fibers, processes =
+      match block with
+      | `Yes -> (Wait, Wait)
+      | `No -> (Refuse, Refuse)
+      | `Fibers -> (Wait, Refuse)
+      | `For seconds ->
+          let until = budget ~sw seconds in
+          (until, until)
+    in
+    let file, (opened : Eio.File.Stat.t) =
+      in_entry_order name @@ fun () ->
+      check_lock_name ~name path;
+      let file = open_lock_file ~sw ~name ~create path in
+      (file, Eio.File.stat file)
+    in
+    use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
+    use_mutex ~patience:fibers ~path:name mutex @@ fun () ->
+    match Eio_unix.Resource.fd_opt file with
+    | Some fd ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.with_exclusive" fd
+        @@ fun raw_fd ->
+        use_os_lock ~patience:processes ~path:name raw_fd @@ fun () ->
+        hold ~name ~opened ~contents ~file path (fun () -> fn { fd })
+    | None ->
+        Fmt.invalid_arg
+          "Eio_fs_unix.Lease.with_exclusive: %s: the rendezvous carries no \
+           Unix file descriptor"
+          name
+end
 
 (* A backend-free component takes its critical section as an
    [Eio_fs_sync.Lock.t]; this is that section over a rendezvous of this
