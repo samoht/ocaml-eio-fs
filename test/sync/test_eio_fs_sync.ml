@@ -46,6 +46,30 @@ let test_posix_needs_no_registration () =
     (fun f -> Eio.Flow.copy_string "x" f);
   Alcotest.(check string) "published" "x" (Eio.Path.load (fs / dir / "cfg"))
 
+(* The published file carries exactly [config.perm]. A create's mode is
+   narrowed by the process umask (open(2): "the mode of the created file is
+   (mode & ~umask)"), so a mode the caller named survives only if publish
+   restates it on the temporary before the rename. The umask here clears the
+   group and other read bits a 0o644 names, so a publish that leaves the
+   create's mode alone reads 0o600 back. *)
+let test_publish_honours_perm_under_umask () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-sync-perm" "" in
+  Sys.remove dir;
+  Eio.Path.mkdir ~perm:0o755 (fs / dir);
+  let previous = Unix.umask 0o077 in
+  Fun.protect ~finally:(fun () ->
+      ignore (Unix.umask previous : int);
+      Eio.Path.rmtree ~missing_ok:true (fs / dir))
+  @@ fun () ->
+  Eio_fs_sync.publish
+    ~config:Eio_fs_sync.{ durable = true; perm = 0o644; max_bytes = 1L }
+    (fs / dir / "cfg")
+    (fun f -> Eio.Flow.copy_string "x" f);
+  let stat = Eio.Path.stat ~follow:false (fs / dir / "cfg") in
+  Alcotest.(check int) "published mode is config.perm" 0o644 stat.perm
+
 (* A barrier that cannot be issued surfaces loudly, with context pointing at
    the Dir_sync registration -- never a silent no-op. *)
 let test_unissuable_barrier_raises () =
@@ -383,6 +407,8 @@ let suite =
       Alcotest.test_case "registered backend" `Quick test_registered_backend;
       Alcotest.test_case "posix needs no registration" `Quick
         test_posix_needs_no_registration;
+      Alcotest.test_case "published mode ignores the umask" `Quick
+        test_publish_honours_perm_under_umask;
       Alcotest.test_case "unissuable barrier raises" `Quick
         test_unissuable_barrier_raises;
       Alcotest.test_case "failed save cleans temporary" `Quick
