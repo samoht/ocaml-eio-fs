@@ -291,9 +291,8 @@ let publish_generation ~durable ?(perm = 0o755) path populate =
     | `Symbolic_link -> Some (Eio.Path.read_link path)
     | _ ->
         invalid_arg
-          (Format.asprintf
-             "Eio_fs_sync.publish_generation: %a is not a generation pointer"
-             Eio.Path.pp path)
+          ("Eio_fs_sync.publish_generation: " ^ snd path
+         ^ " is not a generation pointer")
   in
   let generation = fresh_generation name in
   let staged = Eio.Path.(parent / generation) in
