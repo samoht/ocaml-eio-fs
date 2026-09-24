@@ -146,6 +146,18 @@ let test_previous_reclaimed () =
     entries;
   Alcotest.check tree "the new tree" (Some new_tree) (read_back (base / "out"))
 
+(* A link a caller made by hand names a tree this publication does not own:
+   the switch replaces the link and leaves the tree. *)
+let test_foreign_target_kept () =
+  with_empty @@ fun fs ->
+  populate [ ("elsewhere/x", "kept") ] fs;
+  Eio.Path.symlink ~link_to:"elsewhere" (fs / "out");
+  publish ~durable:true fs new_tree;
+  Alcotest.check tree "the new tree" (Some new_tree) (read_back (fs / "out"));
+  Alcotest.(check string)
+    "the foreign tree stands" "kept"
+    (Eio.Path.load (fs / "elsewhere" / "x"))
+
 let test_failed_populate () =
   with_old @@ fun base ->
   let before = List.sort String.compare (Eio.Path.read_dir base) in
@@ -192,6 +204,8 @@ let suite =
         test_first_publication;
       Alcotest.test_case "previous generation reclaimed" `Quick
         test_previous_reclaimed;
+      Alcotest.test_case "foreign link target kept" `Quick
+        test_foreign_target_kept;
       Alcotest.test_case "failed producer keeps the previous tree" `Quick
         test_failed_populate;
       Alcotest.test_case "plain directory refused" `Quick
