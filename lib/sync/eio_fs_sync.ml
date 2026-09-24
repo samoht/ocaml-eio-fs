@@ -226,19 +226,50 @@ let rec sync_tree dir =
   sync_dir dir;
   List.iter sync_tree subdirs
 
+(* A generation is [.<name>.gen.<salt>.<n>]: hidden beside its pointer, and
+   told from any other name by its suffix. *)
 let generation_infix = ".gen."
 
 let fresh_generation name =
   let n = Atomic.fetch_and_add tmp_sequence 1 in
-  name ^ generation_infix ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+  "." ^ name ^ generation_infix ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+
+let is_digits s i j =
+  j > i
+  &&
+  let rec all k = k >= j || (s.[k] >= '0' && s.[k] <= '9' && all (k + 1)) in
+  all i
+
+(* The name a generation is the generation of, when [s] is one. *)
+let generation_of s =
+  let n = String.length s in
+  let dot = try String.rindex s '.' with Not_found -> -1 in
+  let infix = String.length generation_infix in
+  let rec find i =
+    if i < 1 then None
+    else if String.sub s i infix = generation_infix then Some i
+    else find (i - 1)
+  in
+  if
+    n = 0
+    || (not (Char.equal s.[0] '.'))
+    || dot < 0
+    || not (is_digits s (dot + 1) n)
+  then None
+  else
+    match find (dot - infix - 1) with
+    | Some i when i > 1 && is_digits s (i + infix) dot ->
+        Some (String.sub s 1 (i - 1))
+    | _ -> None
+
+let is_generation s = Option.is_some (generation_of s)
 
 (* A pointer target this publication owns: a sibling generation of the same
    name, never a path elsewhere a caller linked by hand. *)
 let owned_generation ~name target =
-  let prefix = name ^ generation_infix in
-  String.length target > String.length prefix
-  && String.equal (String.sub target 0 (String.length prefix)) prefix
-  && not (String.contains target '/')
+  match generation_of target with
+  | Some owner -> String.equal owner name
+  | None -> false
 
 let discard p =
   Eio.Cancel.protect @@ fun () ->

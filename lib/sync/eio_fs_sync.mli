@@ -139,15 +139,20 @@ val publish_generation :
 
     [path] must be absent or a symbolic link: anything else raises
     [Invalid_argument] before [populate] runs, and is left as it was. A
-    generation is a sibling named [path]'s basename, [".gen."] and a fresh
-    suffix; the one the old link named is reclaimed only when it is such a
-    sibling. One writer publishes a given [path] at a time; the exclusion is the
-    caller's ({!Lock}).
+    generation is a hidden sibling, a dot, [path]'s basename, [".gen."] and a
+    fresh suffix ({!is_generation}); the one the old link named is reclaimed
+    only when it is a generation of the same basename. One writer publishes a
+    given [path] at a time; the exclusion is the caller's ({!Lock}).
 
     On a failure of [populate], a sync or the switch, the staged generation is
     removed and [path] is unchanged. A barrier failure is reported after the
     switch, the new generation visible with uncertain durability and the
     previous one retained. *)
+
+val is_generation : string -> bool
+(** [is_generation name] is whether [name] is a generation {!publish_generation}
+    stages beside its pointer, so a reader listing that directory can tell the
+    pointers from their generations. *)
 
 module Lock = Lock
 (** The critical section a caller supplies: what keeps two writers out of one
