@@ -1885,6 +1885,43 @@ let test_exclusive_rename_keeps_open_parent () =
     "replacement directory untouched" []
     (Eio.Path.read_dir (dir / "elsewhere"))
 
+(* xattr(7): a value is a byte string, and the no-follow calls act on a link
+   itself. The value holds a NUL byte, which a C-string round trip would cut. *)
+let user_value = "v\000alue"
+
+let supported f =
+  try f ()
+  with Unix.Unix_error ((Unix.EOPNOTSUPP | Unix.ENOSYS), _, _) ->
+    Alcotest.skip ()
+
+let test_xattr_round_trip () =
+  with_real_dir @@ fun dir ->
+  let file = dir / "f" in
+  Eio.Path.save ~create:(`Exclusive 0o644) file "data";
+  supported @@ fun () ->
+  Eio_fs_unix.set_xattr file "user.b" "second";
+  Eio_fs_unix.set_xattr file "user.a" user_value;
+  let got =
+    List.filter
+      (fun (n, _) -> String.starts_with ~prefix:"user." n)
+      (Eio_fs_unix.xattrs file)
+  in
+  Alcotest.(check (list (pair string string)))
+    "user.* attributes, in name order"
+    [ ("user.a", user_value); ("user.b", "second") ]
+    got
+
+let test_xattr_does_not_follow () =
+  with_real_dir @@ fun dir ->
+  let file = dir / "target" and link = dir / "link" in
+  Eio.Path.save ~create:(`Exclusive 0o644) file "data";
+  Eio.Path.symlink ~link_to:"target" link;
+  supported @@ fun () ->
+  Eio_fs_unix.set_xattr file "user.a" user_value;
+  Alcotest.(check (option string))
+    "the link does not report its target's attribute" None
+    (List.assoc_opt "user.a" (Eio_fs_unix.xattrs link))
+
 let suite =
   ( "eio_fs_unix",
     [
@@ -2024,4 +2061,8 @@ let suite =
         test_path_usage_counts_the_files_a_copy_would_move;
       Alcotest.test_case "path usage of an empty tree moves nothing" `Quick
         test_path_usage_of_an_empty_tree_moves_nothing;
+      Alcotest.test_case "xattr(7) values round-trip byte for byte" `Quick
+        test_xattr_round_trip;
+      Alcotest.test_case "xattr(7) calls do not follow a final link" `Quick
+        test_xattr_does_not_follow;
     ] )
