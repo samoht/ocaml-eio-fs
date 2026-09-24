@@ -197,4 +197,103 @@ let publish ~config ?(mode = `Replace) ?(rename = Rename.capability)
      raise e);
   result
 
+(* A file opened read-only still names the inode fsync(2) flushes. A registered
+   barrier answers first; the POSIX backends expose their sync on every handle,
+   which is the route [fsync_handle] probes. *)
+let sync_readable file =
+  match file_barrier file with
+  | Some barrier -> barrier ()
+  | None -> fsync_handle file
+
+(* Top down: a directory's barrier commits the entries naming its children, and
+   commits nothing while the directory's own entry is not durable, so [dir]'s
+   entry is committed before this runs and each subdirectory is walked after
+   the barrier that committed it. A file's barrier commits its bytes. *)
+let rec sync_tree dir =
+  let subdirs =
+    List.filter_map
+      (fun name ->
+        let child = Eio.Path.(dir / name) in
+        match Eio.Path.kind ~follow:false child with
+        | `Directory -> Some child
+        | `Regular_file ->
+            Eio.Switch.run (fun sw ->
+                sync_readable (Eio.Path.open_in ~sw child));
+            None
+        | _ -> None)
+      (Eio.Path.read_dir dir)
+  in
+  sync_dir dir;
+  List.iter sync_tree subdirs
+
+let generation_infix = ".gen."
+
+let fresh_generation name =
+  let n = Atomic.fetch_and_add tmp_sequence 1 in
+  name ^ generation_infix ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+
+(* A pointer target this publication owns: a sibling generation of the same
+   name, never a path elsewhere a caller linked by hand. *)
+let owned_generation ~name target =
+  let prefix = name ^ generation_infix in
+  String.length target > String.length prefix
+  && String.equal (String.sub target 0 (String.length prefix)) prefix
+  && not (String.contains target '/')
+
+let discard p =
+  Eio.Cancel.protect @@ fun () ->
+  try Eio.Path.rmtree ~missing_ok:true p with Eio.Io _ -> ()
+
+(* Stage a fresh sibling generation, commit it whole, rename a pointer to it
+   over the published name, commit that, then reclaim the generation the old
+   pointer named. *)
+let publish_generation ~durable ?(perm = 0o755) path populate =
+  let parent, name =
+    match Eio.Path.split path with
+    | Some split -> split
+    | None ->
+        invalid_arg "Eio_fs_sync.publish_generation: the root has no parent"
+  in
+  let previous =
+    match Eio.Path.kind ~follow:false path with
+    | `Not_found -> None
+    | `Symbolic_link -> Some (Eio.Path.read_link path)
+    | _ ->
+        invalid_arg
+          (Format.asprintf
+             "Eio_fs_sync.publish_generation: %a is not a generation pointer"
+             Eio.Path.pp path)
+  in
+  let generation = fresh_generation name in
+  let staged = Eio.Path.(parent / generation) in
+  Eio.Path.mkdir ~perm staged;
+  let result =
+    try
+      let result = populate staged in
+      if durable then begin
+        sync_dir parent;
+        sync_tree staged
+      end;
+      result
+    with e ->
+      discard staged;
+      raise e
+  in
+  let link = Eio.Path.(parent / fresh_name name) in
+  (try
+     Eio.Cancel.protect @@ fun () ->
+     Eio.Path.symlink ~link_to:generation link;
+     Eio.Path.rename link path
+   with e ->
+     Eio.Cancel.protect (fun () ->
+         try Eio.Path.unlink link with Eio.Io _ -> ());
+     discard staged;
+     raise e);
+  if durable then sync_dir parent;
+  (match previous with
+  | Some target when owned_generation ~name target ->
+      Eio.Path.rmtree ~missing_ok:true Eio.Path.(parent / target)
+  | Some _ | None -> ());
+  result
+
 module Lock = Lock

@@ -118,6 +118,37 @@ val publish :
     after the rename, the new file visible with uncertain durability.
     {!type-config.field-durable} [false] keeps only the atomicity. *)
 
+val publish_generation :
+  durable:bool ->
+  ?perm:Eio.File.Unix_perm.t ->
+  'a Eio.Path.t ->
+  ('a Eio.Path.t -> 'b) ->
+  'b
+(** [publish_generation ~durable path populate] publishes a directory tree at
+    [path] whole: [populate] fills a fresh sibling generation directory (mode
+    [perm], default [0o755]), and a symbolic link to it is renamed over [path].
+    rename(2) keeps [path] naming the old link or the new one throughout, so a
+    reader resolving [path] sees one complete generation or the other and never
+    a mixture.
+
+    With [durable], every file and directory in the generation is synced before
+    the switch and [path]'s directory is barriered after it, so after a crash
+    [path] resolves to the previous generation or the new one, never to neither;
+    the previous generation is removed only once the switch is committed.
+    [durable] [false] keeps only the atomicity.
+
+    [path] must be absent or a symbolic link: anything else raises
+    [Invalid_argument] before [populate] runs, and is left as it was. A
+    generation is a sibling named [path]'s basename, [".gen."] and a fresh
+    suffix; the one the old link named is reclaimed only when it is such a
+    sibling. One writer publishes a given [path] at a time; the exclusion is the
+    caller's ({!Lock}).
+
+    On a failure of [populate], a sync or the switch, the staged generation is
+    removed and [path] is unchanged. A barrier failure is reported after the
+    switch, the new generation visible with uncertain durability and the
+    previous one retained. *)
+
 module Lock = Lock
 (** The critical section a caller supplies: what keeps two writers out of one
     another's read-modify-write, named by the deployment rather than the store.
