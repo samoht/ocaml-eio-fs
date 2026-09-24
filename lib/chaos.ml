@@ -1180,6 +1180,34 @@ module Crash = struct
                 in
                 ctl.metadata <- rebased))
 
+  (* A file the wrapper first meets on an open that finds it on disk was created
+     by nothing the model recorded, so its name is part of every image that
+     holds a regular file at its path: the durable one and each pending entry's.
+     Locating it there lets a crash rewrite it with what it synced. *)
+  let locate_preexisting ctl ((_, _, rel) as location) =
+    match ctl.base with
+    | None -> ()
+    | Some (_, root_path) ->
+        let holds tree =
+          match tree_path ~root:(path_segments root_path) rel with
+          | None -> false
+          | Some segs -> (
+              match tree_find tree segs with
+              | Some (File _) -> true
+              | Some (Dir _ | Link _) | None -> false)
+        in
+        (match ctl.durable_tree with
+        | Some tree when holds tree ->
+            ctl.durable_locations <- location :: ctl.durable_locations
+        | Some _ | None -> ());
+        ctl.metadata <-
+          List.map
+            (fun e ->
+              if holds e.tree then
+                { e with locations = location :: e.locations }
+              else e)
+            ctl.metadata
+
   let do_crash ctl =
     if not ctl.crashed then begin
       ctl.crashed <- true;
@@ -1491,6 +1519,7 @@ module Crash = struct
         | None ->
             let fs = { owner = d.droot; rel; perm; durable = prev } in
             Hashtbl.replace d.dctl.files key fs;
+            if existed then locate_preexisting d.dctl (fs, d.droot, rel);
             fs
       in
       (* An unsynced truncation of pre-existing durable data is itself a change
