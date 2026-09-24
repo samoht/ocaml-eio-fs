@@ -628,6 +628,31 @@ let test_crash_determinism () =
    the file keeps its mode, and a staging subtree closed long before the crash
    does not strand the file. *)
 
+(* A file already on disk when the model wraps the tree is as durable as its
+   name: nothing the wrapper saw created it. Bytes written through the wrapper
+   and synced survive the cut whether or not a metadata barrier came after the
+   open, since the open changed no directory entry (fsync(2) commits a file's
+   data; its name was never pending). [policy] picks which post-crash image
+   the model rebuilds from: [Drop_unsynced] the last committed one, and
+   [Survive] every journal entry's, here a mkdir recorded before the open. *)
+let preexisting_file_synced_after_wrap ~policy ~pending_entry () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let raw = env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "journal") "first";
+  let ctl = Crash.v ~policy () in
+  let fs = Crash.wrap ctl raw in
+  if pending_entry then Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.with_open_out ~create:(`If_missing 0o644) (fs / "journal")
+    (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 5)
+        [ Cstruct.of_string "second" ];
+      Eio.File.sync file);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "synced bytes of a pre-existing file survive" "firstsecond"
+    (Eio.Path.load (post / "journal"))
+
 (* A read-only file whose writes were all synced survives a crash byte-for-byte
    with its mode intact. The rewrite must not fail with EACCES just because the
    file cannot be reopened for writing. *)
@@ -1384,6 +1409,14 @@ let suite =
         test_crash_determinism;
       Alcotest.test_case "crash: after-write trigger" `Quick
         test_crash_after_write_trigger;
+      Alcotest.test_case "pre-existing file synced after the wrap" `Quick
+        (preexisting_file_synced_after_wrap ~policy:Crash.Drop_unsynced
+           ~pending_entry:false);
+      Alcotest.test_case "pre-existing file synced behind a pending entry"
+        `Quick
+        (preexisting_file_synced_after_wrap
+           ~policy:(Crash.Survive (fun _ -> true))
+           ~pending_entry:true);
       Alcotest.test_case "crash: read-only synced file" `Quick
         test_crash_readonly_synced;
       Alcotest.test_case "crash: read-only unsynced tail" `Quick
