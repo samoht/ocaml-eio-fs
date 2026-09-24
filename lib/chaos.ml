@@ -1335,11 +1335,27 @@ module Crash = struct
     let close cf = close_resource cf.cro
   end
 
-  let cro_handler = Eio.File.Pi.ro (module Cro_impl)
+  (* fsync(2) flushes the file, whichever descriptor names it, so a barrier
+     through a read-only handle commits the file as one through a read-write
+     handle does. A file the model does not track was never written through
+     the wrapper and is durable already. *)
+  let sync_ro cf fs =
+    guard cf;
+    match fs with
+    | None -> ()
+    | Some fs ->
+        fs.durable <- read_all cf.cro;
+        cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
+        bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
 
-  let wrap_cfile_ro ctl base : Eio.File.ro_ty r =
+  let wrap_cfile_ro ?fs ctl base : Eio.File.ro_ty r =
+    let cf = { ctl; cfs = None; cro = base; crw = None; cpos = ref 0 } in
     Eio.Resource.T
-      ({ ctl; cfs = None; cro = base; crw = None; cpos = ref 0 }, cro_handler)
+      ( cf,
+        Eio.Resource.handler
+          (Eio.Resource.bindings (Eio.File.Pi.ro (module Cro_impl))
+          @ [ Eio.Resource.H (Eio_fs_sync.File_sync, fun cf -> sync_ro cf fs) ]
+          ) )
 
   module Crw_impl = struct
     type t = cfile
@@ -1496,7 +1512,10 @@ module Crash = struct
     let open_in d ~sw path =
       if d.dctl.crashed then raise_power_lost ();
       let (Base_dir ((module B), bv)) = d.dboxed in
-      wrap_cfile_ro d.dctl (B.open_in bv ~sw path)
+      let fs =
+        Hashtbl.find_opt d.dctl.files (file_key d.droot (at d.dprefix path))
+      in
+      wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw path)
 
     let open_out d ~sw ~append ~create path =
       if d.dctl.crashed then raise_power_lost ();
