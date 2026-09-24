@@ -158,6 +158,39 @@ let test_foreign_target_kept () =
     "the foreign tree stands" "kept"
     (Eio.Path.load (fs / "elsewhere" / "x"))
 
+(* A listing of the pointers' directory tells the pointers from their
+   generations: the generation is hidden and carries its suffix, and no name a
+   caller would choose reads as one. *)
+let test_generation_names () =
+  with_empty @@ fun fs ->
+  publish ~durable:true fs new_tree;
+  let target = Eio.Path.read_link (fs / "out") in
+  Alcotest.(check bool)
+    "the link names a generation" true
+    (Eio_fs_sync.is_generation target);
+  Alcotest.(check bool)
+    "which is hidden" true
+    (String.length target > 0 && target.[0] = '.');
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " is not a generation")
+        false
+        (Eio_fs_sync.is_generation name))
+    [
+      "out";
+      ".out";
+      "out.gen.1.2";
+      ".out.gen.1";
+      ".out.gen.x.2";
+      ".out.gen.1.";
+      "..gen.1.2";
+      ".out.gen.1.2/x";
+    ];
+  Alcotest.(check bool)
+    "a basename holding the infix still parses" true
+    (Eio_fs_sync.is_generation ".a.gen.5.gen.12.3")
+
 let test_failed_populate () =
   with_old @@ fun base ->
   let before = List.sort String.compare (Eio.Path.read_dir base) in
@@ -204,6 +237,7 @@ let suite =
         test_first_publication;
       Alcotest.test_case "previous generation reclaimed" `Quick
         test_previous_reclaimed;
+      Alcotest.test_case "generation names" `Quick test_generation_names;
       Alcotest.test_case "foreign link target kept" `Quick
         test_foreign_target_kept;
       Alcotest.test_case "failed producer keeps the previous tree" `Quick
