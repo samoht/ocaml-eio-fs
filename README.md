@@ -14,7 +14,13 @@ The package also ships `Eio_fs.Chaos`, a wrapper that injects faults (short and
 torn writes, failed syncs, simulated power loss) into any directory for
 crash-consistency tests, and the `eio-fs.sync`, `eio-fs.unix` and `eio-fs.path`
 libraries for durable file operations, POSIX-specific calls and lexical path
-arithmetic.
+arithmetic. A torn write commits some of its bytes to the store and then
+reports failure. For power loss, `Eio_fs.Chaos.Crash` records every data write
+as un-synced until an `Eio.File.sync` on that file makes the earlier writes
+durable, and it journals creations, renames, unlinks and the other directory
+operations in program order. At a simulated crash, un-synced data writes may be
+dropped or reordered, and only a prefix of the uncommitted directory
+operations survives, each dropped operation rolled back whole.
 
 ## Installation
 
