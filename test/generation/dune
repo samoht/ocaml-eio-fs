@@ -1,0 +1,7 @@
+; Its own executable, and its own directory, so the one stanza that names
+; [Eio_fs_sync.publish_generation] is the only one that fails to build until
+; the primitive lands.
+
+(test
+ (name test)
+ (libraries eio eio.mock eio_fs eio-fs.sync alcotest fmt))

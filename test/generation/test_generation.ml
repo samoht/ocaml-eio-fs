@@ -1,0 +1,199 @@
+(* A generation is a directory tree published whole. POSIX rename(2) keeps a
+   replaced name visible throughout, referring to the old file or the new one
+   and never to neither ("a link named new shall remain visible to other
+   threads throughout the renaming operation and refer either to the file
+   referred to by new or old before the operation began"), so a pointer renamed
+   over a pointer is the one switch a tree can take atomically. Durability is
+   the crash model's: a file's bytes survive only up to its last sync, a
+   directory's entries only up to its last barrier, and uncommitted directory
+   operations survive as a prefix of program order (Chaos.Crash).
+
+   Each case crashes at every durability operation of one publication in turn
+   and reads the post-crash tree back through the pointer: it is the whole old
+   generation or the whole new one. *)
+
+module Crash = Eio_fs.Chaos.Crash
+
+let ( / ) = Eio.Path.( / )
+
+(* The two trees differ in every file's length and in their file sets, so a
+   torn file, a lost file and a stray one each read as neither. *)
+let old_tree = [ ("a", "old-a"); ("sub/b", "old-b") ]
+let new_tree = [ ("a", "new-a-longer"); ("c", "new-c"); ("sub/b", "new-bb") ]
+
+(* The producer writes and never syncs: making the bytes durable is the
+   publication's job. *)
+let populate tree dir =
+  List.iter
+    (fun (rel, content) ->
+      (match Filename.dirname rel with
+      | "." -> ()
+      | sub -> Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (dir / sub));
+      Eio.Path.save ~create:(`Exclusive 0o644) (dir / rel) content)
+    tree
+
+let rec files prefix p =
+  List.concat_map
+    (fun name ->
+      let rel = if prefix = "" then name else prefix ^ "/" ^ name in
+      match Eio.Path.kind ~follow:false (p / name) with
+      | `Directory -> files rel (p / name)
+      | _ -> [ (rel, Eio.Path.load (p / name)) ])
+    (List.sort String.compare (Eio.Path.read_dir p))
+
+(* What a reader resolving the published name sees. *)
+let read_back p =
+  match Eio.Path.kind ~follow:true p with
+  | `Not_found -> None
+  | _ -> Some (files "" p)
+
+let tree = Alcotest.(option (list (pair string string)))
+
+let pp_tree ppf = function
+  | None -> Fmt.string ppf "absent"
+  | Some t -> Fmt.(Dump.list (Dump.pair string string)) ppf t
+
+let publish ~durable fs tree =
+  Eio_fs_sync.publish_generation ~durable (fs / "out") (populate tree)
+
+(* A base holding [old_tree], published and committed. *)
+let with_old fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let ctl = Crash.v () in
+  publish ~durable:true (Crash.wrap ctl env#fs) old_tree;
+  fn (Crash.post_crash ctl)
+
+let with_empty fn =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env -> fn env#fs
+
+(* Crash the publication of [new_tree] over [setup]'s base at its [n]th
+   durability operation, for every [n] until one runs to completion. Each
+   crashed image must read as one of [before]; the completed one as the new
+   tree. Returns the outcome of every crash point. *)
+let every_crash_point ~policy ~setup ~before =
+  let rec at n acc =
+    if n > 1000 then Alcotest.fail "the publication never completed";
+    setup @@ fun base ->
+    let ctl = Crash.v ~policy ~trigger:(Crash.Nth_op n) () in
+    (try publish ~durable:true (Crash.wrap ctl base) new_tree
+     with Eio.Io _ when Crash.is_crashed ctl -> ());
+    let completed = not (Crash.is_crashed ctl) in
+    let seen = read_back (Crash.post_crash ctl / "out") in
+    if completed then begin
+      Alcotest.check tree "a completed publication reads as the new tree"
+        (Some new_tree) seen;
+      List.rev acc
+    end
+    else begin
+      if not (List.exists (( = ) seen) before) then
+        Alcotest.failf "crash at operation %d: the tree read as %a" n pp_tree
+          seen;
+      at (n + 1) (seen :: acc)
+    end
+  in
+  at 1 []
+
+let check_windows ~name outcomes ~expect =
+  Alcotest.(check bool)
+    (name ^ ": the crash points include one that keeps the previous tree")
+    true
+    (List.exists (( = ) expect) outcomes);
+  Alcotest.(check bool)
+    (name ^ ": and one after the switch that reads the new tree")
+    true
+    (List.exists (( = ) (Some new_tree)) outcomes)
+
+let test_replace_drop () =
+  let outcomes =
+    every_crash_point ~policy:Crash.Drop_unsynced ~setup:with_old
+      ~before:[ Some old_tree; Some new_tree ]
+  in
+  check_windows ~name:"drop" outcomes ~expect:(Some old_tree)
+
+(* The seeded policy keeps a random subset of unsynced writes, in a shuffled
+   order, and a random prefix of the uncommitted directory operations. *)
+let test_replace_reorder () =
+  for seed = 1 to 8 do
+    ignore
+      (every_crash_point ~policy:(Crash.Reorder_unsynced seed) ~setup:with_old
+         ~before:[ Some old_tree; Some new_tree ])
+  done
+
+let test_first_publication () =
+  let outcomes =
+    every_crash_point ~policy:Crash.Drop_unsynced ~setup:with_empty
+      ~before:[ None; Some new_tree ]
+  in
+  (* Nothing follows the last barrier of a first publication, so no crash
+     point lands after its switch commits; the completed run reads the new
+     tree. *)
+  Alcotest.(check bool)
+    "first: the crash points include one that leaves the name absent" true
+    (List.exists Option.is_none outcomes)
+
+(* The generation a publication replaces is reclaimed once the switch is
+   committed, and a crash leaves nothing a later publication trips on. *)
+let test_previous_reclaimed () =
+  with_old @@ fun base ->
+  publish ~durable:true base new_tree;
+  let entries = List.sort String.compare (Eio.Path.read_dir base) in
+  let target = Eio.Path.read_link (base / "out") in
+  Alcotest.(check (list string))
+    "the pointer and its generation, nothing else"
+    (List.sort String.compare [ "out"; target ])
+    entries;
+  Alcotest.check tree "the new tree" (Some new_tree) (read_back (base / "out"))
+
+let test_failed_populate () =
+  with_old @@ fun base ->
+  let before = List.sort String.compare (Eio.Path.read_dir base) in
+  (match
+     Eio_fs_sync.publish_generation ~durable:true (base / "out") (fun dir ->
+         populate new_tree dir;
+         failwith "producer failed")
+   with
+  | () -> Alcotest.fail "a failed producer published"
+  | exception Failure _ -> ());
+  Alcotest.(check (list string))
+    "the staged generation is removed" before
+    (List.sort String.compare (Eio.Path.read_dir base));
+  Alcotest.check tree "the previous tree stands" (Some old_tree)
+    (read_back (base / "out"))
+
+(* A plain directory is not a pointer: replacing it would need the rename-aside
+   this primitive exists to remove, so it is refused and left as it was. *)
+let test_refuses_plain_directory () =
+  with_empty @@ fun fs ->
+  populate [ ("out/x", "legacy") ] fs;
+  let ran = ref false in
+  (match
+     Eio_fs_sync.publish_generation ~durable:true (fs / "out") (fun _ ->
+         ran := true)
+   with
+  | () -> Alcotest.fail "a plain directory was replaced"
+  | exception Invalid_argument _ -> ());
+  Alcotest.(check bool) "the producer never ran" false !ran;
+  Alcotest.(check (list string))
+    "nothing was staged beside it" [ "out" ] (Eio.Path.read_dir fs);
+  Alcotest.(check string)
+    "the directory is untouched" "legacy"
+    (Eio.Path.load (fs / "out" / "x"))
+
+let suite =
+  ( "generation",
+    [
+      Alcotest.test_case "replace, every crash point, drop" `Quick
+        test_replace_drop;
+      Alcotest.test_case "replace, every crash point, reorder" `Quick
+        test_replace_reorder;
+      Alcotest.test_case "first publication, every crash point" `Quick
+        test_first_publication;
+      Alcotest.test_case "previous generation reclaimed" `Quick
+        test_previous_reclaimed;
+      Alcotest.test_case "failed producer keeps the previous tree" `Quick
+        test_failed_populate;
+      Alcotest.test_case "plain directory refused" `Quick
+        test_refuses_plain_directory;
+    ] )
