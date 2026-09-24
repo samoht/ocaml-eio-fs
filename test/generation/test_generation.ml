@@ -156,7 +156,16 @@ let test_foreign_target_kept () =
   Alcotest.check tree "the new tree" (Some new_tree) (read_back (fs / "out"));
   Alcotest.(check string)
     "the foreign tree stands" "kept"
-    (Eio.Path.load (fs / "elsewhere" / "x"))
+    (Eio.Path.load (fs / "elsewhere" / "x"));
+  (* Nor is another name's generation this name's to reclaim. *)
+  let other = ".other.gen.1.2" in
+  populate [ (other ^ "/x", "theirs") ] fs;
+  Eio.Path.unlink (fs / "out");
+  Eio.Path.symlink ~link_to:other (fs / "out");
+  publish ~durable:true fs new_tree;
+  Alcotest.(check string)
+    "another name's generation stands" "theirs"
+    (Eio.Path.load (fs / other / "x"))
 
 (* A listing of the pointers' directory tells the pointers from their
    generations: the generation is hidden and carries its suffix, and no name a
