@@ -893,6 +893,62 @@ let test_lock_non_blocking_unavailable () =
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   await_holder child
 
+(* ---- a refusal names who holds the lock ----
+
+   A path says which resource is busy, not who has it, and the reader of a
+   refusal is left to find the holder with [lsof]. The kernel knows the
+   process holding a record lock ([fcntl F_GETLK], POSIX.1-2017 fcntl, "the
+   l_pid ... of the lock that would prevent this lock"), so the printed
+   refusal names it. A holder's pid differs from this process's, so the case
+   reds on a refusal that names nobody and on one that names the asker. *)
+
+(* [printed] names process [pid] as a whole number, not a prefix of one. *)
+let names_process printed pid =
+  let needle = Printf.sprintf "process %d" pid in
+  let n = String.length needle and len = String.length printed in
+  let rec from i =
+    i + n <= len
+    && (String.sub printed i n = needle
+        && (i + n = len
+           || not (match printed.[i + n] with '0' .. '9' -> true | _ -> false))
+       || from (i + 1))
+  in
+  from 0
+
+let test_lock_refusal_names_the_holding_process () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"0.3"
+  in
+  let holder = Eio.Process.pid child in
+  (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
+  | () -> Alcotest.fail "a lock another process holds was granted"
+  | exception (Eio_fs_unix.Lock_unavailable _ as refusal) ->
+      let printed = Printexc.to_string refusal in
+      if not (names_process printed holder) then
+        Alcotest.failf "the refusal %S does not name the holder, process %d"
+          printed holder);
+  await_holder child
+
+(* The mutex half of the exclusion is held by a fiber of this process, so the
+   holder a refusal names there is this process. *)
+let test_lock_refusal_names_this_process_for_a_fiber () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  Eio_fs_unix.with_lock lock @@ fun () ->
+  match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
+  | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
+  | exception (Eio_fs_unix.Lock_unavailable _ as refusal) ->
+      let printed = Printexc.to_string refusal in
+      let self = Unix.getpid () in
+      if not (names_process printed self) then
+        Alcotest.failf "the refusal %S does not name this process, %d" printed
+          self
+
 (* ---- waiting for this process, answering about every other one ----
 
    The two halves of the exclusion are two kinds of contention, and a caller
@@ -2076,6 +2132,10 @@ let suite =
         test_lock_updates_contents_in_place;
       Alcotest.test_case "non-blocking lock reports unavailable" `Quick
         test_lock_non_blocking_unavailable;
+      Alcotest.test_case "a refusal names the holding process" `Quick
+        test_lock_refusal_names_the_holding_process;
+      Alcotest.test_case "a refusal names this process for a fiber" `Quick
+        test_lock_refusal_names_this_process_for_a_fiber;
       Alcotest.test_case "a fibers-only lock queues behind a fiber" `Quick
         test_lock_fibers_mode_queues_behind_a_fiber;
       Alcotest.test_case "a fibers-only lock answers another process" `Quick
