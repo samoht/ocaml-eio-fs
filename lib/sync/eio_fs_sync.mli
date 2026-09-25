@@ -70,12 +70,23 @@ val is_process_local : _ Eio.Resource.t -> bool
     [false] when it declares nothing: silence must read as "an outside opener
     exists". *)
 
+type (_, _, _) Eio.Resource.pi +=
+  | Modeless : ('t, 't -> bool, [> `Modeless ]) Eio.Resource.pi
+        (** What a directory backend declares about Unix modes: [true] when it
+            stores none, so a file's mode is neither kept nor changeable and its
+            stat reports a fixed one. *)
+
+val is_modeless : _ Eio.Resource.t -> bool
+(** [is_modeless res] is what [res] declares through {!Modeless}, and [false]
+    when it declares nothing. *)
+
 type config = {
   durable : bool;
       (** Push the temporary and target directory to stable storage. *)
   perm : Eio.File.Unix_perm.t;
       (** The mode of the temporary, and therefore of the published file:
-          exactly this, whatever the process umask. *)
+          exactly this, whatever the process umask. A {!Modeless} backend keeps
+          no mode, so there the file is published without one. *)
   max_bytes : int64;  (** Hard ceiling on bytes accepted from the producer. *)
 }
 (** Publication policy. A finite {!type-config.field-max_bytes} is mandatory:

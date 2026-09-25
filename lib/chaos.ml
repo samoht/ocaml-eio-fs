@@ -631,6 +631,8 @@ let dir_handler :
          in-memory backend nothing outside this process reaches its files,
          over a real directory any process opens them by name. *)
       H (Eio_fs_sync.Process_local, fun t -> Eio_fs_sync.is_process_local t.base);
+      (* Whether a mode is kept is the base's storage model too. *)
+      H (Eio_fs_sync.Modeless, fun t -> Eio_fs_sync.is_modeless t.base);
       (* The barrier is a sync the schedule may fault; it then delegates to
          the base's barrier, so a wrapped POSIX directory still reaches the
          real fsync. *)
@@ -1680,6 +1682,7 @@ module Crash = struct
         H
           ( Eio_fs_sync.Process_local,
             fun d -> Eio_fs_sync.is_process_local d.dbase );
+        H (Eio_fs_sync.Modeless, fun d -> Eio_fs_sync.is_modeless d.dbase);
         (* A store's directory barrier commits the entries of the directory it
            names, exactly as the platform's directory fsync would, and the
            journal is asked root-relative so a barrier issued through a staging

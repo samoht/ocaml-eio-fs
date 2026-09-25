@@ -67,6 +67,16 @@ let is_process_local (Eio.Resource.T (v, ops)) =
   | Some admits -> admits v
   | None -> false
 
+(* A backend that stores no modes has nothing a chmod could set; it registers
+   [Modeless]. Silence reads as a backend that keeps the mode it is given. *)
+type (_, _, _) Eio.Resource.pi +=
+  | Modeless : ('t, 't -> bool, [> `Modeless ]) Eio.Resource.pi
+
+let is_modeless (Eio.Resource.T (v, ops)) =
+  match Eio.Resource.get_opt ops Modeless with
+  | Some modeless -> modeless v
+  | None -> false
+
 type config = { durable : bool; perm : Eio.File.Unix_perm.t; max_bytes : int64 }
 
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
@@ -157,9 +167,11 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
             | _ -> ()
             | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> ());
             (* The create's mode is narrowed by the umask; the published file
-               carries exactly [config.perm]. *)
-            if not (Int.equal (tmp_stat.perm land 0o7777) config.perm) then
-              Eio.Path.chmod ~follow:false ~perm:config.perm tmp;
+               carries exactly [config.perm], on a backend that keeps one. *)
+            if
+              (not (is_modeless tmp_resource))
+              && not (Int.equal (tmp_stat.perm land 0o7777) config.perm)
+            then Eio.Path.chmod ~follow:false ~perm:config.perm tmp;
             let sink = (file :> Eio.Flow.sink_ty Eio.Resource.t) in
             let result =
               write (bounded_sink ~max_bytes:config.max_bytes sink)
