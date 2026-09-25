@@ -502,7 +502,7 @@ let open_lock_file ~sw ~name
 (* What is held once the exclusion is taken, whichever locks carry it: the
    descriptor is weighed against the name it was opened by, the holder's
    diagnostics are written through it, and the caller runs. *)
-let hold ~name ~opened ~contents ~file path fn =
+let run_held ~name ~opened ~contents ~file path fn =
   check_locked_file ~name ~opened path;
   Option.iter (update_lock_contents file) contents;
   fn ()
@@ -544,15 +544,44 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
       use_os_lock ~patience:processes
         ~refused:(fun fd -> refusal ~name ~holder:(held_by_a_process fd) file)
         fd
-      @@ fun () -> hold ~name ~opened ~contents ~file path fn
+      @@ fun () -> run_held ~name ~opened ~contents ~file path fn
   | None ->
       if Eio_fs_sync.is_process_local (fst path) then
-        hold ~name ~opened ~contents ~file path fn
+        run_held ~name ~opened ~contents ~file path fn
       else
         Fmt.invalid_arg
           "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
            descriptor and its backend registers no Eio_fs_sync.Process_local"
           name
+
+(* The hold is a fiber of [sw] parked inside [with_lock]'s section, so it ends
+   with the switch and every release [with_lock] makes is the one it makes. A
+   caller cancelled while it waits abandons the hold: a section entered after
+   that returns at once. *)
+let hold ~sw ?block ?create ?contents path =
+  let taken, set_taken = Eio.Promise.create () in
+  let abandoned = Atomic.make false in
+  Eio.Fiber.fork_daemon ~sw (fun () ->
+      (match
+         with_lock ?block ?create ?contents path (fun () ->
+             if not (Atomic.get abandoned) then begin
+               Eio.Promise.resolve set_taken (Ok ());
+               Eio.Fiber.await_cancel ()
+             end)
+       with
+      | () -> ()
+      | exception (Eio.Cancel.Cancelled _ as cancelled) ->
+          if not (Eio.Promise.is_resolved taken) then
+            Eio.Promise.resolve set_taken (Error cancelled);
+          raise cancelled
+      | exception e -> Eio.Promise.resolve set_taken (Error e));
+      `Stop_daemon);
+  match Eio.Promise.await taken with
+  | Ok () -> ()
+  | Error e -> raise e
+  | exception (Eio.Cancel.Cancelled _ as cancelled) ->
+      Atomic.set abandoned true;
+      raise cancelled
 
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
@@ -629,7 +658,7 @@ module Lease = struct
           ~refused:(fun () -> refusal ~name ~holder:None file)
           raw_fd
         @@ fun () ->
-        hold ~name ~opened ~contents ~file path (fun () -> fn { fd })
+        run_held ~name ~opened ~contents ~file path (fun () -> fn { fd })
     | None ->
         Fmt.invalid_arg
           "Eio_fs_unix.Lease.with_exclusive: %s: the rendezvous carries no \

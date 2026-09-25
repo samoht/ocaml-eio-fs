@@ -956,6 +956,47 @@ let test_lock_refusal_names_this_process_for_a_fiber () =
         "the holder the refusal carries" (Some self) refused.holder;
       Alcotest.(check string) "the holder's record" record refused.record
 
+(* A hold is a lock for the rest of a switch: taken when [hold] returns, still
+   held while the switch runs, and let go when it finishes. *)
+let test_hold_lasts_as_long_as_its_switch () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  let record = "held for the switch\n" in
+  Eio.Switch.run (fun sw ->
+      Eio_fs_unix.hold ~sw ~contents:record lock;
+      match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
+      | () -> Alcotest.fail "a lock held for the switch was granted"
+      | exception Eio_fs_unix.Lock_unavailable refused ->
+          Alcotest.(check (option int))
+            "held by this process"
+            (Some (Unix.getpid ()))
+            refused.holder;
+          Alcotest.(check string) "the hold's record" record refused.record);
+  let granted = ref false in
+  Eio_fs_unix.with_lock ~block:`No lock (fun () -> granted := true);
+  Alcotest.(check bool) "the lock is free once the switch ends" true !granted
+
+(* A hold refused by another process raises to its caller, naming the holder,
+   and leaves nothing held. *)
+let test_hold_refusal_names_the_holding_process () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"0.3"
+  in
+  ( Eio.Switch.run @@ fun hold_sw ->
+    match Eio_fs_unix.hold ~sw:hold_sw ~block:`No lock with
+    | () -> Alcotest.fail "a hold was granted over another process's lock"
+    | exception Eio_fs_unix.Lock_unavailable refused ->
+        Alcotest.(check (option int))
+          "the holder the refusal carries"
+          (Some (Eio.Process.pid child))
+          refused.holder );
+  await_holder child
+
 (* ---- waiting for this process, answering about every other one ----
 
    The two halves of the exclusion are two kinds of contention, and a caller
@@ -2144,6 +2185,10 @@ let suite =
         test_lock_refusal_names_the_holding_process;
       Alcotest.test_case "a refusal names this process for a fiber" `Quick
         test_lock_refusal_names_this_process_for_a_fiber;
+      Alcotest.test_case "a hold lasts as long as its switch" `Quick
+        test_hold_lasts_as_long_as_its_switch;
+      Alcotest.test_case "a hold's refusal names the holding process" `Quick
+        test_hold_refusal_names_the_holding_process;
       Alcotest.test_case "a fibers-only lock queues behind a fiber" `Quick
         test_lock_fibers_mode_queues_behind_a_fiber;
       Alcotest.test_case "a fibers-only lock answers another process" `Quick

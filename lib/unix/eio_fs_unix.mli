@@ -191,6 +191,20 @@ val with_lock :
       {!Eio_fs_sync.Process_local}.
     @raise Unix.Unix_error as [lockf]. *)
 
+val hold :
+  sw:Eio.Switch.t ->
+  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+  ?contents:string ->
+  _ Eio.Path.t ->
+  unit
+(** [hold ~sw path] is {!with_lock} over [path] for the rest of [sw]'s life: it
+    returns once the lock is taken, and the lock is released when [sw] finishes.
+    [block], [create] and [contents] are as {!with_lock}'s.
+
+    @raise Lock_unavailable as {!with_lock} does.
+    @raise Eio.Io as {!with_lock} does. *)
+
 module Lease : sig
   type t
 
