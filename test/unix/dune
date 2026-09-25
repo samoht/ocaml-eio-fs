@@ -6,6 +6,7 @@
   eio.utils
   eio.unix
   eio_main
+  fmt
   eio_fs
   eio-fs.sync
   eio-fs.unix

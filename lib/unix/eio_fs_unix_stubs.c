@@ -60,6 +60,24 @@ CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
   return Val_unit;
 }
 
+/* The process holding a record lock that would refuse an exclusive lock over
+   the whole file (POSIX fcntl F_GETLK), or 0 when none does. F_GETLK answers
+   about other processes only: this process's own locks never conflict. */
+CAMLprim value caml_eio_fs_record_lock_holder(value fd_v)
+{
+  struct flock query;
+  memset(&query, 0, sizeof query);
+  query.l_type = F_WRLCK;
+  query.l_whence = SEEK_SET;
+  query.l_start = 0;
+  query.l_len = 0;
+  if (fcntl(Int_val(fd_v), F_GETLK, &query) == -1)
+    caml_unix_error(errno, "fcntl", Nothing);
+  if (query.l_type == F_UNLCK || query.l_pid <= 0)
+    return Val_int(0);
+  return Val_int(query.l_pid);
+}
+
 /* One Darwin F_FULLFSYNC call. Retry and fallback policy lives in OCaml. */
 CAMLprim value caml_eio_fs_darwin_full_fsync(value fd_v)
 {

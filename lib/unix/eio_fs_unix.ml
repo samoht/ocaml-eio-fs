@@ -6,6 +6,9 @@ external flock_exclusive_native : Unix.file_descr -> bool -> unit
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
 
+external record_lock_holder : Unix.file_descr -> int
+  = "caml_eio_fs_record_lock_holder"
+
 let rec retry_eintr f fd =
   match f fd with
   | () -> ()
@@ -227,7 +230,55 @@ module Rename_backend = Eio_fs_sync.Rename.Make (Exclusive_rename)
 
 let exclusive_rename = Rename_backend.v ()
 
-exception Lock_unavailable of string
+type refusal = { path : string; holder : int option; record : string }
+
+exception Lock_unavailable of refusal
+
+let pp_refusal f { path; holder; record = _ } =
+  match holder with
+  | Some pid -> Fmt.pf f "%s is held by process %d" path pid
+  | None -> Fmt.pf f "%s is held" path
+
+let () =
+  Printexc.register_printer (function
+    | Lock_unavailable refusal ->
+        Fmt.kstr Option.some "Eio_fs_unix.Lock_unavailable: %a" pp_refusal
+          refusal
+    | _ -> None)
+
+(* The holder's record is read without the lock, so it is bounded: a record
+   longer than a diagnostic is cut, not a cost the asker pays in full. *)
+let record_bound = 4096
+
+let read_record file =
+  let buf = Cstruct.create record_bound in
+  let rec fill off =
+    if off >= record_bound then off
+    else
+      match
+        Eio.File.pread file ~file_offset:(Optint.Int63.of_int off)
+          [ Cstruct.shift buf off ]
+      with
+      | 0 -> off
+      | got -> fill (off + got)
+      | exception End_of_file -> off
+  in
+  match fill 0 with
+  | got -> Cstruct.to_string ~len:got buf
+  | exception Eio.Io _ -> ""
+
+(* A fiber holder is this process; another process's hold is named by the
+   kernel, and [None] means it let go before it could be asked. *)
+let refusal ~name ~holder file =
+  Lock_unavailable { path = name; holder; record = read_record file }
+
+let held_by_a_fiber () = Some (Unix.getpid ())
+
+let held_by_a_process fd =
+  match record_lock_holder fd with
+  | 0 -> None
+  | pid -> Some pid
+  | exception Unix.Unix_error _ -> None
 
 (* The fiber exclusion is keyed by device and inode, not by a name: two names
    can reach one file (a hard link), and POSIX record locks do not exclude
@@ -280,7 +331,7 @@ let budget ~sw seconds =
       `Stop_daemon);
   Until lapsed
 
-let use_mutex ~patience ~path mutex fn =
+let use_mutex ~patience ~refused mutex fn =
   let locked = ref false in
   Fun.protect
     ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
@@ -291,7 +342,7 @@ let use_mutex ~patience ~path mutex fn =
           locked := true
       | Refuse ->
           if Eio.Mutex.try_lock mutex then locked := true
-          else raise (Lock_unavailable path)
+          else raise (refused ())
       | Until lapsed ->
           (* [Fiber.first] cancels the loser, and a fiber cancelled inside
              [Eio.Mutex.lock] may have been granted the mutex all the same:
@@ -311,8 +362,7 @@ let use_mutex ~patience ~path mutex fn =
                 Eio.Promise.await lapsed;
                 false)
           in
-          if granted || !taken then locked := true
-          else raise (Lock_unavailable path));
+          if granted || !taken then locked := true else raise (refused ()));
       fn ())
 
 (* Entering is queued too, on a mutex keyed by the caller's name: the open
@@ -335,7 +385,7 @@ let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
    also answers a holder that died, whose lock the kernel drops. *)
 let ask_again_every = 0.05
 
-let use_os_lock ~patience ~path fd fn =
+let use_os_lock ~patience ~refused fd fn =
   let acquired = ref false in
   Fun.protect
     ~finally:(fun () ->
@@ -374,7 +424,7 @@ let use_os_lock ~patience ~path fd fn =
             end
           in
           poll ());
-      if not !acquired then raise (Lock_unavailable path);
+      if not !acquired then raise (refused fd);
       fn ())
 
 (* A planted link under the rendezvous name would send the record lock to
@@ -484,12 +534,17 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     (file, Eio.File.stat file)
   in
   use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
-  use_mutex ~patience:fibers ~path:name mutex @@ fun () ->
+  use_mutex ~patience:fibers
+    ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
+    mutex
+  @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~patience:processes ~path:name fd @@ fun () ->
-      hold ~name ~opened ~contents ~file path fn
+      use_os_lock ~patience:processes
+        ~refused:(fun fd -> refusal ~name ~holder:(held_by_a_process fd) file)
+        fd
+      @@ fun () -> hold ~name ~opened ~contents ~file path fn
   | None ->
       if Eio_fs_sync.is_process_local (fst path) then
         hold ~name ~opened ~contents ~file path fn
@@ -512,7 +567,7 @@ module Lease = struct
     in
     Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" acquire
 
-  let use_os_lock ~patience ~path fd fn =
+  let use_os_lock ~patience ~refused fd fn =
     let acquired = ref false in
     let ask ~nonblocking =
       Eio.Cancel.protect @@ fun () ->
@@ -537,7 +592,7 @@ module Lease = struct
           end
         in
         poll ());
-    if not !acquired then raise (Lock_unavailable path);
+    if not !acquired then raise (refused ());
     fn ()
 
   let with_exclusive ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
@@ -561,12 +616,19 @@ module Lease = struct
       (file, Eio.File.stat file)
     in
     use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
-    use_mutex ~patience:fibers ~path:name mutex @@ fun () ->
+    use_mutex ~patience:fibers
+      ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
+      mutex
+    @@ fun () ->
     match Eio_unix.Resource.fd_opt file with
     | Some fd ->
         Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.with_exclusive" fd
         @@ fun raw_fd ->
-        use_os_lock ~patience:processes ~path:name raw_fd @@ fun () ->
+        (* The kernel names no holder of an [flock]. *)
+        use_os_lock ~patience:processes
+          ~refused:(fun () -> refusal ~name ~holder:None file)
+          raw_fd
+        @@ fun () ->
         hold ~name ~opened ~contents ~file path (fun () -> fn { fd })
     | None ->
         Fmt.invalid_arg
@@ -600,8 +662,8 @@ let enter_lock ?block ?create ?contents path f =
   in
   match with_lock ?block ?create ?contents path section with
   | answer -> answer
-  | exception Lock_unavailable name when not !began ->
-      fail_unavailable "%s is held by another process" name
+  | exception Lock_unavailable refusal when not !began ->
+      fail_unavailable "%a" pp_refusal refusal
   | exception
       Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied (Not_a_lock_file name)), _)
     when not !began ->

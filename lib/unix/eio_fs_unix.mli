@@ -125,9 +125,28 @@ val exclusive_rename : Eio_fs_sync.Rename.t
     unsupported platforms or filesystems refuse. An existing target, including a
     symbolic link, is never overwritten. *)
 
-exception Lock_unavailable of string
+type refusal = {
+  path : string;  (** The native path of the lock file. *)
+  holder : int option;
+      (** The process holding the lock when it was refused: this process when a
+          fiber of it holds it, otherwise the process the kernel reports holding
+          the record lock ([fcntl F_GETLK]). [None] when the holder let go
+          before it could be asked, and for a {!Lease}, whose [flock] the kernel
+          names no holder of. *)
+  record : string;
+      (** The lock file's first 4096 bytes when the lock was refused: what the
+          holder wrote through [contents], or [""]. It is read without the lock,
+          so it is a diagnostic; {!field-holder} is the answer. *)
+}
+(** The type for a refused lock: which file, and who holds it. *)
+
+exception Lock_unavailable of refusal
 (** Raised by {!with_lock} when the lock is held and [block] says not to wait
-    for the holder. The string is the native path of the lock file. *)
+    for the holder. It prints as {!pp_refusal} does. *)
+
+val pp_refusal : refusal Fmt.t
+(** [pp_refusal] formats a refusal as ["<path> is held by process <pid>"], or
+    ["<path> is held"] when its holder is [None]. *)
 
 type Eio.Exn.Backend.t +=
   | Not_a_lock_file of string

@@ -889,7 +889,7 @@ let test_lock_non_blocking_unavailable () =
   in
   (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "non-blocking lock unexpectedly succeeded"
-  | exception Eio_fs_unix.Lock_unavailable path ->
+  | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   await_holder child
 
@@ -904,7 +904,7 @@ let test_lock_non_blocking_unavailable () =
 
 (* [printed] names process [pid] as a whole number, not a prefix of one. *)
 let names_process printed pid =
-  let needle = Printf.sprintf "process %d" pid in
+  let needle = Fmt.str "process %d" pid in
   let n = String.length needle and len = String.length printed in
   let rec from i =
     i + n <= len
@@ -927,27 +927,34 @@ let test_lock_refusal_names_the_holding_process () =
   let holder = Eio.Process.pid child in
   (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "a lock another process holds was granted"
-  | exception (Eio_fs_unix.Lock_unavailable _ as refusal) ->
+  | exception (Eio_fs_unix.Lock_unavailable refused as refusal) ->
       let printed = Printexc.to_string refusal in
       if not (names_process printed holder) then
         Alcotest.failf "the refusal %S does not name the holder, process %d"
-          printed holder);
+          printed holder;
+      Alcotest.(check (option int))
+        "the holder the refusal carries" (Some holder) refused.holder);
   await_holder child
 
 (* The mutex half of the exclusion is held by a fiber of this process, so the
-   holder a refusal names there is this process. *)
+   holder a refusal names there is this process, and the record it carries is
+   what that fiber wrote through [contents]. *)
 let test_lock_refusal_names_this_process_for_a_fiber () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
-  Eio_fs_unix.with_lock lock @@ fun () ->
+  let record = "the holding fiber's record\n" in
+  Eio_fs_unix.with_lock ~contents:record lock @@ fun () ->
   match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
-  | exception (Eio_fs_unix.Lock_unavailable _ as refusal) ->
+  | exception (Eio_fs_unix.Lock_unavailable refused as refusal) ->
       let printed = Printexc.to_string refusal in
       let self = Unix.getpid () in
       if not (names_process printed self) then
         Alcotest.failf "the refusal %S does not name this process, %d" printed
-          self
+          self;
+      Alcotest.(check (option int))
+        "the holder the refusal carries" (Some self) refused.holder;
+      Alcotest.(check string) "the holder's record" record refused.record
 
 (* ---- waiting for this process, answering about every other one ----
 
@@ -1002,7 +1009,7 @@ let test_lock_fibers_mode_refuses_another_process () =
   (match Eio_fs_unix.with_lock ~block:`Fibers lock (fun () -> ()) with
   | () ->
       Alcotest.fail "another process's hold was waited out rather than answered"
-  | exception Eio_fs_unix.Lock_unavailable path ->
+  | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   await_holder child
 
@@ -1027,7 +1034,7 @@ let test_lock_bounded_wait_answers_at_the_bound () =
   let began = Eio.Time.now clock in
   (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
   | () -> Alcotest.fail "a lock held for the whole bound was granted"
-  | exception Eio_fs_unix.Lock_unavailable path ->
+  | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
   let waited = Eio.Time.now clock -. began in
   Alcotest.(check bool)
@@ -1085,7 +1092,7 @@ let test_lock_bounded_wait_answers_a_fiber_that_holds_it () =
       (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
       | () ->
           Alcotest.fail "a lock a fiber held for the whole bound was granted"
-      | exception Eio_fs_unix.Lock_unavailable path ->
+      | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
           refused := true;
           Alcotest.(check string)
             "unavailable path" (Eio.Path.native_exn lock) path);
@@ -1564,7 +1571,7 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
   | () ->
       Alcotest.fail
         "a wrapped rendezvous was locked while another process held its file"
-  | exception Eio_fs_unix.Lock_unavailable path ->
+  | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string)
         "the refusal names the host file the lock is held on"
         (Eio.Path.native_exn (dir / "lock"))
@@ -1744,8 +1751,9 @@ let test_section_excludes_fibers_over_the_rendezvous () =
     (Eio_fs_sync.Lock.use section (fun () -> "answer"))
 
 (* A hold another process took is what a component cannot see and cannot name.
-   It reaches the component as [Unavailable], carrying the rendezvous, so an
-   interface whose type promises a result has something to put in it. *)
+   It reaches the component as [Unavailable], carrying the rendezvous and its
+   holder, so an interface whose type promises a result has something to put in
+   it. *)
 let test_section_refusal_reaches_the_component_as_unavailable () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -1765,8 +1773,8 @@ let test_section_refusal_reaches_the_component_as_unavailable () =
         "the refusal names the rendezvous" true
         (mentions ~needle:(Eio.Path.native_exn lock) what);
       Alcotest.(check bool)
-        "and says another process holds it" true
-        (mentions ~needle:"another process" what));
+        "and names the process that holds it" true
+        (names_process what (Eio.Process.pid child)));
   Alcotest.(check bool) "the section did not run" false !ran;
   await_holder child
 
