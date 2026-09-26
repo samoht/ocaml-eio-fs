@@ -17,12 +17,22 @@ let hold_lease ready =
   done
 
 let lease_test_arg = "--test-inherited-lease"
+let try_lock_arg = "--try-eio-fs-lock"
+
+(* Exit 0 when the record lock over [path] is granted to this process, 3 when
+   another process holds it. *)
+let try_lock path =
+  let fd = Unix.openfile path [ Unix.O_RDWR ] 0o600 in
+  match Unix.lockf fd Unix.F_TLOCK 0 with
+  | () -> exit 0
+  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> exit 3
 
 let () =
   match Array.to_list Sys.argv with
   | [ _; arg; path; ready; seconds ] when String.equal arg hold_lock_arg ->
       hold_lock path ready (float_of_string seconds)
   | [ _; arg; ready ] when String.equal arg hold_lease_arg -> hold_lease ready
+  | [ _; arg; path ] when String.equal arg try_lock_arg -> try_lock path
   | [ _; arg ] when String.equal arg lease_test_arg ->
       Sys.argv.(1) <- "test";
       Alcotest.run "eio-fs.unix.lease" [ Test_eio_fs_unix.lease_suite ]

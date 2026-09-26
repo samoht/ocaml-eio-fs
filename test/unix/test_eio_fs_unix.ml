@@ -956,6 +956,48 @@ let test_lock_refusal_names_this_process_for_a_fiber () =
         "the holder the refusal carries" (Some self) refused.holder;
       Alcotest.(check string) "the holder's record" record refused.record
 
+(* ---- asking from the holding process keeps the hold ----
+
+   POSIX drops every record lock a process holds on a file when that process
+   closes any descriptor for it (POSIX.1-2017 fcntl, "all locks associated with
+   a file for a given process shall be removed when a file descriptor for that
+   file is closed by that process"). A second acquisition from the holding
+   process opens the rendezvous to find its key, so the descriptor it closes on
+   the way out of a refusal is the holder's release. Only another process can
+   tell: in this one the fiber mutex still answers. *)
+
+let another_process_is_granted ~env lock =
+  let self = Sys.executable_name in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    Eio.Process.spawn ~sw
+      (Eio.Stdenv.process_mgr env)
+      ~executable:self
+      [ self; "--try-eio-fs-lock"; Eio.Path.native_exn lock ]
+  in
+  match Eio.Process.await child with
+  | `Exited 0 -> true
+  | `Exited 3 -> false
+  | `Exited n -> Alcotest.failf "lock asker exited %d" n
+  | `Signaled n -> Alcotest.failf "lock asker took signal %d" n
+
+let asked_from_the_holder ~block () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio_fs_unix.with_lock lock @@ fun () ->
+  (match Eio_fs_unix.with_lock ~block lock (fun () -> ()) with
+  | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
+  | exception Eio_fs_unix.Lock_unavailable _ -> ());
+  if another_process_is_granted ~env lock then
+    Alcotest.fail
+      "another process was granted the lock after a refusal in the holder"
+
+let test_lock_refusal_in_the_holder_keeps_its_hold () =
+  asked_from_the_holder ~block:`No ()
+
+let test_lock_bounded_wait_in_the_holder_keeps_its_hold () =
+  asked_from_the_holder ~block:(`For 0.05) ()
+
 (* A hold is a lock for the rest of a switch: taken when [hold] returns, still
    held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
@@ -2185,6 +2227,10 @@ let suite =
         test_lock_refusal_names_the_holding_process;
       Alcotest.test_case "a refusal names this process for a fiber" `Quick
         test_lock_refusal_names_this_process_for_a_fiber;
+      Alcotest.test_case "a refusal in the holder keeps its hold" `Quick
+        test_lock_refusal_in_the_holder_keeps_its_hold;
+      Alcotest.test_case "a bounded wait in the holder keeps its hold" `Quick
+        test_lock_bounded_wait_in_the_holder_keeps_its_hold;
       Alcotest.test_case "a hold lasts as long as its switch" `Quick
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick
