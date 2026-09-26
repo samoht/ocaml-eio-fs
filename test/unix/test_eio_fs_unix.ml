@@ -998,6 +998,24 @@ let test_lock_refusal_in_the_holder_keeps_its_hold () =
 let test_lock_bounded_wait_in_the_holder_keeps_its_hold () =
   asked_from_the_holder ~block:(`For 0.05) ()
 
+(* A descriptor handed to the holder is closed when the hold ends, not kept:
+   each refused ask from the holder would otherwise cost the process one
+   descriptor for as long as it runs. *)
+let open_descriptors () = Array.length (Sys.readdir "/dev/fd")
+
+let test_lock_asks_from_the_holder_leave_no_descriptor () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  let before = open_descriptors () in
+  ( Eio_fs_unix.with_lock lock @@ fun () ->
+    for _ = 1 to 3 do
+      match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
+      | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
+      | exception Eio_fs_unix.Lock_unavailable _ -> ()
+    done );
+  Alcotest.(check int)
+    "descriptors open once the hold ends" before (open_descriptors ())
+
 (* A hold is a lock for the rest of a switch: taken when [hold] returns, still
    held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
@@ -2231,6 +2249,8 @@ let suite =
         test_lock_refusal_in_the_holder_keeps_its_hold;
       Alcotest.test_case "a bounded wait in the holder keeps its hold" `Quick
         test_lock_bounded_wait_in_the_holder_keeps_its_hold;
+      Alcotest.test_case "asks from the holder leave no descriptor" `Quick
+        test_lock_asks_from_the_holder_leave_no_descriptor;
       Alcotest.test_case "a hold lasts as long as its switch" `Quick
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick

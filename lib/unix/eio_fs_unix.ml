@@ -287,7 +287,15 @@ let held_by_a_process fd =
 type lock_key = int64 * int64
 (** The device and inode a record lock is held on. *)
 
-type local_lock = { mutex : Eio.Mutex.t; mutable users : int }
+type local_lock = {
+  mutex : Eio.Mutex.t;
+  mutable users : int;
+  mutable holding : bool;
+      (** A fiber holds [mutex] and may hold the record lock. *)
+  mutable parked : Unix.file_descr list;
+      (** Descriptors on the file that other callers let go of while it was
+          held, closed by the holder once its record lock is released. *)
+}
 
 let local_locks : (lock_key, local_lock) Hashtbl.t = Hashtbl.create 16
 let entry_gates : (string, local_lock) Hashtbl.t = Hashtbl.create 16
@@ -302,7 +310,14 @@ let use_shared_mutex table key fn =
         lock.users <- lock.users + 1;
         lock
     | None ->
-        let lock = { mutex = Eio.Mutex.create (); users = 1 } in
+        let lock =
+          {
+            mutex = Eio.Mutex.create ();
+            users = 1;
+            holding = false;
+            parked = [];
+          }
+        in
         Hashtbl.add table key lock;
         lock
   in
@@ -311,9 +326,52 @@ let use_shared_mutex table key fn =
       Stdlib.Mutex.protect tables_mutex @@ fun () ->
       lock.users <- lock.users - 1;
       if lock.users = 0 then Hashtbl.remove table key)
-    (fun () -> fn lock.mutex)
+    (fun () -> fn lock)
 
 let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
+
+(* POSIX drops every record lock a process holds on a file when the process
+   closes any descriptor for it, so a caller that leaves without the fiber
+   mutex -- refused, out of patience, cancelled -- never closes its descriptor
+   while a fiber of this process holds the file: it hands the descriptor to
+   that holder, which closes it once its own record lock is released. *)
+let let_go_of local file =
+  match Eio_unix.Resource.fd_opt file with
+  | None -> ()
+  | Some fd -> (
+      let park = Stdlib.Mutex.protect tables_mutex @@ fun () -> local.holding in
+      if park then
+        Eio.Cancel.protect @@ fun () ->
+        match Eio_unix.Fd.remove fd with
+        | None -> ()
+        | Some unix_fd ->
+            let closes_now =
+              Stdlib.Mutex.protect tables_mutex @@ fun () ->
+              if local.holding then begin
+                local.parked <- unix_fd :: local.parked;
+                false
+              end
+              else true
+            in
+            if closes_now then Unix.close unix_fd)
+
+(* The holder's side: set once the mutex is taken, and cleared, with every
+   parked descriptor closed, once the record lock is let go. *)
+let holding local fn =
+  Stdlib.Mutex.protect tables_mutex (fun () -> local.holding <- true);
+  Fun.protect
+    ~finally:(fun () ->
+      let parked =
+        Stdlib.Mutex.protect tables_mutex @@ fun () ->
+        let parked = local.parked in
+        local.holding <- false;
+        local.parked <- [];
+        parked
+      in
+      List.iter
+        (fun fd -> try Unix.close fd with Unix.Unix_error _ -> ())
+        parked)
+    fn
 
 (* One budget covers both halves of the exclusion, so it is a moment both watch
    for rather than a duration each is handed. A daemon of the switch sleeps it
@@ -370,7 +428,7 @@ let use_mutex ~patience ~refused mutex fn =
    order their opens came back in. The gate is held only across the open, since
    a name is not a file. *)
 let in_entry_order name fn =
-  use_shared_mutex entry_gates name @@ fun mutex ->
+  use_shared_mutex entry_gates name @@ fun { mutex; _ } ->
   let entered = ref false in
   Fun.protect
     ~finally:(fun () -> if !entered then Eio.Mutex.unlock mutex)
@@ -533,11 +591,16 @@ let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     let file = open_lock_file ~sw ~name ~create path in
     (file, Eio.File.stat file)
   in
-  use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
+  use_local_lock (opened.dev, opened.ino) @@ fun local ->
+  let entered = ref false in
+  Fun.protect ~finally:(fun () -> if not !entered then let_go_of local file)
+  @@ fun () ->
   use_mutex ~patience:fibers
     ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
-    mutex
+    local.mutex
   @@ fun () ->
+  entered := true;
+  holding local @@ fun () ->
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
@@ -644,7 +707,7 @@ module Lease = struct
       let file = open_lock_file ~sw ~name ~create path in
       (file, Eio.File.stat file)
     in
-    use_local_lock (opened.dev, opened.ino) @@ fun mutex ->
+    use_local_lock (opened.dev, opened.ino) @@ fun { mutex; _ } ->
     use_mutex ~patience:fibers
       ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
       mutex
