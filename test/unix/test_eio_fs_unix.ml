@@ -787,6 +787,38 @@ let test_lock_wait_does_not_block_eio () =
     "another fiber progressed while waiting" true !progressed;
   await_holder child
 
+(* A wait for another process is a wait a caller can end: a bound, a
+   Ctrl-C or a sibling fiber that gives up cancels it, and the acquisition
+   answers at the cancel rather than when the holder lets go. The holder here
+   holds for three seconds and the wait is cancelled after a fifth of one. *)
+let test_lock_wait_for_another_process_is_cancellable () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"3"
+  in
+  let began = Eio.Time.now clock in
+  let answer =
+    Eio.Fiber.first
+      (fun () -> Eio_fs_unix.with_lock lock (fun () -> `Granted))
+      (fun () ->
+        Eio.Time.sleep clock 0.2;
+        `Cancelled)
+  in
+  let took = Eio.Time.now clock -. began in
+  (match answer with
+  | `Granted -> Alcotest.fail "a lock another process holds was granted"
+  | `Cancelled -> ());
+  if took > 1. then
+    Alcotest.failf
+      "the cancelled wait returned after %.1f s, when the holder let go, not \
+       at the cancel"
+      took;
+  await_holder child
+
 let test_lock_serializes_fibers () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
@@ -2377,6 +2409,8 @@ let suite =
       Alcotest.test_case "lock wait does not block Eio" `Quick
         test_lock_wait_does_not_block_eio;
       lease_test_case;
+      Alcotest.test_case "a wait for another process is cancellable" `Quick
+        test_lock_wait_for_another_process_is_cancellable;
       Alcotest.test_case "lock serializes fibers" `Quick
         test_lock_serializes_fibers;
       Alcotest.test_case "lock excludes another name for its file" `Quick
