@@ -657,6 +657,7 @@ let with_lock ?block ?create ?contents path fn =
    the lock is still held. Every write through the file is serialised. *)
 module Held = struct
   type t = {
+    name : string;
     mutable file : Eio.File.rw_ty Eio.Resource.t option;
     let_go : unit -> unit;
     writing : Eio.Mutex.t;
@@ -681,6 +682,7 @@ module Held = struct
     let file, let_go = acquire ~sw ?block ?create ?contents path in
     let t =
       {
+        name = lock_name path;
         file = Some (file :> Eio.File.rw_ty Eio.Resource.t);
         let_go;
         writing = Eio.Mutex.create ();
@@ -689,11 +691,30 @@ module Held = struct
     Eio.Switch.on_release sw (fun () -> release t);
     t
 
+  (* Taking the record lock again on the held descriptor changes nothing while
+     it is held, and restores it after a close elsewhere in this process
+     dropped it; a process that took it in between is named, and nothing is
+     written. *)
+  let take_back t file =
+    match Eio_unix.Resource.fd_opt file with
+    | None -> ()
+    | Some fd ->
+        take_os_lock ~patience:Refuse
+          ~refused:(fun () ->
+            let holder =
+              Eio_unix.Fd.use_exn "Eio_fs_unix.Held.restate" fd
+                held_by_a_process
+            in
+            refusal ~name:t.name ~holder file)
+          ~on_taken:ignore fd
+
   let restate t contents =
     writing t @@ fun () ->
     match t.file with
     | None -> invalid_arg "Eio_fs_unix.Held.restate: the lock has been released"
-    | Some file -> update_lock_contents file contents
+    | Some file ->
+        take_back t file;
+        update_lock_contents file contents
 end
 
 let hold ~sw ?block ?create ?contents path =

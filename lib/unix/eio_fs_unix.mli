@@ -242,8 +242,13 @@ module Held : sig
   val restate : t -> string -> unit
   (** [restate h contents] replaces the lock file's contents with [contents]
       through the held descriptor, so no reader finds the file unlocked between
-      the writes and the hold is kept.
+      the writes and the hold is kept. It first takes the record lock again on
+      that descriptor, which restores a hold a close of the file elsewhere in
+      this process dropped.
 
+      @raise Lock_unavailable
+        when another process took the lock after such a close; nothing is
+        written.
       @raise Invalid_argument if [h] has been released. *)
 
   val release : ?contents:string -> t -> unit
