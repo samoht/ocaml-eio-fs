@@ -763,7 +763,7 @@ let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
       let _, status = wait_child child in
       reaped := true;
       (match status with
-      | Unix.WSIGNALED n when n = Sys.sigterm -> ()
+      | Unix.WSIGNALED n when Int.equal n Sys.sigterm -> ()
       | Unix.WEXITED n -> Alcotest.failf "lease child exited %d" n
       | Unix.WSIGNALED n -> Alcotest.failf "lease child took signal %d" n
       | Unix.WSTOPPED n -> Alcotest.failf "lease child stopped by %d" n);
