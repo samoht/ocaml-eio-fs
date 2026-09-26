@@ -205,6 +205,21 @@ val hold :
     @raise Lock_unavailable as {!with_lock} does.
     @raise Eio.Io as {!with_lock} does. *)
 
+val probe : _ Eio.Path.t -> [ `Free of string | `Held of refusal ]
+(** [probe path] is the lock over [path] as an acquisition would find it now,
+    taken without acquiring it: [`Held r] names its holder as a refusal does,
+    and [`Free record] carries the lock file's first 4096 bytes, what its last
+    holder left there. The file is opened for reading only, and a descriptor on
+    a lock this process holds is never closed while it is held, so a probe from
+    the holding process keeps the hold.
+
+    [path] must be the lock's own regular file, as {!with_lock}'s must.
+
+    @raise Eio.Io with {!Eio.Fs.Not_found} when [path] is absent.
+    @raise Eio.Io
+      with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
+      is not the lock's own regular file. *)
+
 module Lease : sig
   type t
 

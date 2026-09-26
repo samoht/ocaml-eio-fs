@@ -1016,6 +1016,69 @@ let test_lock_asks_from_the_holder_leave_no_descriptor () =
   Alcotest.(check int)
     "descriptors open once the hold ends" before (open_descriptors ())
 
+(* ---- a probe says who holds a lock without taking it ----
+
+   Asking by acquiring answers "free" only by holding the lock for a moment,
+   and a real acquirer in another process that asks in that moment is refused
+   by a caller that wanted nothing. A probe asks the kernel ([fcntl F_GETLK])
+   and the fiber half, and takes nothing. *)
+
+let check_free_probe what lock ~record =
+  match Eio_fs_unix.probe lock with
+  | `Free left ->
+      Alcotest.(check string) (what ^ ": the record left") record left
+  | `Held (r : Eio_fs_unix.refusal) ->
+      Alcotest.failf "%s: a free lock probed as held by %a" what
+        Fmt.(option ~none:(any "nobody") int)
+        r.holder
+
+let test_probe_names_the_holding_process () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio_fs_unix.with_lock ~contents:"the last holder\n" lock (fun () -> ());
+  check_free_probe "before the child" lock ~record:"the last holder\n";
+  Eio.Switch.run @@ fun sw ->
+  let child =
+    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
+      ~seconds:"0.3"
+  in
+  (match Eio_fs_unix.probe lock with
+  | `Free _ -> Alcotest.fail "a lock another process holds probed as free"
+  | `Held refused ->
+      Alcotest.(check (option int))
+        "the holder the probe names"
+        (Some (Eio.Process.pid child))
+        refused.holder);
+  await_holder child;
+  check_free_probe "after the child" lock ~record:"the last holder\n"
+
+(* A probe from the holding process names it, and like any ask from there it
+   keeps the hold: only another process can tell. *)
+let test_probe_from_the_holder_keeps_its_hold () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  let record = "the holding fiber's record\n" in
+  Eio_fs_unix.with_lock ~contents:record lock @@ fun () ->
+  (match Eio_fs_unix.probe lock with
+  | `Free _ -> Alcotest.fail "a lock a fiber of this process holds probed free"
+  | `Held refused ->
+      Alcotest.(check (option int))
+        "the holder the probe names"
+        (Some (Unix.getpid ()))
+        refused.holder;
+      Alcotest.(check string) "the holder's record" record refused.record);
+  if another_process_is_granted ~env lock then
+    Alcotest.fail "another process was granted the lock after a probe"
+
+(* A probe takes nothing, so it needs no more than to read the lock file: a
+   lock file this user may read and not write is still answered. *)
+let test_probe_answers_a_read_only_lock_file () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  Eio.Path.save ~create:(`Exclusive 0o400) lock "written under other rights\n";
+  check_free_probe "the probe" lock ~record:"written under other rights\n"
+
 (* A hold is a lock for the rest of a switch: taken when [hold] returns, still
    held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
@@ -2251,6 +2314,12 @@ let suite =
         test_lock_bounded_wait_in_the_holder_keeps_its_hold;
       Alcotest.test_case "asks from the holder leave no descriptor" `Quick
         test_lock_asks_from_the_holder_leave_no_descriptor;
+      Alcotest.test_case "a probe names the holding process" `Quick
+        test_probe_names_the_holding_process;
+      Alcotest.test_case "a probe from the holder keeps its hold" `Quick
+        test_probe_from_the_holder_keeps_its_hold;
+      Alcotest.test_case "a probe answers a read-only lock file" `Quick
+        test_probe_answers_a_read_only_lock_file;
       Alcotest.test_case "a hold lasts as long as its switch" `Quick
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick

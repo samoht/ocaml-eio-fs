@@ -646,6 +646,8 @@ let hold ~sw ?block ?create ?contents path =
       Atomic.set abandoned true;
       raise cancelled
 
+let probe _ = failwith "TODO: Eio_fs_unix.probe is not implemented"
+
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
 
