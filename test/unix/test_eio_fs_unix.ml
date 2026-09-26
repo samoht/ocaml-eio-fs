@@ -1189,6 +1189,20 @@ let test_held_released_from_its_switch_hook_leaves_a_record () =
   | `Free record -> Alcotest.(check string) "the record left" "ended\n" record
   | `Held _ -> Alcotest.fail "a lock whose switch ended probed as held"
 
+(* A close of the held file anywhere in this process -- a reader that opened
+   it by name and let it go -- drops the record lock under the holder, and
+   nothing tells it. A restate takes it again on the held descriptor before it
+   writes, so the claim a holder goes on stating is one it still has. *)
+let test_held_restate_takes_back_a_lock_a_stray_close_dropped () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let held = Eio_fs_unix.Held.take ~sw ~contents:"running\n" lock in
+  Unix.close (Unix.openfile (Eio.Path.native_exn lock) [ Unix.O_RDONLY ] 0);
+  Eio_fs_unix.Held.restate held "still running\n";
+  if another_process_is_granted ~env lock then
+    Alcotest.fail "another process was granted a lock its holder restated"
+
 (* ---- waiting for this process, answering about every other one ----
 
    The two halves of the exclusion are two kinds of contention, and a caller
@@ -2399,6 +2413,8 @@ let suite =
         test_held_release_lets_the_lock_go_and_leaves_a_record;
       Alcotest.test_case "a held lock ends with its switch" `Quick
         test_held_ends_with_its_switch;
+      Alcotest.test_case "a restate takes back a lock a stray close dropped"
+        `Quick test_held_restate_takes_back_a_lock_a_stray_close_dropped;
       Alcotest.test_case "a release from its switch's hook leaves a record"
         `Quick test_held_released_from_its_switch_hook_leaves_a_record;
       Alcotest.test_case "a fibers-only lock queues behind a fiber" `Quick
