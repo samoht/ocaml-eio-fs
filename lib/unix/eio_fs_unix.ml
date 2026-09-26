@@ -302,30 +302,28 @@ let entry_gates : (string, local_lock) Hashtbl.t = Hashtbl.create 16
 let tables_mutex = Stdlib.Mutex.create ()
 
 (* A mutex per key, kept only while a caller uses it. *)
+let shared_mutex table key =
+  Stdlib.Mutex.protect tables_mutex @@ fun () ->
+  match Hashtbl.find_opt table key with
+  | Some lock ->
+      lock.users <- lock.users + 1;
+      lock
+  | None ->
+      let lock =
+        { mutex = Eio.Mutex.create (); users = 1; holding = false; parked = [] }
+      in
+      Hashtbl.add table key lock;
+      lock
+
+let done_with_shared_mutex table key lock =
+  Stdlib.Mutex.protect tables_mutex @@ fun () ->
+  lock.users <- lock.users - 1;
+  if lock.users = 0 then Hashtbl.remove table key
+
 let use_shared_mutex table key fn =
-  let lock =
-    Stdlib.Mutex.protect tables_mutex @@ fun () ->
-    match Hashtbl.find_opt table key with
-    | Some lock ->
-        lock.users <- lock.users + 1;
-        lock
-    | None ->
-        let lock =
-          {
-            mutex = Eio.Mutex.create ();
-            users = 1;
-            holding = false;
-            parked = [];
-          }
-        in
-        Hashtbl.add table key lock;
-        lock
-  in
+  let lock = shared_mutex table key in
   Fun.protect
-    ~finally:(fun () ->
-      Stdlib.Mutex.protect tables_mutex @@ fun () ->
-      lock.users <- lock.users - 1;
-      if lock.users = 0 then Hashtbl.remove table key)
+    ~finally:(fun () -> done_with_shared_mutex table key lock)
     (fun () -> fn lock)
 
 let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
@@ -357,21 +355,18 @@ let let_go_of local file =
 
 (* The holder's side: set once the mutex is taken, and cleared, with every
    parked descriptor closed, once the record lock is let go. *)
-let holding local fn =
-  Stdlib.Mutex.protect tables_mutex (fun () -> local.holding <- true);
-  Fun.protect
-    ~finally:(fun () ->
-      let parked =
-        Stdlib.Mutex.protect tables_mutex @@ fun () ->
-        let parked = local.parked in
-        local.holding <- false;
-        local.parked <- [];
-        parked
-      in
-      List.iter
-        (fun fd -> try Unix.close fd with Unix.Unix_error _ -> ())
-        parked)
-    fn
+let start_holding local =
+  Stdlib.Mutex.protect tables_mutex (fun () -> local.holding <- true)
+
+let stop_holding local =
+  let parked =
+    Stdlib.Mutex.protect tables_mutex @@ fun () ->
+    let parked = local.parked in
+    local.holding <- false;
+    local.parked <- [];
+    parked
+  in
+  List.iter (fun fd -> try Unix.close fd with Unix.Unix_error _ -> ()) parked
 
 (* One budget covers both halves of the exclusion, so it is a moment both watch
    for rather than a duration each is handed. A daemon of the switch sleeps it
@@ -389,38 +384,42 @@ let budget ~sw seconds =
       `Stop_daemon);
   Until lapsed
 
+(* [on_taken] runs the moment the mutex is held, so a caller records how to
+   give it back before anything else can raise. *)
+let take_mutex ~patience ~refused ~on_taken mutex =
+  match patience with
+  | Wait ->
+      Eio.Mutex.lock mutex;
+      on_taken ()
+  | Refuse ->
+      if Eio.Mutex.try_lock mutex then on_taken () else raise (refused ())
+  | Until lapsed ->
+      (* [Fiber.first] cancels the loser, and a fiber cancelled inside
+         [Eio.Mutex.lock] may have been granted the mutex all the same: the
+         unlocker's wake and the cancellation race for one atomic and either
+         can win. So what was taken is remembered rather than read off which
+         fiber came back, and a mutex granted as the bound lapsed is held --
+         and given back by the caller -- rather than dropped with nobody left
+         to unlock it. *)
+      let taken = ref false in
+      let granted =
+        Eio.Fiber.first
+          (fun () ->
+            Eio.Mutex.lock mutex;
+            taken := true;
+            true)
+          (fun () ->
+            Eio.Promise.await lapsed;
+            false)
+      in
+      if granted || !taken then on_taken () else raise (refused ())
+
 let use_mutex ~patience ~refused mutex fn =
   let locked = ref false in
   Fun.protect
     ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
     (fun () ->
-      (match patience with
-      | Wait ->
-          Eio.Mutex.lock mutex;
-          locked := true
-      | Refuse ->
-          if Eio.Mutex.try_lock mutex then locked := true
-          else raise (refused ())
-      | Until lapsed ->
-          (* [Fiber.first] cancels the loser, and a fiber cancelled inside
-             [Eio.Mutex.lock] may have been granted the mutex all the same:
-             the unlocker's wake and the cancellation race for one atomic and
-             either can win. So what was taken is remembered rather than read
-             off which fiber came back, and a mutex granted as the bound
-             lapsed is held -- and released by the [finally] above -- rather
-             than dropped with nobody left to unlock it. *)
-          let taken = ref false in
-          let granted =
-            Eio.Fiber.first
-              (fun () ->
-                Eio.Mutex.lock mutex;
-                taken := true;
-                true)
-              (fun () ->
-                Eio.Promise.await lapsed;
-                false)
-          in
-          if granted || !taken then locked := true else raise (refused ()));
+      take_mutex ~patience ~refused ~on_taken:(fun () -> locked := true) mutex;
       fn ())
 
 (* Entering is queued too, on a mutex keyed by the caller's name: the open
@@ -443,47 +442,49 @@ let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
    also answers a holder that died, whose lock the kernel drops. *)
 let ask_again_every = 0.05
 
-let use_os_lock ~patience ~refused fd fn =
+let os_unlock fd =
+  Eio.Cancel.protect @@ fun () ->
+  Eio_unix.Fd.use_exn "Eio_fs_unix.unlock" fd @@ fun fd ->
+  Eio_unix.run_in_systhread ~label:"eio-fs-unlock" (fun () ->
+      lockf fd Unix.F_ULOCK)
+
+(* [on_taken] runs the moment the record lock is held, as {!take_mutex}'s
+   does. *)
+let take_os_lock ~patience ~refused ~on_taken fd =
   let acquired = ref false in
-  Fun.protect
-    ~finally:(fun () ->
-      if !acquired then
-        Eio.Cancel.protect @@ fun () ->
-        Eio_unix.run_in_systhread ~label:"eio-fs-unlock" (fun () ->
-            lockf fd Unix.F_ULOCK))
-    (fun () ->
-      (* The acquiring [lockf] is not cancellable -- it runs in a systhread and
-         a cancellation cannot reach into one -- so a bounded wait never sits
-         in it: it asks with [F_TLOCK], which answers, and does its waiting in
-         a sleep, which cancels. *)
-      let ask command =
-        Eio.Cancel.protect (fun () ->
-            match
-              Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
-                  lockf fd command)
-            with
-            | () -> acquired := true
-            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) ->
-                ())
+  (* The acquiring [lockf] is not cancellable -- it runs in a systhread and a
+     cancellation cannot reach into one -- so a bounded wait never sits in it:
+     it asks with [F_TLOCK], which answers, and does its waiting in a sleep,
+     which cancels. *)
+  let ask command =
+    Eio.Cancel.protect (fun () ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.lock" fd @@ fun fd ->
+        match
+          Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
+              lockf fd command)
+        with
+        | () ->
+            acquired := true;
+            on_taken ()
+        | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ())
+  in
+  (match patience with
+  | Wait -> ask Unix.F_LOCK
+  | Refuse -> ask Unix.F_TLOCK
+  | Until lapsed ->
+      let rec poll () =
+        ask Unix.F_TLOCK;
+        if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+          (* Waking on the lapse rather than sleeping through it is what keeps
+             the answer inside one further ask of the bound. *)
+          Eio.Fiber.first
+            (fun () -> Eio_unix.sleep ask_again_every)
+            (fun () -> Eio.Promise.await lapsed);
+          poll ()
+        end
       in
-      (match patience with
-      | Wait -> ask Unix.F_LOCK
-      | Refuse -> ask Unix.F_TLOCK
-      | Until lapsed ->
-          let rec poll () =
-            ask Unix.F_TLOCK;
-            if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
-              (* Waking on the lapse rather than sleeping through it is what
-                 keeps the answer inside one further ask of the bound. *)
-              Eio.Fiber.first
-                (fun () -> Eio_unix.sleep ask_again_every)
-                (fun () -> Eio.Promise.await lapsed);
-              poll ()
-            end
-          in
-          poll ());
-      if not !acquired then raise (refused fd);
-      fn ())
+      poll ());
+  if not !acquired then raise (refused ())
 
 (* A planted link under the rendezvous name would send the record lock to
    whatever it names. Creating is an exclusive open (O_CREAT|O_EXCL refuses an
@@ -560,91 +561,144 @@ let open_lock_file ~sw ~name
 (* What is held once the exclusion is taken, whichever locks carry it: the
    descriptor is weighed against the name it was opened by, the holder's
    diagnostics are written through it, and the caller runs. *)
-let run_held ~name ~opened ~contents ~file path fn =
+let settle ~name ~opened ~contents ~file path =
   check_locked_file ~name ~opened path;
-  Option.iter (update_lock_contents file) contents;
+  Option.iter (update_lock_contents file) contents
+
+let run_held ~name ~opened ~contents ~file path fn =
+  settle ~name ~opened ~contents ~file path;
   fn ()
 
-(* The rendezvous is opened before the mutex is taken, the mutex key coming
-   from the opened descriptor. A rendezvous with no descriptor has no record
-   lock to take: a process-local backend makes the mutex the whole exclusion,
-   and any other is refused. *)
-let with_lock ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
-    ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
-      `If_missing 0o600) ?contents path fn =
-  (* [block] is answered per half: the mutex is held by a fiber, the record
-     lock by another process. *)
-  let name = lock_name path in
-  Eio.Switch.run @@ fun sw ->
-  let fibers, processes =
-    match block with
-    | `Yes -> (Wait, Wait)
-    | `No -> (Refuse, Refuse)
-    | `Fibers -> (Wait, Refuse)
-    | `For seconds ->
-        let until = budget ~sw seconds in
-        (until, until)
-  in
-  let file, (opened : Eio.File.Stat.t) =
-    in_entry_order name @@ fun () ->
-    check_lock_name ~name path;
-    let file = open_lock_file ~sw ~name ~create path in
-    (file, Eio.File.stat file)
-  in
-  use_local_lock (opened.dev, opened.ino) @@ fun local ->
-  let entered = ref false in
-  Fun.protect ~finally:(fun () -> if not !entered then let_go_of local file)
-  @@ fun () ->
-  use_mutex ~patience:fibers
-    ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
-    local.mutex
-  @@ fun () ->
-  entered := true;
-  holding local @@ fun () ->
-  match Eio_unix.Resource.fd_opt file with
-  | Some fd ->
-      Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd @@ fun fd ->
-      use_os_lock ~patience:processes
-        ~refused:(fun fd -> refusal ~name ~holder:(held_by_a_process fd) file)
-        fd
-      @@ fun () -> run_held ~name ~opened ~contents ~file path fn
-  | None ->
-      if Eio_fs_sync.is_process_local (fst path) then
-        run_held ~name ~opened ~contents ~file path fn
-      else
-        Fmt.invalid_arg
-          "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
-           descriptor and its backend registers no Eio_fs_sync.Process_local"
-          name
+let block_patience ~sw = function
+  | `Yes -> (Wait, Wait)
+  | `No -> (Refuse, Refuse)
+  | `Fibers -> (Wait, Refuse)
+  | `For seconds ->
+      let until = budget ~sw seconds in
+      (until, until)
 
-(* The hold is a fiber of [sw] parked inside [with_lock]'s section, so it ends
-   with the switch and every release [with_lock] makes is the one it makes. A
-   caller cancelled while it waits abandons the hold: a section entered after
-   that returns at once. *)
+(* An acquisition keeps how to give back each thing it took, the latest
+   first. Letting go runs them in that order, and a refusal part-way gives
+   back what was already taken. *)
+let let_go steps =
+  Eio.Cancel.protect @@ fun () ->
+  let taken = !steps in
+  steps := [];
+  List.iter (fun give_back -> give_back ()) taken
+
+(* The rendezvous is opened before the mutex is taken, the mutex key coming
+   from the opened descriptor, and on [sw], which closes it. A rendezvous with
+   no descriptor has no record lock to take: a process-local backend makes the
+   mutex the whole exclusion, and any other is refused. [block] is answered per
+   half: the mutex is held by a fiber, the record lock by another process; its
+   bound is kept on a switch of its own, which ends with the acquisition. *)
+let acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
+    ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
+      `If_missing 0o600) ?contents path =
+  let name = lock_name path in
+  let steps = ref [] in
+  let taken give_back = steps := give_back :: !steps in
+  match
+    Eio.Switch.run @@ fun budget_sw ->
+    let fibers, processes = block_patience ~sw:budget_sw block in
+    let file, (opened : Eio.File.Stat.t) =
+      in_entry_order name @@ fun () ->
+      check_lock_name ~name path;
+      let file = open_lock_file ~sw ~name ~create path in
+      taken (fun () -> Eio.Resource.close file);
+      (file, Eio.File.stat file)
+    in
+    let key = (opened.dev, opened.ino) in
+    let local = shared_mutex local_locks key in
+    taken (fun () -> done_with_shared_mutex local_locks key local);
+    let entered = ref false in
+    taken (fun () -> if not !entered then let_go_of local file);
+    take_mutex ~patience:fibers
+      ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
+      ~on_taken:(fun () ->
+        entered := true;
+        taken (fun () -> Eio.Mutex.unlock local.mutex))
+      local.mutex;
+    start_holding local;
+    taken (fun () -> stop_holding local);
+    (match Eio_unix.Resource.fd_opt file with
+    | Some fd ->
+        take_os_lock ~patience:processes
+          ~refused:(fun () ->
+            let holder =
+              Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd held_by_a_process
+            in
+            refusal ~name ~holder file)
+          ~on_taken:(fun () -> taken (fun () -> os_unlock fd))
+          fd
+    | None ->
+        if not (Eio_fs_sync.is_process_local (fst path)) then
+          Fmt.invalid_arg
+            "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
+             descriptor and its backend registers no Eio_fs_sync.Process_local"
+            name);
+    settle ~name ~opened ~contents ~file path;
+    file
+  with
+  | file -> (file, fun () -> let_go steps)
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      let_go steps;
+      Printexc.raise_with_backtrace e bt
+
+let with_lock ?block ?create ?contents path fn =
+  Eio.Switch.run @@ fun sw ->
+  let _, let_go = acquire ~sw ?block ?create ?contents path in
+  Fun.protect ~finally:let_go fn
+
+(* A held lock is an acquisition whose giving back waits for {!Held.release}
+   or for [sw]'s release hooks, which run after every fiber of [sw] has
+   finished: a hook the holder registered after taking it runs first, while
+   the lock is still held. Every write through the file is serialised. *)
+module Held = struct
+  type t = {
+    mutable file : Eio.File.rw_ty Eio.Resource.t option;
+    let_go : unit -> unit;
+    writing : Eio.Mutex.t;
+  }
+
+  (* A refused restate is the caller's mistake and poisons nothing. *)
+  let writing t fn =
+    Eio.Cancel.protect @@ fun () ->
+    Eio.Mutex.lock t.writing;
+    Fun.protect ~finally:(fun () -> Eio.Mutex.unlock t.writing) fn
+
+  let release ?contents t =
+    writing t @@ fun () ->
+    match t.file with
+    | None -> ()
+    | Some file ->
+        t.file <- None;
+        Fun.protect ~finally:t.let_go (fun () ->
+            Option.iter (update_lock_contents file) contents)
+
+  let take ~sw ?block ?create ?contents path =
+    let file, let_go = acquire ~sw ?block ?create ?contents path in
+    let t =
+      {
+        file = Some (file :> Eio.File.rw_ty Eio.Resource.t);
+        let_go;
+        writing = Eio.Mutex.create ();
+      }
+    in
+    Eio.Switch.on_release sw (fun () -> release t);
+    t
+
+  let restate t contents =
+    writing t @@ fun () ->
+    match t.file with
+    | None -> invalid_arg "Eio_fs_unix.Held.restate: the lock has been released"
+    | Some file -> update_lock_contents file contents
+end
+
 let hold ~sw ?block ?create ?contents path =
-  let taken, set_taken = Eio.Promise.create () in
-  let abandoned = Atomic.make false in
-  Eio.Fiber.fork_daemon ~sw (fun () ->
-      (match
-         with_lock ?block ?create ?contents path (fun () ->
-             if not (Atomic.get abandoned) then begin
-               Eio.Promise.resolve set_taken (Ok ());
-               Eio.Fiber.await_cancel ()
-             end)
-       with
-      | () -> ()
-      | exception (Eio.Cancel.Cancelled _ as cancelled) ->
-          if not (Eio.Promise.is_resolved taken) then
-            Eio.Promise.resolve set_taken (Error cancelled);
-          raise cancelled
-      | exception e -> Eio.Promise.resolve set_taken (Error e));
-      `Stop_daemon);
-  match Eio.Promise.await taken with
-  | Ok () -> ()
-  | Error e -> raise e
-  | exception (Eio.Cancel.Cancelled _ as cancelled) ->
-      Atomic.set abandoned true;
-      raise cancelled
+  let (_ : Held.t) = Held.take ~sw ?block ?create ?contents path in
+  ()
 
 (* The kernel is asked first: it names another process holding the record
    lock, and a fiber of this process waiting for that process holds the mutex
@@ -676,19 +730,6 @@ let probe path =
   match holder with
   | None -> `Free record
   | Some _ -> `Held { path = name; holder; record }
-
-module Held = struct
-  type t = unit
-
-  let take ~sw:_ ?block:_ ?create:_ ?contents:_ _ =
-    failwith "TODO: Eio_fs_unix.Held.take is not implemented"
-
-  let restate () _ =
-    failwith "TODO: Eio_fs_unix.Held.restate is not implemented"
-
-  let release ?contents:_ () =
-    failwith "TODO: Eio_fs_unix.Held.release is not implemented"
-end
 
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
