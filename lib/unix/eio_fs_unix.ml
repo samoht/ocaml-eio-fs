@@ -453,37 +453,42 @@ let os_unlock fd =
 let take_os_lock ~patience ~refused ~on_taken fd =
   let acquired = ref false in
   (* The acquiring [lockf] is not cancellable -- it runs in a systhread and a
-     cancellation cannot reach into one -- so a bounded wait never sits in it:
-     it asks with [F_TLOCK], which answers, and does its waiting in a sleep,
-     which cancels. *)
-  let ask command =
+     cancellation cannot reach into one -- so no wait sits in it: every ask is
+     an [F_TLOCK], which answers, and the waiting is done in a sleep, which a
+     bound, a Ctrl-C or a fiber giving up cancels. *)
+  let ask () =
     Eio.Cancel.protect (fun () ->
         Eio_unix.Fd.use_exn "Eio_fs_unix.lock" fd @@ fun fd ->
         match
           Eio_unix.run_in_systhread ~label:"eio-fs-lock" (fun () ->
-              lockf fd command)
+              lockf fd Unix.F_TLOCK)
         with
         | () ->
             acquired := true;
             on_taken ()
         | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ())
   in
+  let rec wait_for lapsed =
+    ask ();
+    if not !acquired then
+      match lapsed with
+      | None ->
+          Eio_unix.sleep ask_again_every;
+          wait_for lapsed
+      | Some lapse ->
+          if not (Eio.Promise.is_resolved lapse) then begin
+            (* Waking on the lapse rather than sleeping through it is what
+               keeps the answer inside one further ask of the bound. *)
+            Eio.Fiber.first
+              (fun () -> Eio_unix.sleep ask_again_every)
+              (fun () -> Eio.Promise.await lapse);
+            wait_for lapsed
+          end
+  in
   (match patience with
-  | Wait -> ask Unix.F_LOCK
-  | Refuse -> ask Unix.F_TLOCK
-  | Until lapsed ->
-      let rec poll () =
-        ask Unix.F_TLOCK;
-        if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
-          (* Waking on the lapse rather than sleeping through it is what keeps
-             the answer inside one further ask of the bound. *)
-          Eio.Fiber.first
-            (fun () -> Eio_unix.sleep ask_again_every)
-            (fun () -> Eio.Promise.await lapsed);
-          poll ()
-        end
-      in
-      poll ());
+  | Wait -> wait_for None
+  | Refuse -> ask ()
+  | Until lapse -> wait_for (Some lapse));
   if not !acquired then raise (refused ())
 
 (* A planted link under the rendezvous name would send the record lock to
