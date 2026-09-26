@@ -1120,6 +1120,75 @@ let test_hold_refusal_names_the_holding_process () =
           refused.holder );
   await_holder child
 
+(* ---- a held lock is restated and let go on demand ----
+
+   A process that claims a file for as long as it runs states what it is
+   doing in the lock file as it goes, and lets the claim go before it exits,
+   leaving a last record for the reader who comes after it. Both writes go
+   through the held descriptor: opening the file again to write it would be
+   a close on the held file, and POSIX would release the lock with it. *)
+
+let held_record what lock ~record =
+  match Eio_fs_unix.probe lock with
+  | `Free _ -> Alcotest.failf "%s: the lock probed as free" what
+  | `Held (r : Eio_fs_unix.refusal) ->
+      Alcotest.(check (option int))
+        (what ^ ": held by this process")
+        (Some (Unix.getpid ()))
+        r.holder;
+      Alcotest.(check string) (what ^ ": the record") record r.record
+
+let test_held_restates_its_record () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let held = Eio_fs_unix.Held.take ~sw ~contents:"booting\n" lock in
+  held_record "as taken" lock ~record:"booting\n";
+  Eio_fs_unix.Held.restate held "running\n";
+  held_record "restated" lock ~record:"running\n";
+  if another_process_is_granted ~env lock then
+    Alcotest.fail "another process was granted a lock that was restated"
+
+let test_held_release_lets_the_lock_go_and_leaves_a_record () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let held = Eio_fs_unix.Held.take ~sw ~contents:"running\n" lock in
+  Eio_fs_unix.Held.release ~contents:"ended\n" held;
+  (match Eio_fs_unix.probe lock with
+  | `Free record -> Alcotest.(check string) "the record left" "ended\n" record
+  | `Held _ -> Alcotest.fail "a released lock probed as held");
+  if not (another_process_is_granted ~env lock) then
+    Alcotest.fail "another process was refused a released lock";
+  Eio_fs_unix.Held.release held;
+  match Eio_fs_unix.Held.restate held "again\n" with
+  | () -> Alcotest.fail "a released lock was restated"
+  | exception Invalid_argument _ -> ()
+
+let test_held_ends_with_its_switch () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  let held =
+    Eio.Switch.run @@ fun sw -> Eio_fs_unix.Held.take ~sw ~contents:"" lock
+  in
+  if not (another_process_is_granted ~env lock) then
+    Alcotest.fail "another process was refused a lock whose switch ended";
+  Eio_fs_unix.Held.release held
+
+(* A holder that lets go when its switch ends does so from a release hook of
+   that switch, where it knows its last record: the lock is still held there,
+   so the record goes through the held descriptor and stays. *)
+let test_held_released_from_its_switch_hook_leaves_a_record () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  ( Eio.Switch.run @@ fun sw ->
+    let held = Eio_fs_unix.Held.take ~sw ~contents:"running\n" lock in
+    Eio.Switch.on_release sw (fun () ->
+        Eio_fs_unix.Held.release ~contents:"ended\n" held) );
+  match Eio_fs_unix.probe lock with
+  | `Free record -> Alcotest.(check string) "the record left" "ended\n" record
+  | `Held _ -> Alcotest.fail "a lock whose switch ended probed as held"
+
 (* ---- waiting for this process, answering about every other one ----
 
    The two halves of the exclusion are two kinds of contention, and a caller
@@ -2324,6 +2393,14 @@ let suite =
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick
         test_hold_refusal_names_the_holding_process;
+      Alcotest.test_case "a held lock restates its record" `Quick
+        test_held_restates_its_record;
+      Alcotest.test_case "a held lock's release leaves a record" `Quick
+        test_held_release_lets_the_lock_go_and_leaves_a_record;
+      Alcotest.test_case "a held lock ends with its switch" `Quick
+        test_held_ends_with_its_switch;
+      Alcotest.test_case "a release from its switch's hook leaves a record"
+        `Quick test_held_released_from_its_switch_hook_leaves_a_record;
       Alcotest.test_case "a fibers-only lock queues behind a fiber" `Quick
         test_lock_fibers_mode_queues_behind_a_fiber;
       Alcotest.test_case "a fibers-only lock answers another process" `Quick

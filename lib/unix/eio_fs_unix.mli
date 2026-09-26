@@ -220,6 +220,38 @@ val probe : _ Eio.Path.t -> [ `Free of string | `Held of refusal ]
       with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
       is not the lock's own regular file. *)
 
+(** A lock held for as long as its holder says, restated as it goes. *)
+module Held : sig
+  type t
+  (** The type for a lock this process holds. *)
+
+  val take :
+    sw:Eio.Switch.t ->
+    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?contents:string ->
+    _ Eio.Path.t ->
+    t
+  (** [take ~sw path] is {!with_lock} over [path], held from when it returns
+      until {!release} or the end of [sw], whichever comes first. [block],
+      [create] and [contents] are as {!with_lock}'s.
+
+      @raise Lock_unavailable as {!with_lock} does.
+      @raise Eio.Io as {!with_lock} does. *)
+
+  val restate : t -> string -> unit
+  (** [restate h contents] replaces the lock file's contents with [contents]
+      through the held descriptor, so no reader finds the file unlocked between
+      the writes and the hold is kept.
+
+      @raise Invalid_argument if [h] has been released. *)
+
+  val release : ?contents:string -> t -> unit
+  (** [release ~contents h] writes [contents], when present, through the held
+      descriptor and lets the lock go, returning once it is free. Releasing a
+      released lock, or one whose switch has ended, does nothing. *)
+end
+
 module Lease : sig
   type t
 

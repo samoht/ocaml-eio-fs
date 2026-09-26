@@ -677,6 +677,19 @@ let probe path =
   | None -> `Free record
   | Some _ -> `Held { path = name; holder; record }
 
+module Held = struct
+  type t = unit
+
+  let take ~sw:_ ?block:_ ?create:_ ?contents:_ _ =
+    failwith "TODO: Eio_fs_unix.Held.take is not implemented"
+
+  let restate () _ =
+    failwith "TODO: Eio_fs_unix.Held.restate is not implemented"
+
+  let release ?contents:_ () =
+    failwith "TODO: Eio_fs_unix.Held.release is not implemented"
+end
+
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
 
