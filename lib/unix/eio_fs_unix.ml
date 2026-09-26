@@ -646,7 +646,36 @@ let hold ~sw ?block ?create ?contents path =
       Atomic.set abandoned true;
       raise cancelled
 
-let probe _ = failwith "TODO: Eio_fs_unix.probe is not implemented"
+(* The kernel is asked first: it names another process holding the record
+   lock, and a fiber of this process waiting for that process holds the mutex
+   and not the lock. A fiber holder is this process, which the kernel never
+   reports. *)
+let probe path =
+  let name = lock_name path in
+  Eio.Switch.run @@ fun sw ->
+  check_lock_name ~name path;
+  let file = Eio.Path.open_in ~sw path in
+  let opened = Eio.File.stat file in
+  check_locked_file ~name ~opened path;
+  use_local_lock (opened.dev, opened.ino) @@ fun local ->
+  Fun.protect ~finally:(fun () -> let_go_of local file) @@ fun () ->
+  let another =
+    match Eio_unix.Resource.fd_opt file with
+    | None -> None
+    | Some fd -> Eio_unix.Fd.use_exn "Eio_fs_unix.probe" fd held_by_a_process
+  in
+  let holder =
+    match another with
+    | Some _ -> another
+    | None ->
+        if Stdlib.Mutex.protect tables_mutex (fun () -> local.holding) then
+          held_by_a_fiber ()
+        else None
+  in
+  let record = read_record file in
+  match holder with
+  | None -> `Free record
+  | Some _ -> `Held { path = name; holder; record }
 
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
