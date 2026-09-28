@@ -356,9 +356,6 @@ let test_path_through_file_is_io_error () =
     match f () with
     | _ -> Alcotest.failf "%s: expected an Eio.Io error" what
     | exception Eio.Io _ -> ()
-    | exception exn ->
-        Alcotest.failf "%s: raised %s, want an Eio.Io error" what
-          (Printexc.to_string exn)
   in
   expect_io "load through a file" (fun () ->
       Eio.Path.load (fs / "page.txt" / "index.html"));

@@ -377,12 +377,9 @@ let test_sync_file_asks_the_registration_before_the_descriptor () =
   Alcotest.(check bool)
     "the file carries a descriptor for the barrier to find" true
     (Option.is_some (Eio_unix.Resource.fd_opt file));
-  (match Eio_fs_unix.sync_file file with
-  | () -> ()
-  | exception e ->
-      Alcotest.failf
-        "the barrier reached past the registration for the descriptor: %s"
-        (Printexc.to_string e));
+  (* A raise here means the barrier reached past the registration for the
+     descriptor. *)
+  Eio_fs_unix.sync_file file;
   Alcotest.(check int)
     "the registration answered the barrier" 1
     !(state.Registered_file.calls)

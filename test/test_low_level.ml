@@ -10,8 +10,6 @@ let expect_io_error expected fn =
       | "permission denied", Eio.Fs.Permission_denied _ -> ()
       | _ -> Alcotest.failf "expected %s, got another filesystem error" expected
       )
-  | exception exn ->
-      Alcotest.failf "expected %s, got %s" expected (Printexc.to_string exn)
 
 let with_env ?cwd fn = Eio_mock.Backend.run @@ fun () -> Eio_fs.run ?cwd fn
 
@@ -133,9 +131,6 @@ let expect_eio_io what fn =
   match fn () with
   | () -> Alcotest.failf "expected %s to fail" what
   | exception Eio.Io _ -> ()
-  | exception exn ->
-      Alcotest.failf "expected %s to raise Eio.Io, got %s" what
-        (Printexc.to_string exn)
 
 let test_read_directory_fd () =
   with_env @@ fun env ->

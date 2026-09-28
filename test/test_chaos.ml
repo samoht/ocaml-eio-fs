@@ -23,8 +23,6 @@ let expect_io name fn =
   match fn () with
   | () -> Alcotest.failf "%s: expected Eio.Io, got success" name
   | exception Eio.Io _ -> ()
-  | exception exn ->
-      Alcotest.failf "%s: expected Eio.Io, got %s" name (Printexc.to_string exn)
 
 (* {2 Scripted, exact-scenario faults} *)
 
