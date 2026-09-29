@@ -1086,6 +1086,39 @@ let test_lock_asks_during_a_hold_keep_one_descriptor () =
       1 (descriptors_on lock)
   done
 
+(* An ask from the holding process reads the holder's record through the
+   holder's descriptor, and the holder may let go of the lock, closing that
+   descriptor, at any point of the ask: every ask still answers, the lock held
+   or free, and never reads a closed descriptor. The holder releases with a
+   last record, whose write suspends it while it still holds, and the ask
+   starts after 0 to 19 yields of its own, so the close lands at each
+   suspension point of the ask in turn. *)
+let test_lock_asks_while_the_holder_lets_go () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  let ask name f =
+    for yields = 0 to 19 do
+      Eio.Switch.run @@ fun sw ->
+      let held =
+        Eio_fs_unix.Held.take ~sw ~contents:"held for the ask\n" lock
+      in
+      Eio.Fiber.both
+        (fun () -> Eio_fs_unix.Held.release ~contents:"let go\n" held)
+        (fun () ->
+          for _ = 1 to yields do
+            Eio.Fiber.yield ()
+          done;
+          match f () with
+          | () -> ()
+          | exception Invalid_argument message ->
+              Alcotest.failf "%s after %d yields: %s" name yields message)
+    done
+  in
+  ask "a probe" (fun () -> ignore (Eio_fs_unix.probe lock));
+  ask "a refused ask" (fun () ->
+      try Eio_fs_unix.with_lock ~block:`No lock ignore
+      with Eio_fs_unix.Lock_unavailable _ -> ())
+
 (* ---- a probe says who holds a lock without taking it ----
 
    Asking by acquiring answers "free" only by holding the lock for a moment,
@@ -2471,6 +2504,8 @@ let suite =
         test_lock_asks_from_the_holder_leave_no_descriptor;
       Alcotest.test_case "asks during a hold keep one descriptor" `Quick
         test_lock_asks_during_a_hold_keep_one_descriptor;
+      Alcotest.test_case "asks while the holder lets go answer" `Quick
+        test_lock_asks_while_the_holder_lets_go;
       Alcotest.test_case "a probe names the holding process" `Quick
         test_probe_names_the_holding_process;
       Alcotest.test_case "a probe from the holder keeps its hold" `Quick
