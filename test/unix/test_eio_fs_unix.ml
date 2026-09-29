@@ -1048,6 +1048,44 @@ let test_lock_asks_from_the_holder_leave_no_descriptor () =
   Alcotest.(check int)
     "descriptors open once the hold ends" before (open_descriptors ())
 
+(* The descriptors this process holds open on [lock]'s file, each of [/dev/fd]
+   matched by inode: macOS's [/dev/fd] reports its own device for each. *)
+let descriptors_on lock =
+  let ino = (Unix.stat (Eio.Path.native_exn lock)).st_ino in
+  Sys.readdir "/dev/fd"
+  |> Array.fold_left
+       (fun n fd ->
+         match Unix.stat (Filename.concat "/dev/fd" fd) with
+         | { st_kind = Unix.S_REG; st_ino; _ } when st_ino = ino -> n + 1
+         | _ | (exception Unix.Unix_error _) -> n)
+       0
+
+(* A holder that holds for the life of its process, as a server holds its
+   serve lock, is asked again and again from that process: every ask leaves
+   the process with the holder's one descriptor on the file, never one more,
+   so the asks of a long life cannot reach the descriptor limit. *)
+let test_lock_asks_during_a_hold_keep_one_descriptor () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lock" in
+  Eio_fs_unix.with_lock ~contents:"held for life\n" lock @@ fun () ->
+  for round = 1 to 5 do
+    (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
+    | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
+    | exception Eio_fs_unix.Lock_unavailable _ -> ());
+    (match Eio_fs_unix.with_lock ~block:(`For 0.01) lock (fun () -> ()) with
+    | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
+    | exception Eio_fs_unix.Lock_unavailable _ -> ());
+    (match Eio_fs_unix.probe lock with
+    | `Free _ ->
+        Alcotest.fail "a lock a fiber of this process holds probed free"
+    | `Held refused ->
+        Alcotest.(check string)
+          "the holder's record" "held for life\n" refused.record);
+    Alcotest.(check int)
+      (Fmt.str "descriptors on the lock file after %d rounds of asks" round)
+      1 (descriptors_on lock)
+  done
+
 (* ---- a probe says who holds a lock without taking it ----
 
    Asking by acquiring answers "free" only by holding the lock for a moment,
@@ -2431,6 +2469,8 @@ let suite =
         test_lock_bounded_wait_in_the_holder_keeps_its_hold;
       Alcotest.test_case "asks from the holder leave no descriptor" `Quick
         test_lock_asks_from_the_holder_leave_no_descriptor;
+      Alcotest.test_case "asks during a hold keep one descriptor" `Quick
+        test_lock_asks_during_a_hold_keep_one_descriptor;
       Alcotest.test_case "a probe names the holding process" `Quick
         test_probe_names_the_holding_process;
       Alcotest.test_case "a probe from the holder keeps its hold" `Quick
