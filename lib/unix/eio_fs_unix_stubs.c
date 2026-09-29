@@ -60,6 +60,35 @@ CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
   return Val_unit;
 }
 
+/* The first [len] bytes of the file [fd] reads, or fewer where it ends, read
+   with pread(2) so the descriptor's offset is left where its owner put it. */
+CAMLprim value caml_eio_fs_pread_head(value fd_v, value len_v)
+{
+  CAMLparam2(fd_v, len_v);
+  CAMLlocal1(result);
+  size_t len = Long_val(len_v);
+  char *buf = malloc(len > 0 ? len : 1);
+  if (buf == NULL)
+    caml_raise_out_of_memory();
+  size_t got = 0;
+  while (got < len) {
+    ssize_t n = pread(Int_val(fd_v), buf + got, len - got, (off_t)got);
+    if (n == -1 && errno == EINTR)
+      continue;
+    if (n == -1) {
+      int saved_errno = errno;
+      free(buf);
+      caml_unix_error(saved_errno, "pread", Nothing);
+    }
+    if (n == 0)
+      break;
+    got += n;
+  }
+  result = caml_alloc_initialized_string(got, buf);
+  free(buf);
+  CAMLreturn(result);
+}
+
 /* The process holding a record lock that would refuse an exclusive lock over
    the whole file (POSIX fcntl F_GETLK), or 0 when none does. F_GETLK answers
    about other processes only: this process's own locks never conflict. */

@@ -9,6 +9,9 @@ external darwin_full_fsync : Unix.file_descr -> unit
 external record_lock_holder : Unix.file_descr -> int
   = "caml_eio_fs_record_lock_holder"
 
+external pread_head : Unix.file_descr -> int -> string
+  = "caml_eio_fs_pread_head"
+
 let rec retry_eintr f fd =
   match f fd with
   | () -> ()
@@ -267,6 +270,15 @@ let read_record file =
   | got -> Cstruct.to_string ~len:got buf
   | exception Eio.Io _ -> ""
 
+(* The holder's record read through [file], or through [unix], the Unix
+   descriptor an ask keeps open with [Eio_unix.Fd.use]: an Eio read would take
+   a use of its own, which a close by the holder refuses even while the ask's
+   use keeps the descriptor open. *)
+let read_held_record file = function
+  | None -> read_record file
+  | Some unix -> (
+      try pread_head unix record_bound with Unix.Unix_error _ -> "")
+
 (* A fiber holder is this process; another process's hold is named by the
    kernel, and [None] means it let go before it could be asked. *)
 let refusal ~name ~holder file =
@@ -383,9 +395,11 @@ let set_held_file local file =
 
 (* [fn file fd] over the holder's descriptor, kept open for the call, with
    [fd] its Unix descriptor when it has one; [otherwise ()] when no fiber
-   holds the file with a descriptor open, or the holder let go of it. An ask
-   from this process answered here opens nothing, so it leaves nothing parked
-   with the holder, however long the holder holds. *)
+   holds the file with a descriptor open, or the holder let go of it. [fn]
+   reads through [fd] when there is one ({!read_held_record}), since the
+   holder may close [file] during the call. An ask from this process answered
+   here opens nothing, so it leaves nothing parked with the holder, however
+   long the holder holds. *)
 let with_held_file local ~otherwise fn =
   let file =
     Stdlib.Mutex.protect tables_mutex @@ fun () ->
@@ -404,9 +418,7 @@ let with_held_file local ~otherwise fn =
    holder's descriptor. *)
 let refused_by_a_fiber ~name local =
   let record =
-    with_held_file local
-      ~otherwise:(fun () -> "")
-      (fun file _ -> read_record file)
+    with_held_file local ~otherwise:(fun () -> "") read_held_record
   in
   Lock_unavailable { path = name; holder = held_by_a_fiber (); record }
 
@@ -841,7 +853,9 @@ let probe path =
                   | Some _ as another -> another
                   | None -> held_by_a_fiber ()
                 in
-                Some (`Held { path = name; holder; record = read_record file }))
+                Some
+                  (`Held
+                     { path = name; holder; record = read_held_record file fd }))
         )
   in
   match from_the_holder with
