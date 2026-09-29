@@ -657,6 +657,51 @@ let let_go steps =
 (* The name was given to another file between its key and its open. *)
 exception Renamed
 
+(* The key of the file the name holds, read before anything is opened; a
+   name that holds nothing yet is opened (or created) first and keyed by its
+   descriptor, which is returned with it. *)
+let key_of_name ~taken ~name path open_rendezvous =
+  in_entry_order name @@ fun () ->
+  match named_key ~name path with
+  | Some key -> (key, None)
+  | None ->
+      let file, (opened : Eio.File.Stat.t) = open_rendezvous () in
+      taken (fun () -> Eio.Resource.close file);
+      ((opened.dev, opened.ino), Some (file, opened))
+
+(* The rendezvous opened once the mutex is held, which must be the file
+   [key] names: a name given to another file in between raises [Renamed]. *)
+let open_keyed ~taken ~key open_rendezvous =
+  let file, (opened : Eio.File.Stat.t) = open_rendezvous () in
+  let opened_key = (opened.dev, opened.ino) in
+  if opened_key <> key then (
+    (* Another fiber of this process may hold the file now named. *)
+    use_local_lock opened_key (fun other -> let_go_of other file);
+    Eio.Resource.close file;
+    raise_notrace Renamed);
+  taken (fun () -> Eio.Resource.close file);
+  (file, opened)
+
+(* The record lock on the rendezvous's descriptor. A rendezvous with none has
+   no record lock to take, which only a process-local backend allows. *)
+let take_record_lock ~taken ~patience ~name file path =
+  match Eio_unix.Resource.fd_opt file with
+  | Some fd ->
+      take_os_lock ~patience
+        ~refused:(fun () ->
+          let holder =
+            Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd held_by_a_process
+          in
+          refusal ~name ~holder file)
+        ~on_taken:(fun () -> taken (fun () -> os_unlock fd))
+        fd
+  | None ->
+      if not (Eio_fs_sync.is_process_local (fst path)) then
+        Fmt.invalid_arg
+          "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
+           descriptor and its backend registers no Eio_fs_sync.Process_local"
+          name
+
 (* The mutex is keyed by the file the name holds, read before anything is
    opened, so an ask that waits for or is refused by a fiber of this process
    opens no descriptor to leave with the holder: POSIX drops the record lock
@@ -682,15 +727,7 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
   match
     Eio.Switch.run @@ fun budget_sw ->
     let fibers, processes = block_patience ~sw:budget_sw block in
-    let key, opened_first =
-      in_entry_order name @@ fun () ->
-      match named_key ~name path with
-      | Some key -> (key, None)
-      | None ->
-          let file, opened = open_rendezvous () in
-          taken (fun () -> Eio.Resource.close file);
-          ((opened.dev, opened.ino), Some (file, opened))
-    in
+    let key, opened_first = key_of_name ~taken ~name path open_rendezvous in
     let local = shared_mutex local_locks key in
     taken (fun () -> done_with_shared_mutex local_locks key local);
     let entered = ref false in
@@ -712,35 +749,11 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     let file, (opened : Eio.File.Stat.t) =
       match opened_first with
       | Some opened -> opened
-      | None ->
-          let file, opened = open_rendezvous () in
-          let opened_key = (opened.dev, opened.ino) in
-          if opened_key <> key then (
-            (* Another fiber of this process may hold the file now named. *)
-            use_local_lock opened_key (fun other -> let_go_of other file);
-            Eio.Resource.close file;
-            raise_notrace Renamed);
-          taken (fun () -> Eio.Resource.close file);
-          (file, opened)
+      | None -> open_keyed ~taken ~key open_rendezvous
     in
     set_held_file local (Some (file :> Eio.File.ro_ty Eio.Resource.t));
     taken (fun () -> set_held_file local None);
-    (match Eio_unix.Resource.fd_opt file with
-    | Some fd ->
-        take_os_lock ~patience:processes
-          ~refused:(fun () ->
-            let holder =
-              Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd held_by_a_process
-            in
-            refusal ~name ~holder file)
-          ~on_taken:(fun () -> taken (fun () -> os_unlock fd))
-          fd
-    | None ->
-        if not (Eio_fs_sync.is_process_local (fst path)) then
-          Fmt.invalid_arg
-            "Eio_fs_unix.with_lock: %s: the rendezvous carries no Unix file \
-             descriptor and its backend registers no Eio_fs_sync.Process_local"
-            name);
+    take_record_lock ~taken ~patience:processes ~name file path;
     settle ~name ~opened ~contents ~file path;
     file
   with
