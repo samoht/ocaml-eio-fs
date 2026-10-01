@@ -1508,11 +1508,16 @@ module Crash = struct
         else Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs)
       states
 
+  (* After the crash nothing reaches the store: a killed process does nothing
+     more, so every operation through the wrapper fails, a directory operation
+     as a read or a write does. *)
+  let live d = if d.dctl.crashed then raise_power_lost ()
+
   module Cdir_impl = struct
     type t = cdir
 
     let open_in d ~sw path =
-      if d.dctl.crashed then raise_power_lost ();
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let fs =
         Hashtbl.find_opt d.dctl.files (file_key d.droot (at d.dprefix path))
@@ -1520,7 +1525,7 @@ module Crash = struct
       wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw path)
 
     let open_out d ~sw ~append ~create path =
-      if d.dctl.crashed then raise_power_lost ();
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = at d.dprefix path in
       let key = file_key d.droot rel in
@@ -1554,17 +1559,19 @@ module Crash = struct
       wrap_cfile_rw d.dctl fs base
 
     let open_subtree d ~sw path =
-      if d.dctl.crashed then raise_power_lost ();
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let sub = B.open_subtree bv ~sw path in
       !crash_dir_hook d.dctl ~root:d.droot ~prefix:(at d.dprefix path)
         ~base:(sub :> Eio.Fs.dir_ty r)
 
     let stat d ~follow path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.stat bv ~follow path
 
     let mkdir d ~perm path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.mkdir bv ~perm path;
       let rel = at d.dprefix path in
@@ -1572,14 +1579,17 @@ module Crash = struct
       bump_metadata d.dctl ~path:rel ~kind:Mkdir
 
     let read_dir d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.read_dir bv path
 
     let with_dir_entries d path fn =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.with_dir_entries bv path fn
 
     let unlink d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.unlink bv path;
       let rel = at d.dprefix path in
@@ -1588,6 +1598,7 @@ module Crash = struct
       bump_metadata d.dctl ~path:rel ~kind:Unlink
 
     let rmdir d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.rmdir bv path;
       let rel = at d.dprefix path in
@@ -1595,6 +1606,7 @@ module Crash = struct
       bump_metadata d.dctl ~path:rel ~kind:Rmdir
 
     let rename_with exclusive d old_path new_dir new_path =
+      live d;
       let (Eio.Resource.T (nv, nops)) = new_dir in
       let target_cdir =
         Option.map (fun f -> f nv) (Eio.Resource.get_opt nops Crash_dir)
@@ -1631,14 +1643,15 @@ module Crash = struct
       rename_with None d old_path new_dir new_path
 
     let rename_exclusive d backend ~source ~target:(new_dir, new_path) =
-      if d.dctl.crashed then raise_power_lost ();
       rename_with (Some backend) d source new_dir new_path
 
     let read_link d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.read_link bv path
 
     let symlink ~link_to d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.symlink ~link_to bv path;
       let rel = at d.dprefix path in
@@ -1647,10 +1660,12 @@ module Crash = struct
       bump_metadata d.dctl ~path:rel ~kind
 
     let chmod d ~follow ~perm path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.chmod bv ~follow ~perm path
 
     let chown ~follow ?uid ?gid d path =
+      live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.chown ~follow ?uid ?gid bv path
 

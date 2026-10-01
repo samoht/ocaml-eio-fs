@@ -240,8 +240,10 @@ module Crash : sig
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per
       {!policy} and rewrites the base to it. A second call does nothing. After a
-      crash, reads, writes and syncs through the wrapper fail with an {!Eio.Io}
-      exception ("power lost"); re-read through {!post_crash}. *)
+      crash, every operation through the wrapper (a read, a write, a sync, an
+      open, a stat or a directory operation) fails with an {!Eio.Io} exception
+      ("power lost") and leaves the image as it is; re-read through
+      {!post_crash}. *)
 
   val is_crashed : t -> bool
   (** [is_crashed t] is [true] once a crash has fired. *)
