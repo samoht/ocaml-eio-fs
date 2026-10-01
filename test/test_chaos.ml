@@ -998,6 +998,36 @@ let test_crash_nth_op_counts_dir_ops () =
   Eio.Path.mkdir ~perm:0o755 (fs / "d");
   Alcotest.(check bool) "mkdir fired the trigger" true (Crash.is_crashed ctl)
 
+(* After the crash fires nothing reaches the store: a directory operation
+   through the dead wrapper fails as a read or a write does, and the image is
+   the one the crash left. A process killed at that point does nothing more
+   either, so a cleanup handler the failure runs cannot undo the crash. *)
+let test_crash_stops_directory_ops () =
+  let ctl =
+    Crash.v ~policy:(Crash.Survive (fun _ -> true)) ~trigger:(Crash.Nth_op 4) ()
+  in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "x") "x";
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.mkdir ~perm:0o755 (fs / "e");
+  Alcotest.(check bool)
+    "the fourth op fired the trigger" true (Crash.is_crashed ctl);
+  let refused label f =
+    Alcotest.(check bool)
+      label true
+      (match f () with () -> false | exception Eio.Io _ -> true)
+  in
+  refused "unlink fails" (fun () -> Eio.Path.unlink (fs / "x"));
+  refused "rmdir fails" (fun () -> Eio.Path.rmdir (fs / "e"));
+  refused "rename fails" (fun () -> Eio.Path.rename (fs / "d") (fs / "moved"));
+  refused "mkdir fails" (fun () -> Eio.Path.mkdir ~perm:0o755 (fs / "f"));
+  refused "symlink fails" (fun () -> Eio.Path.symlink ~link_to:"x" (fs / "l"));
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "x kept" "x" (Eio.Path.load (post / "x"));
+  Alcotest.(check (list string))
+    "the image the crash left" [ "d"; "e"; "x" ]
+    (List.sort String.compare (Eio.Path.read_dir post))
+
 (* The pending-change listing names directory operations in program order. *)
 let test_crash_unsynced_lists_dir_ops () =
   let ctl = Crash.v ~policy:Drop_unsynced () in
@@ -1459,6 +1489,8 @@ let suite =
         test_crash_survive_prefix_rule;
       Alcotest.test_case "crash: nth-op counts dir ops" `Quick
         test_crash_nth_op_counts_dir_ops;
+      Alcotest.test_case "crash: no directory op after the crash" `Quick
+        test_crash_stops_directory_ops;
       Alcotest.test_case "crash: unsynced lists dir ops" `Quick
         test_crash_unsynced_lists_dir_ops;
       Alcotest.test_case "crash: dir sync leaves its own entry pending" `Quick
