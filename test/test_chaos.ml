@@ -998,6 +998,27 @@ let test_crash_nth_op_counts_dir_ops () =
   Eio.Path.mkdir ~perm:0o755 (fs / "d");
   Alcotest.(check bool) "mkdir fired the trigger" true (Crash.is_crashed ctl)
 
+(* A file whose bytes were synced and whose name a barrier on its directory
+   made durable keeps its bytes, even behind an older operation in another
+   directory still pending: the image a crash rebuilds from that pending
+   entry holds the file, so it must hold the file's bytes too. *)
+let test_crash_synced_file_behind_older_pending_entry () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d1");
+  Eio.Path.mkdir ~perm:0o755 (fs / "d2");
+  Crash.sync_metadata ctl;
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "d2" / "b") "b";
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+    (fs / "d1" / "a")
+    (fun f ->
+      Eio.Flow.copy_string "a" f;
+      Eio.File.sync f);
+  Eio_fs_sync.sync_dir (fs / "d1");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "a's bytes" "a" (Eio.Path.load (post / "d1" / "a"));
+  Alcotest.(check string) "b's bytes" "b" (Eio.Path.load (post / "d2" / "b"))
+
 (* After the crash fires nothing reaches the store: a directory operation
    through the dead wrapper fails as a read or a write does, and the image is
    the one the crash left. A process killed at that point does nothing more
@@ -1491,6 +1512,8 @@ let suite =
         test_crash_nth_op_counts_dir_ops;
       Alcotest.test_case "crash: no directory op after the crash" `Quick
         test_crash_stops_directory_ops;
+      Alcotest.test_case "crash: a synced file behind an older pending entry"
+        `Quick test_crash_synced_file_behind_older_pending_entry;
       Alcotest.test_case "crash: unsynced lists dir ops" `Quick
         test_crash_unsynced_lists_dir_ops;
       Alcotest.test_case "crash: dir sync leaves its own entry pending" `Quick
