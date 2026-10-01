@@ -1173,11 +1173,23 @@ module Crash = struct
                 in
                 ctl.durable_tree <- Some durable;
                 ctl.durable_locations <- locations ctl;
+                (* A rebased entry's image holds every durable file, so it
+                   names each one to rewrite, a file made after the entry was
+                   recorded included. *)
+                let with_durable own =
+                  own
+                  @ List.filter
+                      (fun (fs, _, _) ->
+                        not (List.exists (fun (fs', _, _) -> fs' == fs) own))
+                      ctl.durable_locations
+                in
                 let _, rebased =
                   List.fold_left
                     (fun (tree, acc) e ->
                       let tree = apply_delta tree e.delta in
-                      (tree, { e with tree } :: acc))
+                      ( tree,
+                        { e with tree; locations = with_durable e.locations }
+                        :: acc ))
                     (durable, []) pending
                 in
                 ctl.metadata <- rebased))
