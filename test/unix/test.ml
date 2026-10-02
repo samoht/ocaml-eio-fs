@@ -53,4 +53,4 @@ let () =
   | [ _; arg ] when String.equal arg lease_test_arg ->
       Sys.argv.(1) <- "test";
       Alcotest.run "eio-fs.unix.lease" [ Test_eio_fs_unix.lease_suite ]
-  | _ -> Alcotest.run "eio-fs.unix" [ Test_eio_fs_unix.suite ]
+  | _ -> Alcotest.run "eio-fs.unix" [ Test_eio_fs_unix.suite; Test_link.suite ]

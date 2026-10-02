@@ -369,3 +369,33 @@ val set_xattr : _ Eio.Path.t -> string -> string -> unit
     @raise Invalid_argument
       if [path] has no native Unix representation or [path] or [name] holds a
       NUL byte. *)
+
+module Link : sig
+  type t
+  type publication = Created | Present
+
+  val with_parent :
+    ?mkdir:int ->
+    root:_ Eio.Path.t ->
+    path:string ->
+    (t -> ('a, string) result) ->
+    ('a, string) result
+  (** [with_parent ~root ~path fn] opens each parent component of [path] beneath
+      [root] with [O_DIRECTORY | O_NOFOLLOW], then calls [fn] with the held
+      parent and final basename. [path] must be canonical and relative, with no
+      empty, dot, dot-dot or NUL components. [mkdir] permits missing parents to
+      be created with the given mode, subject to the process umask. Created
+      parents survive a later refusal.
+
+      The handle is closed when [fn] returns and must not escape its scope. A
+      renamed parent remains the held directory; this does not promise that its
+      original textual path still names it. [root] is the caller's chosen
+      capability, resolved once before descending. *)
+
+  val publish : t -> target:string -> (publication, string) result
+  (** [publish parent ~target] atomically creates an absent symbolic link using
+      [symlinkat]. An existing link holding exactly [target] is observed as
+      {!constructor-Present}; no filesystem immutability is implied. Every other
+      existing entry is refused without replacing it. Errors name the original
+      path and the action needed to retry. *)
+end

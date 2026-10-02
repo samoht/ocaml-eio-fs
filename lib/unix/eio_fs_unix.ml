@@ -240,6 +240,17 @@ module Rename_backend = Eio_fs_sync.Rename.Make (Exclusive_rename)
 
 let exclusive_rename = Rename_backend.v ()
 
+module Link = struct
+  type t = unit
+  type publication = Created | Present
+
+  let with_parent ?mkdir:_ ~root:_ ~path:_ _ =
+    failwith "Eio_fs_unix.Link.with_parent is not implemented"
+
+  let publish _ ~target:_ =
+    failwith "Eio_fs_unix.Link.publish is not implemented"
+end
+
 type refusal = { path : string; holder : int option; record : string }
 
 exception Lock_unavailable of refusal
