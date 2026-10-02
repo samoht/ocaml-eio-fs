@@ -124,13 +124,13 @@ let test_parent_file () =
 let test_nested_link () =
   with_dir @@ fun root ->
   Eio.Path.mkdir ~perm:0o755 (root / "packages");
-  Eio.Path.mkdir ~perm:0o755 (root / "outside");
-  Eio.Path.symlink ~link_to:"../outside" (root / "packages/nested");
+  Eio.Path.mkdir ~perm:0o755 (root / "packages/outside");
+  Eio.Path.symlink ~link_to:"outside" (root / "packages/nested");
   refusal root "packages/nested/library"
     (publish ~mkdir:0o755 root "packages/nested/library" "/selected");
   Alcotest.(check (list string))
     "outside stays empty" []
-    (Eio.Path.read_dir (root / "outside"))
+    (Eio.Path.read_dir (root / "packages/outside"))
 
 let test_directory_leaf () =
   with_dir @@ fun root ->
