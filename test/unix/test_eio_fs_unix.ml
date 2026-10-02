@@ -742,6 +742,30 @@ let await_holder child =
   | `Exited n -> Alcotest.failf "lock holder exited %d" n
   | `Signaled n -> Alcotest.failf "lock holder took signal %d" n
 
+let with_held_lock ~sw ~env ~clock ~lock fn =
+  let manager = Eio.Stdenv.process_mgr env in
+  let input, release = Eio.Process.pipe ~sw manager in
+  let ready, output = Eio.Process.pipe ~sw manager in
+  let self = Sys.executable_name in
+  let child =
+    Eio.Process.spawn ~sw manager ~stdin:input ~stdout:output ~executable:self
+      [ self; "--hold-eio-fs-lock-until-release"; Eio.Path.native_exn lock ]
+  in
+  Eio.Resource.close input;
+  Eio.Resource.close output;
+  let announced = Cstruct.create 1 in
+  Eio.Time.with_timeout_exn clock 10.0 (fun () ->
+      Eio.Flow.read_exact ready announced);
+  Alcotest.(check char)
+    "holder acquired the native lock" 'R'
+    (Cstruct.get_char announced 0);
+  Fun.protect
+    ~finally:(fun () ->
+      Eio.Flow.copy_string "X" release;
+      Eio.Resource.close release;
+      Eio.Time.with_timeout_exn clock 10.0 (fun () -> await_holder child))
+    fn
+
 let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -1947,10 +1971,7 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
-      ~ready:(dir / "ready") ~seconds:"0.25"
-  in
+  with_held_lock ~sw ~env ~clock ~lock:(dir / "lock") @@ fun () ->
   let wrapped = Crash.wrap (Crash.v ~policy:Drop_unsynced ()) dir in
   let file =
     Eio.Path.open_out ~sw ~create:(`If_missing 0o600) (wrapped / "probe")
@@ -1958,7 +1979,7 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
   Alcotest.(check bool)
     "a file opened through the wrapper carries the host's descriptor" true
     (Option.is_some (Eio_unix.Resource.fd_opt file));
-  (match Eio_fs_unix.with_lock ~block:`No (wrapped / "lock") (fun () -> ()) with
+  match Eio_fs_unix.with_lock ~block:`No (wrapped / "lock") (fun () -> ()) with
   | () ->
       Alcotest.fail
         "a wrapped rendezvous was locked while another process held its file"
@@ -1966,8 +1987,7 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
       Alcotest.(check string)
         "the refusal names the host file the lock is held on"
         (Eio.Path.native_exn (dir / "lock"))
-        path);
-  await_holder child
+        path
 
 (* What a lock writes is a write like any other: [~contents] goes through the
    wrapper's own file, so the crash model sees it and the policy decides
