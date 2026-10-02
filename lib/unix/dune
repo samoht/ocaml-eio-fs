@@ -16,6 +16,7 @@
   eio.unix
   eio_posix
   eio-fs
+  eio-fs.path
   eio-fs.sync
   cstruct
   fmt

@@ -241,14 +241,107 @@ module Rename_backend = Eio_fs_sync.Rename.Make (Exclusive_rename)
 let exclusive_rename = Rename_backend.v ()
 
 module Link = struct
-  type t = unit
+  module Low = Eio_posix.Low_level
+
+  type t = { parent : Eio_unix.Fd.t; name : string; path : string }
   type publication = Created | Present
 
-  let with_parent ?mkdir:_ ~root:_ ~path:_ _ =
-    failwith "Eio_fs_unix.Link.with_parent is not implemented"
+  let err_refused path reason =
+    Fmt.kstr
+      (fun message -> Error message)
+      "cannot publish symbolic link %s: %s; repair or remove the conflicting \
+       entry before retrying"
+      path reason
 
-  let publish _ ~target:_ =
-    failwith "Eio_fs_unix.Link.publish is not implemented"
+  let components path =
+    if Eio_fs_path.is_abs path then Error "expected a relative path"
+    else
+      match Eio_fs_path.canonical ("/" ^ path) with
+      | Ok parts -> Ok parts
+      | Error _ -> Error "expected a non-empty canonical path without NUL"
+
+  let with_parent ?mkdir ~root ~path fn =
+    let original = Eio_fs.Path.name Eio.Path.(root / path) in
+    match components path with
+    | Error reason -> err_refused original reason
+    | Ok components -> (
+        Eio.Switch.run @@ fun sw ->
+        let open_parent () =
+          let directory = Eio.Path.open_dir ~sw root in
+          let file = Eio.Path.open_in ~sw directory in
+          let descriptor =
+            match Eio_unix.Resource.fd_opt file with
+            | Some fd -> fd
+            | None ->
+                invalid_arg
+                  "Eio_fs_unix.Link.with_parent: native directory required"
+          in
+          let rec descend fd = function
+            | [] -> assert false
+            | [ name ] -> { parent = fd; name; path = original }
+            | name :: rest ->
+                let parent = Low.Fd fd in
+                let open_component () =
+                  Low.openat ~sw ~mode:0 parent name
+                    Low.Open_flags.(rdonly + directory + nofollow)
+                in
+                let next =
+                  match open_component () with
+                  | opened -> opened
+                  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> (
+                      match mkdir with
+                      | None ->
+                          raise (Unix.Unix_error (Unix.ENOENT, "openat", name))
+                      | Some mode ->
+                          (try Low.mkdir ~mode parent name
+                           with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+                          open_component ())
+                in
+                descend next rest
+          in
+          descend descriptor components
+        in
+        let opened =
+          match open_parent () with
+          | handle -> Ok handle
+          | exception Unix.Unix_error (code, operation, argument) ->
+              err_refused original
+                (Fmt.str "%s %s: %s" operation argument
+                   (Unix.error_message code))
+          | exception (Eio.Io _ as ex) ->
+              err_refused original (Printexc.to_string ex)
+        in
+        match opened with Error _ as error -> error | Ok handle -> fn handle)
+
+  let publish t ~target =
+    let parent = Low.Fd t.parent in
+    let existing () =
+      let stat = Low.create_stat () in
+      Low.fstatat ~buf:stat ~follow:false parent t.name;
+      match Low.kind stat with
+      | `Symbolic_link ->
+          let held = Low.read_link parent t.name in
+          if String.equal held target then Ok Present
+          else
+            err_refused t.path
+              (Fmt.str "symbolic link points at %S, expected %S" held target)
+      | `Regular_file -> err_refused t.path "regular file already exists"
+      | `Directory -> err_refused t.path "directory already exists"
+      | _ -> err_refused t.path "foreign filesystem entry already exists"
+    in
+    if String.equal target "" || String.contains target '\000' then
+      err_refused t.path "target must be non-empty and contain no NUL"
+    else
+      match
+        match Low.symlink ~link_to:target parent t.name with
+        | () -> Ok Created
+        | exception Unix.Unix_error (Unix.EEXIST, _, _) -> existing ()
+      with
+      | result -> result
+      | exception Unix.Unix_error (code, operation, argument) ->
+          err_refused t.path
+            (Fmt.str "%s %s: %s" operation argument (Unix.error_message code))
+      | exception (Eio.Io _ as ex) -> err_refused t.path (Printexc.to_string ex)
 end
 
 type refusal = { path : string; holder : int option; record : string }
