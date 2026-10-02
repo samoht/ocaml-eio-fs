@@ -38,6 +38,7 @@ let raise_io code ctx = raise (Eio.Exn.create (Eio.Exn.X (backend code ctx)))
 module Fault = struct
   type kind =
     [ `Short_read
+    | `Read_error
     | `Short_write
     | `Torn_write
     | `Write_error
@@ -49,6 +50,7 @@ module Fault = struct
   type t =
     | Short_read of int
         (** Deliver at most [n] bytes of the requested read ([n >= 1]). *)
+    | Read_error of code  (** Deliver nothing, raise a read error. *)
     | Short_write of int
         (** Accept at most [n] bytes of the offered write ([n >= 1]). *)
     | Torn_write of int
@@ -71,6 +73,7 @@ module Fault = struct
     | Short_write x, Short_write y
     | Torn_write x, Torn_write y ->
         x = y
+    | Read_error x, Read_error y
     | Write_error x, Write_error y
     | Sync_error x, Sync_error y
     | Open_error x, Open_error y
@@ -81,6 +84,7 @@ module Fault = struct
 
   let pp ppf = function
     | Short_read n -> Fmt.pf ppf "short-read(%d)" n
+    | Read_error c -> Fmt.pf ppf "read-error(%s)" (code_name c)
     | Short_write n -> Fmt.pf ppf "short-write(%d)" n
     | Torn_write n -> Fmt.pf ppf "torn-write(%d)" n
     | Write_error c -> Fmt.pf ppf "write-error(%s)" (code_name c)
@@ -154,6 +158,7 @@ module Schedule = struct
   let all_kinds =
     [
       `Short_read;
+      `Read_error;
       `Short_write;
       `Torn_write;
       `Write_error;
@@ -183,7 +188,7 @@ module Schedule = struct
 
   let applies_to (kind : Op.kind) (fk : Fault.kind) =
     match (kind, fk) with
-    | `Read, `Short_read -> true
+    | `Read, (`Short_read | `Read_error) -> true
     | `Write, (`Short_write | `Torn_write | `Write_error) -> true
     | `Sync, `Sync_error -> true
     | `Open, `Open_error -> true
@@ -199,6 +204,7 @@ module Schedule = struct
 
   let build_fault rng (op : Op.t) : Fault.kind -> Fault.t = function
     | `Short_read -> Short_read (split_count rng op.length)
+    | `Read_error -> Read_error `Eio
     | `Short_write -> Short_write (split_count rng op.length)
     | `Torn_write -> Torn_write (split_count rng op.length)
     | `Write_error -> Write_error `Enospc
@@ -319,6 +325,7 @@ let do_single_read sched path ~pos (base : Eio.File.ro_ty r) buf =
   let op = Op.read path ~offset:!pos ~len in
   let buf =
     match Schedule.next sched op with
+    | Some (Fault.Read_error c) -> raise_io c path
     | Some (Fault.Short_read n) -> Cstruct.sub buf 0 (clamp 1 len n)
     | _ -> buf
   in
@@ -331,6 +338,7 @@ let do_pread sched path (base : Eio.File.ro_ty r) ~file_offset bufs =
   let op = Op.read path ~offset:(Optint.Int63.to_int file_offset) ~len in
   let bufs =
     match Schedule.next sched op with
+    | Some (Fault.Read_error c) -> raise_io c path
     | Some (Fault.Short_read n) -> take_v (clamp 1 len n) bufs
     | _ -> bufs
   in

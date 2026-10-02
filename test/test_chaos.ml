@@ -46,6 +46,51 @@ let test_short_read () =
     "first 3 bytes correct" "hel"
     (Cstruct.to_string (Cstruct.sub buf 0 got))
 
+let test_read_error positional () =
+  let observed = ref [] in
+  let schedule =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Read; path = "f" };
+          fault = Read_error `Eio;
+        };
+      ]
+  in
+  let sched =
+    Schedule.observing
+      (fun op -> if op.Op.kind = `Read then observed := op :: !observed)
+      schedule
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "f") "hello";
+  Eio.Path.with_open_in (chaos / "f") @@ fun file ->
+  let buf = Cstruct.create 3 in
+  let read () =
+    if positional then Eio.File.pread file ~file_offset:(i63 1) [ buf ]
+    else Eio.Flow.single_read file buf
+  in
+  expect_io "read failure" (fun () -> ignore (read ()));
+  Alcotest.(check string)
+    "failure delivers no bytes" "\000\000\000" (Cstruct.to_string buf);
+  Alcotest.(check string)
+    "read fault consumed once" "scripted(0 rules)"
+    (Fmt.str "%a" Schedule.pp schedule);
+  (match !observed with
+  | [ op ] ->
+      Alcotest.(check string) "read retains opened path" "f" op.Op.path;
+      Alcotest.(check int)
+        "requested read offset"
+        (if positional then 1 else 0)
+        op.Op.file_offset;
+      Alcotest.(check int) "requested read length" 3 op.Op.length
+  | _ -> Alcotest.fail "expected exactly one observed read");
+  Alcotest.(check int) "next read reaches unchanged data" 3 (read ());
+  Alcotest.(check string)
+    "failed read preserves streaming cursor"
+    (if positional then "ell" else "hel")
+    (Cstruct.to_string buf)
+
 let test_short_write () =
   let sched =
     Schedule.scripted
@@ -1456,6 +1501,8 @@ let suite =
   ( "chaos",
     [
       Alcotest.test_case "short read" `Quick test_short_read;
+      Alcotest.test_case "streaming read error" `Quick (test_read_error false);
+      Alcotest.test_case "positional read error" `Quick (test_read_error true);
       Alcotest.test_case "short write" `Quick test_short_write;
       Alcotest.test_case "torn write" `Quick test_torn_write;
       Alcotest.test_case "write error" `Quick test_write_error;

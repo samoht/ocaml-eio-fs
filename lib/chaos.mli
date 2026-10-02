@@ -19,6 +19,7 @@ type code = [ `Enoent | `Eacces | `Enospc | `Eio ]
 module Fault : sig
   type kind =
     [ `Short_read
+    | `Read_error
     | `Short_write
     | `Torn_write
     | `Write_error
@@ -33,6 +34,7 @@ module Fault : sig
     | Short_read of int
         (** Deliver at most [n] bytes of the requested read ([n >= 1]), forcing
             the caller to loop. *)
+    | Read_error of code  (** Deliver nothing, raise a read error. *)
     | Short_write of int
         (** Accept at most [n] bytes of the offered write ([n >= 1]), forcing
             the caller to loop. *)
