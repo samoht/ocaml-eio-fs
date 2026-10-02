@@ -98,6 +98,19 @@ let test_read_error positional () =
     (if positional then "ell" else "hel")
     (Cstruct.to_string buf)
 
+let test_seeded_read_error positional () =
+  let sched =
+    Schedule.seeded ~probability:1. ~kinds:[ `Read_error ] ~seed:29 ()
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "f") "hello";
+  Eio.Path.with_open_in (chaos / "f") @@ fun file ->
+  let buf = Cstruct.create 3 in
+  expect_io "seeded read failure" (fun () ->
+      ignore
+        (if positional then Eio.File.pread file ~file_offset:(i63 1) [ buf ]
+         else Eio.Flow.single_read file buf))
+
 let test_short_write () =
   let sched =
     Schedule.scripted
@@ -1509,6 +1522,10 @@ let suite =
     [
       Alcotest.test_case "short read" `Quick test_short_read;
       Alcotest.test_case "streaming read error" `Quick (test_read_error false);
+      Alcotest.test_case "seeded streaming read error" `Quick
+        (test_seeded_read_error false);
+      Alcotest.test_case "seeded positional read error" `Quick
+        (test_seeded_read_error true);
       Alcotest.test_case "positional read error" `Quick (test_read_error true);
       Alcotest.test_case "short write" `Quick test_short_write;
       Alcotest.test_case "torn write" `Quick test_torn_write;
