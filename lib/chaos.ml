@@ -374,6 +374,11 @@ let do_sync sched path (base : Eio.File.rw_ty r) =
   | Some (Fault.Sync_error c) -> raise_io c path
   | _ -> Eio.File.sync base
 
+let do_stat sched path (base : Eio.File.ro_ty r) =
+  match Schedule.next sched (Op.stat path) with
+  | Some (Fault.Stat_error c) -> raise_io c path
+  | _ -> Eio.File.stat base
+
 (* One record backs both wrappers. [ro] is always present (reads work on either
    kind); [rw] is present exactly when the file was opened read-write, and is
    the same underlying resource as [ro]. *)
@@ -395,7 +400,7 @@ module Ro_impl = struct
   let read_methods = []
   let single_read t buf = do_single_read t.sched t.path ~pos:t.pos t.ro buf
   let pread t ~file_offset bufs = do_pread t.sched t.path t.ro ~file_offset bufs
-  let stat t = Eio.File.stat t.ro
+  let stat t = do_stat t.sched t.path t.ro
   let seek t off cmd = Eio.File.seek t.ro off cmd
   let close t = close_resource t.ro
 end
@@ -411,7 +416,7 @@ module Rw_impl = struct
   let read_methods = []
   let single_read t buf = do_single_read t.sched t.path ~pos:t.pos t.ro buf
   let pread t ~file_offset bufs = do_pread t.sched t.path t.ro ~file_offset bufs
-  let stat t = Eio.File.stat t.ro
+  let stat t = do_stat t.sched t.path t.ro
   let seek t off cmd = Eio.File.seek t.ro off cmd
   let close t = close_resource t.ro
 
