@@ -42,6 +42,13 @@ let statvfs path =
   Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
   statvfs_native native
 
+external clone_tree_native : string -> string -> bool = "caml_eio_fs_clone_tree"
+
+let clone_tree src dst =
+  let src = Eio.Path.native_exn src and dst = Eio.Path.native_exn dst in
+  Eio_unix.run_in_systhread ~label:"eio-fs-clone-tree" @@ fun () ->
+  clone_tree_native src dst
+
 type extent = { logical : int64; physical : int64; length : int64 }
 
 external seek_data_native : Unix.file_descr -> int64 -> int64 option

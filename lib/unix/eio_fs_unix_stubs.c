@@ -26,6 +26,10 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <sys/clonefile.h>
+#endif
+
 #if defined(__linux__)
 #include <linux/fiemap.h>
 #include <linux/fs.h>
@@ -582,4 +586,37 @@ CAMLprim value caml_eio_fs_lsetxattr(value path_v, value name_v, value data_v)
   if (r == -1)
     caml_unix_error(saved_errno, "lsetxattr", path_v);
   CAMLreturn(Val_unit);
+}
+
+/* One clonefile(2) of a file, or of a directory and everything under it, into
+   a destination that does not exist. A platform or a file system that cannot
+   clone, or two volumes, answer false and write nothing; any other failure is
+   an error. The clone is owned by the caller (CLONE_NOOWNERCOPY), as a copy
+   it made would be. */
+CAMLprim value caml_eio_fs_clone_tree(value src_v, value dst_v)
+{
+  CAMLparam2(src_v, dst_v);
+  if (memchr(String_val(src_v), '\0', caml_string_length(src_v)) != NULL ||
+      memchr(String_val(dst_v), '\0', caml_string_length(dst_v)) != NULL)
+    caml_invalid_argument("Eio_fs_unix.clone_tree: NUL byte in path");
+  char *src = caml_stat_strdup(String_val(src_v));
+  char *dst = caml_stat_strdup(String_val(dst_v));
+  int r;
+  caml_release_runtime_system();
+#if defined(__APPLE__)
+  r = clonefile(src, dst, CLONE_NOOWNERCOPY);
+#else
+  errno = ENOTSUP;
+  r = -1;
+#endif
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(src);
+  caml_stat_free(dst);
+  if (r == 0)
+    CAMLreturn(Val_true);
+  if (saved_errno == ENOTSUP || saved_errno == EXDEV)
+    CAMLreturn(Val_false);
+  caml_unix_error(saved_errno, "clonefile", src_v);
+  CAMLreturn(Val_false);
 }

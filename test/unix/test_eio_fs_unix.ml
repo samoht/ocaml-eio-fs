@@ -460,6 +460,50 @@ let test_sync_file_on_a_plain_posix_file () =
     "the file reads back whole after its barrier" "payload"
     (Eio.Path.load (dir / "f"))
 
+(* clonefile(2) on Darwin: the directory and everything under it, the files'
+   bytes and modes, a symbolic link kept a link; the clone is a copy, so
+   writing to it leaves the source alone; a destination that exists is an
+   error. Elsewhere there is no clone, and nothing is written. *)
+let test_clone_tree () =
+  with_real_dir @@ fun dir ->
+  let src = Eio.Path.(dir / "src") and dst = Eio.Path.(dir / "dst") in
+  Eio.Path.mkdirs ~perm:0o755 Eio.Path.(src / "sub");
+  Eio.Path.save ~create:(`Exclusive 0o755) Eio.Path.(src / "sub" / "run") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(src / "data") "bytes";
+  Eio.Path.symlink ~link_to:"sub/run" Eio.Path.(src / "link");
+  let darwin =
+    let ic = Unix.open_process_in "uname -s" in
+    let os = In_channel.input_all ic in
+    ignore (Unix.close_process_in ic);
+    String.trim os = "Darwin"
+  in
+  match Eio_fs_unix.clone_tree src dst with
+  | false ->
+      Alcotest.(check bool) "not on Darwin" false darwin;
+      Alcotest.(check bool)
+        "nothing written" true
+        (Eio.Path.kind ~follow:false dst = `Not_found)
+  | true ->
+      Alcotest.(check string)
+        "a file" "bytes"
+        (Eio.Path.load Eio.Path.(dst / "data"));
+      Alcotest.(check int)
+        "its mode" 0o755
+        ((Eio.Path.stat ~follow:false Eio.Path.(dst / "sub" / "run")).perm
+       land 0o777);
+      Alcotest.(check string)
+        "a link" "sub/run"
+        (Eio.Path.read_link Eio.Path.(dst / "link"));
+      Eio.Path.save ~create:(`Or_truncate 0o644) Eio.Path.(dst / "data") "other";
+      Alcotest.(check string)
+        "the source keeps its bytes" "bytes"
+        (Eio.Path.load Eio.Path.(src / "data"));
+      Alcotest.(check bool)
+        "a destination that exists" true
+        (match Eio_fs_unix.clone_tree src dst with
+        | _ -> false
+        | exception Unix.Unix_error (Unix.EEXIST, _, _) -> true)
+
 let test_statvfs_reports_raw_block_capacity () =
   with_real_dir @@ fun dir ->
   let usage = Eio_fs_unix.statvfs dir in
@@ -2461,6 +2505,7 @@ let suite =
         test_full_fsync_surfaces_errors;
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
+      Alcotest.test_case "clone_tree" `Quick test_clone_tree;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
         test_seek_data_and_hole_walk_the_file;
       Alcotest.test_case "extents report the physical map" `Quick

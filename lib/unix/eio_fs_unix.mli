@@ -35,6 +35,24 @@ val statvfs : _ Eio.Path.t -> statvfs
     @raise Unix.Unix_error as POSIX [statvfs].
     @raise Invalid_argument if [path] has no native Unix representation. *)
 
+(** {2 Copy-on-write clones} *)
+
+val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
+(** [clone_tree src dst] clones the file [src], or the directory [src] with
+    everything under it, to [dst], which must not exist, in one copy-on-write
+    operation that shares the data blocks: [clonefile(2)] on Darwin. The clone
+    keeps modes, times, symbolic links and extended attributes, and is owned by
+    the caller. It is [true] iff it cloned, and [false], with nothing written,
+    when the file system has no such operation or [src] and [dst] are on two
+    volumes. Linux clones one file at a time ([FICLONE]) and has no call for a
+    tree, so there it is always [false]: a tree cloned file by file costs a call
+    per entry, which a caller that wants it walks itself. The call is made on a
+    system thread; a clone of a directory is one call whatever it holds.
+
+    @raise Unix.Unix_error
+      as [clonefile]: [dst] exists, [src] does not, permission is denied.
+    @raise Invalid_argument if a path has no native Unix representation. *)
+
 (** {2 The sparse map} *)
 
 val seek_data : Unix.file_descr -> int64 -> int64 option
