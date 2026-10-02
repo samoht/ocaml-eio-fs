@@ -86,6 +86,13 @@ let test_read_error positional () =
       Alcotest.(check int) "requested read length" 3 op.Op.length
   | _ -> Alcotest.fail "expected exactly one observed read");
   Alcotest.(check int) "next read reaches unchanged data" 3 (read ());
+  (match !observed with
+  | [ next; _ ] ->
+      Alcotest.(check int)
+        "failed read preserves scheduled cursor"
+        (if positional then 1 else 0)
+        next.Op.file_offset
+  | _ -> Alcotest.fail "expected exactly two observed reads");
   Alcotest.(check string)
     "failed read preserves streaming cursor"
     (if positional then "ell" else "hel")
