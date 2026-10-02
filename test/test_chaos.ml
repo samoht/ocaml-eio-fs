@@ -141,6 +141,19 @@ let test_open_error () =
   Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "secret") "x";
   expect_io "open" (fun () -> ignore (Eio.Path.load (chaos / "secret")))
 
+let test_descriptor_stat_error writable () =
+  let observed = ref [] in
+  let schedule = Schedule.scripted [{ trigger = Op_on_path {kind = `Stat; path = "f"}; fault = Stat_error `Eacces }] in
+  let sched = Schedule.observing (fun op -> if op.Op.kind = `Stat then observed := op.Op.path :: !observed) schedule in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "f") "hello";
+  Eio.Switch.run @@ fun sw ->
+  let file = if writable then (Eio.Path.open_out ~sw ~create:`Never (chaos / "f") :> Eio.File.ro_ty Eio.Resource.t) else Eio.Path.open_in ~sw (chaos / "f") in
+  expect_io "descriptor metadata" (fun () -> ignore (Eio.File.size file));
+  Alcotest.(check (list string)) "one descriptor stat retains its opened path" ["f"] (List.rev !observed);
+  Alcotest.(check string) "one scripted metadata fault was consumed" "scripted(0 rules)" (Fmt.str "%a" Schedule.pp schedule);
+  Alcotest.(check int) "the unchanged descriptor metadata succeeds afterward" 5 (Optint.Int63.to_int (Eio.File.size file))
+
 let test_stat_error () =
   let sched =
     Schedule.scripted
@@ -1427,6 +1440,8 @@ let suite =
       Alcotest.test_case "sync error" `Quick test_sync_error;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
+      Alcotest.test_case "read-only descriptor stat error" `Quick (test_descriptor_stat_error false);
+      Alcotest.test_case "read-write descriptor stat error" `Quick (test_descriptor_stat_error true);
       Alcotest.test_case "swap-symlink TOCTOU" `Quick test_swap_symlink;
       Alcotest.test_case "swap-symlink on open_in" `Quick
         test_swap_symlink_on_open_in;
