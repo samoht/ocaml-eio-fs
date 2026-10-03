@@ -201,6 +201,60 @@ external rename_exclusive_at :
   Unix.file_descr -> string -> Unix.file_descr -> string -> unit
   = "caml_eio_fs_rename_exclusive"
 
+(* A file over a descriptor the host opened, read and written as Eio_posix's
+   own files are (eio_posix's Flow, which Eio does not export): the
+   descriptor is its resource's, tagged [`Unix_fd], so {!sync_file} and
+   {!Eio_unix.Resource.fd_opt} reach it. *)
+module Imported = struct
+  type t = Eio_unix.Fd.t
+
+  module Low = Eio_posix.Low_level
+
+  (* _XOPEN_IOV_MAX, the fewest buffers one vectored call takes on any POSIX
+     system: a longer list is written or read in part, as the flow API lets a
+     single call answer. *)
+  let iov_max = 16
+  let vector bufs = Array.of_list (List.filteri (fun i _ -> i < iov_max) bufs)
+  let read_methods = []
+
+  let single_read t buf =
+    match eio_unix_errors (fun () -> Low.readv t [| buf |]) with
+    | 0 -> raise End_of_file
+    | got -> got
+
+  let single_write t bufs =
+    eio_unix_errors (fun () -> Low.writev t (vector bufs))
+
+  let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
+
+  let pread t ~file_offset bufs =
+    match
+      eio_unix_errors (fun () -> Low.preadv ~file_offset t (vector bufs))
+    with
+    | 0 -> raise End_of_file
+    | got -> got
+
+  let pwrite t ~file_offset bufs =
+    eio_unix_errors (fun () -> Low.pwritev ~file_offset t (vector bufs))
+
+  let stat t = eio_unix_errors (fun () -> stat_of_fd t)
+
+  let seek t offset whence =
+    eio_unix_errors (fun () -> Low.lseek t offset whence)
+
+  let sync t = eio_unix_errors (fun () -> Low.fsync t)
+  let truncate t length = eio_unix_errors (fun () -> Low.ftruncate t length)
+  let close = Eio_unix.Fd.close
+end
+
+let imported =
+  Eio.Resource.handler
+    (Eio.Resource.H (Eio_unix.Resource.T, Fun.id)
+    :: Eio.Resource.bindings (Eio.File.Pi.rw (module Imported)))
+
+let import_file ~sw ~close_unix fd =
+  Eio.Resource.T (Eio_unix.Fd.of_unix ~sw ~close_unix fd, imported)
+
 module Exclusive_rename = struct
   type t = unit
 

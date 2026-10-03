@@ -135,6 +135,23 @@ val read_file_nofollow :
       when the open or read fails, including when the final component is a
       symbolic link. *)
 
+val import_file :
+  sw:Eio.Switch.t ->
+  close_unix:bool ->
+  Unix.file_descr ->
+  [ `Unix_fd | Eio.File.rw_ty ] Eio.Resource.t
+(** [import_file ~sw ~close_unix fd] is the file [fd], a descriptor on a regular
+    file, read and written through the Eio file API as a file
+    {!Eio.Path.open_out} opens is: positional reads and writes, [stat], [seek],
+    [sync] and [truncate]. The descriptor is closed with the file, or when [sw]
+    finishes, iff [close_unix]; {!Eio_unix.Fd.remove} on its
+    {!Eio_unix.Resource.fd} takes it back without closing it. This is
+    {!Eio_unix.Net.import_socket_stream} for a file, which Eio does not provide:
+    a caller that keeps a descriptor open across handles, as SQLite's os_unix.c
+    keeps one on its inode while a lock stands, opens no other.
+
+    @raise Invalid_argument if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
+
 val exclusive_rename : Eio_fs_sync.Rename.t
 (** [exclusive_rename] is the POSIX backend for atomic no-replace publication.
     Directory wrappers are consulted before resolving the source and target

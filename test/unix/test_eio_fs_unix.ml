@@ -406,6 +406,39 @@ let test_sync_file_takes_the_descriptor_when_nothing_is_registered () =
         "the barrier skipped the descriptor of a file that registers none"
   | exception Invalid_argument _ -> ()
 
+(* A file imported over a host descriptor reads and writes the descriptor's
+   file at the offsets asked, and is that descriptor: [fd_opt] reaches it, and
+   a switch that ends leaves open what [close_unix:false] says it does not
+   own. The bytes written are not a period of the offsets read. *)
+let test_import_file () =
+  with_real_dir @@ fun dir ->
+  let name = Option.get (Eio.Path.native (dir / "f")) in
+  let raw = Unix.openfile name [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
+  Fun.protect ~finally:(fun () -> Unix.close raw) @@ fun () ->
+  let at = Optint.Int63.of_int in
+  Eio.Switch.run (fun sw ->
+      let file = Eio_fs_unix.import_file ~sw ~close_unix:false raw in
+      Eio.File.pwrite_all file ~file_offset:(at 3)
+        [ Cstruct.of_string "abcdefg" ];
+      let buf = Cstruct.create 4 in
+      Eio.File.pread_exact file ~file_offset:(at 5) [ buf ];
+      Alcotest.(check string)
+        "read at its offset" "cdef" (Cstruct.to_string buf);
+      Alcotest.(check int)
+        "stat reads the file's size" 10
+        (Optint.Int63.to_int (Eio.File.stat file).size);
+      Eio.File.truncate file (at 6);
+      Alcotest.(check string)
+        "the host reads what the file wrote" "\000\000\000abc"
+        (In_channel.with_open_bin name In_channel.input_all);
+      Alcotest.(check bool)
+        "the resource is the descriptor" true
+        (match Eio_unix.Resource.fd_opt file with
+        | None -> false
+        | Some fd -> Eio_unix.Fd.use_exn "import" fd (fun fd -> fd = raw)));
+  Alcotest.(check int)
+    "the descriptor outlives the switch" 6 (Unix.fstat raw).st_size
+
 (* The same ordering in the shape a store publishes in, over the real
    filesystem it runs on. The crash wrapper's file carries the host's own
    descriptor, so a barrier that reached for it would be a real F_FULLFSYNC
@@ -2512,6 +2545,8 @@ let suite =
         test_sync_dir_barriers_the_held_directory;
       Alcotest.test_case "barrier refuses a name a link took" `Quick
         test_sync_dir_refuses_a_name_a_link_took;
+      Alcotest.test_case "an imported descriptor is a file" `Quick
+        test_import_file;
       Alcotest.test_case "file barrier asks the registration first" `Quick
         test_sync_file_asks_the_registration_before_the_descriptor;
       Alcotest.test_case "file barrier takes an unregistered file's descriptor"

@@ -11,6 +11,7 @@
   eio-fs.sync
   eio-fs.unix
   cstruct
+  optint
   unix
   alcotest))
 
