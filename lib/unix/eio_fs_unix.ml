@@ -427,8 +427,11 @@ module Link = struct
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
           err_read "%s is not a regular file" t.path
-        else if size < 0L || size > Int64.of_int max_bytes then
-          err_read "%s is too large to read" t.path
+        else if
+          size < 0L
+          || size >= Int64.of_int max_int
+          || size > Int64.of_int max_bytes
+        then err_read "%s is too large to read" t.path
         else
           match
             Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)
