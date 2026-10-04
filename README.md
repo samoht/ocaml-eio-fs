@@ -7,8 +7,9 @@ A program written against `Eio.Path` should not care whether its files are on
 a disk or in memory. Tests often want them in memory, and so does a unikernel,
 which has no filesystem at all. This library provides that in-memory backend.
 `Eio_fs.Fs.v ()` returns the root of a new, empty filesystem in memory.
-`Eio_fs.Fs.load` fills the in-memory filesystem from a directory tree, and
-`Eio_fs.Fs.tree` prints any `Eio.Path` tree.
+`Eio_fs.Fs.load` returns the root of a new one holding a copy of a directory
+tree, and `Eio_fs.Fs.tree` prints any `Eio.Path` tree. Two of these
+filesystems share no file.
 
 For crash-consistency tests, `Eio_fs.Chaos` wraps a directory and injects
 faults into it: short writes, torn writes, failed syncs and power loss. A torn
@@ -82,8 +83,8 @@ let entries : Eio_fs.Crunch.t =
 let load () = Eio_fs.Crunch.load entries
 ```
 
-At run time, `Assets.load ()` rebuilds the tree in the in-memory filesystem and
-returns its root. A unikernel or a test with no real filesystem can then read
+At run time, `Assets.load ()` rebuilds the tree in a new in-memory filesystem
+and returns its root. A unikernel or a test with no real filesystem can then read
 its static assets through an ordinary `Eio.Path`. This repository crunches
 [examples/readme/static](examples/readme/static) with the rule above, and the
 example below runs against the module it generates:

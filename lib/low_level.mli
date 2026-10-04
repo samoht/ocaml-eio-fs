@@ -1,7 +1,7 @@
 (** Filesystem and file-descriptor operations of the in-memory backend.
 
-    This is an internal interface: the functions mirror the POSIX [*at] calls
-    over a global descriptor table. *)
+    This is an internal interface: the functions mirror the POSIX [*at] calls,
+    each resolving against the file system its directory belongs to. *)
 
 (** Flags for {!openat}. *)
 module Open_flags : sig
@@ -36,23 +36,25 @@ module Open_flags : sig
   (** [f0 + f1] is the union of the flag sets [f0] and [f1]. *)
 end
 
+type t
+(** The type for in-memory file systems: a tree and the descriptors open on it.
+    Two file systems share neither. *)
+
+val v : ?cwd:string -> unit -> t
+(** [v ~cwd ()] is a new file system holding only an empty root directory, whose
+    current directory is the absolute path [cwd] (defaults to ["/"]). *)
+
 (** File descriptors. *)
 module Fd : sig
   type t
-  (** The type for file descriptors in the global table. *)
+  (** The type for file descriptors, each open on one file system. *)
 end
 
 (** Directory descriptors. *)
 module Dir : sig
-  (** The type for the directory a relative path resolves against: the
-      filesystem root, the fiber's current directory, or an open descriptor. *)
-  type fd = Fs | Cwd | Dir_fd of Fd.t
-end
-
-(** The current directory. *)
-module Directory : sig
-  val cwd : string Eio.Fiber.key
-  (** [cwd] is the fiber-local absolute path that {!Dir.Cwd} resolves to. *)
+  (** The type for the directory a relative path resolves against: a file
+      system's root, its current directory, or an open descriptor. *)
+  type fd = Fs of t | Cwd of t | Dir_fd of Fd.t
 end
 
 val openat : mode:int -> sw:Eio.Switch.t -> Dir.fd -> string -> int -> Fd.t
@@ -102,7 +104,9 @@ val chown : follow:bool -> ?uid:int64 -> ?gid:int64 -> Dir.fd -> string -> unit
 val rename : ?replace:bool -> Dir.fd -> string -> Dir.fd -> string -> unit
 (** [rename ~replace dir0 path0 dir1 path1] renames [path0] under [dir0] to
     [path1] under [dir1], replacing an existing [path1] iff [replace] is [true]
-    (defaults to [true]). *)
+    (defaults to [true]).
+
+    @raise Eio.Io if [dir0] and [dir1] belong to two file systems. *)
 
 val symlinkat : link_to:string -> Dir.fd -> string -> unit
 (** [symlinkat ~link_to dir path] creates the symbolic link [path] pointing to
@@ -115,6 +119,3 @@ module Flow : sig
     Eio.Resource.t
   (** [of_fd fd] is [fd] as an Eio flow and file resource. *)
 end
-
-val reset : unit -> unit
-(** [reset ()] empties the global descriptor table and the filesystem. *)

@@ -53,7 +53,8 @@ module Error = struct
     raise exn
 end
 
-module Fd : sig
+(* The number a descriptor table hands out. *)
+module Num : sig
   type t = private int
 
   val compare : t -> t -> int
@@ -72,17 +73,10 @@ module Inode = struct
 
   let compare = Int64.compare
   let equal = Int64.equal
-
-  let fresh =
-    let i = ref 0L in
-    fun () ->
-      i := Int64.add !i 1L;
-      !i
 end
 
-module Dir = struct
+module Dir_node = struct
   type 'a t = { name : string; stat : Eio.File.Stat.t; entries : 'a list }
-  type fd = Fs | Cwd | Dir_fd of Fd.t
 
   let v ~parent name stat =
     { name; stat; entries = [ (stat.ino, "."); (parent, "..") ] }
@@ -132,7 +126,7 @@ module File = struct
   let to_string = function Literal s -> s | Buffer b -> Cstruct.to_string b
 end
 
-module Fd_table = Map.Make (Fd)
+module Fd_table = Map.Make (Num)
 
 (* Only what the tree itself holds. This backend has no console, so it has no
    standard streams to open: descriptors 0 to 2 are reserved by {!first_fd} and
@@ -140,7 +134,7 @@ module Fd_table = Map.Make (Fd)
 module Resource = struct
   type t =
     | File of File.t
-    | Dir of (Inode.t * string) Dir.t
+    | Dir of (Inode.t * string) Dir_node.t
     | Symlink of Symlink.t
 
   let pp ppf = function
@@ -199,27 +193,50 @@ let reset_file ~truncate ~append r =
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
    backend hands out is never one a caller reads as stdin, stdout or stderr. *)
-let first_fd = Fd.of_int 3
-let fd_table : resource ref Fd_table.t ref = ref Fd_table.empty
+let first_fd = Num.of_int 3
 
-let update_fd_table_with_result fn =
-  let v, new_fd_table = fn !fd_table in
-  fd_table := new_fd_table;
+let next_fd_of_fds fds =
+  match Fd_table.max_binding_opt fds with
+  | None -> first_fd
+  | Some (fd, _) -> Num.incr fd
+
+module Entries = Map.Make (Inode)
+
+(* One file system: its tree by inode, the descriptors open on it, the last
+   inode it numbered, and the directory a relative path resolves against.
+   Nothing is shared between two of them. *)
+type fs = {
+  mutable tree : resource ref Entries.t;
+  mutable fds : resource ref Fd_table.t;
+  mutable last_ino : Inode.t;
+  cwd : string;
+}
+
+type t = fs
+
+module Fd = struct
+  type t = { fs : fs; num : Num.t }
+end
+
+module Dir = struct
+  type fd = Fs of fs | Cwd of fs | Dir_fd of Fd.t
+
+  let fs = function Fs fs | Cwd fs -> fs | Dir_fd fd -> fd.fs
+end
+
+let update_fd_table_with_result fs fn =
+  let v, fds = fn fs.fds in
+  fs.fds <- fds;
   v
 
-let update_fd_table fn =
-  let () = update_fd_table_with_result (fun fd -> ((), fn fd)) in
+let update_fd_table fs fn =
+  let () = update_fd_table_with_result fs (fun fds -> ((), fn fds)) in
   ()
 
 let update_entry ?(if_missing = fun () -> ()) fd fds fn =
   match Fd_table.find_opt fd fds with None -> if_missing () | Some e -> fn e
 
-let read_fd_table fn = fn !fd_table
-
-let next_fd_of_fds fds =
-  match Fd_table.max_binding_opt fds with
-  | None -> first_fd
-  | Some (fd, _) -> Fd.incr fd
+let read_fd_table fs fn = fn fs.fds
 
 let default_stat =
   Eio.File.Stat.
@@ -240,21 +257,16 @@ let default_stat =
       blocks = 0L;
     }
 
-let new_stat ?kind ?perm () =
+let new_stat fs ?kind ?perm () =
+  fs.last_ino <- Int64.succ fs.last_ino;
   {
     default_stat with
-    ino = Inode.fresh ();
+    ino = fs.last_ino;
     kind = Option.value ~default:default_stat.kind kind;
     perm = Option.value ~default:default_stat.perm perm;
   }
 
-module Directory = struct
-  let cwd : string Eio.Fiber.key = Eio.Fiber.create_key ()
-end
-
 module Filesystem = struct
-  module Entries = Map.Make (Inode)
-
   type t = resource ref Entries.t
 
   (* A function, not a value: the root is a [ref] mutated in place as entries
@@ -276,21 +288,15 @@ module Filesystem = struct
     in
     Entries.empty |> Entries.add 0L (ref root)
 
-  let root = ref (empty ())
-  let read_filesystem fn = fn !root
-  let write_filesystem fn = root := fn !root
-  let add_file ino r = write_filesystem (Entries.add ino r)
+  let add_file fs ino r = fs.tree <- Entries.add ino r fs.tree
 
-  let absolute_path (dir : _ Dir.t) =
+  let absolute_path (tree : t) (dir : _ Dir_node.t) =
     if dir.stat.ino = 0L then "/"
     else
-      let rec loop (dir : _ Dir.t) acc =
+      let rec loop (dir : _ Dir_node.t) acc =
         if Int64.equal dir.stat.ino 0L then "/" ^ acc
         else
-          let parent =
-            (* let ino_p, fname = Dir.parent dir in  *)
-            read_filesystem @@ Entries.find (Dir.parent dir |> fst)
-          in
+          let parent = Entries.find (Dir_node.parent dir |> fst) tree in
           loop (as_dir ~label:"absolute" !parent) (dir.name ^ "/" ^ acc)
       in
       loop dir ""
@@ -306,9 +312,11 @@ module Filesystem = struct
 
   let rec find_entry_relative_to_dir ~check ~follow fs dir (path : string) =
     let confinement_dir = as_dir ~label:"confinement-dir" !dir in
-    let confinement_path = absolute_path confinement_dir in
+    let confinement_path = absolute_path fs confinement_dir in
     let check_confinement parent resource_name =
-      let parent_path = absolute_path (as_dir ~label:"confinement" !parent) in
+      let parent_path =
+        absolute_path fs (as_dir ~label:"confinement" !parent)
+      in
       let path_of_next_item =
         if resource_name = "/" then resource_name
         else begin
@@ -326,7 +334,7 @@ module Filesystem = struct
               find_entry_relative_to_dir ~check ~follow fs parent s.link_to
           | _ ->
               let parent_path =
-                absolute_path (as_dir ~label:"find-loop" !parent)
+                absolute_path fs (as_dir ~label:"find-loop" !parent)
               in
               let resource_name = Resource.name !r in
               if resource_name = "/" then (resource_name, r)
@@ -355,8 +363,7 @@ module Filesystem = struct
     let parent =
       match !dir with
       | Dir d ->
-          read_filesystem @@ fun fs ->
-          let ino, _ = Dir.parent d in
+          let ino, _ = Dir_node.parent d in
           Entries.find ino fs
       | _ -> assert false
     in
@@ -379,58 +386,57 @@ module Filesystem = struct
     | r -> Fmt.kstr Error.not_found "not a directory: %a" Resource.pp r
 
   let lookup ~follow dir_fd path =
-    read_filesystem @@ fun fs ->
-    let root = Entries.find 0L fs in
-    (* An absolute path with full access *)
-    if Eio_fs_path.is_abs path && dir_fd = Dir.Fs then
-      let _, r = find_entry_relative_to_dir ~check:false ~follow fs root path in
-      r (* Relative path with full access *)
-    else if Eio_fs_path.is_rel path && dir_fd = Dir.Fs then
-      let cwd_path = Eio.Fiber.get Directory.cwd |> Option.value ~default:"/" in
-      let path = Eio_fs_path.append cwd_path path in
-      let _, r = find_entry_relative_to_dir ~check:false ~follow fs root path in
-      r
-    else
-      (* Confined to cwd or dir-fd *)
-      match dir_fd with
-      | Dir.Fs -> assert false (* handled above *)
-      | Dir.Cwd ->
-          let cwd_path =
-            Eio.Fiber.get Directory.cwd |> Option.value ~default:"/"
-          in
-          let _, cwddir =
-            find_entry_relative_to_dir ~check:false ~follow fs root cwd_path
-          in
-          let resource_path, r =
-            find_entry_relative_to_dir ~check:true ~follow fs cwddir path
-          in
-          (* Check for confinement *)
-          if is_confined ~root:cwd_path resource_path then r
-          else Error.permission_denied resource_path
-      | Dir.Dir_fd dir ->
-          (* A directory fd closed with its switch is EBADF, as for a real
-             O_DIRECTORY fd, never a silent success. *)
-          let dir =
-            match read_fd_table (Fd_table.find_opt dir) with
-            | Some d -> d
-            | None -> Error.badf ()
-          in
-          let resource_path, r =
-            find_entry_relative_to_dir ~check:true ~follow fs dir path
-          in
-          (* Check for confinement *)
-          if
-            is_confined
-              ~root:(absolute_path (as_dir ~label:"lookup" !dir))
-              resource_path
-          then r
-          else Error.permission_denied resource_path
+    let { tree; cwd; _ } = Dir.fs dir_fd in
+    let root = Entries.find 0L tree in
+    match dir_fd with
+    | Dir.Fs _ ->
+        (* Full access: a relative path resolves against the current
+           directory. *)
+        let path =
+          if Eio_fs_path.is_abs path then path else Eio_fs_path.append cwd path
+        in
+        let _, r =
+          find_entry_relative_to_dir ~check:false ~follow tree root path
+        in
+        r
+    | Dir.Cwd _ ->
+        (* Confined to the current directory. *)
+        let _, cwddir =
+          find_entry_relative_to_dir ~check:false ~follow tree root cwd
+        in
+        let resource_path, r =
+          find_entry_relative_to_dir ~check:true ~follow tree cwddir path
+        in
+        if is_confined ~root:cwd resource_path then r
+        else Error.permission_denied resource_path
+    | Dir.Dir_fd { fs; num } ->
+        (* Confined to the descriptor's directory. A directory fd closed with
+           its switch is EBADF, as for a real O_DIRECTORY fd, never a silent
+           success. *)
+        let dir =
+          match read_fd_table fs (Fd_table.find_opt num) with
+          | Some d -> d
+          | None -> Error.badf ()
+        in
+        let resource_path, r =
+          find_entry_relative_to_dir ~check:true ~follow tree dir path
+        in
+        if
+          is_confined
+            ~root:(absolute_path tree (as_dir ~label:"lookup" !dir))
+            resource_path
+        then r
+        else Error.permission_denied resource_path
 end
+
+let v ?(cwd = "/") () =
+  { tree = Filesystem.empty (); fds = Fd_table.empty; last_ino = 0L; cwd }
 
 (* Closing an already-closed handle does nothing, as [Eio.Resource.close]
    specifies and eio's posix backend does. A handle with two owners, a caller
    closing early in front of its switch, is the ordinary reason. *)
-let close fd = update_fd_table @@ fun fds -> Fd_table.remove fd fds
+let close { Fd.fs; num } =
+  update_fd_table fs @@ fun fds -> Fd_table.remove num fds
 
 (* open(2): opening an existing file requires the permission bits the access
    mode asks for; the mode given at creation does not restrict the creating
@@ -460,12 +466,13 @@ let new_file ~follow ~mode dir_fd path =
        resolve. *)
     | _ -> Error.not_found path
   in
-  let stat = new_stat ~perm:(mode land 0o7777) () in
+  let fs = Dir.fs dir_fd in
+  let stat = new_stat fs ~perm:(mode land 0o7777) () in
   let f = File.v ~stat fname in
   let dir = { dir with entries = (f.stat.ino, f.name) :: dir.entries } in
   rdir := Resource.Dir dir;
   let file = ref (Resource.File f) in
-  Filesystem.add_file f.stat.ino file;
+  Filesystem.add_file fs f.stat.ino file;
   file
 
 let openat ~mode ~sw dir_fd path flags =
@@ -481,16 +488,18 @@ let openat ~mode ~sw dir_fd path flags =
     | Resource.Symlink _ when nofollow -> Error.permission_denied path
     | _ -> ()
   in
+  let fs = Dir.fs dir_fd in
   match is_create || is_excl with
   | false ->
-      update_fd_table_with_result @@ fun fds ->
-      let fd = next_fd_of_fds fds in
+      update_fd_table_with_result fs @@ fun fds ->
+      let num = next_fd_of_fds fds in
+      let fd = { Fd.fs; num } in
       let r = Filesystem.lookup ~follow dir_fd path in
       refuse_link r;
       check_access path flags r;
       reset_file ~truncate ~append r;
       Eio.Switch.on_release sw (fun () -> close fd);
-      (fd, Fd_table.add fd r fds)
+      (fd, Fd_table.add num r fds)
   | true -> (
       let () =
         try
@@ -499,8 +508,9 @@ let openat ~mode ~sw dir_fd path flags =
             Error.already_exists path
         with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> ()
       in
-      update_fd_table_with_result @@ fun fds ->
-      let fd = next_fd_of_fds fds in
+      update_fd_table_with_result fs @@ fun fds ->
+      let num = next_fd_of_fds fds in
+      let fd = { Fd.fs; num } in
       let r =
         try Option.some @@ Filesystem.lookup ~follow dir_fd path
         with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
@@ -509,13 +519,13 @@ let openat ~mode ~sw dir_fd path flags =
       | Some r ->
           refuse_link r;
           check_access path flags r;
-          let fds = Fd_table.add fd r fds in
+          let fds = Fd_table.add num r fds in
           reset_file ~truncate ~append r;
           Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds)
       | None ->
           let file = new_file ~follow ~mode dir_fd path in
-          let fds = Fd_table.add fd file fds in
+          let fds = Fd_table.add num file fds in
           Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds))
 
@@ -551,12 +561,13 @@ let unlink dir_fd path =
 
 let mkdirat dir_fd ~perm path =
   let path = check_path path in
+  let fs = Dir.fs dir_fd in
   let mkdir r name =
-    let new_stat = new_stat ~kind:`Directory ~perm () in
+    let new_stat = new_stat fs ~kind:`Directory ~perm () in
     let d = as_dir ~label:"mkdirat" !r in
-    let dir = Dir.v ~parent:d.stat.ino name new_stat in
+    let dir = Dir_node.v ~parent:d.stat.ino name new_stat in
     let ino = new_stat.ino in
-    Filesystem.add_file ino (ref (Resource.Dir dir));
+    Filesystem.add_file fs ino (ref (Resource.Dir dir));
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
@@ -570,16 +581,17 @@ let mkdirat dir_fd ~perm path =
 
 let embed dir_fd ~perm path ~contents =
   let path = check_path path in
+  let fs = Dir.fs dir_fd in
   let add r name =
     let stat =
       {
-        (new_stat ~perm:(perm land 0o7777) ()) with
+        (new_stat fs ~perm:(perm land 0o7777) ()) with
         size = Optint.Int63.of_int (String.length contents);
       }
     in
     let d = as_dir ~label:"embed" !r in
     let f = File.literal ~stat name contents in
-    Filesystem.add_file stat.ino (ref (Resource.File f));
+    Filesystem.add_file fs stat.ino (ref (Resource.File f));
     r := Dir { d with entries = (stat.ino, name) :: d.entries }
   in
   try
@@ -592,12 +604,13 @@ let embed dir_fd ~perm path ~contents =
 
 let symlinkat ~link_to dir_fd path =
   let path = check_path path in
+  let fs = Dir.fs dir_fd in
   let symlink r name =
-    let new_stat = new_stat ~kind:`Symbolic_link ~perm:0o644 () in
+    let new_stat = new_stat fs ~kind:`Symbolic_link ~perm:0o644 () in
     let d = as_dir ~label:"symlink" !r in
     let dir = Symlink.v ~link_to name new_stat in
     let ino = new_stat.ino in
-    Filesystem.add_file ino (ref (Resource.Symlink dir));
+    Filesystem.add_file fs ino (ref (Resource.Symlink dir));
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
@@ -634,9 +647,7 @@ let read_dir_entries dir_fd path =
       |> List.filter (fun (_, name) -> name <> "." && name <> "..")
       |> List.map (fun (ino, name) ->
           let kind =
-            match
-              Filesystem.read_filesystem (Filesystem.Entries.find_opt ino)
-            with
+            match Entries.find_opt ino (Dir.fs dir_fd).tree with
             | Some res -> (Resource.stat !res).kind
             | None -> `Unknown
           in
@@ -648,7 +659,7 @@ let rmdir dir_fd path =
   let r = Filesystem.lookup ~follow:true dir_fd path in
   match !r with
   | Resource.Dir d ->
-      if not (Dir.is_empty d) then Error.err "Directory is not empty"
+      if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
       else begin
         (* TODO: need to delete from FD table? *)
         let dir, _ = dir_base path in
@@ -666,6 +677,10 @@ let rmdir dir_fd path =
 let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let old_path = check_path old_path in
   let new_path = check_path new_path in
+  (* rename(2) does not move an entry between two file systems: EXDEV, which
+     Eio.Fs has no constructor for. *)
+  if Dir.fs dir_fd != Dir.fs new_dir then
+    Error.err ("rename: invalid cross-device link: " ^ new_path);
   (* Rename the directory entry itself. In particular, a symlink's target need
      not exist and must not be followed while moving the link. *)
   let old_res = Filesystem.lookup ~follow:false dir_fd old_path in
@@ -701,8 +716,8 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       Resource.Dir { src with entries = without old_name src.entries }
   end
 
-let stat fd =
-  read_fd_table @@ fun fds ->
+let stat { Fd.fs; num = fd } =
+  read_fd_table fs @@ fun fds ->
   match Fd_table.find_opt fd fds with
   | None -> Error.badf ()
   | Some r -> Resource.stat !r
@@ -730,8 +745,8 @@ let blit_and_grow ~src ~dst ~off =
    [Eio.Path.open_in] on a directory is legal and the portable directory
    barrier depends on it -- so the operations below refuse one with EISDIR, as
    read(2) and write(2) do. *)
-let writev fd bufs =
-  update_fd_table_with_result @@ fun fds ->
+let writev { Fd.fs; num = fd } bufs =
+  update_fd_table_with_result fs @@ fun fds ->
   let () =
     update_entry fd fds @@ fun r ->
     match !r with
@@ -768,8 +783,8 @@ let writev fd bufs =
   in
   (Cstruct.length (Cstruct.concat bufs), fds)
 
-let readv fd bufs =
-  update_fd_table_with_result @@ fun fds ->
+let readv { Fd.fs; num = fd } bufs =
+  update_fd_table_with_result fs @@ fun fds ->
   let read = ref 0 in
   let () =
     update_entry fd fds @@ fun r ->
@@ -794,8 +809,8 @@ let readv fd bufs =
 
 (* Positioned reads and writes address an explicit [file_offset] and never move
    the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
-let preadv fd ~file_offset bufs =
-  read_fd_table @@ fun fds ->
+let preadv { Fd.fs; num = fd } ~file_offset bufs =
+  read_fd_table fs @@ fun fds ->
   match Fd_table.find_opt fd fds |> Option.map ( ! ) with
   | None -> Error.badf ()
   | Some (Resource.File e) ->
@@ -817,8 +832,8 @@ let preadv fd ~file_offset bufs =
       end
   | Some r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
 
-let pwritev fd ~file_offset bufs =
-  update_fd_table_with_result @@ fun fds ->
+let pwritev { Fd.fs; num = fd } ~file_offset bufs =
+  update_fd_table_with_result fs @@ fun fds ->
   let written = ref 0 in
   let () =
     update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
@@ -838,8 +853,8 @@ let pwritev fd ~file_offset bufs =
   in
   (!written, fds)
 
-let seek_fd fd off cmd =
-  update_fd_table_with_result @@ fun fds ->
+let seek_fd { Fd.fs; num = fd } off cmd =
+  update_fd_table_with_result fs @@ fun fds ->
   let result = ref Optint.Int63.zero in
   let () =
     update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
@@ -859,8 +874,8 @@ let seek_fd fd off cmd =
   in
   (!result, fds)
 
-let truncate_fd fd len =
-  update_fd_table @@ fun fds ->
+let truncate_fd { Fd.fs; num = fd } len =
+  update_fd_table fs @@ fun fds ->
   update_entry
     ~if_missing:(fun () -> ignore (Error.badf () : 'a))
     fd fds
@@ -944,7 +959,3 @@ module Flow = struct
   let handler = flow_handler (module Impl)
   let of_fd fd = Eio.Resource.T (fd, handler)
 end
-
-let reset () =
-  Filesystem.root := Filesystem.empty ();
-  fd_table := Fd_table.empty

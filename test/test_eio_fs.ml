@@ -263,7 +263,7 @@ module Crunch = struct
       "read through symlink" "world"
       (Eio.Path.load (fs / "link"))
 
-  (* [load] resets the filesystem: nothing outlives it. *)
+  (* [load] builds a filesystem of its own: nothing written elsewhere is in it. *)
   let test_load_resets () =
     with_fs @@ fun fs ->
     write fs "old.txt" "stale";
@@ -362,8 +362,8 @@ module Crunch = struct
        val entries : Eio_fs.Crunch.t\n\
        (** The embedded file tree. *)\n\n\
        val load : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t\n\
-       (** [load ()] resets the in-memory filesystem, populates it with\n\
-      \    {!entries} and returns its root. *)\n"
+       (** [load ()] is the root of a new in-memory filesystem holding\n\
+      \    {!entries}. *)\n"
     in
     Alcotest.(check string) "interface" expected Eio_fs.Crunch.interface
 

@@ -40,8 +40,8 @@ output.
   (** The embedded file tree. *)
   
   val load : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [load ()] resets the in-memory filesystem, populates it with
-      {!entries} and returns its root. *)
+  (** [load ()] is the root of a new in-memory filesystem holding
+      {!entries}. *)
 
 
 

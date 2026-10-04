@@ -16,7 +16,7 @@ let i63 = Optint.Int63.of_int
    outcome together with the bytes that actually reached the store. The file
    is created read-only (0o444) or writable, directly at the root or through a
    short-lived staging subtree. Every run starts from a fresh in-memory tree
-   ([Eio_fs.run] resets it). *)
+   ([Eio_fs.run] makes a new one). *)
 let run_workload ~seed ~probability ~nblocks ~block ~read_only ~via_subtree =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->

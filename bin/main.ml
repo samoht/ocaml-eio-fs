@@ -50,7 +50,7 @@ let cmd =
       `P
         "$(tname) walks $(i,DIR) and prints an OCaml module that embeds every \
          directory, file and symbolic link it contains. Linking the generated \
-         module and calling its [load ()] rebuilds the tree in the eio-fs \
+         module and calling its [load ()] rebuilds the tree in a new eio-fs \
          in-memory filesystem, giving programs without a real filesystem \
          (unikernels, tests) an ordinary [Eio.Path] view of static assets.";
     ]
