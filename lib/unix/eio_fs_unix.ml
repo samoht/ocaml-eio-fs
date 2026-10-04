@@ -350,7 +350,7 @@ module Link = struct
       | exception (Eio.Io _ as ex) -> err_refused t.path (Printexc.to_string ex)
 
   let read_regular t =
-    let error fmt = Fmt.kstr (fun message -> Error message) fmt in
+    let err_read fmt = Fmt.kstr (fun message -> Error message) fmt in
     let parent = Low.Fd t.parent in
     let opened =
       match
@@ -360,10 +360,10 @@ module Link = struct
       | fd -> Ok (Some fd)
       | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok None
       | exception Unix.Unix_error (code, operation, argument) ->
-          error "%s: %s %s: %s" t.path operation argument
+          err_read "%s: %s %s: %s" t.path operation argument
             (Unix.error_message code)
       | exception (Eio.Io _ as ex) ->
-          error "%s: %s" t.path (Printexc.to_string ex)
+          err_read "%s: %s" t.path (Printexc.to_string ex)
     in
     match opened with
     | Error _ as error -> error
@@ -372,9 +372,9 @@ module Link = struct
         let stat = stat_of_fd fd in
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
-          error "%s is not a regular file" t.path
+          err_read "%s is not a regular file" t.path
         else if size < 0L || size >= Int64.of_int max_int then
-          error "%s is too large to read" t.path
+          err_read "%s is too large to read" t.path
         else
           match
             Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)
@@ -383,8 +383,8 @@ module Link = struct
               ~read:(fun buffer -> Low.readv fd [| buffer |])
           with
           | Ok bytes -> Ok (Some (Cstruct.to_string bytes))
-          | Error `Too_large -> error "%s changed size while read" t.path
-          | Error (`Invalid reason) -> error "%s: %s" t.path reason)
+          | Error `Too_large -> err_read "%s changed size while read" t.path
+          | Error (`Invalid reason) -> err_read "%s: %s" t.path reason)
 end
 
 type refusal = { path : string; holder : int option; record : string }
