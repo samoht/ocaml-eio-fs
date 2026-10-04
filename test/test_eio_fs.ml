@@ -13,6 +13,26 @@ let test_write_read () =
   write fs "hello.txt" "world";
   Alcotest.(check string) "roundtrip" "world" (Eio.Path.load (fs / "hello.txt"))
 
+(* [Fs.v ()] is the root of a fresh filesystem, so two roots are two
+   filesystems: a file written under one does not exist under the other, even
+   when both were made before the write. *)
+let test_v_roots_share_no_file () =
+  Eio_mock.Backend.run @@ fun () ->
+  let first = Eio_fs.Fs.v () in
+  let second = Eio_fs.Fs.v () in
+  write first "first.txt" "one";
+  Alcotest.(check bool)
+    "the second root does not see the first root's file" true
+    (Eio.Path.kind ~follow:false (second / "first.txt") = `Not_found)
+
+(* [Fs.v ()] is the root of an empty filesystem whatever another root holds. *)
+let test_v_is_empty () =
+  Eio_mock.Backend.run @@ fun () ->
+  write (Eio_fs.Fs.v ()) "earlier.txt" "stale";
+  Alcotest.(check (list string))
+    "a fresh root has no entry" []
+    (Eio.Path.read_dir (Eio_fs.Fs.v ()))
+
 let test_mkdir_read_dir () =
   with_fs @@ fun fs ->
   Eio.Path.mkdir ~perm:0o755 (fs / "d");
@@ -472,6 +492,9 @@ let suite =
   ( "eio_fs",
     [
       Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "v roots share no file" `Quick
+        test_v_roots_share_no_file;
+      Alcotest.test_case "v is empty" `Quick test_v_is_empty;
       Alcotest.test_case "tree labels each node by its last component" `Quick
         test_tree_labels_each_node_by_its_last_component;
       Alcotest.test_case "name falls back to the Eio rendering" `Quick
