@@ -799,6 +799,122 @@ let with_held_lock ~sw ~env ~clock ~lock fn =
       Eio.Time.with_timeout_exn clock 10.0 (fun () -> await_holder child))
     fn
 
+(* A process holding [lock] by [kind] ([test.ml], [hold_until_release]) until
+   [release] is called, which returns how it ended: [`Exited 0] when it let go
+   at [release], [`Exited 3] when it let go at its own five-second bound. *)
+let holding_process ~sw ~env ~clock ~kind ~lock =
+  let manager = Eio.Stdenv.process_mgr env in
+  let input, release = Eio.Process.pipe ~sw manager in
+  let ready, output = Eio.Process.pipe ~sw manager in
+  let self = Sys.executable_name in
+  let child =
+    Eio.Process.spawn ~sw manager ~stdin:input ~stdout:output ~executable:self
+      [ self; "--hold-until-release"; kind; Eio.Path.native_exn lock ]
+  in
+  Eio.Resource.close input;
+  Eio.Resource.close output;
+  let announced = Cstruct.create 1 in
+  Eio.Time.with_timeout_exn clock 5.0 (fun () ->
+      Eio.Flow.read_exact ready announced);
+  Alcotest.(check char)
+    "the other process holds the lock" 'R'
+    (Cstruct.get_char announced 0);
+  fun () ->
+    (try Eio.Flow.copy_string "X" release with Eio.Io _ -> ());
+    Eio.Resource.close release;
+    Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Process.await child)
+
+let status =
+  Alcotest.testable
+    (fun ppf -> function
+      | `Exited n -> Fmt.pf ppf "exited %d" n
+      | `Signaled n -> Fmt.pf ppf "signalled %d" n)
+    ( = )
+
+(* A wait for a lock another process holds is the kernel's blocking request
+   (POSIX fcntl F_SETLKW, "fcntl() shall wait until the request can be
+   satisfied"; flock(2) without LOCK_NB), which answers when the holder lets
+   go: the waiter asks once, says it waits once, and is granted at the
+   release, with no further ask. [take ~on_wait lock fn] is the acquisition
+   under test. The waiter's grant is read after the holder was told to let
+   go, and never before. *)
+let a_wait_answers_at_the_release ~kind take () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let waits = ref 0 in
+  let granted, now_granted = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      take
+        ~on_wait:(fun () ->
+          incr waits;
+          ignore (Eio.Promise.try_resolve now_waiting ()))
+        lock
+        (fun () -> Eio.Promise.resolve now_granted ()));
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
+  Alcotest.(check bool)
+    "not granted while held" false
+    (Eio.Promise.is_resolved granted);
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ());
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await granted);
+  Alcotest.(check int) "said it waits once" 1 !waits
+
+(* The same wait is one a caller can end: cancelled once the waiter is in the
+   kernel's wait, it answers at the cancel while the holder still holds (the
+   holder lets go at the test's word, after the cancel, so a wait that
+   answered only at a release finds the holder gone at its own bound), and it
+   leaves no hold behind: once the holder lets go, [free lock] finds the lock
+   free. *)
+let a_wait_is_cancellable ~kind take ~free () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let answer =
+    Eio.Fiber.first
+      (fun () ->
+        take
+          ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+          lock
+          (fun () -> `Granted))
+      (fun () ->
+        Eio.Promise.await waiting;
+        `Cancelled)
+  in
+  (match answer with
+  | `Granted -> Alcotest.fail "a lock another process holds was granted"
+  | `Cancelled -> ());
+  Alcotest.check status "the holder let go when told, after the cancel"
+    (`Exited 0) (release ());
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> free ~env lock)
+
+let take_record ~on_wait lock fn = Eio_fs_unix.with_lock ~on_wait lock fn
+
+let take_lease ~on_wait lock fn =
+  Eio_fs_unix.Lease.with_exclusive ~on_wait lock (fun _ -> fn ())
+
+(* Another process is granted the record lock: this process's own asks are
+   granted whatever it holds. *)
+let record_free ~env lock =
+  let manager = Eio.Stdenv.process_mgr env in
+  let self = Sys.executable_name in
+  Alcotest.check status "another process is granted the lock" (`Exited 0)
+    ( Eio.Switch.run @@ fun sw ->
+      Eio.Process.await
+        (Eio.Process.spawn ~sw manager ~executable:self
+           [ self; "--try-eio-fs-lock"; Eio.Path.native_exn lock ]) )
+
+(* A lease belongs to its open file description, so a lease of this process
+   excludes another of its own: a blocking one is granted once nothing holds
+   it. *)
+let lease_free ~env:_ lock =
+  Eio_fs_unix.Lease.with_exclusive ~block:`Yes lock (fun _ -> ())
+
 let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
@@ -2579,6 +2695,14 @@ let suite =
       lease_test_case;
       Alcotest.test_case "a wait for another process is cancellable" `Quick
         test_lock_wait_for_another_process_is_cancellable;
+      Alcotest.test_case "a record lock wait answers at the release" `Quick
+        (a_wait_answers_at_the_release ~kind:"record" take_record);
+      Alcotest.test_case "a record lock wait answers at a cancel" `Quick
+        (a_wait_is_cancellable ~kind:"record" take_record ~free:record_free);
+      Alcotest.test_case "a lease wait answers at the release" `Quick
+        (a_wait_answers_at_the_release ~kind:"lease" take_lease);
+      Alcotest.test_case "a lease wait answers at a cancel" `Quick
+        (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
       Alcotest.test_case "lock serializes fibers" `Quick
         test_lock_serializes_fibers;
       Alcotest.test_case "lock excludes another name for its file" `Quick

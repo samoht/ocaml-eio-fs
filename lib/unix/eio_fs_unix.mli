@@ -192,6 +192,7 @@ val with_lock :
   ?block:[ `Yes | `No | `Fibers | `For of float ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
+  ?on_wait:(unit -> unit) ->
   _ Eio.Path.t ->
   (unit -> 'a) ->
   'a
@@ -208,6 +209,12 @@ val with_lock :
     {!Lock_unavailable}, [`Fibers] waits only for a fiber of this process, and
     [`For seconds] waits up to a monotonic bound. Locks are coordinated between
     fibers by device and inode, and between processes by the POSIX record lock.
+
+    With [`Yes], a lock another process holds is waited for by the kernel's
+    blocking request (POSIX [fcntl] [F_SETLKW]), which answers when that process
+    lets go: the lock is asked for once without waiting, [on_wait ()] is called
+    once if it is held (it does nothing by default), and the request follows. A
+    cancelled wait withdraws the request and answers at the cancel.
 
     [path] must be the lock's own regular file: a link, a directory, a FIFO, or
     a name that took the entry between resolution and open is refused with
@@ -231,11 +238,12 @@ val hold :
   ?block:[ `Yes | `No | `Fibers | `For of float ] ->
   ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
   ?contents:string ->
+  ?on_wait:(unit -> unit) ->
   _ Eio.Path.t ->
   unit
 (** [hold ~sw path] is {!with_lock} over [path] for the rest of [sw]'s life: it
     returns once the lock is taken, and the lock is released when [sw] finishes.
-    [block], [create] and [contents] are as {!with_lock}'s.
+    [block], [create], [contents] and [on_wait] are as {!with_lock}'s.
 
     @raise Lock_unavailable as {!with_lock} does.
     @raise Eio.Io as {!with_lock} does. *)
@@ -265,11 +273,12 @@ module Held : sig
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
+    ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
     t
   (** [take ~sw path] is {!with_lock} over [path], held from when it returns
       until {!release} or the end of [sw], whichever comes first. [block],
-      [create] and [contents] are as {!with_lock}'s.
+      [create], [contents] and [on_wait] are as {!with_lock}'s.
 
       @raise Lock_unavailable as {!with_lock} does.
       @raise Eio.Io as {!with_lock} does. *)
@@ -306,6 +315,7 @@ module Lease : sig
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
+    ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
     (t -> 'a) ->
     'a
@@ -320,6 +330,15 @@ module Lease : sig
       {!Eio.Fs.Not_found} when absent. [contents], when present, replaces the
       rendezvous contents while the lease is held. [block] selects the wait
       policy used by {!with_lock}.
+
+      With [block] [`Yes], a lease another process holds is waited for by the
+      kernel's blocking [flock], which answers when that process lets go: the
+      lease is tried first, [on_wait ()] is called once if it is held (it does
+      nothing by default), and the wait follows. A cancelled wait answers at the
+      cancel. [flock] is no cancellation point, so its request stays with the
+      kernel on a thread of its own, which lets the lease go once granted; the
+      lease belongs to the open file description, which no other caller shares,
+      so that grant takes nothing from anyone.
 
       Only a path backed by a native Unix descriptor can hold a lease. The path
       must name its own regular file; a link, directory, FIFO, or name changed

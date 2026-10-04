@@ -18,6 +18,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +64,90 @@ CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
   if (r == -1)
     caml_unix_error(saved_errno, "flock", Nothing);
   return Val_unit;
+}
+
+/* A wait for a record lock another process holds: the kernel's blocking
+   request (POSIX fcntl F_SETLKW, "fcntl() shall wait until the request can be
+   satisfied"), made on a thread of its own that runs no OCaml. It writes one
+   byte to [notify] once answered, which the waiting fiber awaits. F_SETLKW is
+   a cancellation point (POSIX, "Thread Cancellation"), so a cancel withdraws
+   the request: the thread is cancelled and joined, and no lock is left to the
+   process unless it was granted first. The request locks what [lockf] does,
+   from the descriptor's offset to the end of the file. */
+struct record_lock_wait {
+  pthread_t thread;
+  int fd;
+  int notify;
+  int err;
+};
+
+static void *record_lock_wait_run(void *arg)
+{
+  struct record_lock_wait *w = arg;
+  struct flock request;
+  int r;
+  memset(&request, 0, sizeof request);
+  request.l_type = F_WRLCK;
+  request.l_whence = SEEK_CUR;
+  request.l_start = 0;
+  request.l_len = 0;
+  do
+    r = fcntl(w->fd, F_SETLKW, &request);
+  while (r == -1 && errno == EINTR);
+  /* Answered: a cancel from here on would lose a granted lock. */
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+  w->err = r == -1 ? errno : 0;
+  {
+    char answered = 0;
+    ssize_t n;
+    do
+      n = write(w->notify, &answered, 1);
+    while (n == -1 && errno == EINTR);
+  }
+  return NULL;
+}
+
+CAMLprim value caml_eio_fs_record_lock_wait_start(value fd_v, value notify_v)
+{
+  struct record_lock_wait *w = malloc(sizeof *w);
+  sigset_t all, previous;
+  int r;
+  if (w == NULL)
+    caml_raise_out_of_memory();
+  w->fd = Int_val(fd_v);
+  w->notify = Int_val(notify_v);
+  w->err = 0;
+  /* The thread takes no signal: the process's handlers belong to OCaml. */
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, &previous);
+  r = pthread_create(&w->thread, NULL, record_lock_wait_run, w);
+  pthread_sigmask(SIG_SETMASK, &previous, NULL);
+  if (r != 0) {
+    free(w);
+    caml_unix_error(r, "pthread_create", Nothing);
+  }
+  return caml_copy_nativeint((intnat)w);
+}
+
+/* Joins the wait, cancelling it first when [cancel]: [true] when the lock was
+   granted, [false] when the cancel withdrew the request. */
+CAMLprim value caml_eio_fs_record_lock_wait_end(value wait_v, value cancel_v)
+{
+  struct record_lock_wait *w = (struct record_lock_wait *)Nativeint_val(wait_v);
+  void *ended = NULL;
+  int err;
+  if (Bool_val(cancel_v))
+    pthread_cancel(w->thread);
+  caml_release_runtime_system();
+  pthread_join(w->thread, &ended);
+  caml_acquire_runtime_system();
+  err = w->err;
+  free(w);
+  if (ended == PTHREAD_CANCELED)
+    return Val_false;
+  if (err != 0)
+    caml_unix_error(err, "fcntl", Nothing);
+  return Val_true;
 }
 
 /* The first [len] bytes of the file [fd] reads, or fewer where it ends, read

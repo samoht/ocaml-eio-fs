@@ -32,6 +32,44 @@ let hold_lease ready =
     Unix.sleep 3600
   done
 
+let until_release_arg = "--hold-until-release"
+
+(* Holds [path] by [kind], [record] for the POSIX record lock and [lease] for
+   the BSD [flock], says ['R'] on standard output, and lets go once ['X']
+   arrives on standard input: exit 0. A holder that hears nothing for five
+   seconds lets go by exiting 3, so a case whose wait answered only at that
+   release reads it from the exit. *)
+let hold_until_release kind path =
+  let await_release () =
+    output_char stdout 'R';
+    flush stdout;
+    match Unix.select [ Unix.stdin ] [] [] 5.0 with
+    | [], _, _ -> 3
+    | _ ->
+        let release = Bytes.create 1 in
+        if
+          Unix.read Unix.stdin release 0 1 = 1
+          && Char.equal (Bytes.get release 0) 'X'
+        then 0
+        else 4
+  in
+  let code =
+    match kind with
+    | "record" ->
+        let fd = Unix.openfile path [ Unix.O_CREAT; Unix.O_RDWR ] 0o600 in
+        Unix.lockf fd Unix.F_LOCK 0;
+        let code = await_release () in
+        Unix.close fd;
+        code
+    | "lease" ->
+        Eio_main.run @@ fun env ->
+        Eio_fs_unix.Lease.with_exclusive ~block:`No
+          Eio.Path.(Eio.Stdenv.fs env / path)
+          (fun _ -> await_release ())
+    | _ -> 5
+  in
+  exit code
+
 let lease_test_arg = "--test-inherited-lease"
 let try_lock_arg = "--try-eio-fs-lock"
 
@@ -46,6 +84,8 @@ let try_lock path =
 let () =
   match Array.to_list Sys.argv with
   | [ _; arg; path ] when String.equal arg held_lock_arg -> held_lock path
+  | [ _; arg; kind; path ] when String.equal arg until_release_arg ->
+      hold_until_release kind path
   | [ _; arg; path; ready; seconds ] when String.equal arg hold_lock_arg ->
       hold_lock path ready (float_of_string seconds)
   | [ _; arg; ready ] when String.equal arg hold_lease_arg -> hold_lease ready

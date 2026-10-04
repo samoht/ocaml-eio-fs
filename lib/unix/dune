@@ -21,6 +21,7 @@
   cstruct
   fmt
   optint
+  threads.posix
   unix)
  (c_library_flags
   (:standard

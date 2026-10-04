@@ -12,6 +12,15 @@ external record_lock_holder : Unix.file_descr -> int
 external pread_head : Unix.file_descr -> int -> string
   = "caml_eio_fs_pread_head"
 
+type record_lock_wait
+
+external record_lock_wait_start :
+  Unix.file_descr -> Unix.file_descr -> record_lock_wait
+  = "caml_eio_fs_record_lock_wait_start"
+
+external record_lock_wait_end : record_lock_wait -> bool -> bool
+  = "caml_eio_fs_record_lock_wait_end"
+
 let rec retry_eintr f fd =
   match f fd with
   | () -> ()
@@ -713,14 +722,30 @@ let os_unlock fd =
   Eio_unix.run_in_systhread ~label:"eio-fs-unlock" (fun () ->
       lockf fd Unix.F_ULOCK)
 
+(* The kernel's blocking record lock over [fd], which answers when the holder
+   lets go: [true] once granted. The request waits on a thread of its own
+   (record_lock_wait_start), which writes to a pipe when answered, so the
+   fiber waits on the pipe and a cancel reaches it; the cancel then withdraws
+   the request before the fiber goes, and a lock granted in that instant is
+   let go. *)
+let await_record_lock fd =
+  let answered, notify = Unix.pipe ~cloexec:true () in
+  Fun.protect ~finally:(fun () ->
+      Unix.close answered;
+      Unix.close notify)
+  @@ fun () ->
+  let wait = record_lock_wait_start fd notify in
+  match Eio_unix.await_readable answered with
+  | () -> record_lock_wait_end wait false
+  | exception (Eio.Cancel.Cancelled _ as e) ->
+      if record_lock_wait_end wait true then lockf fd Unix.F_ULOCK;
+      raise e
+
 (* [on_taken] runs the moment the record lock is held, as {!take_mutex}'s
-   does. *)
-let take_os_lock ~patience ~refused ~on_taken fd =
+   does. A wait asks once without waiting, calls [on_wait] if the lock is
+   held, then makes the kernel's blocking request. *)
+let take_os_lock ~patience ~refused ~on_taken ~on_wait fd =
   let acquired = ref false in
-  (* The acquiring [lockf] is not cancellable -- it runs in a systhread and a
-     cancellation cannot reach into one -- so no wait sits in it: every ask is
-     an [F_TLOCK], which answers, and the waiting is done in a sleep, which a
-     bound, a Ctrl-C or a fiber giving up cancels. *)
   let ask () =
     Eio.Cancel.protect (fun () ->
         Eio_unix.Fd.use_exn "Eio_fs_unix.lock" fd @@ fun fd ->
@@ -733,27 +758,33 @@ let take_os_lock ~patience ~refused ~on_taken fd =
             on_taken ()
         | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ())
   in
-  let rec wait_for lapsed =
+  let wait () =
     ask ();
-    if not !acquired then
-      match lapsed with
-      | None ->
-          Eio_unix.sleep ask_again_every;
-          wait_for lapsed
-      | Some lapse ->
-          if not (Eio.Promise.is_resolved lapse) then begin
-            (* Waking on the lapse rather than sleeping through it is what
-               keeps the answer inside one further ask of the bound. *)
-            Eio.Fiber.first
-              (fun () -> Eio_unix.sleep ask_again_every)
-              (fun () -> Eio.Promise.await lapse);
-            wait_for lapsed
-          end
+    if not !acquired then begin
+      on_wait ();
+      Eio_unix.Fd.use_exn "Eio_fs_unix.lock" fd @@ fun fd ->
+      if await_record_lock fd then begin
+        acquired := true;
+        on_taken ()
+      end
+    end
+  in
+  (* A bounded wait asks again on a cadence, until the bound. *)
+  let rec wait_until lapse =
+    ask ();
+    if (not !acquired) && not (Eio.Promise.is_resolved lapse) then begin
+      (* Waking on the lapse rather than sleeping through it is what keeps
+         the answer inside one further ask of the bound. *)
+      Eio.Fiber.first
+        (fun () -> Eio_unix.sleep ask_again_every)
+        (fun () -> Eio.Promise.await lapse);
+      wait_until lapse
+    end
   in
   (match patience with
-  | Wait -> wait_for None
+  | Wait -> wait ()
   | Refuse -> ask ()
-  | Until lapse -> wait_for (Some lapse));
+  | Until lapse -> wait_until lapse);
   if not !acquired then raise (refused ())
 
 (* A planted link under the rendezvous name would send the record lock to
@@ -895,7 +926,7 @@ let open_keyed ~taken ~key open_rendezvous =
 
 (* The record lock on the rendezvous's descriptor. A rendezvous with none has
    no record lock to take, which only a process-local backend allows. *)
-let take_record_lock ~taken ~patience ~name file path =
+let take_record_lock ~taken ~patience ~on_wait ~name file path =
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
       take_os_lock ~patience
@@ -905,7 +936,7 @@ let take_record_lock ~taken ~patience ~name file path =
           in
           refusal ~name ~holder file)
         ~on_taken:(fun () -> taken (fun () -> os_unlock fd))
-        fd
+        ~on_wait fd
   | None ->
       if not (Eio_fs_sync.is_process_local (fst path)) then
         Fmt.invalid_arg
@@ -927,7 +958,7 @@ let take_record_lock ~taken ~patience ~name file path =
    which ends with the acquisition. *)
 let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
-      `If_missing 0o600) ?contents path =
+      `If_missing 0o600) ?contents ?(on_wait = ignore) path =
   let name = lock_name path in
   let steps = ref [] in
   let taken give_back = steps := give_back :: !steps in
@@ -964,22 +995,22 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     in
     set_held_file local (Some (file :> Eio.File.ro_ty Eio.Resource.t));
     taken (fun () -> set_held_file local None);
-    take_record_lock ~taken ~patience:processes ~name file path;
+    take_record_lock ~taken ~patience:processes ~on_wait ~name file path;
     settle ~name ~opened ~contents ~file path;
     file
   with
   | file -> (file, fun () -> let_go steps)
   | exception Renamed ->
       let_go steps;
-      acquire ~sw ~block ~create ?contents path
+      acquire ~sw ~block ~create ?contents ~on_wait path
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       let_go steps;
       Printexc.raise_with_backtrace e bt
 
-let with_lock ?block ?create ?contents path fn =
+let with_lock ?block ?create ?contents ?on_wait path fn =
   Eio.Switch.run @@ fun sw ->
-  let _, let_go = acquire ~sw ?block ?create ?contents path in
+  let _, let_go = acquire ~sw ?block ?create ?contents ?on_wait path in
   Fun.protect ~finally:let_go fn
 
 (* A held lock is an acquisition whose giving back waits for {!Held.release}
@@ -1009,8 +1040,8 @@ module Held = struct
         Fun.protect ~finally:t.let_go (fun () ->
             Option.iter (update_lock_contents file) contents)
 
-  let take ~sw ?block ?create ?contents path =
-    let file, let_go = acquire ~sw ?block ?create ?contents path in
+  let take ~sw ?block ?create ?contents ?on_wait path =
+    let file, let_go = acquire ~sw ?block ?create ?contents ?on_wait path in
     let t =
       {
         name = lock_name path;
@@ -1037,7 +1068,7 @@ module Held = struct
                 held_by_a_process
             in
             refusal ~name:t.name ~holder file)
-          ~on_taken:ignore fd
+          ~on_taken:ignore ~on_wait:ignore fd
 
   let restate t contents =
     writing t @@ fun () ->
@@ -1048,8 +1079,8 @@ module Held = struct
         update_lock_contents file contents
 end
 
-let hold ~sw ?block ?create ?contents path =
-  let (_ : Held.t) = Held.take ~sw ?block ?create ?contents path in
+let hold ~sw ?block ?create ?contents ?on_wait path =
+  let (_ : Held.t) = Held.take ~sw ?block ?create ?contents ?on_wait path in
   ()
 
 (* The kernel is asked first: it names another process holding the record
@@ -1116,15 +1147,39 @@ module Lease = struct
 
   let fd t = t.fd
 
-  let flock fd ~nonblocking =
-    let rec acquire () =
-      match flock_exclusive_native fd nonblocking with
-      | () -> ()
-      | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire ()
-    in
-    Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" acquire
+  let rec acquire fd ~nonblocking =
+    match flock_exclusive_native fd nonblocking with
+    | () -> ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire fd ~nonblocking
 
-  let use_os_lock ~patience ~refused fd fn =
+  let flock fd ~nonblocking =
+    Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
+        acquire fd ~nonblocking)
+
+  (* The kernel's blocking [flock], which answers when the holder lets go, on a
+     thread of its own: a request in the kernel cannot be withdrawn, so a
+     cancelled caller leaves it to that thread and answers at once. The thread
+     asks through a duplicate of [fd], which shares its open file description
+     and so the lock the kernel grants, and closes it once answered: a lock
+     granted after the cancel goes when the caller's [fd] closes too. *)
+  let await_release fd =
+    let copy = Unix.dup ~cloexec:true fd in
+    let answer, set_answer = Eio.Promise.create () in
+    let _ : Thread.t =
+      Thread.create
+        (fun () ->
+          let granted =
+            match acquire copy ~nonblocking:false with
+            | () -> Ok ()
+            | exception (Unix.Unix_error _ as e) -> Error e
+          in
+          Unix.close copy;
+          Eio.Promise.resolve set_answer granted)
+        ()
+    in
+    match Eio.Promise.await answer with Ok () -> () | Error e -> raise e
+
+  let use_os_lock ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in
     let ask ~nonblocking =
       Eio.Cancel.protect @@ fun () ->
@@ -1136,7 +1191,13 @@ module Lease = struct
           ()
     in
     (match patience with
-    | Wait -> ask ~nonblocking:false
+    | Wait ->
+        ask ~nonblocking:true;
+        if not !acquired then begin
+          on_wait ();
+          await_release fd;
+          acquired := true
+        end
     | Refuse -> ask ~nonblocking:true
     | Until lapsed ->
         let rec poll () =
@@ -1154,7 +1215,7 @@ module Lease = struct
 
   let with_exclusive ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
       ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
-        `If_missing 0o600) ?contents path fn =
+        `If_missing 0o600) ?contents ?(on_wait = ignore) path fn =
     let name = lock_name path in
     Eio.Switch.run @@ fun sw ->
     let fibers, processes =
@@ -1184,7 +1245,7 @@ module Lease = struct
         (* The kernel names no holder of an [flock]. *)
         use_os_lock ~patience:processes
           ~refused:(fun () -> refusal ~name ~holder:None file)
-          raw_fd
+          ~on_wait raw_fd
         @@ fun () ->
         run_held ~name ~opened ~contents ~file path (fun () -> fn { fd })
     | None ->
