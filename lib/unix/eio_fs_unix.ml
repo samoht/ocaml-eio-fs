@@ -243,7 +243,13 @@ let exclusive_rename = Rename_backend.v ()
 module Link = struct
   module Low = Eio_posix.Low_level
 
-  type t = { parent : Eio_unix.Fd.t; name : string; path : string }
+  type t = {
+    parent : Eio_unix.Fd.t;
+    sw : Eio.Switch.t;
+    name : string;
+    path : string;
+  }
+
   type publication = Created | Present
 
   let err_refused path reason =
@@ -278,7 +284,7 @@ module Link = struct
           in
           let rec descend fd = function
             | [] -> assert false
-            | [ name ] -> { parent = fd; name; path = original }
+            | [ name ] -> { parent = fd; sw; name; path = original }
             | name :: rest ->
                 let parent = Low.Fd fd in
                 let open_component () =
@@ -342,6 +348,43 @@ module Link = struct
           err_refused t.path
             (Fmt.str "%s %s: %s" operation argument (Unix.error_message code))
       | exception (Eio.Io _ as ex) -> err_refused t.path (Printexc.to_string ex)
+
+  let read_regular t =
+    let error fmt = Fmt.kstr (fun message -> Error message) fmt in
+    let parent = Low.Fd t.parent in
+    let opened =
+      match
+        Low.openat ~sw:t.sw ~mode:0 parent t.name
+          Low.Open_flags.(rdonly + nofollow)
+      with
+      | fd -> Ok (Some fd)
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok None
+      | exception Unix.Unix_error (code, operation, argument) ->
+          error "%s: %s %s: %s" t.path operation argument
+            (Unix.error_message code)
+      | exception (Eio.Io _ as ex) ->
+          error "%s: %s" t.path (Printexc.to_string ex)
+    in
+    match opened with
+    | Error _ as error -> error
+    | Ok None -> Ok None
+    | Ok (Some fd) -> (
+        let stat = stat_of_fd fd in
+        let size = Optint.Int63.to_int64 stat.size in
+        if stat.kind <> `Regular_file then
+          error "%s is not a regular file" t.path
+        else if size < 0L || size >= Int64.of_int max_int then
+          error "%s is too large to read" t.path
+        else
+          match
+            Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)
+              ~validate:(fun _ -> Ok ())
+              ~stat
+              ~read:(fun buffer -> Low.readv fd [| buffer |])
+          with
+          | Ok bytes -> Ok (Some (Cstruct.to_string bytes))
+          | Error `Too_large -> error "%s changed size while read" t.path
+          | Error (`Invalid reason) -> error "%s: %s" t.path reason)
 end
 
 type refusal = { path : string; holder : int option; record : string }
