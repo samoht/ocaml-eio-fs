@@ -33,6 +33,24 @@ let test_v_is_empty () =
     "a fresh root has no entry" []
     (Eio.Path.read_dir (Eio_fs.Fs.v ()))
 
+(* rename(2) fails with EXDEV when its two paths are on different file systems
+   (POSIX.1-2017, rename, ERRORS), and two [Fs.v ()] roots are two: the entry
+   stays where it was and the target gains nothing. *)
+let test_rename_across_roots_is_refused () =
+  Eio_mock.Backend.run @@ fun () ->
+  let first = Eio_fs.Fs.v () in
+  let second = Eio_fs.Fs.v () in
+  write first "moved.txt" "one";
+  (match Eio.Path.rename (first / "moved.txt") (second / "moved.txt") with
+  | () -> Alcotest.fail "a rename moved an entry between two filesystems"
+  | exception Eio.Io _ -> ());
+  Alcotest.(check string)
+    "the source keeps its file" "one"
+    (Eio.Path.load (first / "moved.txt"));
+  Alcotest.(check bool)
+    "the target gained nothing" true
+    (Eio.Path.kind ~follow:false (second / "moved.txt") = `Not_found)
+
 let test_mkdir_read_dir () =
   with_fs @@ fun fs ->
   Eio.Path.mkdir ~perm:0o755 (fs / "d");
@@ -495,6 +513,8 @@ let suite =
       Alcotest.test_case "v roots share no file" `Quick
         test_v_roots_share_no_file;
       Alcotest.test_case "v is empty" `Quick test_v_is_empty;
+      Alcotest.test_case "rename across roots is refused" `Quick
+        test_rename_across_roots_is_refused;
       Alcotest.test_case "tree labels each node by its last component" `Quick
         test_tree_labels_each_node_by_its_last_component;
       Alcotest.test_case "name falls back to the Eio rendering" `Quick
