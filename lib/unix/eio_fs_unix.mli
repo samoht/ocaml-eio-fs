@@ -416,10 +416,11 @@ module Link : sig
       existing entry is refused without replacing it. Errors name the original
       path and the action needed to retry. *)
 
-  val read_regular : t -> (string option, string) result
+  val read_regular : ?max_bytes:int -> t -> (string option, string) result
   (** [read_regular parent] opens the final entry beneath the held parent with
       [O_NOFOLLOW] and reads from that descriptor. [None] means the final entry
       is absent. A symbolic link or another non-regular entry refuses; a file
-      that grows beyond its size at open also refuses. The enclosing
-      {!val-with_parent} refuses symbolic links at every parent component. *)
+      that exceeds [max_bytes] or grows beyond its size at open also refuses.
+      The default is [max_int]. The enclosing {!val-with_parent} refuses
+      symbolic links at every parent component. *)
 end

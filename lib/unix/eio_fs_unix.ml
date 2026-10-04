@@ -403,7 +403,7 @@ module Link = struct
             (Fmt.str "%s %s: %s" operation argument (Unix.error_message code))
       | exception (Eio.Io _ as ex) -> err_refused t.path (Printexc.to_string ex)
 
-  let read_regular t =
+  let read_regular ?(max_bytes = max_int) t =
     let err_read fmt = Fmt.kstr (fun message -> Error message) fmt in
     let parent = Low.Fd t.parent in
     let opened =
@@ -427,7 +427,7 @@ module Link = struct
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
           err_read "%s is not a regular file" t.path
-        else if size < 0L || size >= Int64.of_int max_int then
+        else if size < 0L || size > Int64.of_int max_bytes then
           err_read "%s is too large to read" t.path
         else
           match
