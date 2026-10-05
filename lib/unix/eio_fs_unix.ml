@@ -1321,3 +1321,27 @@ let set_xattr path name v =
   let native = Eio.Path.native_exn path in
   Eio_unix.run_in_systhread ~label:"eio-fs-set-xattr" @@ fun () ->
   lsetxattr native name v
+
+module Batch = struct
+  type t = unit
+
+  type op =
+    | Mkdir of { path : string; perm : int }
+    | Create of { path : string; perm : int; contents : string }
+    | Symlink of { path : string; target : string }
+    | Unlink of { path : string; dir : bool }
+    | Rename of { src : string; dst : string }
+    | Lstat of string
+
+  type outcome = Done | Stat of Eio.File.Stat.t
+  type error = [ `Refused of string | `Unix of Unix.error * string * string ]
+
+  let pp_error ppf = function
+    | `Refused reason -> Fmt.pf ppf "refused: %s" reason
+    | `Unix (code, call, arg) ->
+        Fmt.pf ppf "%s %s: %s" call arg (Unix.error_message code)
+
+  let v ~sw:_ _ = failwith "TODO: Eio_fs_unix.Batch.v"
+  let run _ _ = failwith "TODO: Eio_fs_unix.Batch.run"
+  let hops () = failwith "TODO: Eio_fs_unix.Batch.hops"
+end

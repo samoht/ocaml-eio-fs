@@ -443,3 +443,68 @@ module Link : sig
       The default is [max_int]. The enclosing {!val-with_parent} refuses
       symbolic links at every parent component. *)
 end
+
+(** Confined directory operations, many to one system-thread hop.
+
+    {!Eio.Path} makes one system-thread hop per operation, which dominates the
+    cost of writing a large tree of small files. A batch runs a list of
+    operations beneath one directory in a single hop and answers each one
+    separately.
+
+    Every path is relative to the batch's directory and resolved one component
+    at a time with [openat(O_DIRECTORY | O_NOFOLLOW)], as [eio_posix] resolves a
+    path where the kernel has no [RESOLVE_BENEATH]. The confinement is stricter
+    than {!Eio.Path}'s: an absolute path, an empty, [.] or [..] component, a NUL
+    byte, or a symbolic link before the last component is refused, never
+    followed, so no operation reaches outside the directory. The last component
+    is never followed either. The directories a run opens are held for the run
+    only. *)
+module Batch : sig
+  type t
+  (** The type for a directory that batches run beneath. *)
+
+  val v : sw:Eio.Switch.t -> _ Eio.Path.t -> t
+  (** [v ~sw dir] opens [dir], resolved by {!Eio.Path}'s own confinement, and
+      holds it until [sw] finishes.
+
+      @raise Eio.Io when [dir] cannot be opened as a directory.
+      @raise Invalid_argument if the backend provides no POSIX descriptor. *)
+
+  type op =
+    | Mkdir of { path : string; perm : int }
+        (** [mkdirat(2)] with [perm], subject to the umask. *)
+    | Create of { path : string; perm : int; contents : string }
+        (** [openat(2)] with [O_CREAT | O_EXCL | O_NOFOLLOW], every byte of
+            [contents] written, then [fchmod(2)] to [perm], so the umask does
+            not apply. A failed write leaves the file holding what was written.
+        *)
+    | Symlink of { path : string; target : string }
+        (** [symlinkat(2)]; [target] is stored as given and never resolved. *)
+    | Unlink of { path : string; dir : bool }
+        (** [unlinkat(2)], with [AT_REMOVEDIR] iff [dir]. *)
+    | Rename of { src : string; dst : string }
+        (** [renameat(2)]; both paths are confined. *)
+    | Lstat of string  (** [fstatat(2)] with [AT_SYMLINK_NOFOLLOW]. *)
+
+  type outcome = Done | Stat of Eio.File.Stat.t
+
+  type error =
+    [ `Refused of string
+      (** The path names nothing beneath the directory; the string says why. *)
+    | `Unix of Unix.error * string * string
+      (** The system call failed: its error, its name and its argument. *) ]
+
+  val pp_error : error Fmt.t
+  (** [pp_error] formats an error for logs and test failures. *)
+
+  val run : t -> op list -> (outcome, error) result list
+  (** [run t ops] performs [ops] in order, in one system-thread hop, and is
+      their results in the same order. An operation that fails does not stop the
+      ones after it.
+
+      @raise Invalid_argument if [t]'s switch has finished. *)
+
+  val hops : unit -> int
+  (** [hops ()] is how many system-thread hops this module has made since the
+      program started. *)
+end
