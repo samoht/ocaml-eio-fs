@@ -12,13 +12,13 @@
     backend provide the same operation without exposing its descriptor. *)
 module Nofollow : sig
   type error = [ `Invalid of string | `Too_large ]
-  type result = (Cstruct.t, error) Stdlib.result
+  type result = (Cstruct.t, error) Result.t
 
   type reader =
     sw:Eio.Switch.t ->
     path:string ->
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Stdlib.result) ->
+    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
     result
 
   val find : _ Eio.Resource.t -> reader option
@@ -26,7 +26,7 @@ module Nofollow : sig
 
   val run :
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Stdlib.result) ->
+    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
     result
