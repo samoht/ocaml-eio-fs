@@ -869,6 +869,28 @@ CAMLprim value caml_eio_fs_batch_rename(value srcfd_v, value src_v,
   CAMLreturn(Val_unit);
 }
 
+/* linkat(2) with no flags: a symbolic link at [src] is linked itself and
+   never followed. */
+CAMLprim value caml_eio_fs_batch_link(value srcfd_v, value src_v,
+                                      value dstfd_v, value dst_v)
+{
+  CAMLparam4(srcfd_v, src_v, dstfd_v, dst_v);
+  caml_unix_check_path(src_v, "linkat");
+  caml_unix_check_path(dst_v, "linkat");
+  char *src = caml_stat_strdup(String_val(src_v));
+  char *dst = caml_stat_strdup(String_val(dst_v));
+  int r;
+  caml_release_runtime_system();
+  r = linkat(Int_val(srcfd_v), src, Int_val(dstfd_v), dst, 0);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(src);
+  caml_stat_free(dst);
+  if (r == -1)
+    caml_unix_error(saved_errno, "linkat", dst_v);
+  CAMLreturn(Val_unit);
+}
+
 /* The result is a block of 15 fields in the order of Batch.raw_stat: ten
    boxed int64 (dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks)
    and three boxed doubles (atime, mtime, ctime). */

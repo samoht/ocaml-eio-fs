@@ -58,6 +58,8 @@ let test_dotdot () =
       Batch.Mkdir { path = "../outside_dir/x"; perm = 0o755 };
       Batch.Symlink { path = "../outside_dir/l"; target = "x" };
       Batch.Rename { src = "../outside"; dst = "stolen" };
+      Batch.Link { src = "../outside"; dst = "stolen" };
+      Batch.Link { src = "f"; dst = "../outside_dir/aliased" };
       Batch.Unlink { path = "../outside"; dir = false };
       escaping "/tmp/escaped";
       escaping "./a";
@@ -88,6 +90,7 @@ let test_symlink_component () =
         Batch.Mkdir { path = "link/sub"; perm = 0o755 };
         Batch.Symlink { path = "link/s"; target = "x" };
         Batch.Rename { src = "f"; dst = "link/f" };
+        Batch.Link { src = "f"; dst = "link/aliased" };
         Batch.Lstat "link/x";
       ]
   in
@@ -99,6 +102,37 @@ let test_symlink_component () =
   | [ Error e ] ->
       Alcotest.failf "leaf: expected EEXIST, got %a" Batch.pp_error e
   | _ -> Alcotest.fail "leaf: expected EEXIST");
+  check_outside base
+
+(* [linkat(2)] with no flags links the symbolic link at [src] itself (IEEE Std
+   1003.1-2017, linkat), so a planted link to the outside file gains a second
+   name while the outside file keeps its one. A regular file beneath the root
+   gains a second name sharing its inode. *)
+let test_link () =
+  with_tree @@ fun base batch ->
+  let inside = Filename.concat base "inside" in
+  Unix.symlink "../outside" (Filename.concat inside "leaf");
+  Out_channel.with_open_bin (Filename.concat inside "f") (fun oc ->
+      output_string oc "f");
+  (match
+     Batch.run batch
+       [
+         Batch.Link { src = "f"; dst = "g" };
+         Batch.Link { src = "leaf"; dst = "leaf2" };
+       ]
+   with
+  | [ Ok Batch.Done; Ok Batch.Done ] -> ()
+  | _ -> Alcotest.fail "expected both links to be made");
+  let f = Unix.lstat (Filename.concat inside "f")
+  and g = Unix.lstat (Filename.concat inside "g") in
+  Alcotest.(check int) "g shares f's inode" f.Unix.st_ino g.Unix.st_ino;
+  Alcotest.(check int) "f has two names" 2 f.Unix.st_nlink;
+  Alcotest.(check bool)
+    "leaf2 is the link itself" true
+    ((Unix.lstat (Filename.concat inside "leaf2")).Unix.st_kind = Unix.S_LNK);
+  Alcotest.(check int)
+    "outside file keeps one name" 1
+    (Unix.lstat (Filename.concat base "outside")).Unix.st_nlink;
   check_outside base
 
 let kind = function
@@ -187,5 +221,6 @@ let suite =
       Alcotest.test_case "symlink component is refused" `Quick
         test_symlink_component;
       Alcotest.test_case "per-op errors" `Quick test_per_op_errors;
+      Alcotest.test_case "link" `Quick test_link;
       Alcotest.test_case "one hop per batch" `Quick test_one_hop;
     ] )

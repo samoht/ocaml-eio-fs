@@ -1342,6 +1342,10 @@ module Batch = struct
     Unix.file_descr -> string -> Unix.file_descr -> string -> unit
     = "caml_eio_fs_batch_rename"
 
+  external link_native :
+    Unix.file_descr -> string -> Unix.file_descr -> string -> unit
+    = "caml_eio_fs_batch_link"
+
   type raw_stat = {
     dev : int64;
     ino : int64;
@@ -1364,8 +1368,10 @@ module Batch = struct
   type t = { fd : Eio_unix.Fd.t }
 
   let v ~sw dir =
-    let dir = Eio.Path.open_dir ~sw dir in
-    let file = Eio.Path.open_in ~sw dir in
+    (* Opening [dir] through the supplied capability is the path operation a
+       wrapper observes; its already-open base then yields the descriptor. *)
+    let opened, _ = Eio.Path.open_dir ~sw dir in
+    let file = Eio.Path.open_in ~sw (Eio.Path.of_dir (unwrapped_dir opened)) in
     match Eio_unix.Resource.fd_opt file with
     | Some fd -> { fd }
     | None -> invalid_arg "Eio_fs_unix.Batch.v: native directory required"
@@ -1376,6 +1382,7 @@ module Batch = struct
     | Symlink of { path : string; target : string }
     | Unlink of { path : string; dir : bool }
     | Rename of { src : string; dst : string }
+    | Link of { src : string; dst : string }
     | Lstat of string
 
   type outcome = Done | Stat of Eio.File.Stat.t
@@ -1506,6 +1513,11 @@ module Batch = struct
         let dst_dir, dst_leaf = parent run dst in
         rename_native src_dir src_leaf dst_dir dst_leaf;
         forget run;
+        Done
+    | Link { src; dst } ->
+        let src_dir, src_leaf = parent run src in
+        let dst_dir, dst_leaf = parent run dst in
+        link_native src_dir src_leaf dst_dir dst_leaf;
         Done
     | Lstat path ->
         let dir, leaf = parent run path in

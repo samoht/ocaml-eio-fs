@@ -465,7 +465,8 @@ module Batch : sig
 
   val v : sw:Eio.Switch.t -> _ Eio.Path.t -> t
   (** [v ~sw dir] opens [dir], resolved by {!Eio.Path}'s own confinement, and
-      holds it until [sw] finishes.
+      holds it until [sw] finishes. A wrapper such as {!Eio_fs.Chaos} observes
+      the open and the batch then runs beneath the directory it wraps.
 
       @raise Eio.Io when [dir] cannot be opened as a directory.
       @raise Invalid_argument if the backend provides no POSIX descriptor. *)
@@ -484,6 +485,10 @@ module Batch : sig
         (** [unlinkat(2)], with [AT_REMOVEDIR] iff [dir]. *)
     | Rename of { src : string; dst : string }
         (** [renameat(2)]; both paths are confined. *)
+    | Link of { src : string; dst : string }
+        (** [linkat(2)] making [dst] a second name for [src]; both paths are
+            confined, and a symbolic link at [src] is linked itself, never
+            followed. *)
     | Lstat of string  (** [fstatat(2)] with [AT_SYMLINK_NOFOLLOW]. *)
 
   type outcome = Done | Stat of Eio.File.Stat.t
