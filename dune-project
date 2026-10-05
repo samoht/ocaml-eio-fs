@@ -18,7 +18,7 @@
 (package
  (name eio-fs)
  (synopsis "Filesystem helpers and an in-memory backend for Eio")
- (tags (org:blacksun system))
+ (tags (org:blacksun system hermetic:eio-boundary))
  (description
   "Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
    [Eio_fs.Fs.v ()] creates a fresh filesystem, [Eio_fs.Fs.load] populates it
@@ -29,6 +29,7 @@
    (https://tangled.org/patrick.sirref.org/eio_mem), which is itself derived
    from the Eio filesystem interfaces.")
  (depends
+  hermetic
   (ocaml (>= 5.1))
   (eio (>= 1.5))
   (eio_posix (>= 1.0))

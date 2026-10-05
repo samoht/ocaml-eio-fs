@@ -2,4 +2,15 @@
  (name eio_fs)
  (public_name eio-fs)
  (private_modules low_level)
- (libraries eio eio.utils eio-fs.path eio-fs.sync fmt cstruct optint console))
+ (libraries
+  hermetic.eio
+  eio
+  eio.utils
+  eio-fs.path
+  eio-fs.sync
+  fmt
+  cstruct
+  optint
+  console)
+ (flags
+  (:standard -open Hermetic_eio)))
