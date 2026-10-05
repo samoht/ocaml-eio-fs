@@ -1,0 +1,6 @@
+; Not run by any test: writes a git tree's HEAD three ways and prints files/s.
+; dune exec ocaml-eio-fs/bench/batch_bench.exe -- <git repo> <scratch dir>
+
+(executable
+ (name batch_bench)
+ (libraries eio eio.unix eio_main eio-fs.unix fmt unix))

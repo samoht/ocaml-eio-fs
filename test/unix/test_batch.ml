@@ -46,23 +46,23 @@ let refused message = function
       Alcotest.failf "%s: expected a refusal, got %a" message Batch.pp_error e
   | Ok _ -> Alcotest.failf "%s: expected a refusal, got success" message
 
-let create path = Batch.Create { path; perm = 0o644; contents = "escaped" }
+let escaping path = Batch.Create { path; perm = 0o644; contents = "escaped" }
 
 let test_dotdot () =
   with_tree @@ fun base batch ->
   let ops =
     [
-      create "../outside";
-      create "../escaped";
-      create "sub/../../escaped";
+      escaping "../outside";
+      escaping "../escaped";
+      escaping "sub/../../escaped";
       Batch.Mkdir { path = "../outside_dir/x"; perm = 0o755 };
       Batch.Symlink { path = "../outside_dir/l"; target = "x" };
       Batch.Rename { src = "../outside"; dst = "stolen" };
       Batch.Unlink { path = "../outside"; dir = false };
-      create "/tmp/escaped";
-      create "./a";
-      create "a//b";
-      create "";
+      escaping "/tmp/escaped";
+      escaping "./a";
+      escaping "a//b";
+      escaping "";
     ]
   in
   let results = Batch.run batch ops in
@@ -84,7 +84,7 @@ let test_symlink_component () =
   let results =
     Batch.run batch
       [
-        create "link/x";
+        escaping "link/x";
         Batch.Mkdir { path = "link/sub"; perm = 0o755 };
         Batch.Symlink { path = "link/s"; target = "x" };
         Batch.Rename { src = "f"; dst = "link/f" };
@@ -94,7 +94,7 @@ let test_symlink_component () =
   List.iteri (fun i r -> refused (Fmt.str "op %d" i) r) results;
   (* The last component is never followed: creating over a planted link to
      the outside file fails with EEXIST and writes nothing through it. *)
-  (match Batch.run batch [ create "leaf" ] with
+  (match Batch.run batch [ escaping "leaf" ] with
   | [ Error (`Unix (Unix.EEXIST, _, _)) ] -> ()
   | [ Error e ] ->
       Alcotest.failf "leaf: expected EEXIST, got %a" Batch.pp_error e

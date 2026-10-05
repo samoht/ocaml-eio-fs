@@ -1395,25 +1395,26 @@ module Batch = struct
 
   exception Refused of string
 
-  let refuse fmt = Fmt.kstr (fun reason -> raise (Refused reason)) fmt
+  let fail_refused fmt = Fmt.kstr (fun reason -> raise (Refused reason)) fmt
 
   (* The parent components and the last one, or a refusal for any path that
      could name something outside the root. *)
   let split path =
-    if String.equal path "" then refuse "empty path"
-    else if Char.equal path.[0] '/' then refuse "%S is absolute" path
-    else if String.contains path '\000' then refuse "%S holds a NUL byte" path
+    if String.equal path "" then fail_refused "empty path"
+    else if Char.equal path.[0] '/' then fail_refused "%S is absolute" path
+    else if String.contains path '\000' then
+      fail_refused "%S holds a NUL byte" path
     else
       let parts = String.split_on_char '/' path in
       List.iter
         (function
-          | "" -> refuse "%S has an empty component" path
-          | ("." | "..") as c -> refuse "%S has a %s component" path c
+          | "" -> fail_refused "%S has an empty component" path
+          | ("." | "..") as c -> fail_refused "%S has a %s component" path c
           | _ -> ())
         parts;
       match List.rev parts with
       | leaf :: rev_parents -> (List.rev rev_parents, leaf)
-      | [] -> refuse "empty path"
+      | [] -> fail_refused "empty path"
 
   let kind_of_mode mode =
     match mode land 0o170000 with
@@ -1476,7 +1477,7 @@ module Batch = struct
               match lstat_native fd name with
               | { mode; _ }
                 when kind_of_mode (Int64.to_int mode) = `Symbolic_link ->
-                  refuse "%S is a symbolic link" key
+                  fail_refused "%S is a symbolic link" key
               | _ | (exception Unix.Unix_error _) -> raise e))
     in
     let fd, _ = List.fold_left step (run.root, "") parents in
