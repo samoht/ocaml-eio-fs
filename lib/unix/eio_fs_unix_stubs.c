@@ -706,3 +706,210 @@ CAMLprim value caml_eio_fs_clone_tree(value src_v, value dst_v)
   caml_unix_error(saved_errno, "clonefile", src_v);
   CAMLreturn(Val_false);
 }
+
+/* --- Batched confined directory operations ---
+
+   Each stub is one call of a Batch operation: it copies its arguments out of
+   the OCaml heap, releases the runtime for the system calls and raises
+   Unix_error on failure. Batch.run calls them from one system thread. */
+
+#include <sys/stat.h>
+
+static int eio_fs_batch_retry_close(int fd)
+{
+  int r = close(fd);
+  return (r == -1 && errno == EINTR) ? 0 : r;
+}
+
+CAMLprim value caml_eio_fs_batch_open_dir(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  caml_unix_check_path(name_v, "openat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int fd;
+  caml_release_runtime_system();
+  do {
+    fd = openat(Int_val(dirfd_v), name,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd == -1 && errno == EINTR);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (fd == -1)
+    caml_unix_error(saved_errno, "openat", name_v);
+  CAMLreturn(Val_int(fd));
+}
+
+CAMLprim value caml_eio_fs_batch_create(value dirfd_v, value name_v,
+                                        value perm_v, value contents_v)
+{
+  CAMLparam4(dirfd_v, name_v, perm_v, contents_v);
+  caml_unix_check_path(name_v, "openat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  size_t len = caml_string_length(contents_v);
+  char *buf = caml_stat_alloc(len + 1);
+  memcpy(buf, String_val(contents_v), len);
+  mode_t perm = (mode_t)Int_val(perm_v);
+  const char *call = "openat";
+  int r = 0, saved_errno = 0;
+  caml_release_runtime_system();
+  int fd;
+  do {
+    fd = openat(Int_val(dirfd_v), name,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, perm);
+  } while (fd == -1 && errno == EINTR);
+  if (fd == -1) {
+    r = -1;
+    saved_errno = errno;
+  } else {
+    size_t off = 0;
+    while (off < len) {
+      ssize_t w = write(fd, buf + off, len - off);
+      if (w == -1) {
+        if (errno == EINTR)
+          continue;
+        r = -1;
+        saved_errno = errno;
+        call = "write";
+        break;
+      }
+      off += (size_t)w;
+    }
+    if (r == 0 && fchmod(fd, perm) == -1) {
+      r = -1;
+      saved_errno = errno;
+      call = "fchmod";
+    }
+    if (eio_fs_batch_retry_close(fd) == -1 && r == 0) {
+      r = -1;
+      saved_errno = errno;
+      call = "close";
+    }
+  }
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  caml_stat_free(buf);
+  if (r == -1)
+    caml_unix_error(saved_errno, call, name_v);
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value caml_eio_fs_batch_mkdir(value dirfd_v, value name_v,
+                                       value perm_v)
+{
+  CAMLparam3(dirfd_v, name_v, perm_v);
+  caml_unix_check_path(name_v, "mkdirat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int r;
+  caml_release_runtime_system();
+  r = mkdirat(Int_val(dirfd_v), name, (mode_t)Int_val(perm_v));
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "mkdirat", name_v);
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value caml_eio_fs_batch_symlink(value target_v, value dirfd_v,
+                                         value name_v)
+{
+  CAMLparam3(target_v, dirfd_v, name_v);
+  caml_unix_check_path(target_v, "symlinkat");
+  caml_unix_check_path(name_v, "symlinkat");
+  char *target = caml_stat_strdup(String_val(target_v));
+  char *name = caml_stat_strdup(String_val(name_v));
+  int r;
+  caml_release_runtime_system();
+  r = symlinkat(target, Int_val(dirfd_v), name);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(target);
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "symlinkat", name_v);
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value caml_eio_fs_batch_unlink(value dirfd_v, value name_v,
+                                        value dir_v)
+{
+  CAMLparam3(dirfd_v, name_v, dir_v);
+  caml_unix_check_path(name_v, "unlinkat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int flags = Bool_val(dir_v) ? AT_REMOVEDIR : 0;
+  int r;
+  caml_release_runtime_system();
+  r = unlinkat(Int_val(dirfd_v), name, flags);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "unlinkat", name_v);
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value caml_eio_fs_batch_rename(value srcfd_v, value src_v,
+                                        value dstfd_v, value dst_v)
+{
+  CAMLparam4(srcfd_v, src_v, dstfd_v, dst_v);
+  caml_unix_check_path(src_v, "renameat");
+  caml_unix_check_path(dst_v, "renameat");
+  char *src = caml_stat_strdup(String_val(src_v));
+  char *dst = caml_stat_strdup(String_val(dst_v));
+  int r;
+  caml_release_runtime_system();
+  r = renameat(Int_val(srcfd_v), src, Int_val(dstfd_v), dst);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(src);
+  caml_stat_free(dst);
+  if (r == -1)
+    caml_unix_error(saved_errno, "renameat", dst_v);
+  CAMLreturn(Val_unit);
+}
+
+/* The result is a block of 15 fields in the order of Batch.raw_stat: ten
+   boxed int64 (dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks)
+   and three boxed doubles (atime, mtime, ctime). */
+CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  CAMLlocal2(res, v);
+  caml_unix_check_path(name_v, "fstatat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  struct stat st;
+  int r;
+  caml_release_runtime_system();
+  r = fstatat(Int_val(dirfd_v), name, &st, AT_SYMLINK_NOFOLLOW);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "fstatat", name_v);
+#if defined(__APPLE__)
+  double at = st.st_atimespec.tv_sec + st.st_atimespec.tv_nsec / 1e9;
+  double mt = st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec / 1e9;
+  double ct = st.st_ctimespec.tv_sec + st.st_ctimespec.tv_nsec / 1e9;
+#else
+  double at = st.st_atim.tv_sec + st.st_atim.tv_nsec / 1e9;
+  double mt = st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9;
+  double ct = st.st_ctim.tv_sec + st.st_ctim.tv_nsec / 1e9;
+#endif
+  int64_t ints[10] = {(int64_t)st.st_dev,    (int64_t)st.st_ino,
+                      (int64_t)st.st_mode,   (int64_t)st.st_nlink,
+                      (int64_t)st.st_uid,    (int64_t)st.st_gid,
+                      (int64_t)st.st_rdev,   (int64_t)st.st_size,
+                      (int64_t)st.st_blksize, (int64_t)st.st_blocks};
+  double times[3] = {at, mt, ct};
+  res = caml_alloc_tuple(13);
+  for (int i = 0; i < 10; i++) {
+    v = caml_copy_int64(ints[i]);
+    Store_field(res, i, v);
+  }
+  for (int i = 0; i < 3; i++) {
+    v = caml_copy_double(times[i]);
+    Store_field(res, 10 + i, v);
+  }
+  CAMLreturn(res);
+}

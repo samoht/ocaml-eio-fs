@@ -1323,7 +1323,52 @@ let set_xattr path name v =
   lsetxattr native name v
 
 module Batch = struct
-  type t = unit
+  external open_dir_native : Unix.file_descr -> string -> Unix.file_descr
+    = "caml_eio_fs_batch_open_dir"
+
+  external create_native : Unix.file_descr -> string -> int -> string -> unit
+    = "caml_eio_fs_batch_create"
+
+  external mkdir_native : Unix.file_descr -> string -> int -> unit
+    = "caml_eio_fs_batch_mkdir"
+
+  external symlink_native : string -> Unix.file_descr -> string -> unit
+    = "caml_eio_fs_batch_symlink"
+
+  external unlink_native : Unix.file_descr -> string -> bool -> unit
+    = "caml_eio_fs_batch_unlink"
+
+  external rename_native :
+    Unix.file_descr -> string -> Unix.file_descr -> string -> unit
+    = "caml_eio_fs_batch_rename"
+
+  type raw_stat = {
+    dev : int64;
+    ino : int64;
+    mode : int64;
+    nlink : int64;
+    uid : int64;
+    gid : int64;
+    rdev : int64;
+    size : int64;
+    blksize : int64;
+    blocks : int64;
+    atime : float;
+    mtime : float;
+    ctime : float;
+  }
+
+  external lstat_native : Unix.file_descr -> string -> raw_stat
+    = "caml_eio_fs_batch_lstat"
+
+  type t = { fd : Eio_unix.Fd.t }
+
+  let v ~sw dir =
+    let dir = Eio.Path.open_dir ~sw dir in
+    let file = Eio.Path.open_in ~sw dir in
+    match Eio_unix.Resource.fd_opt file with
+    | Some fd -> { fd }
+    | None -> invalid_arg "Eio_fs_unix.Batch.v: native directory required"
 
   type op =
     | Mkdir of { path : string; perm : int }
@@ -1341,7 +1386,147 @@ module Batch = struct
     | `Unix (code, call, arg) ->
         Fmt.pf ppf "%s %s: %s" call arg (Unix.error_message code)
 
-  let v ~sw:_ _ = failwith "TODO: Eio_fs_unix.Batch.v"
-  let run _ _ = failwith "TODO: Eio_fs_unix.Batch.run"
-  let hops () = failwith "TODO: Eio_fs_unix.Batch.hops"
+  let hop_count = Atomic.make 0
+  let hops () = Atomic.get hop_count
+
+  let hop fn =
+    Atomic.incr hop_count;
+    Eio_unix.run_in_systhread ~label:"eio-fs-batch" fn
+
+  exception Refused of string
+
+  let refuse fmt = Fmt.kstr (fun reason -> raise (Refused reason)) fmt
+
+  (* The parent components and the last one, or a refusal for any path that
+     could name something outside the root. *)
+  let split path =
+    if String.equal path "" then refuse "empty path"
+    else if Char.equal path.[0] '/' then refuse "%S is absolute" path
+    else if String.contains path '\000' then refuse "%S holds a NUL byte" path
+    else
+      let parts = String.split_on_char '/' path in
+      List.iter
+        (function
+          | "" -> refuse "%S has an empty component" path
+          | ("." | "..") as c -> refuse "%S has a %s component" path c
+          | _ -> ())
+        parts;
+      match List.rev parts with
+      | leaf :: rev_parents -> (List.rev rev_parents, leaf)
+      | [] -> refuse "empty path"
+
+  let kind_of_mode mode =
+    match mode land 0o170000 with
+    | 0o040000 -> `Directory
+    | 0o100000 -> `Regular_file
+    | 0o120000 -> `Symbolic_link
+    | 0o010000 -> `Fifo
+    | 0o020000 -> `Character_special
+    | 0o060000 -> `Block_device
+    | 0o140000 -> `Socket
+    | _ -> `Unknown
+
+  let stat_of_raw (r : raw_stat) : Eio.File.Stat.t =
+    let mode = Int64.to_int r.mode in
+    {
+      dev = r.dev;
+      ino = r.ino;
+      kind = kind_of_mode mode;
+      perm = mode land 0o7777;
+      nlink = r.nlink;
+      uid = r.uid;
+      gid = r.gid;
+      rdev = r.rdev;
+      size = Optint.Int63.of_int64 r.size;
+      blksize = r.blksize;
+      blocks = r.blocks;
+      atime = r.atime;
+      mtime = r.mtime;
+      ctime = r.ctime;
+    }
+
+  (* The directories one run has opened, by their path beneath the root. A
+     rename or a directory removal may move or delete any of them, so either
+     empties the table. *)
+  type run = {
+    root : Unix.file_descr;
+    dirs : (string, Unix.file_descr) Hashtbl.t;
+  }
+
+  let forget run =
+    Hashtbl.iter (fun _ fd -> Unix.close fd) run.dirs;
+    Hashtbl.reset run.dirs
+
+  (* [parent run path] is the directory holding [path]'s last component and
+     that component, opened one component at a time with O_NOFOLLOW. *)
+  let parent run path =
+    let parents, leaf = split path in
+    let step (fd, prefix) name =
+      let key = if String.equal prefix "" then name else prefix ^ "/" ^ name in
+      match Hashtbl.find_opt run.dirs key with
+      | Some fd -> (fd, key)
+      | None -> (
+          match open_dir_native fd name with
+          | next ->
+              Hashtbl.add run.dirs key next;
+              (next, key)
+          | exception
+              (Unix.Unix_error ((Unix.ELOOP | Unix.ENOTDIR | Unix.EMLINK), _, _)
+               as e) -> (
+              match lstat_native fd name with
+              | { mode; _ }
+                when kind_of_mode (Int64.to_int mode) = `Symbolic_link ->
+                  refuse "%S is a symbolic link" key
+              | _ | (exception Unix.Unix_error _) -> raise e))
+    in
+    let fd, _ = List.fold_left step (run.root, "") parents in
+    (fd, leaf)
+
+  let perform run = function
+    | Mkdir { path; perm } ->
+        let dir, leaf = parent run path in
+        mkdir_native dir leaf perm;
+        Done
+    | Create { path; perm; contents } ->
+        let dir, leaf = parent run path in
+        create_native dir leaf perm contents;
+        Done
+    | Symlink { path; target } ->
+        let dir, leaf = parent run path in
+        symlink_native target dir leaf;
+        Done
+    | Unlink { path; dir = is_dir } ->
+        let dir, leaf = parent run path in
+        unlink_native dir leaf is_dir;
+        if is_dir then forget run;
+        Done
+    | Rename { src; dst } ->
+        let src_dir, src_leaf = parent run src in
+        let dst_dir, dst_leaf = parent run dst in
+        rename_native src_dir src_leaf dst_dir dst_leaf;
+        forget run;
+        Done
+    | Lstat path ->
+        let dir, leaf = parent run path in
+        Stat (stat_of_raw (lstat_native dir leaf))
+
+  let attempt run op =
+    match perform run op with
+    | outcome -> Ok outcome
+    | exception Refused reason -> Error (`Refused reason)
+    | exception Unix.Unix_error (code, call, arg) ->
+        Error (`Unix (code, call, arg))
+
+  let run t ops =
+    match ops with
+    | [] -> []
+    | ops ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.Batch.run" t.fd @@ fun root ->
+        hop @@ fun () ->
+        let run = { root; dirs = Hashtbl.create 16 } in
+        Fun.protect
+          ~finally:(fun () -> forget run)
+          (fun () ->
+            List.rev
+              (List.fold_left (fun acc op -> attempt run op :: acc) [] ops))
 end
