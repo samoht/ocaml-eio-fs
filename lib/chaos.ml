@@ -521,23 +521,23 @@ let swap_after boxed fault path =
 module Dir_impl = struct
   type t = dir
 
-  let open_in t ~sw path =
+  let open_in t ~sw ~follow path =
     let fault = Schedule.next t.sched (Op.open_ path) in
     (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
-    let file = B.open_in bv ~sw path in
+    let file = B.open_in bv ~sw ~follow path in
     swap_after t.boxed fault path;
     wrap_ro t.sched ~path file
 
-  let open_out t ~sw ~append ~create path =
+  let open_out t ~sw ~follow ~append ~create path =
     let fault = Schedule.next t.sched (Op.open_ path) in
     (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
-    let file = B.open_out bv ~sw ~append ~create path in
+    let file = B.open_out bv ~sw ~follow ~append ~create path in
     swap_after t.boxed fault path;
     wrap_rw t.sched ~path file
 
@@ -787,7 +787,8 @@ module Crash = struct
     | { kind = `Regular_file; _ } -> (
         try
           with_readable owner path (fun () ->
-              Switch.run (fun sw -> read_all (B.open_in bv ~sw path)))
+              Switch.run (fun sw ->
+                  read_all (B.open_in bv ~sw ~follow:true path)))
         with Eio.Io _ -> Cstruct.empty)
     | _ -> Cstruct.empty
 
@@ -955,7 +956,8 @@ module Crash = struct
     @@ fun () ->
     Switch.run @@ fun sw ->
     let f =
-      B.open_out bv ~sw ~append:false ~create:(`Or_truncate fs.perm) fs.rel
+      B.open_out bv ~sw ~follow:true ~append:false
+        ~create:(`Or_truncate fs.perm) fs.rel
     in
     if Cstruct.length content > 0 then
       Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ content ]
@@ -968,7 +970,8 @@ module Crash = struct
     | { kind = `Regular_file; perm; _ } ->
         let data =
           with_readable owner path (fun () ->
-              Switch.run (fun sw -> read_all (B.open_in bv ~sw path)))
+              Switch.run (fun sw ->
+                  read_all (B.open_in bv ~sw ~follow:true path)))
           |> copy_cs
         in
         File { data; perm }
@@ -989,7 +992,8 @@ module Crash = struct
     | File { data; perm } ->
         Switch.run @@ fun sw ->
         let f =
-          B.open_out bv ~sw ~append:false ~create:(`Or_truncate perm) path
+          B.open_out bv ~sw ~follow:true ~append:false
+            ~create:(`Or_truncate perm) path
         in
         if Cstruct.length data > 0 then
           Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ];
@@ -1541,15 +1545,15 @@ module Crash = struct
   module Cdir_impl = struct
     type t = cdir
 
-    let open_in d ~sw path =
+    let open_in d ~sw ~follow path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let fs =
         Hashtbl.find_opt d.dctl.files (file_key d.droot (at d.dprefix path))
       in
-      wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw path)
+      wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw ~follow path)
 
-    let open_out d ~sw ~append ~create path =
+    let open_out d ~sw ~follow ~append ~create path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = at d.dprefix path in
@@ -1560,7 +1564,7 @@ module Crash = struct
         | exception Eio.Io _ -> false
       in
       let prev = read_existing d.dboxed path in
-      let base = B.open_out bv ~sw ~append ~create path in
+      let base = B.open_out bv ~sw ~follow ~append ~create path in
       let perm = create_perm create in
       let fs =
         match Hashtbl.find_opt d.dctl.files key with

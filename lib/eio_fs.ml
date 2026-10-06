@@ -195,13 +195,16 @@ module Fs = struct
     let fd t = t.fd
     let v ~label ~path:dir_path fd = { fd; dir_path; label }
 
-    let open_in t ~sw path =
-      let fd =
-        Low_level.openat ~mode:0 ~sw t.fd path Low_level.Open_flags.o_rdonly
-      in
+    (* [~follow:false] refuses a symlink at [path] itself, as O_NOFOLLOW. *)
+    let nofollow ~follow flags =
+      if follow then flags else Low_level.Open_flags.(flags + o_nofollow)
+
+    let open_in t ~sw ~follow path =
+      let flags = nofollow ~follow Low_level.Open_flags.o_rdonly in
+      let fd = Low_level.openat ~mode:0 ~sw t.fd path flags in
       (Low_level.Flow.of_fd fd :> Eio.File.ro_ty Eio.Resource.t)
 
-    let open_out t ~sw ~append ~create path =
+    let open_out t ~sw ~follow ~append ~create path =
       let mode, flags =
         match create with
         | `Never -> (0, Low_level.Open_flags.empty)
@@ -212,7 +215,7 @@ module Fs = struct
       let flags =
         if append then Low_level.Open_flags.(flags + o_append) else flags
       in
-      let flags = Low_level.Open_flags.(flags + o_rdwr) in
+      let flags = nofollow ~follow Low_level.Open_flags.(flags + o_rdwr) in
       match Low_level.openat ~sw ~mode t.fd path flags with
       | fd -> (Low_level.Flow.of_fd fd :> Eio.File.rw_ty r)
 
