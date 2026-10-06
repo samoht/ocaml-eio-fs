@@ -2616,6 +2616,51 @@ let test_xattr_does_not_follow () =
     "the link does not report its target's attribute" None
     (List.assoc_opt "user.a" (Eio_fs_unix.xattrs link))
 
+(* The lease is a kernel flock, which dies with its holder: a process that
+   exits holding it leaves no stale lock, and the next taker is granted it at
+   once, with no takeover. *)
+let test_lease_dies_with_its_holder () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lease" in
+  let manager = Eio.Stdenv.process_mgr env in
+  let self = Sys.executable_name in
+  Alcotest.check status "the holder exited holding the lease" (`Exited 0)
+    ( Eio.Switch.run @@ fun sw ->
+      Eio.Process.await
+        (Eio.Process.spawn ~sw manager ~executable:self
+           [ self; "--exit-holding-eio-fs-lease"; Eio.Path.native_exn lock ]) );
+  Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ())
+
+(* A lease a fiber of this process holds is refused to another fiber as held by
+   this process, which a reader must not take for another process: the
+   refusal says so, and names no pid that reads as a foreign holder. *)
+let test_lease_refusal_names_a_fiber () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "lease" in
+  Eio_fs_unix.Lease.with_exclusive ~contents:"preparing lib\n" lock @@ fun _ ->
+  match Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()) with
+  | () -> Alcotest.fail "a lease a fiber holds was granted"
+  | exception Eio_fs_unix.Lock_unavailable refusal ->
+      let said = Fmt.str "%a" Eio_fs_unix.pp_refusal refusal in
+      let has sub =
+        let n = String.length sub and m = String.length said in
+        let rec at i =
+          i + n <= m && (String.sub said i n = sub || at (i + 1))
+        in
+        at 0
+      in
+      Alcotest.(check bool)
+        ("another fiber of this process: " ^ said)
+        true
+        (has "held by another fiber of this process");
+      Alcotest.(check bool)
+        ("what the holder is doing: " ^ said)
+        true (has "preparing lib");
+      Alcotest.(check bool)
+        ("no pid as a foreign holder: " ^ said)
+        false
+        (has (Fmt.str "process %d" (Unix.getpid ())))
+
 let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
     test_lease_survives_owner_close_until_inherited_descriptor_closes
@@ -2627,6 +2672,10 @@ let suite =
     [
       Alcotest.test_case "exclusive rename refuses existing names" `Quick
         test_exclusive_rename_refuses_existing_names;
+      Alcotest.test_case "a lease dies with its holder" `Quick
+        test_lease_dies_with_its_holder;
+      Alcotest.test_case "a lease refusal names a fiber" `Quick
+        test_lease_refusal_names_a_fiber;
       Alcotest.test_case "exclusive rename refuses embedded NUL" `Quick
         test_exclusive_rename_refuses_embedded_nul;
       Alcotest.test_case "exclusive publication reaches crash model" `Quick

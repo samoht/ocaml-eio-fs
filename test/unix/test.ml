@@ -70,6 +70,17 @@ let hold_until_release kind path =
   in
   exit code
 
+let exit_holding_arg = "--exit-holding-eio-fs-lease"
+
+(* Takes the lease over [path] and exits holding it, unwinding nothing and
+   running no [at_exit]: the kernel closes the descriptor, and the lease with
+   it. *)
+let exit_holding path =
+  Eio_main.run @@ fun env ->
+  Eio_fs_unix.Lease.with_exclusive ~block:`No
+    Eio.Path.(Eio.Stdenv.fs env / path)
+    (fun _ -> Unix._exit 0)
+
 let lease_test_arg = "--test-inherited-lease"
 let try_lock_arg = "--try-eio-fs-lock"
 
@@ -90,6 +101,7 @@ let () =
       hold_lock path ready (float_of_string seconds)
   | [ _; arg; ready ] when String.equal arg hold_lease_arg -> hold_lease ready
   | [ _; arg; path ] when String.equal arg try_lock_arg -> try_lock path
+  | [ _; arg; path ] when String.equal arg exit_holding_arg -> exit_holding path
   | [ _; arg ] when String.equal arg lease_test_arg ->
       Sys.argv.(1) <- "test";
       Alcotest.run "eio-fs.unix.lease" [ Test_eio_fs_unix.lease_suite ]
