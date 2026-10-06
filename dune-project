@@ -18,7 +18,7 @@
 (package
  (name eio-fs)
  (synopsis "Filesystem helpers and an in-memory backend for Eio")
- (tags (org:blacksun system hermetic:eio-boundary))
+ (tags (org:blacksun system hermetic:eio-boundary area:concurrency))
  (description
   "Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
    [Eio_fs.Fs.v ()] creates a fresh filesystem, [Eio_fs.Fs.load] populates it
