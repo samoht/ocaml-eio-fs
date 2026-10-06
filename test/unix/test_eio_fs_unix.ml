@@ -1798,10 +1798,10 @@ module Plant_after_stat = struct
       ~finally:(fun () -> plant t path)
       (fun () -> Eio.Path.stat ~follow (at t path))
 
-  let open_in t ~sw path = Eio.Path.open_in ~sw (at t path)
+  let open_in t ~sw ~follow path = Eio.Path.open_in ~sw ~follow (at t path)
 
-  let open_out t ~sw ~append ~create path =
-    Eio.Path.open_out ~sw ~append ~create (at t path)
+  let open_out t ~sw ~follow ~append ~create path =
+    Eio.Path.open_out ~sw ~follow ~append ~create (at t path)
 
   let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)
   let read_dir t path = Eio.Path.read_dir (at t path)
@@ -2039,13 +2039,13 @@ module Slow_open = struct
 
   let at t path = (t.base, path)
 
-  let open_out t ~sw ~append ~create path =
+  let open_out t ~sw ~follow ~append ~create path =
     dawdle ();
-    Eio.Path.open_out ~sw ~append ~create (at t path)
+    Eio.Path.open_out ~sw ~follow ~append ~create (at t path)
 
-  let open_in t ~sw path =
+  let open_in t ~sw ~follow path =
     dawdle ();
-    Eio.Path.open_in ~sw (at t path)
+    Eio.Path.open_in ~sw ~follow (at t path)
 
   let stat t ~follow path = Eio.Path.stat ~follow (at t path)
   let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)
@@ -2215,10 +2215,12 @@ module Hide_descriptors = struct
   type t = Eio.Fs.dir_ty Eio.Resource.t
 
   let at t path = (t, path)
-  let open_in t ~sw path = hidden_ro (Eio.Path.open_in ~sw (at t path))
 
-  let open_out t ~sw ~append ~create path =
-    hidden_rw (Eio.Path.open_out ~sw ~append ~create (at t path))
+  let open_in t ~sw ~follow path =
+    hidden_ro (Eio.Path.open_in ~sw ~follow (at t path))
+
+  let open_out t ~sw ~follow ~append ~create path =
+    hidden_rw (Eio.Path.open_out ~sw ~follow ~append ~create (at t path))
 
   let stat t ~follow path = Eio.Path.stat ~follow (at t path)
   let mkdir t ~perm path = Eio.Path.mkdir ~perm (at t path)

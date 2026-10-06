@@ -31,7 +31,7 @@
  (depends
   hermetic
   (ocaml (>= 5.1))
-  (eio (>= 1.5))
+  (eio (>= 1.6))
   (eio_posix (>= 1.0))
   fmt
   cstruct
