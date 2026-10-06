@@ -457,8 +457,23 @@ type refusal = { path : string; holder : int option; record : string }
 
 exception Lock_unavailable of refusal
 
-let pp_refusal f { path; holder; record = _ } =
+(* What the holder wrote: the record's first line that is not blank. *)
+let pp_doing f record =
+  match
+    List.find_opt
+      (fun l -> String.trim l <> "")
+      (String.split_on_char '\n' record)
+  with
+  | Some line -> Fmt.pf f ": %s" (String.trim line)
+  | None -> ()
+
+(* POSIX record locks belong to a process, so the kernel never names this
+   process as the holder: this process is named only for a fiber's hold. *)
+let pp_refusal f { path; holder; record } =
   match holder with
+  | Some pid when pid = Unix.getpid () ->
+      Fmt.pf f "%s is held by another fiber of this process%a" path pp_doing
+        record
   | Some pid -> Fmt.pf f "%s is held by process %d" path pid
   | None -> Fmt.pf f "%s is held" path
 

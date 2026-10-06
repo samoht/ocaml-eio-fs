@@ -180,7 +180,9 @@ exception Lock_unavailable of refusal
     for the holder. It prints as {!pp_refusal} does. *)
 
 val pp_refusal : refusal Fmt.t
-(** [pp_refusal] formats a refusal as ["<path> is held by process <pid>"], or
+(** [pp_refusal] formats a refusal as ["<path> is held by process <pid>"] for
+    another process, ["<path> is held by another fiber of this process: <line>"]
+    for a fiber of this one, [<line>] the first line its record carries, or
     ["<path> is held"] when its holder is [None]. *)
 
 type Eio.Exn.Backend.t +=
