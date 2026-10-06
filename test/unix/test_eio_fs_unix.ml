@@ -1183,8 +1183,9 @@ let test_lock_refusal_names_the_holding_process () =
   await_holder child
 
 (* The mutex half of the exclusion is held by a fiber of this process, so the
-   holder a refusal names there is this process, and the record it carries is
-   what that fiber wrote through [contents]. *)
+   holder a refusal carries there is this process, which it prints as another
+   fiber of it, never as a pid that reads as a foreign holder, and the record
+   it carries is what that fiber wrote through [contents]. *)
 let test_lock_refusal_names_this_process_for_a_fiber () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
@@ -1195,9 +1196,9 @@ let test_lock_refusal_names_this_process_for_a_fiber () =
   | exception (Eio_fs_unix.Lock_unavailable refused as refusal) ->
       let printed = Printexc.to_string refusal in
       let self = Unix.getpid () in
-      if not (names_process printed self) then
-        Alcotest.failf "the refusal %S does not name this process, %d" printed
-          self;
+      if names_process printed self then
+        Alcotest.failf "the refusal %S names this process, %d, as a holder"
+          printed self;
       Alcotest.(check (option int))
         "the holder the refusal carries" (Some self) refused.holder;
       Alcotest.(check string) "the holder's record" record refused.record
@@ -2766,7 +2767,7 @@ let suite =
         test_lock_non_blocking_unavailable;
       Alcotest.test_case "a refusal names the holding process" `Quick
         test_lock_refusal_names_the_holding_process;
-      Alcotest.test_case "a refusal names this process for a fiber" `Quick
+      Alcotest.test_case "a refusal names a fiber of this process" `Quick
         test_lock_refusal_names_this_process_for_a_fiber;
       Alcotest.test_case "a refusal in the holder keeps its hold" `Quick
         test_lock_refusal_in_the_holder_keeps_its_hold;
