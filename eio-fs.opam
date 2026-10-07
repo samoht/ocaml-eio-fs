@@ -13,7 +13,7 @@ Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
 maintainer: ["Thomas Gazagnaire <thomas@gazagnaire.org>"]
 authors: ["Thomas Leonard" "Patrick Ferris"]
 license: "ISC"
-tags: ["org:blacksun" "system" "hermetic:eio-boundary" "area:concurrency"]
+tags: ["org:blacksun" "os" "hermetic:eio-boundary" "area:10011777"]
 homepage: "https://tangled.org/gazagnaire.org/ocaml-eio-fs"
 bug-reports: "https://tangled.org/gazagnaire.org/ocaml-eio-fs/issues"
 depends: [
