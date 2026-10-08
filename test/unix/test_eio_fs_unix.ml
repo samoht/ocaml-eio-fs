@@ -1479,6 +1479,41 @@ let test_probe_of_a_lock_file_that_goes () =
       Alcotest.fail "a lock file that went was refused as no lock file");
   Alcotest.(check bool) "the file went between the open and the stat" true !gone
 
+(* A lock file's name can be given to a new file while a probe reads the
+   old one: a build slot numbers a new ticket after the highest left, so
+   the first ticket's name comes back once every ticket went. The probe
+   answers for the file the name holds when it answers, the new one, and
+   never refuses the name as not a lock file. The old file goes and the new
+   one takes its name at the first stat after the open. *)
+let test_probe_of_a_lock_file_replaced () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "ticket") "the old ticket\n";
+  let native = Eio.Path.native_exn (dir / "ticket") in
+  Eio.Path.with_open_dir dir @@ fun base ->
+  let opened = ref false and replaced = ref false in
+  let schedule =
+    Chaos.Schedule.observing
+      (fun (operation : Chaos.Op.t) ->
+        match operation.kind with
+        | `Open -> opened := true
+        | `Stat when !opened && not !replaced ->
+            Unix.unlink native;
+            Out_channel.with_open_gen [ Open_wronly; Open_creat; Open_excl ]
+              0o600 native (fun oc -> output_string oc "the new ticket\n");
+            replaced := true
+        | _ -> ())
+      Chaos.Schedule.empty
+  in
+  let wrapped = Chaos.wrap schedule base in
+  (match Eio_fs_unix.probe (wrapped / "ticket") with
+  | `Free record ->
+      Alcotest.(check string) "the new file's record" "the new ticket\n" record
+  | `Held _ -> Alcotest.fail "a free lock file was answered as held"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) ->
+      Alcotest.fail "a lock file replaced was refused as no lock file");
+  Alcotest.(check bool)
+    "the file was replaced between the open and the stat" true !replaced
+
 (* A hold is a lock for the rest of a switch: taken when [hold] returns, still
    held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
@@ -2854,6 +2889,8 @@ let suite =
         test_probe_answers_a_read_only_lock_file;
       Alcotest.test_case "a probe of a lock file that goes" `Quick
         test_probe_of_a_lock_file_that_goes;
+      Alcotest.test_case "a probe of a lock file replaced" `Quick
+        test_probe_of_a_lock_file_replaced;
       Alcotest.test_case "a hold lasts as long as its switch" `Quick
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick
