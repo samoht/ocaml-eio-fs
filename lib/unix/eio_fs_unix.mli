@@ -304,6 +304,22 @@ module Held : sig
       released lock, or one whose switch has ended, does nothing. *)
 end
 
+val await_record_lock :
+  ?mode:[ `Shared | `Exclusive ] -> Unix.file_descr -> unit
+(** [await_record_lock ~mode fd] takes the POSIX record lock over [fd], from its
+    offset to the end of the file as [lockf] does, by the kernel's blocking
+    request ([fcntl] [F_SETLKW]), and returns once the kernel grants it. [mode]
+    is [`Exclusive] (a write lock) by default, or [`Shared] (a read lock). The
+    request waits on a thread of its own and the calling fiber waits for its
+    answer, so the domain goes on running other fibers; a cancel withdraws the
+    request, and a lock granted in that instant is let go.
+
+    It is the wait under {!with_lock}, for a caller that keeps its own
+    descriptors: the record lock belongs to the process, and closing any
+    descriptor on the file drops it.
+
+    @raise Unix.Unix_error as [fcntl] does. *)
+
 module Lease : sig
   type t
 

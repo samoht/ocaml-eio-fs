@@ -73,11 +73,13 @@ CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
    a cancellation point (POSIX, "Thread Cancellation"), so a cancel withdraws
    the request: the thread is cancelled and joined, and no lock is left to the
    process unless it was granted first. The request locks what [lockf] does,
-   from the descriptor's offset to the end of the file. */
+   from the descriptor's offset to the end of the file, as a read lock when
+   [shared] and a write lock otherwise. */
 struct record_lock_wait {
   pthread_t thread;
   int fd;
   int notify;
+  int shared;
   int err;
 };
 
@@ -87,7 +89,7 @@ static void *record_lock_wait_run(void *arg)
   struct flock request;
   int r;
   memset(&request, 0, sizeof request);
-  request.l_type = F_WRLCK;
+  request.l_type = w->shared ? F_RDLCK : F_WRLCK;
   request.l_whence = SEEK_CUR;
   request.l_start = 0;
   request.l_len = 0;
@@ -107,7 +109,8 @@ static void *record_lock_wait_run(void *arg)
   return NULL;
 }
 
-CAMLprim value caml_eio_fs_record_lock_wait_start(value fd_v, value notify_v)
+CAMLprim value caml_eio_fs_record_lock_wait_start(value fd_v, value notify_v,
+                                                  value shared_v)
 {
   struct record_lock_wait *w = malloc(sizeof *w);
   sigset_t all, previous;
@@ -116,6 +119,7 @@ CAMLprim value caml_eio_fs_record_lock_wait_start(value fd_v, value notify_v)
     caml_raise_out_of_memory();
   w->fd = Int_val(fd_v);
   w->notify = Int_val(notify_v);
+  w->shared = Bool_val(shared_v);
   w->err = 0;
   /* The thread takes no signal: the process's handlers belong to OCaml. */
   sigfillset(&all);
