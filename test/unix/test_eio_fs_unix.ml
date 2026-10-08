@@ -893,6 +893,40 @@ let a_wait_is_cancellable ~kind take ~free () =
     (`Exited 0) (release ());
   Eio.Time.with_timeout_exn clock 5.0 (fun () -> free ~env lock)
 
+(* A lease a fiber of this process holds is waited for under [`Fibers], and
+   the waiter says it waits, once, before it queues: a caller that waits on
+   its own run's fibers can tell it from one that ran at once. The waiter is
+   granted once the holder lets go, and not before. *)
+let test_lease_wait_for_a_fiber_says_so () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let held, now_held = Eio.Promise.create () in
+  let go, now_go = Eio.Promise.create () in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let waits = ref 0 in
+  let granted, now_granted = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio_fs_unix.Lease.with_exclusive ~block:`Fibers lock (fun _ ->
+          Eio.Promise.resolve now_held ();
+          Eio.Promise.await go));
+  Eio.Promise.await held;
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio_fs_unix.Lease.with_exclusive ~block:`Fibers
+        ~on_wait:(fun () ->
+          incr waits;
+          ignore (Eio.Promise.try_resolve now_waiting ()))
+        lock
+        (fun _ -> Eio.Promise.resolve now_granted ()));
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
+  Alcotest.(check bool)
+    "not granted while held" false
+    (Eio.Promise.is_resolved granted);
+  Eio.Promise.resolve now_go ();
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await granted);
+  Alcotest.(check int) "said it waits once" 1 !waits
+
 let take_record ~on_wait lock fn = Eio_fs_unix.with_lock ~on_wait lock fn
 
 let take_lease ~on_wait lock fn =
@@ -2755,6 +2789,8 @@ let suite =
         (a_wait_answers_at_the_release ~kind:"lease" take_lease);
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
+      Alcotest.test_case "a lease wait for a fiber says so" `Quick
+        test_lease_wait_for_a_fiber_says_so;
       Alcotest.test_case "lock serializes fibers" `Quick
         test_lock_serializes_fibers;
       Alcotest.test_case "lock excludes another name for its file" `Quick
