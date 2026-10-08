@@ -674,11 +674,15 @@ let budget ~sw seconds =
   Until lapsed
 
 (* [on_taken] runs the moment the mutex is held, so a caller records how to
-   give it back before anything else can raise. *)
-let take_mutex ~patience ~refused ~on_taken mutex =
+   give it back before anything else can raise. A wait behind a holder calls
+   [on_wait ()] first. *)
+let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
   match patience with
   | Wait ->
-      Eio.Mutex.lock mutex;
+      if not (Eio.Mutex.try_lock mutex) then begin
+        on_wait ();
+        Eio.Mutex.lock mutex
+      end;
       on_taken ()
   | Refuse ->
       if Eio.Mutex.try_lock mutex then on_taken () else raise (refused ())
@@ -703,12 +707,14 @@ let take_mutex ~patience ~refused ~on_taken mutex =
       in
       if granted || !taken then on_taken () else raise (refused ())
 
-let use_mutex ~patience ~refused mutex fn =
+let use_mutex ?on_wait ~patience ~refused mutex fn =
   let locked = ref false in
   Fun.protect
     ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
     (fun () ->
-      take_mutex ~patience ~refused ~on_taken:(fun () -> locked := true) mutex;
+      take_mutex ?on_wait ~patience ~refused
+        ~on_taken:(fun () -> locked := true)
+        mutex;
       fn ())
 
 (* Entering is queued too, on a mutex keyed by the caller's name: the stat or
@@ -1249,7 +1255,7 @@ module Lease = struct
       (file, Eio.File.stat file)
     in
     use_local_lock (opened.dev, opened.ino) @@ fun { mutex; _ } ->
-    use_mutex ~patience:fibers
+    use_mutex ~on_wait ~patience:fibers
       ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
       mutex
     @@ fun () ->

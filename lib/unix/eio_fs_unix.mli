@@ -336,11 +336,13 @@ module Lease : sig
       With [block] [`Yes], a lease another process holds is waited for by the
       kernel's blocking [flock], which answers when that process lets go: the
       lease is tried first, [on_wait ()] is called once if it is held (it does
-      nothing by default), and the wait follows. A cancelled wait answers at the
-      cancel. [flock] is no cancellation point, so its request stays with the
-      kernel on a thread of its own, which lets the lease go once granted; the
-      lease belongs to the open file description, which no other caller shares,
-      so that grant takes nothing from anyone.
+      nothing by default), and the wait follows. With [`Yes] or [`Fibers], a
+      lease a fiber of this process holds is waited for in this process, and
+      [on_wait ()] is called before that wait too. A cancelled wait answers at
+      the cancel. [flock] is no cancellation point, so its request stays with
+      the kernel on a thread of its own, which lets the lease go once granted;
+      the lease belongs to the open file description, which no other caller
+      shares, so that grant takes nothing from anyone.
 
       Only a path backed by a native Unix descriptor can hold a lease. The path
       must name its own regular file; a link, directory, FIFO, or name changed
