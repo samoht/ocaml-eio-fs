@@ -450,3 +450,197 @@ let suite =
       Alcotest.test_case "file barrier reaches the crash model" `Quick
         test_sync_file_reaches_the_crash_model;
     ] )
+
+module Links = struct
+  let fixture test =
+    Eio_mock.Backend.run @@ fun () ->
+    Eio_fs.run @@ fun env -> test env#fs
+
+  let publish fs ?(durable = false) expected target =
+    Eio_fs_sync.publish_link ~durable ~lock:Eio_fs_sync.Lock.none ~expected
+      ~link_to:target (fs / "portal")
+
+  let test_raw () =
+    fixture @@ fun fs ->
+    let raw = "../old library//./checkout" in
+    Eio.Path.symlink ~link_to:raw (fs / "portal");
+    ignore (Result.get_ok (publish fs (Some raw) "/selected/lib"));
+    Alcotest.(check string)
+      "whole selected link" "/selected/lib"
+      (Eio.Path.read_link (fs / "portal"));
+    ignore (Result.get_ok (publish fs (Some "/selected/lib") raw));
+    Alcotest.(check string)
+      "exact original raw bytes" raw
+      (Eio.Path.read_link (fs / "portal"))
+
+  let test_refusal () =
+    fixture @@ fun fs ->
+    Eio.Path.symlink ~link_to:"../foreign" (fs / "portal");
+    (match publish fs (Some "../old") "/new" with
+    | Error (`Changed (Some "../foreign")) -> ()
+    | _ -> Alcotest.fail "changed portal replaced");
+    Alcotest.(check string)
+      "foreign target survives" "../foreign"
+      (Eio.Path.read_link (fs / "portal"));
+    (match publish fs (Some "../old") "../foreign" with
+    | Error (`Changed (Some "../foreign")) -> ()
+    | _ -> Alcotest.fail "changed portal taken as already published");
+    Eio.Path.unlink (fs / "portal");
+    (match publish fs (Some "../old") "/new" with
+    | Error (`Changed None) -> ()
+    | _ -> Alcotest.fail "missing portal replaced");
+    Eio.Path.save ~create:(`Exclusive 0o644) (fs / "portal") "foreign file";
+    (match publish fs None "/new" with
+    | Error (`Invalid _) -> ()
+    | _ -> Alcotest.fail "regular file replaced");
+    Alcotest.(check string)
+      "foreign file survives" "foreign file"
+      (Eio.Path.load (fs / "portal"))
+
+  let test_unwritable_target () =
+    fixture @@ fun fs ->
+    Eio.Path.symlink ~link_to:"../old" (fs / "portal");
+    List.iter
+      (fun target ->
+        match publish fs (Some "../old") target with
+        | Error (`Invalid _) -> ()
+        | _ -> Alcotest.failf "target %S published" target)
+      [ ""; "../new\000library" ];
+    Alcotest.(check string)
+      "old target survives" "../old"
+      (Eio.Path.read_link (fs / "portal"));
+    Alcotest.(check (list string))
+      "nothing staged" [ "portal" ] (Eio.Path.read_dir fs)
+
+  let test_crash () =
+    fixture @@ fun fs ->
+    let module Crash = Eio_fs.Chaos.Crash in
+    Eio.Path.symlink ~link_to:"../old" (fs / "portal");
+    Eio_fs_sync.sync_dir fs;
+    let ctl = Crash.v () in
+    let wrapped = Crash.wrap ctl fs in
+    ignore
+      (Result.get_ok
+         (publish wrapped ~durable:true (Some "../old")
+            "../new library//./checkout"));
+    Crash.crash ctl;
+    Alcotest.(check string)
+      "raw link survives native metadata barriers" "../new library//./checkout"
+      (Eio.Path.read_link (Crash.post_crash ctl / "portal"))
+
+  let test_durable_retry () =
+    fixture @@ fun fs ->
+    let module Crash = Eio_fs.Chaos.Crash in
+    let module Chaos = Eio_fs.Chaos in
+    Eio.Path.symlink ~link_to:"../old" (fs / "portal");
+    let ctl = Crash.v () in
+    let disk = Crash.wrap ctl fs in
+    let syncs = ref 0 in
+    let schedule =
+      Chaos.Schedule.observing
+        (fun (op : Chaos.Op.t) ->
+          if op.kind = `Sync then (
+            incr syncs;
+            if !syncs = 2 then failwith "fixture post-rename barrier"))
+        Chaos.Schedule.empty
+    in
+    let faults = Chaos.wrap schedule disk in
+    (match publish faults ~durable:true (Some "../old") "../new" with
+    | _ -> Alcotest.fail "post-publication barrier failure hidden"
+    | exception Failure reason ->
+        Alcotest.(check string)
+          "uncertain durability reported" "fixture post-rename barrier" reason);
+    Alcotest.(check string)
+      "new link already visible" "../new"
+      (Eio.Path.read_link (fs / "portal"));
+    ignore (Result.get_ok (publish disk ~durable:true (Some "../new") "../new"));
+    Crash.crash ctl;
+    Alcotest.(check string)
+      "durable no-op redeems publication" "../new"
+      (Eio.Path.read_link (Crash.post_crash ctl / "portal"))
+
+  let test_last_observation () =
+    fixture @@ fun fs ->
+    let module Chaos = Eio_fs.Chaos in
+    Eio.Path.symlink ~link_to:"../old" (fs / "portal");
+    let changed = ref false in
+    let schedule =
+      Chaos.Schedule.observing
+        (fun (op : Chaos.Op.t) ->
+          if op.kind = `Sync && not !changed then (
+            changed := true;
+            Eio.Path.unlink (fs / "portal");
+            Eio.Path.symlink ~link_to:"../foreign" (fs / "portal")))
+        Chaos.Schedule.empty
+    in
+    let faults = Chaos.wrap schedule fs in
+    (match publish faults ~durable:true (Some "../old") "../new" with
+    | Error (`Changed (Some "../foreign")) -> ()
+    | _ -> Alcotest.fail "final raw observation ignored");
+    Alcotest.(check string)
+      "late foreign target preserved" "../foreign"
+      (Eio.Path.read_link (fs / "portal"));
+    Alcotest.(check (list string))
+      "owned staging cleaned" [ "portal" ] (Eio.Path.read_dir fs)
+
+  let test_posix () =
+    Eio_main.run @@ fun env ->
+    let fs = Eio.Stdenv.fs env in
+    let dir = Filename.temp_file "eio-fs-raw-link" "" in
+    Sys.remove dir;
+    Eio.Path.mkdir ~perm:0o755 (fs / dir);
+    Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / dir))
+    @@ fun () ->
+    let root = fs / dir in
+    Eio.Path.symlink ~link_to:"../old library//./checkout" (root / "portal");
+    ignore
+      (Result.get_ok
+         (publish root ~durable:true (Some "../old library//./checkout")
+            "/selected/library"));
+    Alcotest.(check string)
+      "native POSIX raw switch" "/selected/library"
+      (Eio.Path.read_link (root / "portal"));
+    Alcotest.(check (list string))
+      "no native staging remains" [ "portal" ] (Eio.Path.read_dir root)
+
+  let test_lock () =
+    fixture @@ fun fs ->
+    let module Refuses = struct
+      type t = unit
+
+      let use () _ = raise (Eio_fs_sync.Lock.Unavailable "fixture lease held")
+    end in
+    let module Packed = Eio_fs_sync.Lock.Make (Refuses) in
+    (match
+       Eio_fs_sync.publish_link ~durable:false ~lock:(Packed.v ())
+         ~expected:None ~link_to:"../new" (fs / "portal")
+     with
+    | _ -> Alcotest.fail "held caller lease ignored"
+    | exception Eio_fs_sync.Lock.Unavailable reason ->
+        Alcotest.(check string)
+          "exact lease refusal" "fixture lease held" reason);
+    Alcotest.(check bool)
+      "no link or staging published" true
+      (Eio.Path.read_dir fs = [])
+end
+
+let link_suite =
+  ( "publish_link",
+    [
+      Alcotest.test_case "durable retry after uncertain publication" `Quick
+        Links.test_durable_retry;
+      Alcotest.test_case "final raw observation preserves late foreign target"
+        `Quick Links.test_last_observation;
+      Alcotest.test_case "native POSIX raw link publication" `Quick
+        Links.test_posix;
+      Alcotest.test_case "exact raw publication and restoration" `Quick
+        Links.test_raw;
+      Alcotest.test_case "changed missing and regular portals refuse" `Quick
+        Links.test_refusal;
+      Alcotest.test_case "durable raw link survives crash" `Quick
+        Links.test_crash;
+      Alcotest.test_case "empty and NUL targets refuse" `Quick
+        Links.test_unwritable_target;
+      Alcotest.test_case "caller lease refuses before writes" `Quick
+        Links.test_lock;
+    ] )

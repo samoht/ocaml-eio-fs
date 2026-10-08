@@ -176,3 +176,35 @@ module Lock = Lock
 (** The critical section a caller supplies: what keeps two writers out of one
     another's read-modify-write, named by the deployment rather than the store.
 *)
+
+val publish_link :
+  durable:bool ->
+  lock:Lock.t ->
+  expected:string option ->
+  link_to:string ->
+  _ Eio.Path.t ->
+  (unit, [ `Changed of string option | `Invalid of string ]) result
+(** [publish_link ~durable ~lock ~expected ~link_to path] replaces the entry at
+    [path] with a symbolic link holding exactly [link_to], under [lock]. The
+    entry must hold what [expected] says, read without following it: [None] is
+    no entry, [Some raw] a symbolic link whose target is the bytes [raw].
+    Anything else is [`Changed actual], and an entry that is not a symbolic link
+    is [`Invalid]; neither is replaced. A link that already holds [link_to] is
+    left as it is.
+
+    The link is made under a fresh sibling name ({!fresh_name}), the entry at
+    [path] is read again, and the link is renamed over it; rename(2) keeps
+    [path] naming the old entry or the new link throughout. Targets are raw
+    bytes, written and compared as given and never resolved or normalised; an
+    empty target or one holding a NUL byte is [`Invalid].
+
+    With [durable], the parent directory is barriered before the rename and
+    after it, so after a crash [path] holds the old entry or the new link. A
+    barrier that fails after the rename raises, the new link visible with
+    uncertain durability; a later call with the same [link_to] issues the
+    barrier again. [durable] [false] keeps only the atomicity.
+
+    [lock] is the exclusion against other writers of [path], which a writer that
+    ignores it can still race between the last read and the rename.
+
+    @raise Lock.Unavailable when [lock] refuses, before anything is written. *)

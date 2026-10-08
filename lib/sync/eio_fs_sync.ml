@@ -344,3 +344,6 @@ let publish_generation ~durable ?(perm = 0o755) path populate =
   result
 
 module Lock = Lock
+
+let publish_link ~durable:_ ~lock:_ ~expected:_ ~link_to:_ _ =
+  failwith "TODO: Eio_fs_sync.publish_link"
