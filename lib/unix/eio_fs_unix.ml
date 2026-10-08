@@ -858,16 +858,20 @@ let named_key ~name path =
       if not (is_regular stat.kind) then not_a_lock_file name;
       Some (stat.dev, stat.ino)
 
-let check_locked_file ~name ~(opened : Eio.File.Stat.t) path =
+(* The file opened is the regular file the name holds. *)
+let check_same_file ~name ~(opened : Eio.File.Stat.t) (named : Eio.File.Stat.t)
+    =
+  if
+    (not (is_regular opened.kind))
+    || (not (is_regular named.kind))
+    || Int64.compare opened.dev named.dev <> 0
+    || Int64.compare opened.ino named.ino <> 0
+  then not_a_lock_file name
+
+let check_locked_file ~name ~opened path =
   match named_kind path with
   | None -> not_a_lock_file name
-  | Some named ->
-      if
-        (not (is_regular opened.kind))
-        || (not (is_regular named.kind))
-        || Int64.compare opened.dev named.dev <> 0
-        || Int64.compare opened.ino named.ino <> 0
-      then not_a_lock_file name
+  | Some named -> check_same_file ~name ~opened named
 
 let update_lock_contents file contents =
   ignore (Eio.File.seek file Optint.Int63.zero `Set : Optint.Int63.t);
@@ -1142,7 +1146,15 @@ let probe path =
       check_lock_name ~name path;
       let file = Eio.Path.open_in ~sw path in
       let opened = Eio.File.stat file in
-      check_locked_file ~name ~opened path;
+      (* A lock file that went after the open, as a ticket its holder
+         removes, is absent, as it would be had it gone before. *)
+      (match named_kind path with
+      | None ->
+          raise
+            (Eio.Fs.err
+               (Eio.Fs.Not_found
+                  (Eio_unix.Unix_error (Unix.ENOENT, "stat", name))))
+      | Some named -> check_same_file ~name ~opened named);
       use_local_lock (opened.dev, opened.ino) @@ fun local ->
       Fun.protect ~finally:(fun () -> let_go_of local file) @@ fun () ->
       let another =

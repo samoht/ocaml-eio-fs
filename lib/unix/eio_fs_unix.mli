@@ -261,7 +261,9 @@ val probe : _ Eio.Path.t -> [ `Free of string | `Held of refusal ]
 
     [path] must be the lock's own regular file, as {!with_lock}'s must.
 
-    @raise Eio.Io with {!Eio.Fs.Not_found} when [path] is absent.
+    @raise Eio.Io
+      with {!Eio.Fs.Not_found} when [path] is absent, or goes while the probe
+      reads it.
     @raise Eio.Io
       with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
       is not the lock's own regular file. *)
