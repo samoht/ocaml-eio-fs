@@ -1738,35 +1738,83 @@ let test_lock_bounded_wait_answers_at_the_bound () =
    the record lock is free and a fiber of this program is inside, so what the
    bound answers about is the mutex alone: without it, a caller told "up to a
    fifth of a second" would wait a fifth for the fiber and a fifth more for the
-   record lock, which is not the number it was told. *)
+   record lock, which is not the number it was told. The bound is on a clock
+   the case moves once the waiter says it waits, and the fiber lets go only
+   after the answer, so the answer can come from nothing but the bound. *)
 let test_lock_bounded_wait_answers_a_fiber_that_holds_it () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
-  let bound = 0.2 and held = 1.0 in
+  let mono = Eio_mock.Clock.Mono.make () in
   let entered, set_entered = Eio.Promise.create () in
-  let refused = ref false and waited = ref 0. in
-  Eio.Fiber.both
-    (fun () ->
+  let release, let_go = Eio.Promise.create () in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let answer, answered = Eio.Promise.create () in
+  Eio.Switch.run @@ fun sw ->
+  Eio.Fiber.fork ~sw (fun () ->
       Eio_fs_unix.with_lock lock @@ fun () ->
       Eio.Promise.resolve set_entered ();
-      Eio.Time.sleep clock held)
-    (fun () ->
-      Eio.Promise.await entered;
-      let began = Eio.Time.now clock in
-      (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
-      | () ->
-          Alcotest.fail "a lock a fiber held for the whole bound was granted"
-      | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
-          refused := true;
-          Alcotest.(check string)
-            "unavailable path" (Eio.Path.native_exn lock) path);
-      waited := Eio.Time.now clock -. began);
-  Alcotest.(check bool) "the second fiber was answered" true !refused;
+      Eio.Promise.await release);
+  Eio.Promise.await entered;
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio.Promise.resolve answered
+        (on_mono
+           (mono :> Eio.Time.Mono.ty Eio.Resource.t)
+           (fun () ->
+             match
+               Eio_fs_unix.with_lock ~block:(`For 0.2)
+                 ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+                 lock
+                 (fun () -> `Granted)
+             with
+             | answer -> answer
+             | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
+                 `Refused path)));
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
   Alcotest.(check bool)
-    "the bound was waited out before the answer" true (!waited >= bound);
+    "no answer before the bound" false
+    (Eio.Promise.is_resolved answer);
+  Eio_mock.Clock.Mono.advance mono;
+  (match
+     Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await answer)
+   with
+  | `Granted ->
+      Alcotest.fail "a lock a fiber held for the whole bound was granted"
+  | `Refused path ->
+      Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
+  Eio.Promise.resolve let_go ()
+
+(* A wait with no bound behind a fiber of this process says so too, once, and
+   is granted when the fiber lets go. *)
+let test_lock_wait_behind_a_fiber_says_so () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  let entered, set_entered = Eio.Promise.create () in
+  let release, let_go = Eio.Promise.create () in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let granted, now_granted = Eio.Promise.create () in
+  let waits = ref 0 in
+  Eio.Switch.run @@ fun sw ->
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio_fs_unix.with_lock lock @@ fun () ->
+      Eio.Promise.resolve set_entered ();
+      Eio.Promise.await release);
+  Eio.Promise.await entered;
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio_fs_unix.with_lock ~block:`Yes
+        ~on_wait:(fun () ->
+          incr waits;
+          ignore (Eio.Promise.try_resolve now_waiting ()))
+        lock
+      @@ fun () -> Eio.Promise.resolve now_granted ());
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
   Alcotest.(check bool)
-    "and the answer came without waiting out the fiber" true (!waited < held)
+    "not granted while the fiber holds it" false
+    (Eio.Promise.is_resolved granted);
+  Eio.Promise.resolve let_go ();
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await granted);
+  Alcotest.(check int) "said it waits once" 1 !waits
 
 (* A holder that dies does not cost the waiter its bound. The record lock is
    the kernel's, held on an open descriptor, so it goes when the last
@@ -2913,6 +2961,8 @@ let suite =
         test_lock_bounded_wait_answers_at_the_bound;
       Alcotest.test_case "a bounded wait answers a fiber that holds it" `Quick
         test_lock_bounded_wait_answers_a_fiber_that_holds_it;
+      Alcotest.test_case "a wait behind a fiber says so" `Quick
+        test_lock_wait_behind_a_fiber_says_so;
       Alcotest.test_case "a bounded wait does not sit out a killed holder"
         `Quick test_lock_bounded_wait_does_not_sit_out_a_killed_holder;
       Alcotest.test_case "existing-only lock does not create" `Quick
