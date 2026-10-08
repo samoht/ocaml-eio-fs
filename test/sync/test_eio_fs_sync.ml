@@ -397,6 +397,19 @@ let test_exclusive_publication_survives_crash () =
     "published data survives its barriers" "payload"
     (Eio.Path.load (Crash.post_crash ctl / "state"))
 
+(* [save] publishes a string: the target holds it whole, replaced on a
+   second save, and an empty string is a file of no bytes. *)
+let test_save () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let p = env#fs / "state.json" in
+  Eio_fs_sync.save p "{\"a\":1}";
+  Alcotest.(check string) "saved" "{\"a\":1}" (Eio.Path.load p);
+  Eio_fs_sync.save ~durable:false p "{}";
+  Alcotest.(check string) "replaced" "{}" (Eio.Path.load p);
+  Eio_fs_sync.save p "";
+  Alcotest.(check string) "empty" "" (Eio.Path.load p)
+
 let suite =
   ( "eio_fs_sync",
     [
@@ -405,6 +418,7 @@ let suite =
       Alcotest.test_case "exclusive publication survives crash" `Quick
         test_exclusive_publication_survives_crash;
       Alcotest.test_case "registered backend" `Quick test_registered_backend;
+      Alcotest.test_case "save a string" `Quick test_save;
       Alcotest.test_case "posix needs no registration" `Quick
         test_posix_needs_no_registration;
       Alcotest.test_case "published mode ignores the umask" `Quick

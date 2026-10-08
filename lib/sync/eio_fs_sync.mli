@@ -129,6 +129,13 @@ val publish :
     after the rename, the new file visible with uncertain durability.
     {!type-config.field-durable} [false] keeps only the atomicity. *)
 
+val save :
+  ?durable:bool -> ?perm:Eio.File.Unix_perm.t -> _ Eio.Path.t -> string -> unit
+(** [save ~durable ~perm path s] is {!publish} of the string [s] at [path]:
+    [path] holds [s] whole or what it held before, never part of [s]. The
+    ceiling is [s]'s length, [perm] defaults to [0o644] and [durable] to [true].
+*)
+
 val publish_generation :
   durable:bool ->
   ?perm:Eio.File.Unix_perm.t ->

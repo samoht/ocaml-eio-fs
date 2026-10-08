@@ -209,6 +209,11 @@ let publish ~config ?(mode = `Replace) ?(rename = Rename.capability)
      raise e);
   result
 
+(* A string is its own ceiling. *)
+let save ?(durable = true) ?(perm = 0o644) path s =
+  let config = { durable; perm; max_bytes = Int64.of_int (String.length s) } in
+  publish ~config path (fun sink -> Eio.Flow.copy_string s sink)
+
 (* A file opened read-only still names the inode fsync(2) flushes. A registered
    barrier answers first; the POSIX backends expose their sync on every handle,
    which is the route [fsync_handle] probes. *)
