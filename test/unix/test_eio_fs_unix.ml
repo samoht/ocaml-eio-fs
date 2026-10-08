@@ -1447,6 +1447,38 @@ let test_probe_answers_a_read_only_lock_file () =
   Eio.Path.save ~create:(`Exclusive 0o400) lock "written under other rights\n";
   check_free_probe "the probe" lock ~record:"written under other rights\n"
 
+(* A lock file can go while a probe reads it: a build slot's ticket is
+   removed by its holder once the slot is its own, while a watcher probes
+   every ticket. The probe opens the file and then weighs the name against
+   what it opened; a name that holds nothing by then is a lock that is
+   absent, as one absent when the probe began, and never a name that is
+   not a lock file. The file goes at the first stat after the open, the
+   moment between the two, through the file system the probe reads. *)
+let test_probe_of_a_lock_file_that_goes () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "ticket") "a waiting check\n";
+  let native = Eio.Path.native_exn (dir / "ticket") in
+  Eio.Path.with_open_dir dir @@ fun base ->
+  let opened = ref false and gone = ref false in
+  let schedule =
+    Chaos.Schedule.observing
+      (fun (operation : Chaos.Op.t) ->
+        match operation.kind with
+        | `Open -> opened := true
+        | `Stat when !opened && not !gone ->
+            Unix.unlink native;
+            gone := true
+        | _ -> ())
+      Chaos.Schedule.empty
+  in
+  let wrapped = Chaos.wrap schedule base in
+  (match Eio_fs_unix.probe (wrapped / "ticket") with
+  | `Free _ | `Held _ -> Alcotest.fail "a lock file that went was answered"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) ->
+      Alcotest.fail "a lock file that went was refused as no lock file");
+  Alcotest.(check bool) "the file went between the open and the stat" true !gone
+
 (* A hold is a lock for the rest of a switch: taken when [hold] returns, still
    held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
@@ -2820,6 +2852,8 @@ let suite =
         test_probe_from_the_holder_keeps_its_hold;
       Alcotest.test_case "a probe answers a read-only lock file" `Quick
         test_probe_answers_a_read_only_lock_file;
+      Alcotest.test_case "a probe of a lock file that goes" `Quick
+        test_probe_of_a_lock_file_that_goes;
       Alcotest.test_case "a hold lasts as long as its switch" `Quick
         test_hold_lasts_as_long_as_its_switch;
       Alcotest.test_case "a hold's refusal names the holding process" `Quick
