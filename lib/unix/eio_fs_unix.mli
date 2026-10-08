@@ -152,6 +152,23 @@ val import_file :
 
     @raise Invalid_argument if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
 
+val lock_range :
+  Unix.file_descr -> [ `Read | `Write | `Unlock ] -> at:int -> len:int -> unit
+(** [lock_range fd kind ~at ~len] sets a POSIX record lock of [kind] on the
+    [len] bytes of [fd]'s file from byte [at], without waiting (fcntl
+    [F_SETLK]), placed from the start of the file. [fd]'s file offset does not
+    move, where {!Unix.lockf} places its range at the offset and so has to be
+    preceded by a seek. A lock this process holds there already is replaced.
+
+    @raise Unix.Unix_error
+      with [EAGAIN] or [EACCES] where another process holds a lock that
+      conflicts. *)
+
+val range_locked : Unix.file_descr -> at:int -> len:int -> bool
+(** [range_locked fd ~at ~len] is [true] iff another process holds a record lock
+    that would refuse a write lock on the [len] bytes of [fd]'s file from byte
+    [at] (fcntl [F_GETLK]). This process's own locks never count. *)
+
 val exclusive_rename : Eio_fs_sync.Rename.t
 (** [exclusive_rename] is the POSIX backend for atomic no-replace publication.
     Directory wrappers are consulted before resolving the source and target

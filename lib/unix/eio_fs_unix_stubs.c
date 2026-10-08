@@ -201,6 +201,40 @@ CAMLprim value caml_eio_fs_record_lock_holder(value fd_v)
   return Val_int(query.l_pid);
 }
 
+/* A record lock of [kind] (0 read, 1 write, 2 unlock) on [len] bytes from
+   byte [at], set without waiting (POSIX fcntl F_SETLK) and placed from the
+   start of the file, so the descriptor's offset does not move. A lock another
+   process holds fails with EAGAIN or EACCES. */
+CAMLprim value caml_eio_fs_lock_range(value fd_v, value kind_v, value at_v,
+                                      value len_v)
+{
+  struct flock request;
+  int kind = Int_val(kind_v);
+  memset(&request, 0, sizeof request);
+  request.l_type = kind == 0 ? F_RDLCK : kind == 1 ? F_WRLCK : F_UNLCK;
+  request.l_whence = SEEK_SET;
+  request.l_start = (off_t)Long_val(at_v);
+  request.l_len = (off_t)Long_val(len_v);
+  if (fcntl(Int_val(fd_v), F_SETLK, &request) == -1)
+    caml_unix_error(errno, "fcntl", Nothing);
+  return Val_unit;
+}
+
+/* Whether another process holds a record lock that would refuse a write lock
+   on [len] bytes from byte [at] (POSIX fcntl F_GETLK). */
+CAMLprim value caml_eio_fs_range_locked(value fd_v, value at_v, value len_v)
+{
+  struct flock query;
+  memset(&query, 0, sizeof query);
+  query.l_type = F_WRLCK;
+  query.l_whence = SEEK_SET;
+  query.l_start = (off_t)Long_val(at_v);
+  query.l_len = (off_t)Long_val(len_v);
+  if (fcntl(Int_val(fd_v), F_GETLK, &query) == -1)
+    caml_unix_error(errno, "fcntl", Nothing);
+  return Val_bool(query.l_type != F_UNLCK);
+}
+
 /* One Darwin F_FULLFSYNC call. Retry and fallback policy lives in OCaml. */
 CAMLprim value caml_eio_fs_darwin_full_fsync(value fd_v)
 {

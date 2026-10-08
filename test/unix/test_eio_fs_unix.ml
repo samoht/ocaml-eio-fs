@@ -998,6 +998,49 @@ let record_free ~env lock =
         (Eio.Process.spawn ~sw manager ~executable:self
            [ self; "--try-eio-fs-lock"; Eio.Path.native_exn lock ]) )
 
+(* A byte-range lock is placed from the start of the file and leaves the
+   descriptor's offset where it was (POSIX fcntl F_SETLK with SEEK_SET), so a
+   lock taken through a descriptor another reader seeks moves none of its
+   reads. Another process meets the lock, and the lock is gone once let go;
+   [range_locked] answers about another process's lock and never this
+   one's. *)
+let test_lock_range () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "range" in
+  Eio.Path.save ~create:(`Or_truncate 0o600) lock (String.make 64 'r');
+  let fd = Unix.openfile (Eio.Path.native_exn lock) [ Unix.O_RDWR ] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  ignore (Unix.lseek fd 7 Unix.SEEK_SET : int);
+  Eio_fs_unix.lock_range fd `Write ~at:10 ~len:5;
+  Alcotest.(check int)
+    "the lock leaves the offset" 7
+    (Unix.lseek fd 0 Unix.SEEK_CUR);
+  Alcotest.(check bool)
+    "this process's own lock is not another's" false
+    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
+  let manager = Eio.Stdenv.process_mgr env in
+  let self = Sys.executable_name in
+  let try_lock () =
+    Eio.Switch.run @@ fun sw ->
+    Eio.Process.await
+      (Eio.Process.spawn ~sw manager ~executable:self
+         [ self; "--try-eio-fs-lock"; Eio.Path.native_exn lock ])
+  in
+  Alcotest.check status "another process meets the lock" (`Exited 3)
+    (try_lock ());
+  Eio_fs_unix.lock_range fd `Unlock ~at:10 ~len:5;
+  Alcotest.check status "and is granted the file once it is let go" (`Exited 0)
+    (try_lock ());
+  Eio.Switch.run @@ fun sw ->
+  with_held_lock ~sw ~env ~clock ~lock @@ fun () ->
+  Alcotest.(check bool)
+    "another process's lock is seen" true
+    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
+  match Eio_fs_unix.lock_range fd `Read ~at:10 ~len:5 with
+  | () -> Alcotest.fail "a read lock was granted under another's write lock"
+  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ()
+
 (* A lease belongs to its open file description, so a lease of this process
    excludes another of its own: a blocking one is granted once nothing holds
    it. *)
@@ -2816,6 +2859,8 @@ let lease_suite = ("lease", [ lease_test_case ])
 let suite =
   ( "eio_fs_unix",
     [
+      Alcotest.test_case "a byte-range lock leaves the offset" `Quick
+        test_lock_range;
       Alcotest.test_case "exclusive rename refuses existing names" `Quick
         test_exclusive_rename_refuses_existing_names;
       Alcotest.test_case "a lease dies with its holder" `Quick
