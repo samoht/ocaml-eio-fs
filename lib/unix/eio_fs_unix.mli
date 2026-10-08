@@ -259,7 +259,9 @@ val probe : _ Eio.Path.t -> [ `Free of string | `Held of refusal ]
     a lock this process holds is never closed while it is held, so a probe from
     the holding process keeps the hold.
 
-    [path] must be the lock's own regular file, as {!with_lock}'s must.
+    [path] must be the lock's own regular file, as {!with_lock}'s must. A name
+    given to another regular file while the probe reads it is probed again, for
+    the file it holds then.
 
     @raise Eio.Io
       with {!Eio.Fs.Not_found} when [path] is absent, or goes while the probe

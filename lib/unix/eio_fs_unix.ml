@@ -1114,7 +1114,58 @@ let hold ~sw ?block ?create ?contents ?on_wait path =
    and not the lock. A fiber holder is this process, which the kernel never
    reports. While a fiber holds the file, both are asked through the holder's
    descriptor, so the probe opens none of its own. *)
-let probe path =
+(* The lock over the open lock [file], whose stat is [opened]. *)
+let probe_file ~name file (opened : Eio.File.Stat.t) =
+  use_local_lock (opened.dev, opened.ino) @@ fun local ->
+  Fun.protect ~finally:(fun () -> let_go_of local file) @@ fun () ->
+  let another =
+    match Eio_unix.Resource.fd_opt file with
+    | None -> None
+    | Some fd -> Eio_unix.Fd.use_exn "Eio_fs_unix.probe" fd held_by_a_process
+  in
+  let holder =
+    match another with
+    | Some _ -> another
+    | None ->
+        if Stdlib.Mutex.protect tables_mutex (fun () -> local.holding) then
+          held_by_a_fiber ()
+        else None
+  in
+  let record = read_record file in
+  match holder with
+  | None -> `Free record
+  | Some _ -> `Held { path = name; holder; record }
+
+(* The probe of the file the name holds once opened. A lock file that went
+   after the open, as a ticket its holder removes, is absent, as it would be
+   had it gone before; a name given to another regular file meanwhile, as a
+   ticket's number given to the next ticket, is [`Renamed], for the caller
+   to probe the file it holds now. *)
+let probe_opened ~name path =
+  Eio.Switch.run @@ fun sw ->
+  check_lock_name ~name path;
+  let file = Eio.Path.open_in ~sw path in
+  let opened = Eio.File.stat file in
+  match named_kind path with
+  | None ->
+      raise
+        (Eio.Fs.err
+           (Eio.Fs.Not_found (Eio_unix.Unix_error (Unix.ENOENT, "stat", name))))
+  | Some named
+    when is_regular opened.kind && is_regular named.kind
+         && (Int64.compare opened.dev named.dev <> 0
+            || Int64.compare opened.ino named.ino <> 0) ->
+      `Renamed
+  | Some named ->
+      check_same_file ~name ~opened named;
+      `Answer (probe_file ~name file opened)
+
+(* The probes a name given to new files over and over may take before it is
+   refused: each needs the name to be given to another file while the probe
+   reads it. *)
+let probe_attempts = 8
+
+let rec probe_at ~attempts path =
   let name = lock_name path in
   let from_the_holder =
     match named_key ~name path with
@@ -1142,39 +1193,12 @@ let probe path =
   match from_the_holder with
   | Some answer -> answer
   | None -> (
-      Eio.Switch.run @@ fun sw ->
-      check_lock_name ~name path;
-      let file = Eio.Path.open_in ~sw path in
-      let opened = Eio.File.stat file in
-      (* A lock file that went after the open, as a ticket its holder
-         removes, is absent, as it would be had it gone before. *)
-      (match named_kind path with
-      | None ->
-          raise
-            (Eio.Fs.err
-               (Eio.Fs.Not_found
-                  (Eio_unix.Unix_error (Unix.ENOENT, "stat", name))))
-      | Some named -> check_same_file ~name ~opened named);
-      use_local_lock (opened.dev, opened.ino) @@ fun local ->
-      Fun.protect ~finally:(fun () -> let_go_of local file) @@ fun () ->
-      let another =
-        match Eio_unix.Resource.fd_opt file with
-        | None -> None
-        | Some fd ->
-            Eio_unix.Fd.use_exn "Eio_fs_unix.probe" fd held_by_a_process
-      in
-      let holder =
-        match another with
-        | Some _ -> another
-        | None ->
-            if Stdlib.Mutex.protect tables_mutex (fun () -> local.holding) then
-              held_by_a_fiber ()
-            else None
-      in
-      let record = read_record file in
-      match holder with
-      | None -> `Free record
-      | Some _ -> `Held { path = name; holder; record })
+      match probe_opened ~name path with
+      | `Answer answer -> answer
+      | `Renamed when attempts > 1 -> probe_at ~attempts:(attempts - 1) path
+      | `Renamed -> not_a_lock_file name)
+
+let probe path = probe_at ~attempts:probe_attempts path
 
 module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
