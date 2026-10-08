@@ -927,7 +927,89 @@ let test_lease_wait_for_a_fiber_says_so () =
   Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await granted);
   Alcotest.(check int) "said it waits once" 1 !waits
 
+(* A monotonic clock that counts the waits begun on it and never moves, so a
+   bound set on it never lapses and a wait that paces itself on it never asks
+   again. *)
+module Still_clock = struct
+  type t = int ref
+  type time = Mtime.t
+
+  let now _ = Mtime.min_stamp
+
+  let sleep_until begun _ =
+    incr begun;
+    Eio.Fiber.await_cancel ()
+end
+
+(* [counting_waits f] is [f ()] with every [Eio_unix.sleep] of the fibers [f]
+   starts on a {!Still_clock}, and the number of waits begun on it. *)
+let counting_waits f =
+  let begun = ref 0 in
+  let clock = Eio.Resource.T (begun, Eio.Time.Pi.clock (module Still_clock)) in
+  let rec on_still : type r. (unit -> r) -> r =
+   fun f ->
+    let effc : type a.
+        a Effect.t -> ((a, r) Effect.Deep.continuation -> r) option = function
+      | Eio_unix.Private.Get_monotonic_clock ->
+          Some (fun k -> Effect.Deep.continue k clock)
+      | Eio.Private.Effects.Fork (ctx, child) ->
+          Some
+            (fun k ->
+              Effect.perform
+                (Eio.Private.Effects.Fork (ctx, fun () -> on_still child));
+              Effect.Deep.continue k ())
+      | _ -> None
+    in
+    Effect.Deep.try_with f () { effc }
+  in
+  let value = on_still f in
+  (value, !begun)
+
+(* A wait bounded by [`For] is the same kernel request, raced against its
+   bound: the waiter asks once, says it waits once, and is granted at the
+   release, having begun one wait on the monotonic clock, its bound's. The
+   clock never moves, so a wait that asked again on a cadence would begin a
+   second wait and never ask again. *)
+let a_bounded_wait_answers_at_the_release ~kind take () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let waits = ref 0 in
+  let granted, now_granted = Eio.Promise.create () in
+  let begun, now_begun = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      let (), begun =
+        counting_waits (fun () ->
+            take
+              ~on_wait:(fun () ->
+                incr waits;
+                ignore (Eio.Promise.try_resolve now_waiting ()))
+              lock
+              (fun () -> Eio.Promise.resolve now_granted ()))
+      in
+      Eio.Promise.resolve now_begun begun);
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
+  Alcotest.(check bool)
+    "not granted while held" false
+    (Eio.Promise.is_resolved granted);
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ());
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await granted);
+  Alcotest.(check int) "said it waits once" 1 !waits;
+  Alcotest.(check int)
+    "began one wait on the clock, its bound's" 1
+    (Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await begun))
+
 let take_record ~on_wait lock fn = Eio_fs_unix.with_lock ~on_wait lock fn
+
+let take_record_for ~on_wait lock fn =
+  Eio_fs_unix.with_lock ~block:(`For 60.) ~on_wait lock fn
+
+let take_lease_for ~on_wait lock fn =
+  Eio_fs_unix.Lease.with_exclusive ~block:(`For 60.) ~on_wait lock (fun _ ->
+      fn ())
 
 let take_lease ~on_wait lock fn =
   Eio_fs_unix.Lease.with_exclusive ~on_wait lock (fun _ -> fn ())
@@ -2789,6 +2871,11 @@ let suite =
         (a_wait_answers_at_the_release ~kind:"lease" take_lease);
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
+      Alcotest.test_case "a bounded record lock wait answers at the release"
+        `Quick
+        (a_bounded_wait_answers_at_the_release ~kind:"record" take_record_for);
+      Alcotest.test_case "a bounded lease wait answers at the release" `Quick
+        (a_bounded_wait_answers_at_the_release ~kind:"lease" take_lease_for);
       Alcotest.test_case "a lease wait for a fiber says so" `Quick
         test_lease_wait_for_a_fiber_says_so;
       Alcotest.test_case "lock serializes fibers" `Quick

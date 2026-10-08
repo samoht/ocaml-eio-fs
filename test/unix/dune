@@ -12,6 +12,7 @@
   eio-fs.unix
   cstruct
   optint
+  mtime
   unix
   alcotest))
 

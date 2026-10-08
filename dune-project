@@ -41,4 +41,5 @@
   eio_main
   (mdx :with-test)
   (alcotest :with-test)
-  (alcobar :with-test)))
+  (alcobar :with-test)
+  (mtime :with-test)))
