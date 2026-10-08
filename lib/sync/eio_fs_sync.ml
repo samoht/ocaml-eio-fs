@@ -345,5 +345,52 @@ let publish_generation ~durable ?(perm = 0o755) path populate =
 
 module Lock = Lock
 
-let publish_link ~durable:_ ~lock:_ ~expected:_ ~link_to:_ _ =
-  failwith "TODO: Eio_fs_sync.publish_link"
+(* The raw target at [path], read without following it: [None] when there is
+   no entry, and a refusal for an entry that is not a symbolic link. *)
+let link_target path =
+  match Eio.Path.kind ~follow:false path with
+  | `Not_found -> Ok None
+  | `Symbolic_link -> Ok (Some (Eio.Path.read_link path))
+  | _ -> Error (`Invalid "the entry to replace is not a symbolic link")
+
+(* The link is made under a fresh name and removed unless renamed into
+   place, so a refusal or a raise leaves only what was there. *)
+let stage_link ~durable ~expected ~link_to path =
+  let parent, name =
+    match Eio.Path.split path with
+    | Some pair -> pair
+    | None -> invalid_arg "Eio_fs_sync.publish_link: the root has no parent"
+  in
+  let stage = Eio.Path.(parent / fresh_name name) in
+  let staged = ref false in
+  Fun.protect
+    ~finally:(fun () ->
+      if !staged then Eio.Cancel.protect (fun () -> Eio.Path.unlink stage))
+    (fun () ->
+      Eio.Path.symlink ~link_to stage;
+      staged := true;
+      if durable then sync_parent stage;
+      match link_target path with
+      | Error e -> Error e
+      | Ok actual when not (Option.equal String.equal actual expected) ->
+          Error (`Changed actual)
+      | Ok _ ->
+          Eio.Cancel.protect (fun () ->
+              Eio.Path.rename stage path;
+              staged := false;
+              if durable then sync_parent path);
+          Ok ())
+
+let publish_link ~durable ~lock ~expected ~link_to path =
+  Lock.use lock @@ fun () ->
+  if link_to = "" || String.contains link_to '\000' then
+    Error (`Invalid "a symbolic link's target is empty or holds a NUL byte")
+  else
+    match link_target path with
+    | Error e -> Error e
+    | Ok actual when not (Option.equal String.equal actual expected) ->
+        Error (`Changed actual)
+    | Ok (Some actual) when String.equal actual link_to ->
+        if durable then sync_parent path;
+        Ok ()
+    | Ok _ -> stage_link ~durable ~expected ~link_to path
