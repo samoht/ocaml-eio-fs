@@ -674,8 +674,8 @@ let budget ~sw seconds =
   Until lapsed
 
 (* [on_taken] runs the moment the mutex is held, so a caller records how to
-   give it back before anything else can raise. A wait behind a holder calls
-   [on_wait ()] first. *)
+   give it back before anything else can raise. A wait behind a holder, bounded
+   or not, calls [on_wait ()] first. *)
 let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
   match patience with
   | Wait ->
@@ -686,7 +686,9 @@ let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
       on_taken ()
   | Refuse ->
       if Eio.Mutex.try_lock mutex then on_taken () else raise (refused ())
+  | Until _ when Eio.Mutex.try_lock mutex -> on_taken ()
   | Until lapsed ->
+      on_wait ();
       (* [Fiber.first] cancels the loser, and a fiber cancelled inside
          [Eio.Mutex.lock] may have been granted the mutex all the same: the
          unlocker's wake and the cancellation race for one atomic and either
@@ -1003,7 +1005,7 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
       (fun (file, _) ->
         taken (fun () -> if not !entered then let_go_of local file))
       opened_first;
-    take_mutex ~patience:fibers
+    take_mutex ~on_wait ~patience:fibers
       ~refused:(fun () ->
         match opened_first with
         | Some (file, _) -> refusal ~name ~holder:(held_by_a_fiber ()) file
