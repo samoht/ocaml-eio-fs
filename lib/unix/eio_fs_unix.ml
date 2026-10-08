@@ -733,10 +733,6 @@ let in_entry_order name fn =
 
 let lockf fd command = retry_eintr (fun fd -> Unix.lockf fd command 0) fd
 
-(* POSIX has no portable timed record lock, so a bounded wait asks again; it
-   also answers a holder that died, whose lock the kernel drops. *)
-let ask_again_every = 0.05
-
 let os_unlock fd =
   Eio.Cancel.protect @@ fun () ->
   Eio_unix.Fd.use_exn "Eio_fs_unix.unlock" fd @@ fun fd ->
@@ -764,7 +760,8 @@ let await_record_lock fd =
 
 (* [on_taken] runs the moment the record lock is held, as {!take_mutex}'s
    does. A wait asks once without waiting, calls [on_wait] if the lock is
-   held, then makes the kernel's blocking request. *)
+   held, then makes the kernel's blocking request; a bounded wait races that
+   request against its lapse, which withdraws it. *)
 let take_os_lock ~patience ~refused ~on_taken ~on_wait fd =
   let acquired = ref false in
   let ask () =
@@ -779,33 +776,29 @@ let take_os_lock ~patience ~refused ~on_taken ~on_wait fd =
             on_taken ()
         | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ())
   in
-  let wait () =
+  let wait ~lapsed ~granted =
     ask ();
-    if not !acquired then begin
+    if (not !acquired) && not (lapsed ()) then begin
       on_wait ();
       Eio_unix.Fd.use_exn "Eio_fs_unix.lock" fd @@ fun fd ->
-      if await_record_lock fd then begin
+      if granted fd then begin
         acquired := true;
         on_taken ()
       end
     end
   in
-  (* A bounded wait asks again on a cadence, until the bound. *)
-  let rec wait_until lapse =
-    ask ();
-    if (not !acquired) && not (Eio.Promise.is_resolved lapse) then begin
-      (* Waking on the lapse rather than sleeping through it is what keeps
-         the answer inside one further ask of the bound. *)
-      Eio.Fiber.first
-        (fun () -> Eio_unix.sleep ask_again_every)
-        (fun () -> Eio.Promise.await lapse);
-      wait_until lapse
-    end
-  in
   (match patience with
-  | Wait -> wait ()
+  | Wait -> wait ~lapsed:(fun () -> false) ~granted:await_record_lock
   | Refuse -> ask ()
-  | Until lapse -> wait_until lapse);
+  | Until lapse ->
+      wait
+        ~lapsed:(fun () -> Eio.Promise.is_resolved lapse)
+        ~granted:(fun fd ->
+          Eio.Fiber.first
+            (fun () -> await_record_lock fd)
+            (fun () ->
+              Eio.Promise.await lapse;
+              false)));
   if not !acquired then raise (refused ())
 
 (* A planted link under the rendezvous name would send the record lock to
@@ -1221,16 +1214,18 @@ module Lease = struct
         end
     | Refuse -> ask ~nonblocking:true
     | Until lapsed ->
-        let rec poll () =
-          ask ~nonblocking:true;
-          if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+        ask ~nonblocking:true;
+        if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+          on_wait ();
+          acquired :=
             Eio.Fiber.first
-              (fun () -> Eio_unix.sleep ask_again_every)
-              (fun () -> Eio.Promise.await lapsed);
-            poll ()
-          end
-        in
-        poll ());
+              (fun () ->
+                await_release fd;
+                true)
+              (fun () ->
+                Eio.Promise.await lapsed;
+                false)
+        end);
     if not !acquired then raise (refused ());
     fn ()
 
