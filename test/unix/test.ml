@@ -1,4 +1,3 @@
-let hold_lock_arg = "--hold-eio-fs-lock"
 let hold_lease_arg = "--hold-eio-fs-lease"
 let held_lock_arg = "--hold-eio-fs-lock-until-release"
 
@@ -17,17 +16,10 @@ let held_lock path =
         || not (Char.equal (Bytes.get release 0) 'X')
       then failwith "lock holder expected explicit release"
 
-let hold_lock path ready seconds =
-  let fd = Unix.openfile path [ Unix.O_CREAT; Unix.O_RDWR ] 0o600 in
-  Fun.protect
-    ~finally:(fun () -> Unix.close fd)
-    (fun () ->
-      Unix.lockf fd Unix.F_LOCK 0;
-      Out_channel.with_open_bin ready (fun _ -> ());
-      Unix.sleepf seconds)
-
-let hold_lease ready =
-  Out_channel.with_open_bin ready (fun _ -> ());
+(* Holds the inherited lease until killed, having said it runs. *)
+let hold_lease () =
+  output_char stdout 'R';
+  flush stdout;
   while true do
     Unix.sleep 3600
   done
@@ -97,9 +89,7 @@ let () =
   | [ _; arg; path ] when String.equal arg held_lock_arg -> held_lock path
   | [ _; arg; kind; path ] when String.equal arg until_release_arg ->
       hold_until_release kind path
-  | [ _; arg; path; ready; seconds ] when String.equal arg hold_lock_arg ->
-      hold_lock path ready (float_of_string seconds)
-  | [ _; arg; ready ] when String.equal arg hold_lease_arg -> hold_lease ready
+  | [ _; arg ] when String.equal arg hold_lease_arg -> hold_lease ()
   | [ _; arg; path ] when String.equal arg try_lock_arg -> try_lock path
   | [ _; arg; path ] when String.equal arg exit_holding_arg -> exit_holding path
   | [ _; arg ] when String.equal arg lease_test_arg ->

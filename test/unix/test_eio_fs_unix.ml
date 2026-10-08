@@ -714,25 +714,22 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
    the domain for each whole call. [test_lock_wait_does_not_block_eio] binds
    that half, holding its call open while another process holds the lock. *)
 let test_sparse_map_does_not_block_eio () =
-  with_sparse_file @@ fun env fd ~size ->
-  let clock = Eio.Stdenv.clock env in
-  let ticks = ref 0 in
-  let walked = ref false in
+  with_sparse_file @@ fun _env fd ~size ->
+  let ran = ref false in
   Eio.Switch.run @@ fun sw ->
+  (* The fork runs the ticking fiber at once, and its yield puts it behind
+     this one: it runs again only when the walk suspends. *)
   Eio.Fiber.fork ~sw (fun () ->
-      while not !walked do
-        Eio.Time.sleep clock 0.001;
-        incr ticks
-      done);
+      Eio.Fiber.yield ();
+      ran := true);
   for _ = 1 to 2000 do
     ignore (Eio_fs_unix.seek_data fd 0L : int64 option);
     ignore
       (Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:8
         : Eio_fs_unix.extent list)
   done;
-  walked := true;
   Alcotest.(check bool)
-    "another fiber ran while the map was being walked" true (!ticks > 0)
+    "another fiber ran while the map was being walked" true !ran
 
 (* The in-memory backend registers its barrier as a no-op -- volatile storage
    has nothing to sync -- so the platter-strength entry point runs unchanged
@@ -740,34 +737,6 @@ let test_sparse_map_does_not_block_eio () =
 let test_sync_dir_in_memory_no_op () =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env -> Eio_fs_unix.sync_dir env#fs
-
-(* A second process holding the record lock over the rendezvous: the opener the
-   mutex in this process cannot see, and the only one that tells a real
-   exclusion from an in-process one. The child takes the lock, reports [ready],
-   and holds it for [seconds]; the caller resumes once the lock is taken. *)
-let hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready ~seconds =
-  let self = Sys.executable_name in
-  let child =
-    Eio.Process.spawn ~sw
-      (Eio.Stdenv.process_mgr env)
-      ~executable:self
-      [
-        self;
-        "--hold-eio-fs-lock";
-        Eio.Path.native_exn lock;
-        Eio.Path.native_exn ready;
-        seconds;
-      ]
-  in
-  let rec await_ready () =
-    if Eio.Path.is_file ready then ()
-    else begin
-      Eio.Time.sleep clock 0.01;
-      await_ready ()
-    end
-  in
-  await_ready ();
-  child
 
 let await_holder child =
   match Eio.Process.await child with
@@ -799,9 +768,10 @@ let with_held_lock ~sw ~env ~clock ~lock fn =
       Eio.Time.with_timeout_exn clock 10.0 (fun () -> await_holder child))
     fn
 
-(* A process holding [lock] by [kind] ([test.ml], [hold_until_release]) until
-   [release] is called, which returns how it ended: [`Exited 0] when it let go
-   at [release], [`Exited 3] when it let go at its own five-second bound. *)
+(* A process holding [lock] by [kind] ([test.ml], [hold_until_release]), and
+   [release], which tells it to let go and returns how it ended: [`Exited 0]
+   when it let go at [release], [`Exited 3] when it let go at its own
+   five-second bound. *)
 let holding_process ~sw ~env ~clock ~kind ~lock =
   let manager = Eio.Stdenv.process_mgr env in
   let input, release = Eio.Process.pipe ~sw manager in
@@ -819,10 +789,11 @@ let holding_process ~sw ~env ~clock ~kind ~lock =
   Alcotest.(check char)
     "the other process holds the lock" 'R'
     (Cstruct.get_char announced 0);
-  fun () ->
-    (try Eio.Flow.copy_string "X" release with Eio.Io _ -> ());
-    Eio.Resource.close release;
-    Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Process.await child)
+  ( child,
+    fun () ->
+      (try Eio.Flow.copy_string "X" release with Eio.Io _ -> ());
+      Eio.Resource.close release;
+      Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Process.await child) )
 
 let status =
   Alcotest.testable
@@ -843,7 +814,7 @@ let a_wait_answers_at_the_release ~kind take () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let _, release = holding_process ~sw ~env ~clock ~kind ~lock in
   let waiting, now_waiting = Eio.Promise.create () in
   let waits = ref 0 in
   let granted, now_granted = Eio.Promise.create () in
@@ -873,7 +844,7 @@ let a_wait_is_cancellable ~kind take ~free () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let _, release = holding_process ~sw ~env ~clock ~kind ~lock in
   let waiting, now_waiting = Eio.Promise.create () in
   let answer =
     Eio.Fiber.first
@@ -941,28 +912,30 @@ module Still_clock = struct
     Eio.Fiber.await_cancel ()
 end
 
-(* [counting_waits f] is [f ()] with every [Eio_unix.sleep] of the fibers [f]
-   starts on a {!Still_clock}, and the number of waits begun on it. *)
+(* [on_mono clock f] is [f ()] with every [Eio_unix.sleep] of the fibers [f]
+   starts on [clock]. *)
+let rec on_mono : type r. Eio.Time.Mono.ty Eio.Resource.t -> (unit -> r) -> r =
+ fun clock f ->
+  let effc : type a. a Effect.t -> ((a, r) Effect.Deep.continuation -> r) option
+      = function
+    | Eio_unix.Private.Get_monotonic_clock ->
+        Some (fun k -> Effect.Deep.continue k clock)
+    | Eio.Private.Effects.Fork (ctx, child) ->
+        Some
+          (fun k ->
+            Effect.perform
+              (Eio.Private.Effects.Fork (ctx, fun () -> on_mono clock child));
+            Effect.Deep.continue k ())
+    | _ -> None
+  in
+  Effect.Deep.try_with f () { effc }
+
+(* [counting_waits f] is [f ()] on a {!Still_clock}, and the number of waits
+   begun on it. *)
 let counting_waits f =
   let begun = ref 0 in
   let clock = Eio.Resource.T (begun, Eio.Time.Pi.clock (module Still_clock)) in
-  let rec on_still : type r. (unit -> r) -> r =
-   fun f ->
-    let effc : type a.
-        a Effect.t -> ((a, r) Effect.Deep.continuation -> r) option = function
-      | Eio_unix.Private.Get_monotonic_clock ->
-          Some (fun k -> Effect.Deep.continue k clock)
-      | Eio.Private.Effects.Fork (ctx, child) ->
-          Some
-            (fun k ->
-              Effect.perform
-                (Eio.Private.Effects.Fork (ctx, fun () -> on_still child));
-              Effect.Deep.continue k ())
-      | _ -> None
-    in
-    Effect.Deep.try_with f () { effc }
-  in
-  let value = on_still f in
+  let value = on_mono clock f in
   (value, !begun)
 
 (* A wait bounded by [`For] is the same kernel request, raced against its
@@ -975,7 +948,7 @@ let a_bounded_wait_answers_at_the_release ~kind take () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let release = holding_process ~sw ~env ~clock ~kind ~lock in
+  let _, release = holding_process ~sw ~env ~clock ~kind ~lock in
   let waiting, now_waiting = Eio.Promise.create () in
   let waits = ref 0 in
   let granted, now_granted = Eio.Promise.create () in
@@ -1032,10 +1005,8 @@ let lease_free ~env:_ lock =
   Eio_fs_unix.Lease.with_exclusive ~block:`Yes lock (fun _ -> ())
 
 let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
-  with_real_dir_env @@ fun env dir ->
-  let clock = Eio.Stdenv.clock env in
+  with_real_dir_env @@ fun _env dir ->
   let lock = dir / "lease" in
-  let ready = dir / "lease-ready" in
   let wait_child pid =
     let rec loop () =
       match Unix.waitpid [] pid with
@@ -1052,31 +1023,28 @@ let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
         Fun.id
     in
     Unix.clear_close_on_exec fd;
+    (* The child says it runs, holding the inherited descriptor, with one
+       byte on [announced]. *)
+    let announced, announce = Unix.pipe ~cloexec:true () in
+    Fun.protect ~finally:(fun () -> Unix.close announced) @@ fun () ->
     let pid =
       Fun.protect
-        ~finally:(fun () -> Unix.set_close_on_exec fd)
+        ~finally:(fun () ->
+          Unix.close announce;
+          Unix.set_close_on_exec fd)
         (fun () ->
           Unix.create_process Sys.executable_name
-            [|
-              Sys.executable_name;
-              "--hold-eio-fs-lease";
-              Eio.Path.native_exn ready;
-            |]
-            Unix.stdin Unix.stdout Unix.stderr)
+            [| Sys.executable_name; "--hold-eio-fs-lease" |]
+            Unix.stdin announce Unix.stderr)
     in
-    let rec await_ready attempts =
-      if Eio.Path.is_file ready then pid
-      else if attempts = 0 then begin
-        (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
-        ignore (wait_child pid);
-        Alcotest.fail "lease child did not start within one second"
-      end
-      else begin
-        Eio.Time.sleep clock 0.01;
-        await_ready (attempts - 1)
-      end
-    in
-    await_ready 100
+    Eio_unix.await_readable announced;
+    let said = Bytes.create 1 in
+    if Unix.read announced said 0 1 <> 1 || Bytes.get said 0 <> 'R' then begin
+      (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+      ignore (wait_child pid);
+      Alcotest.fail "lease child ended before it said it runs"
+    end;
+    pid
   in
   let reaped = ref false in
   Fun.protect
@@ -1099,55 +1067,30 @@ let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
       | Unix.WSTOPPED n -> Alcotest.failf "lease child stopped by %d" n);
       Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()))
 
+(* The holder lets go only when a sibling fiber tells it to, and the sibling
+   runs only once the wait has begun: a wait that held the domain would never
+   be answered, and the holder would let go at its own bound, exiting 3. *)
 let test_lock_wait_does_not_block_eio () =
-  with_real_dir_env @@ fun env dir ->
-  let clock = Eio.Stdenv.clock env in
-  Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
-      ~ready:(dir / "ready") ~seconds:"0.25"
-  in
-  let progressed = ref false in
-  Eio.Switch.run @@ fun tick_sw ->
-  Eio.Fiber.fork ~sw:tick_sw (fun () ->
-      Eio.Time.sleep clock 0.05;
-      progressed := true);
-  Eio_fs_unix.with_lock (dir / "lock") (fun () -> ());
-  Alcotest.(check bool)
-    "another fiber progressed while waiting" true !progressed;
-  await_holder child
-
-(* A wait for another process is a wait a caller can end: a bound, a
-   Ctrl-C or a sibling fiber that gives up cancels it, and the acquisition
-   answers at the cancel rather than when the holder lets go. The holder here
-   holds for three seconds and the wait is cancelled after a fifth of one. *)
-let test_lock_wait_for_another_process_is_cancellable () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"3"
-  in
-  let began = Eio.Time.now clock in
-  let answer =
-    Eio.Fiber.first
-      (fun () -> Eio_fs_unix.with_lock lock (fun () -> `Granted))
-      (fun () ->
-        Eio.Time.sleep clock 0.2;
-        `Cancelled)
-  in
-  let took = Eio.Time.now clock -. began in
-  (match answer with
-  | `Granted -> Alcotest.fail "a lock another process holds was granted"
-  | `Cancelled -> ());
-  if took > 1. then
-    Alcotest.failf
-      "the cancelled wait returned after %.1f s, when the holder let go, not \
-       at the cancel"
-      took;
-  await_holder child
+  let _, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let progressed = ref false and ended = ref (`Exited (-1)) in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.with_lock
+        ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+        lock
+        (fun () -> ()))
+    (fun () ->
+      Eio.Promise.await waiting;
+      progressed := true;
+      ended := release ());
+  Alcotest.(check bool)
+    "another fiber progressed while waiting" true !progressed;
+  Alcotest.check status "the holder let go when told" (`Exited 0) !ended
 
 let test_lock_serializes_fibers () =
   with_real_dir @@ fun dir ->
@@ -1245,15 +1188,12 @@ let test_lock_non_blocking_unavailable () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"0.15"
-  in
+  let _, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "non-blocking lock unexpectedly succeeded"
   | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* ---- a refusal names who holds the lock ----
 
@@ -1282,10 +1222,7 @@ let test_lock_refusal_names_the_holding_process () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"0.3"
-  in
+  let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   let holder = Eio.Process.pid child in
   (match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
   | () -> Alcotest.fail "a lock another process holds was granted"
@@ -1296,7 +1233,7 @@ let test_lock_refusal_names_the_holding_process () =
           printed holder;
       Alcotest.(check (option int))
         "the holder the refusal carries" (Some holder) refused.holder);
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* The mutex half of the exclusion is held by a fiber of this process, so the
    holder a refusal carries there is this process, which it prints as another
@@ -1473,10 +1410,7 @@ let test_probe_names_the_holding_process () =
   Eio_fs_unix.with_lock ~contents:"the last holder\n" lock (fun () -> ());
   check_free_probe "before the child" lock ~record:"the last holder\n";
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"0.3"
-  in
+  let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   (match Eio_fs_unix.probe lock with
   | `Free _ -> Alcotest.fail "a lock another process holds probed as free"
   | `Held refused ->
@@ -1484,7 +1418,7 @@ let test_probe_names_the_holding_process () =
         "the holder the probe names"
         (Some (Eio.Process.pid child))
         refused.holder);
-  await_holder child;
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ());
   check_free_probe "after the child" lock ~record:"the last holder\n"
 
 (* A probe from the holding process names it, and like any ask from there it
@@ -1540,10 +1474,7 @@ let test_hold_refusal_names_the_holding_process () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"0.3"
-  in
+  let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   ( Eio.Switch.run @@ fun hold_sw ->
     match Eio_fs_unix.hold ~sw:hold_sw ~block:`No lock with
     | () -> Alcotest.fail "a hold was granted over another process's lock"
@@ -1552,7 +1483,7 @@ let test_hold_refusal_names_the_holding_process () =
           "the holder the refusal carries"
           (Some (Eio.Process.pid child))
           refused.holder );
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* ---- a held lock is restated and let go on demand ----
 
@@ -1683,16 +1614,13 @@ let test_lock_fibers_mode_refuses_another_process () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"1.0"
-  in
+  let _, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   (match Eio_fs_unix.with_lock ~block:`Fibers lock (fun () -> ()) with
   | () ->
       Alcotest.fail "another process's hold was waited out rather than answered"
   | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* ---- a bound is a wait a caller can plan against ----
 
@@ -1706,49 +1634,38 @@ let test_lock_bounded_wait_answers_at_the_bound () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
-  let bound = 0.2 and held = 1.0 in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:(string_of_float held)
-  in
-  let began = Eio.Time.now clock in
-  (match Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> ()) with
-  | () -> Alcotest.fail "a lock held for the whole bound was granted"
-  | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
+  let _, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
+  let mono = Eio_mock.Clock.Mono.make () in
+  let waiting, now_waiting = Eio.Promise.create () in
+  let answer, answered = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio.Promise.resolve answered
+        (on_mono
+           (mono :> Eio.Time.Mono.ty Eio.Resource.t)
+           (fun () ->
+             match
+               Eio_fs_unix.with_lock ~block:(`For 0.2)
+                 ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+                 lock
+                 (fun () -> `Granted)
+             with
+             | answer -> answer
+             | exception Eio_fs_unix.Lock_unavailable { path; _ } ->
+                 `Refused path)));
+  Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await waiting);
+  Alcotest.(check bool)
+    "no answer before the bound" false
+    (Eio.Promise.is_resolved answer);
+  Eio_mock.Clock.Mono.advance mono;
+  (match
+     Eio.Time.with_timeout_exn clock 5.0 (fun () -> Eio.Promise.await answer)
+   with
+  | `Granted -> Alcotest.fail "a lock held for the whole bound was granted"
+  | `Refused path ->
       Alcotest.(check string) "unavailable path" (Eio.Path.native_exn lock) path);
-  let waited = Eio.Time.now clock -. began in
-  Alcotest.(check bool)
-    "the bound was waited out before the answer" true (waited >= bound);
-  Alcotest.(check bool)
-    "and the answer came without waiting out the holder" true (waited < held);
-  await_holder child
-
-(* The other half of the bound: a wait that is a wait. The child says it holds
-   the lock before this fiber runs, so a caller that refused at zero would
-   raise here, and one that comes back having run its section waited the holder
-   out. Coming back in a small share of the bound is what says it woke on the
-   release rather than at the deadline. *)
-let test_lock_bounded_wait_takes_the_lock_when_the_holder_releases () =
-  with_real_dir_env @@ fun env dir ->
-  let clock = Eio.Stdenv.clock env in
-  let lock = dir / "lock" in
-  let bound = 30.0 and held = 0.3 in
-  Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:(string_of_float held)
-  in
-  let began = Eio.Time.now clock in
-  let granted = ref false in
-  Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> granted := true);
-  let waited = Eio.Time.now clock -. began in
-  Alcotest.(check bool)
-    "the holder was waited out and the section ran" true !granted;
-  Alcotest.(check bool)
-    "and the wait ended on the release rather than at the bound" true
-    (waited < bound /. 10.);
-  await_holder child
+  Alcotest.check status "the holder still held it, and let go when told"
+    (`Exited 0) (release ())
 
 (* The fibers of this process are the other holder a bound has to cover. Here
    the record lock is free and a fiber of this program is inside, so what the
@@ -1788,31 +1705,32 @@ let test_lock_bounded_wait_answers_a_fiber_that_holds_it () =
    the kernel's, held on an open descriptor, so it goes when the last
    descriptor to the file closes -- which a killed process does as surely as an
    exiting one. A waiter that read the rendezvous rather than asking the kernel
-   would sit out the whole bound behind a process that is gone; this one is
-   inside within one ask of the kill. *)
+   would sit out the whole bound behind a process that is gone. Here the bound
+   is on a clock that never moves and the holder never lets go on its own, so
+   the kill is all that can end the wait. *)
 let test_lock_bounded_wait_does_not_sit_out_a_killed_holder () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
-  let bound = 30.0 in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"600.0"
-  in
-  let began = Eio.Time.now clock in
+  let child, _ = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
+  let waiting, now_waiting = Eio.Promise.create () in
   let granted = ref false in
-  Eio.Fiber.both
-    (fun () ->
-      Eio.Time.sleep clock 0.2;
-      Eio.Process.signal child Sys.sigkill)
-    (fun () ->
-      Eio_fs_unix.with_lock ~block:(`For bound) lock (fun () -> granted := true));
-  let waited = Eio.Time.now clock -. began in
+  Eio.Time.with_timeout_exn clock 5.0 (fun () ->
+      Eio.Fiber.both
+        (fun () ->
+          Eio.Promise.await waiting;
+          Eio.Process.signal child Sys.sigkill)
+        (fun () ->
+          let (), _ =
+            counting_waits (fun () ->
+                Eio_fs_unix.with_lock ~block:(`For 30.)
+                  ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+                  lock
+                  (fun () -> granted := true))
+          in
+          ()));
   Alcotest.(check bool) "the lock was taken once its holder died" true !granted;
-  Alcotest.(check bool)
-    "and it came free with its holder rather than at the bound" true
-    (waited < bound /. 10.);
   match Eio.Process.await child with
   | `Signaled n when Int.equal n Sys.sigkill -> ()
   | `Exited n ->
@@ -2381,9 +2299,8 @@ let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
   with_real_dir_env @@ fun env dir ->
   let clock = Eio.Stdenv.clock env in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock:(dir / "lock")
-      ~ready:(dir / "ready") ~seconds:"0.25"
+  let _, release =
+    holding_process ~sw ~env ~clock ~kind:"record" ~lock:(dir / "lock")
   in
   let hidden = hide_descriptors dir in
   let ran = ref false in
@@ -2401,7 +2318,7 @@ let test_lock_refuses_a_wrapper_that_hides_a_host_descriptor () =
         (mentions ~needle:(Eio.Path.native_exn (dir / "lock")) message));
   Alcotest.(check bool)
     "the critical section did not run over the held file" false !ran;
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* ---- the rendezvous as a section a backend-free component runs inside ----
 
@@ -2438,10 +2355,7 @@ let test_section_refusal_reaches_the_component_as_unavailable () =
   let clock = Eio.Stdenv.clock env in
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let child =
-    hold_lock_in_another_process ~sw ~env ~clock ~lock ~ready:(dir / "ready")
-      ~seconds:"1.0"
-  in
+  let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   let section = Eio_fs_unix.lock_section ~block:`Fibers lock in
   let ran = ref false in
   (match Eio_fs_sync.Lock.use section (fun () -> ran := true) with
@@ -2455,7 +2369,7 @@ let test_section_refusal_reaches_the_component_as_unavailable () =
         "and names the process that holds it" true
         (names_process what (Eio.Process.pid child)));
   Alcotest.(check bool) "the section did not run" false !ran;
-  await_holder child
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
 
 (* A name that is not the lock's own regular file is the other refusal, and it
    is not the ordinary busy one: a component told "held by another process"
@@ -2861,8 +2775,6 @@ let suite =
       Alcotest.test_case "lock wait does not block Eio" `Quick
         test_lock_wait_does_not_block_eio;
       lease_test_case;
-      Alcotest.test_case "a wait for another process is cancellable" `Quick
-        test_lock_wait_for_another_process_is_cancellable;
       Alcotest.test_case "a record lock wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"record" take_record);
       Alcotest.test_case "a record lock wait answers at a cancel" `Quick
@@ -2928,8 +2840,6 @@ let suite =
         test_lock_fibers_mode_refuses_another_process;
       Alcotest.test_case "a bounded wait answers at the bound" `Quick
         test_lock_bounded_wait_answers_at_the_bound;
-      Alcotest.test_case "a bounded wait takes the lock on the release" `Quick
-        test_lock_bounded_wait_takes_the_lock_when_the_holder_releases;
       Alcotest.test_case "a bounded wait answers a fiber that holds it" `Quick
         test_lock_bounded_wait_answers_a_fiber_that_holds_it;
       Alcotest.test_case "a bounded wait does not sit out a killed holder"
