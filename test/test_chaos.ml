@@ -256,6 +256,75 @@ let test_stat_error () =
   expect_io "stat" (fun () ->
       ignore (Eio.Path.stat ~follow:false (chaos / "f")))
 
+let directory_names entries path =
+  if entries then Eio.Path.read_dir_entries path |> List.map snd
+  else Eio.Path.read_dir path
+
+let test_directory_error entries () =
+  let observed = ref [] in
+  let scripted =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Read_dir; path = "tree" };
+          fault = Read_error `Eacces;
+        };
+      ]
+  in
+  let sched =
+    Schedule.observing (fun op -> observed := op :: !observed) scripted
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.mkdir ~perm:0o755 (raw / "tree");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "tree" / "f") "payload";
+  let callbacks = ref 0 in
+  expect_io "directory refusal" (fun () ->
+      if entries then
+        Eio.Path.with_dir_entries (chaos / "tree") (fun _ -> incr callbacks)
+      else ignore (directory_names false (chaos / "tree")));
+  Alcotest.(check int) "no callback before refusal" 0 !callbacks;
+  (match !observed with
+  | [ op ] ->
+      Alcotest.(check string) "directory path" "tree" op.Op.path;
+      Alcotest.(check bool) "directory operation" true (op.kind = `Read_dir);
+      Alcotest.(check int) "no byte offset" 0 op.file_offset;
+      Alcotest.(check int) "no byte length" 0 op.length
+  | _ -> Alcotest.fail "expected exactly one directory opportunity");
+  Alcotest.(check string)
+    "fault consumed once" "scripted(0 rules)"
+    (Fmt.str "%a" Schedule.pp scripted);
+  Alcotest.(check (list string))
+    "subsequent read recovers" [ "f" ]
+    (directory_names entries (chaos / "tree"));
+  Alcotest.(check string)
+    "refusal preserves payload" "payload"
+    (Eio.Path.load (raw / "tree" / "f"))
+
+let test_seeded_directory_error entries () =
+  let sched =
+    Schedule.seeded ~probability:1. ~kinds:[ `Read_error ] ~seed:29 ()
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.mkdir ~perm:0o755 (raw / "tree");
+  expect_io "seeded directory refusal" (fun () ->
+      ignore (directory_names entries (chaos / "tree")))
+
+let test_directory_short_read_inapplicable () =
+  let sched =
+    Schedule.seeded ~probability:1. ~kinds:[ `Short_read ] ~seed:29 ()
+  in
+  let op : Op.t =
+    { kind = `Read_dir; path = "tree"; file_offset = 0; length = 0 }
+  in
+  Alcotest.(check bool)
+    "no byte fault selected for directory" true
+    (Schedule.next sched op = None);
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.mkdir ~perm:0o755 (raw / "tree");
+  Alcotest.(check (list string))
+    "directory read is not a byte read" []
+    (directory_names false (chaos / "tree"))
+
 (* A [Swap_symlink] fault reproduces a TOCTOU: the scripted [`Stat] on "victim"
    still returns the original regular file, then the path becomes a symlink to
    the secret, so a follow-up open on the same path -- as a builder that stats
@@ -1533,6 +1602,15 @@ let suite =
       Alcotest.test_case "sync error" `Quick test_sync_error;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
+      Alcotest.test_case "directory error" `Quick (test_directory_error false);
+      Alcotest.test_case "directory entries error" `Quick
+        (test_directory_error true);
+      Alcotest.test_case "seeded directory error" `Quick
+        (test_seeded_directory_error false);
+      Alcotest.test_case "seeded directory entries error" `Quick
+        (test_seeded_directory_error true);
+      Alcotest.test_case "directory short-read inapplicable" `Quick
+        test_directory_short_read_inapplicable;
       Alcotest.test_case "read-only descriptor stat error" `Quick
         (test_descriptor_stat_error false);
       Alcotest.test_case "read-write descriptor stat error" `Quick

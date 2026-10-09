@@ -2,10 +2,10 @@
 
     {!wrap} composes with any base directory capability, such as the in-memory
     backend from {!Eio_fs.Fs} or a real filesystem, and perturbs reads, writes,
-    syncs, opens and stats according to a {!Schedule.t}. A schedule is either
-    {e seeded} (deterministic pseudo-random faults, for fuzzing) or {e scripted}
-    (an inspectable list of rules, for pinning an exact scenario such as a torn
-    write during a superblock flush).
+    syncs, opens, stats and directory reads according to a {!Schedule.t}. A
+    schedule is either {e seeded} (deterministic pseudo-random faults, for
+    fuzzing) or {e scripted} (an inspectable list of rules, for pinning an exact
+    scenario such as a torn write during a superblock flush).
 
     All injected faults surface as ordinary {!Eio.Io} exceptions, so code under
     test cannot distinguish an injected failure from a real backend failure. *)
@@ -61,7 +61,9 @@ end
 
 (** An operation the schedule is consulted about before it is performed. *)
 module Op : sig
-  type kind = [ `Read | `Write | `Sync | `Open | `Stat ]
+  type kind = [ `Read | `Read_dir | `Write | `Sync | `Open | `Stat ]
+  (** [`Read_dir] covers both directory enumeration entry points. It accepts
+      {!Fault.Read_error}, never byte-oriented short reads. *)
 
   type t = {
     kind : kind;
@@ -79,7 +81,7 @@ module Schedule : sig
   type trigger =
     | Nth_op of int
         (** Fire on the [n]th operation the schedule is consulted for (1-based,
-            counting reads, writes, syncs, opens and stats). *)
+            counting reads, directory reads, writes, syncs, opens and stats). *)
     | Op_on_path of { kind : Op.kind; path : string }
         (** Fire on the first [kind] operation on [path]. *)
     | Write_covering of { path : string; file_offset : int }

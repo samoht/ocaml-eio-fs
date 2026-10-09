@@ -1,6 +1,7 @@
 (* An adversarial [Eio.Fs.dir] wrapper for fault-injection testing. It composes
    with any base directory capability (the in-memory backend or a real one) and
-   perturbs reads, writes, syncs, opens and stats according to a schedule that is
+   perturbs reads, writes, syncs, opens, stats and directory reads according to a
+   schedule that is
    either seeded (for fuzzing) or scripted (for pinning an exact scenario). *)
 
 open Eio.Std
@@ -95,7 +96,7 @@ module Fault = struct
 end
 
 module Op = struct
-  type kind = [ `Read | `Write | `Sync | `Open | `Stat ]
+  type kind = [ `Read | `Read_dir | `Write | `Sync | `Open | `Stat ]
 
   let equal_kind (a : kind) (b : kind) = a = b
 
@@ -108,6 +109,7 @@ module Op = struct
 
   let pp_kind ppf = function
     | `Read -> Fmt.string ppf "read"
+    | `Read_dir -> Fmt.string ppf "read-dir"
     | `Write -> Fmt.string ppf "write"
     | `Sync -> Fmt.string ppf "sync"
     | `Open -> Fmt.string ppf "open"
@@ -122,6 +124,7 @@ module Op = struct
   let write path ~offset ~len =
     { kind = `Write; path; file_offset = offset; length = len }
 
+  let read_dir path = { kind = `Read_dir; path; file_offset = 0; length = 0 }
   let sync path = { kind = `Sync; path; file_offset = 0; length = 0 }
   let open_ path = { kind = `Open; path; file_offset = 0; length = 0 }
   let stat path = { kind = `Stat; path; file_offset = 0; length = 0 }
@@ -189,6 +192,7 @@ module Schedule = struct
   let applies_to (kind : Op.kind) (fk : Fault.kind) =
     match (kind, fk) with
     | `Read, (`Short_read | `Read_error) -> true
+    | `Read_dir, `Read_error -> true
     | `Write, (`Short_write | `Torn_write | `Write_error) -> true
     | `Sync, `Sync_error -> true
     | `Open, `Open_error -> true
@@ -566,10 +570,16 @@ module Dir_impl = struct
     B.mkdir bv ~perm path
 
   let read_dir t path =
+    (match Schedule.next t.sched (Op.read_dir path) with
+    | Some (Fault.Read_error c) -> raise_io c path
+    | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
     B.read_dir bv path
 
   let with_dir_entries t path fn =
+    (match Schedule.next t.sched (Op.read_dir path) with
+    | Some (Fault.Read_error c) -> raise_io c path
+    | _ -> ());
     let (Base_dir ((module B), bv)) = t.boxed in
     B.with_dir_entries bv path fn
 
