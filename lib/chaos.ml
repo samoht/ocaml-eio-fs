@@ -523,8 +523,6 @@ let swap_after boxed fault path =
   | Some _ | None -> ()
 
 module Dir_impl = struct
-  type t = dir
-
   let open_in t ~sw ~follow path =
     let fault = Schedule.next t.sched (Op.open_ path) in
     (match fault with
@@ -637,42 +635,71 @@ module Dir_impl = struct
   include Eio_utils.Posix_path
 end
 
-let dir_handler :
-    ( dir,
-      [ `Dir | `Close | `Chaos | `Dir_sync | `Process_local ] )
-    Eio.Resource.handler =
-  Eio.Resource.handler
-    [
-      H (Eio.Fs.Pi.Dir, (module Dir_impl));
-      H (Eio.Resource.Close, fun t -> close_resource t.base);
-      H (Chaos_base, fun t -> t.base);
-      H (Eio_fs_sync.Rename.Exclusive, Dir_impl.rename_exclusive);
-      (* Who can open these files is the base's to say, and the wrapper adds
-         no opener of its own: it gives a file no name outside this process
-         and no descriptor it did not already have. One binding serves every
-         base because the answer is taken from the resource -- over the
-         in-memory backend nothing outside this process reaches its files,
-         over a real directory any process opens them by name. *)
-      H (Eio_fs_sync.Process_local, fun t -> Eio_fs_sync.is_process_local t.base);
-      (* Whether a mode is kept is the base's storage model too. *)
-      H (Eio_fs_sync.Modeless, fun t -> Eio_fs_sync.is_modeless t.base);
-      (* The barrier is a sync the schedule may fault; it then delegates to
-         the base's barrier, so a wrapped POSIX directory still reaches the
-         real fsync. *)
-      H
-        ( Eio_fs_sync.Dir_sync,
-          fun t ~path ->
-            (match Schedule.next t.sched (Op.sync path) with
-            | Some (Fault.Sync_error c) -> raise_io c path
-            | _ -> ());
-            Eio_fs_sync.sync_dir (t.base, path) );
-    ]
+let dir_extra_bindings state =
+  [
+    Eio.Resource.H (Eio.Resource.Close, fun _ -> close_resource state.base);
+    Eio.Resource.H (Chaos_base, fun _ -> state.base);
+    Eio.Resource.H
+      ( Eio_fs_sync.Rename.Exclusive,
+        fun _ backend ~source ~target ->
+          Dir_impl.rename_exclusive state backend ~source ~target );
+    Eio.Resource.H
+      ( Eio_fs_sync.Process_local,
+        fun _ -> Eio_fs_sync.is_process_local state.base );
+    Eio.Resource.H
+      (Eio_fs_sync.Modeless, fun _ -> Eio_fs_sync.is_modeless state.base);
+    Eio.Resource.H
+      ( Eio_fs_sync.Dir_sync,
+        fun _ ~path ->
+          (match Schedule.next state.sched (Op.sync path) with
+          | Some (Fault.Sync_error c) -> raise_io c path
+          | _ -> ());
+          Eio_fs_sync.sync_dir (state.base, path) );
+  ]
 
+(* Keep the base value and every backend binding. A directory's native
+   process-cwd capability is not part of the portable DIR interface; boxing
+   the value and replacing its handler discards that capability. The closure
+   supplies the schedule only to the operations Chaos owns. *)
 let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =
   let (Eio.Resource.T (bv, bops)) = base in
-  let boxed = Base_dir (Eio.Resource.get bops Eio.Fs.Pi.Dir, bv) in
-  (Eio.Resource.T ({ base; boxed; sched }, dir_handler)
-    :> [ `Close | Eio.Fs.dir_ty ] r)
+  let module B = (val Eio.Resource.get bops Eio.Fs.Pi.Dir) in
+  let state = { base; boxed = Base_dir ((module B), bv); sched } in
+  let module O = struct
+    include B
+
+    let open_in _ ~sw ~follow path = Dir_impl.open_in state ~sw ~follow path
+
+    let open_out _ ~sw ~follow ~append ~create path =
+      Dir_impl.open_out state ~sw ~follow ~append ~create path
+
+    let open_subtree _ ~sw path = Dir_impl.open_subtree state ~sw path
+    let stat _ ~follow path = Dir_impl.stat state ~follow path
+    let mkdir _ ~perm path = Dir_impl.mkdir state ~perm path
+    let read_dir _ path = Dir_impl.read_dir state path
+    let with_dir_entries _ path fn = Dir_impl.with_dir_entries state path fn
+    let unlink _ path = Dir_impl.unlink state path
+    let rmdir _ path = Dir_impl.rmdir state path
+
+    let rename _ old_path new_dir new_path =
+      Dir_impl.rename state old_path new_dir new_path
+
+    let read_link _ path = Dir_impl.read_link state path
+    let symlink ~link_to _ path = Dir_impl.symlink ~link_to state path
+    let chmod _ ~follow ~perm path = Dir_impl.chmod state ~follow ~perm path
+
+    let chown ~follow ?uid ?gid _ path =
+      Dir_impl.chown ~follow ?uid ?gid state path
+
+    let native _ path = Dir_impl.native state path
+    let pp ppf _ = Dir_impl.pp ppf state
+  end in
+  let ops =
+    Eio.Resource.handler
+      ((Eio.Resource.H (Eio.Fs.Pi.Dir, (module O)) :: dir_extra_bindings state)
+      @ Eio.Resource.bindings bops)
+  in
+  (Eio.Resource.T (bv, ops) :> [ `Close | Eio.Fs.dir_ty ] r)
 
 let () = wrap_dir_hook := wrap_dir
 

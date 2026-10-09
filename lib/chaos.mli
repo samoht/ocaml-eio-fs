@@ -134,13 +134,17 @@ end
 
 val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 (** [wrap schedule base] is [base] with operations perturbed by [schedule];
-    opened files and subdirectories stay wrapped and share [schedule].
+    opened files and subdirectories stay wrapped and share [schedule]. The
+    base's other directory capabilities remain available, including a native
+    process working directory. Operations issued directly through those backend
+    capabilities or by a child process do not consult [schedule]; faults cover
+    the wrapped directory and file operations, not native descriptor syscalls.
 
     The wrapper answers for the base it was given: it reports the base's
     {!Eio_fs_sync.Process_local}, and a file opened read-write carries the
-    base's descriptor where there is one. That descriptor is not a way past the
-    schedule, and the file also registers {!Eio_fs_sync.File_sync} so a barrier
-    through {!Eio_fs_sync.sync_file} reaches the schedule's own sync. *)
+    base's descriptor where there is one. The file registers
+    {!Eio_fs_sync.File_sync} so a barrier through {!Eio_fs_sync.sync_file}
+    reaches the schedule's own sync. *)
 
 val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
 (** [base_dir dir] is the directory wrapped by {!wrap}, when [dir] is such a
