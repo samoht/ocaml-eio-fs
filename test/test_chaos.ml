@@ -481,6 +481,29 @@ let with_real_dir fn =
   Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / name))
   @@ fun () -> Eio.Path.with_open_dir (fs / name) fn
 
+(* A wrapper retains the backend's capabilities as well as its directory
+   operations: a real child still opens its cwd through the base backend. *)
+let test_real_child_cwd () =
+  Eio_main.run @@ fun env ->
+  Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. @@ fun () ->
+  let fs = Eio.Stdenv.fs env in
+  let name = Filename.temp_file "eio-fs-chaos-child" "" in
+  Eio.Path.unlink (fs / name);
+  Eio.Path.mkdir ~perm:0o755 (fs / name);
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / name))
+  @@ fun () ->
+  Eio.Path.save ~create:(`Or_truncate 0o644)
+    (fs / name / "payload")
+    "the child's exact cwd payload\n";
+  let chaos = Chaos.wrap Schedule.empty (fs / name) in
+  let got =
+    Eio.Process.parse_out
+      (Eio.Stdenv.process_mgr env)
+      ~cwd:chaos Eio.Buf_read.take_all [ "cat"; "payload" ]
+  in
+  Alcotest.(check string)
+    "native child reads wrapped cwd" "the child's exact cwd payload\n" got
+
 let swap_on_open path target =
   Schedule.scripted
     [
@@ -1602,6 +1625,7 @@ let suite =
       Alcotest.test_case "sync error" `Quick test_sync_error;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
+      Alcotest.test_case "real child cwd" `Quick test_real_child_cwd;
       Alcotest.test_case "directory error" `Quick (test_directory_error false);
       Alcotest.test_case "directory entries error" `Quick
         (test_directory_error true);
