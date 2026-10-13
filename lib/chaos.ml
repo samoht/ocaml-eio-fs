@@ -136,6 +136,8 @@ module Schedule = struct
         (** Fire on the [n]th operation the schedule is consulted for. *)
     | Op_on_path of { kind : Op.kind; path : string }
         (** Fire on the first [kind] operation on [path]. *)
+    | Nth_op_on_path of { n : int; kind : Op.kind; path : string }
+        (** Fire on the [n]th [kind] operation on [path]. *)
     | Write_covering of { path : string; file_offset : int }
         (** Fire on the first write on [path] whose byte range covers
             [file_offset]. *)
@@ -145,7 +147,12 @@ module Schedule = struct
 
   type t =
     | Empty
-    | Scripted of { mutable rules : rule list; mutable n : int }
+    | Scripted of {
+        mutable rules : rule list;
+        mutable n : int;
+        seen : (Op.kind * string, int) Hashtbl.t;
+            (* How many operations of each kind each path has had. *)
+      }
     | Seeded of {
         seed : int;
         config : config;
@@ -155,7 +162,7 @@ module Schedule = struct
     | Observed of { f : Op.t -> unit; inner : t }
 
   let empty = Empty
-  let scripted rules = Scripted { rules; n = 0 }
+  let scripted rules = Scripted { rules; n = 0; seen = Hashtbl.create 8 }
   let observing f t = Observed { f; inner = t }
 
   let all_kinds =
@@ -179,10 +186,12 @@ module Schedule = struct
         n = 0;
       }
 
-  let trigger_matches ~n (op : Op.t) = function
+  let trigger_matches ~n ~on_path (op : Op.t) = function
     | Nth_op k -> k = n
     | Op_on_path { kind; path } ->
         Op.equal_kind op.kind kind && String.equal op.path path
+    | Nth_op_on_path { n = k; kind; path } ->
+        Op.equal_kind op.kind kind && String.equal op.path path && k = on_path
     | Write_covering { path; file_offset } ->
         Op.equal_kind op.kind `Write
         && String.equal op.path path
@@ -229,9 +238,14 @@ module Schedule = struct
         next inner op
     | Scripted s ->
         s.n <- s.n + 1;
+        let key = (op.kind, op.path) in
+        let on_path =
+          1 + Option.value ~default:0 (Hashtbl.find_opt s.seen key)
+        in
+        Hashtbl.replace s.seen key on_path;
         let rec pick acc = function
           | [] -> None
-          | r :: rest when trigger_matches ~n:s.n op r.trigger ->
+          | r :: rest when trigger_matches ~n:s.n ~on_path op r.trigger ->
               s.rules <- List.rev_append acc rest;
               Some r.fault
           | r :: rest -> pick (r :: acc) rest

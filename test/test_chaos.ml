@@ -602,6 +602,38 @@ let test_scripted_fires_once () =
   check "op2 fires" (Some (Fault.Short_read 1));
   check "op3 passes through (rule spent)" None
 
+(* The third open of "f" fails, and no other operation: not the opens
+   before it, not an open of another path between them, not a read of "f",
+   and not the open after it, the rule being spent. *)
+let test_nth_op_on_path () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Nth_op_on_path { n = 3; kind = `Open; path = "f" };
+          fault = Open_error `Enoent;
+        };
+      ]
+  in
+  let op kind path = { Op.kind; path; file_offset = 0; length = 0 } in
+  let faults =
+    List.map
+      (fun o -> Option.is_some (Schedule.next sched o))
+      [
+        op `Open "f";
+        op `Open "g";
+        op `Read "f";
+        op `Open "f";
+        op `Read "f";
+        op `Open "f";
+        op `Open "f";
+      ]
+  in
+  Alcotest.(check (list bool))
+    "only the third open of f fails"
+    [ false; false; false; false; false; true; false ]
+    faults
+
 (* {2 Seeded determinism} *)
 
 let ops_fixture =
@@ -1653,6 +1685,7 @@ let suite =
       Alcotest.test_case "swap on a populated directory subtree (real fs)"
         `Quick test_swap_on_real_populated_directory_subtree;
       Alcotest.test_case "scripted fires once" `Quick test_scripted_fires_once;
+      Alcotest.test_case "nth operation on a path" `Quick test_nth_op_on_path;
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
       Alcotest.test_case "chaos perturbs" `Quick test_chaos_perturbs;

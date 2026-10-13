@@ -84,6 +84,11 @@ module Schedule : sig
             counting reads, directory reads, writes, syncs, opens and stats). *)
     | Op_on_path of { kind : Op.kind; path : string }
         (** Fire on the first [kind] operation on [path]. *)
+    | Nth_op_on_path of { n : int; kind : Op.kind; path : string }
+        (** Fire on the [n]th [kind] operation on [path] (1-based), counting
+            from the schedule's first operation whether or not a rule fired on
+            the earlier ones: the fault falls on a chosen later open or read of
+            a file the code under test also opens before it. *)
     | Write_covering of { path : string; file_offset : int }
         (** Fire on the first write on [path] whose byte range covers
             [file_offset]. Best paired with a write that starts at a known
