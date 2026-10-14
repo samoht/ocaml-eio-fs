@@ -66,6 +66,21 @@ CAMLprim value caml_eio_fs_flock_exclusive(value fd_v, value nonblocking_v)
   return Val_unit;
 }
 
+/* Release a BSD flock. The lock belongs to the open file description, so
+   this frees it for every descriptor that shares the description, one an
+   execed supervisor inherited included. */
+CAMLprim value caml_eio_fs_flock_unlock(value fd_v)
+{
+  int fd = Int_val(fd_v);
+  int r;
+  do
+    r = flock(fd, LOCK_UN);
+  while (r == -1 && errno == EINTR);
+  if (r == -1)
+    caml_unix_error(errno, "flock", Nothing);
+  return Val_unit;
+}
+
 /* A wait for a record lock another process holds: the kernel's blocking
    request (POSIX fcntl F_SETLKW, "fcntl() shall wait until the request can be
    satisfied"), made on a thread of its own that runs no OCaml. It writes one

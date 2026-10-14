@@ -3,6 +3,9 @@ external is_darwin : unit -> bool = "caml_eio_fs_is_darwin"
 external flock_exclusive_native : Unix.file_descr -> bool -> unit
   = "caml_eio_fs_flock_exclusive"
 
+external flock_unlock_native : Unix.file_descr -> unit
+  = "caml_eio_fs_flock_unlock"
+
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
 
@@ -1230,7 +1233,9 @@ module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
 
   let fd t = t.fd
-  let unlock _ = failwith "Eio_fs_unix.Lease.unlock: flock LOCK_UN is not bound"
+
+  let unlock t =
+    Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native
 
   let rec acquire fd ~nonblocking =
     match flock_exclusive_native fd nonblocking with
