@@ -357,8 +357,15 @@ module Lease : sig
   (** [fd lease] is the descriptor whose open file description owns the lease. A
       supervisor can inherit it before the callback returns. Closing the
       parent's descriptor does not release the lease while an inherited
-      descriptor remains open. The descriptor must be closed to release the
-      lease; do not unlock it explicitly. *)
+      descriptor remains open. The descriptor must be closed, or the lease
+      {!unlock}ed, to release it. *)
+
+  val unlock : t -> unit
+  (** [unlock lease] lets go of [lease] by the kernel's [flock] [LOCK_UN] on its
+      open file description, so every descriptor sharing that description, one a
+      supervisor inherited included, holds nothing from then on. The descriptors
+      stay open; the callback that holds [lease] still returns to let go of the
+      lease within this process. *)
 
   val with_exclusive :
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->

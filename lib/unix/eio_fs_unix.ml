@@ -1230,6 +1230,7 @@ module Lease = struct
   type t = { fd : Eio_unix.Fd.t }
 
   let fd t = t.fd
+  let unlock _ = failwith "Eio_fs_unix.Lease.unlock: flock LOCK_UN is not bound"
 
   let rec acquire fd ~nonblocking =
     match flock_exclusive_native fd nonblocking with

@@ -1110,6 +1110,67 @@ let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
       | Unix.WSTOPPED n -> Alcotest.failf "lease child stopped by %d" n);
       Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()))
 
+(* An unlocked lease holds nothing through any descriptor that shares its
+   open file description: a process that inherited it lives on, and the lease
+   is free for the next taker all the same. *)
+let test_lease_unlock_frees_inherited_descriptor () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "lease" in
+  let wait_child pid =
+    let rec loop () =
+      match Unix.waitpid [] pid with
+      | answer -> answer
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
+    in
+    loop ()
+  in
+  let child =
+    Eio_fs_unix.Lease.with_exclusive lock @@ fun lease ->
+    let fd =
+      Eio_unix.Fd.use_exn "test unlocked lease"
+        (Eio_fs_unix.Lease.fd lease)
+        Fun.id
+    in
+    Unix.clear_close_on_exec fd;
+    let announced, announce = Unix.pipe ~cloexec:true () in
+    Fun.protect ~finally:(fun () -> Unix.close announced) @@ fun () ->
+    let pid =
+      Fun.protect
+        ~finally:(fun () ->
+          Unix.close announce;
+          Unix.set_close_on_exec fd)
+        (fun () ->
+          Unix.create_process Sys.executable_name
+            [| Sys.executable_name; "--hold-eio-fs-lease" |]
+            Unix.stdin announce Unix.stderr)
+    in
+    Eio_unix.await_readable announced;
+    let said = Bytes.create 1 in
+    if Unix.read announced said 0 1 <> 1 || Bytes.get said 0 <> 'R' then begin
+      (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+      ignore (wait_child pid);
+      Alcotest.fail "lease child ended before it said it runs"
+    end;
+    (try Eio_fs_unix.Lease.unlock lease
+     with e ->
+       (try Unix.kill pid Sys.sigterm with Unix.Unix_error _ -> ());
+       ignore (wait_child pid);
+       raise e);
+    pid
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      (try Unix.kill child Sys.sigterm with Unix.Unix_error _ -> ());
+      ignore (wait_child child))
+    (fun () ->
+      (match Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()) with
+      | () -> ()
+      | exception Eio_fs_unix.Lock_unavailable _ ->
+          Alcotest.fail "an unlocked lease was still held by its inheritor");
+      match Unix.waitpid [ Unix.WNOHANG ] child with
+      | 0, _ -> ()
+      | _ -> Alcotest.fail "lease child ended before the lease was taken")
+
 (* The holder lets go only when a sibling fiber tells it to, and the sibling
    runs only once the wait has begun: a wait that held the domain would never
    be answered, and the holder would let go at its own bound, exiting 3. *)
@@ -2864,7 +2925,11 @@ let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
     test_lease_survives_owner_close_until_inherited_descriptor_closes
 
-let lease_suite = ("lease", [ lease_test_case ])
+let lease_unlock_test_case =
+  Alcotest.test_case "an unlocked lease frees its inheritor" `Quick
+    test_lease_unlock_frees_inherited_descriptor
+
+let lease_suite = ("lease", [ lease_test_case; lease_unlock_test_case ])
 
 let suite =
   ( "eio_fs_unix",
@@ -2945,6 +3010,7 @@ let suite =
       Alcotest.test_case "lock wait does not block Eio" `Quick
         test_lock_wait_does_not_block_eio;
       lease_test_case;
+      lease_unlock_test_case;
       Alcotest.test_case "a record lock wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"record" take_record);
       Alcotest.test_case "a record lock wait answers at a cancel" `Quick
