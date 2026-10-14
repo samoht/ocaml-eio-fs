@@ -169,6 +169,13 @@ val range_locked : Unix.file_descr -> at:int -> len:int -> bool
     that would refuse a write lock on the [len] bytes of [fd]'s file from byte
     [at] (fcntl [F_GETLK]). This process's own locks never count. *)
 
+val range_holder : Unix.file_descr -> at:int -> len:int -> int option option
+(** [range_holder fd ~at ~len] is [Some (Some pid)] where process [pid] holds a
+    record lock that would refuse a write lock on the [len] bytes of [fd]'s file
+    from byte [at] (fcntl [F_GETLK]), [Some None] where one is held and the
+    kernel names no process, and [None] where none is. This process's own locks
+    never count. *)
+
 val exclusive_rename : Eio_fs_sync.Rename.t
 (** [exclusive_rename] is the POSIX backend for atomic no-replace publication.
     Directory wrappers are consulted before resolving the source and target

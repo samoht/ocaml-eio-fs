@@ -235,6 +235,24 @@ CAMLprim value caml_eio_fs_range_locked(value fd_v, value at_v, value len_v)
   return Val_bool(query.l_type != F_UNLCK);
 }
 
+/* The process holding a record lock that would refuse a write lock on [len]
+   bytes from byte [at] (POSIX fcntl F_GETLK), [0] where the kernel names
+   none, or [-1] where no other process holds one. */
+CAMLprim value caml_eio_fs_range_holder(value fd_v, value at_v, value len_v)
+{
+  struct flock query;
+  memset(&query, 0, sizeof query);
+  query.l_type = F_WRLCK;
+  query.l_whence = SEEK_SET;
+  query.l_start = (off_t)Long_val(at_v);
+  query.l_len = (off_t)Long_val(len_v);
+  if (fcntl(Int_val(fd_v), F_GETLK, &query) == -1)
+    caml_unix_error(errno, "fcntl", Nothing);
+  if (query.l_type == F_UNLCK)
+    return Val_int(-1);
+  return Val_int(query.l_pid > 0 ? query.l_pid : 0);
+}
+
 /* One Darwin F_FULLFSYNC call. Retry and fallback policy lives in OCaml. */
 CAMLprim value caml_eio_fs_darwin_full_fsync(value fd_v)
 {

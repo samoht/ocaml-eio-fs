@@ -15,11 +15,20 @@ external lock_range_native : Unix.file_descr -> int -> int -> int -> unit
 external range_locked_native : Unix.file_descr -> int -> int -> bool
   = "caml_eio_fs_range_locked"
 
+external range_holder_native : Unix.file_descr -> int -> int -> int
+  = "caml_eio_fs_range_holder"
+
 let lock_range fd kind ~at ~len =
   let kind = match kind with `Read -> 0 | `Write -> 1 | `Unlock -> 2 in
   lock_range_native fd kind at len
 
 let range_locked fd ~at ~len = range_locked_native fd at len
+
+let range_holder fd ~at ~len =
+  match range_holder_native fd at len with
+  | -1 -> None
+  | 0 -> Some None
+  | pid -> Some (Some pid)
 
 external pread_head : Unix.file_descr -> int -> string
   = "caml_eio_fs_pread_head"
