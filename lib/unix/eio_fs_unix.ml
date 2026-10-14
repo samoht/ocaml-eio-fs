@@ -671,19 +671,22 @@ let refused_by_a_fiber ~name local =
 
 (* One budget covers both halves of the exclusion, so it is a moment both watch
    for rather than a duration each is handed. A daemon of the switch sleeps it
-   on the scheduler's monotonic clock. *)
+   on the scheduler's monotonic clock, from the first wait: an acquisition that
+   never waits starts no timer. *)
 type patience =
   | Wait  (** wait for the holder, however long it holds *)
   | Refuse  (** answer at once *)
-  | Until of unit Eio.Promise.t  (** wait until the budget lapses *)
+  | Until of unit Eio.Promise.t Lazy.t  (** wait until the budget lapses *)
 
 let budget ~sw seconds =
-  let lapsed, set_lapsed = Eio.Promise.create () in
-  Eio.Fiber.fork_daemon ~sw (fun () ->
-      Eio_unix.sleep seconds;
-      Eio.Promise.resolve set_lapsed ();
-      `Stop_daemon);
-  Until lapsed
+  Until
+    (lazy
+      (let lapsed, set_lapsed = Eio.Promise.create () in
+       Eio.Fiber.fork_daemon ~sw (fun () ->
+           Eio_unix.sleep seconds;
+           Eio.Promise.resolve set_lapsed ();
+           `Stop_daemon);
+       lapsed))
 
 (* [on_taken] runs the moment the mutex is held, so a caller records how to
    give it back before anything else can raise. A wait behind a holder, bounded
@@ -716,7 +719,7 @@ let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
             taken := true;
             true)
           (fun () ->
-            Eio.Promise.await lapsed;
+            Eio.Promise.await (Lazy.force lapsed);
             false)
       in
       if granted || !taken then on_taken () else raise (refused ())
@@ -812,14 +815,14 @@ let take_os_lock ~patience ~refused ~on_taken ~on_wait fd =
   | Refuse -> ask ()
   | Until lapse ->
       wait
-        ~lapsed:(fun () -> Eio.Promise.is_resolved lapse)
+        ~lapsed:(fun () -> Eio.Promise.is_resolved (Lazy.force lapse))
         ~granted:(fun fd ->
           Eio.Fiber.first
             (fun () ->
               await_record_lock fd;
               true)
             (fun () ->
-              Eio.Promise.await lapse;
+              Eio.Promise.await (Lazy.force lapse);
               false)));
   if not !acquired then raise (refused ())
 
@@ -1273,7 +1276,8 @@ module Lease = struct
     | Refuse -> ask ~nonblocking:true
     | Until lapsed ->
         ask ~nonblocking:true;
-        if (not !acquired) && not (Eio.Promise.is_resolved lapsed) then begin
+        if (not !acquired) && not (Eio.Promise.is_resolved (Lazy.force lapsed))
+        then begin
           on_wait ();
           acquired :=
             Eio.Fiber.first
@@ -1281,7 +1285,7 @@ module Lease = struct
                 await_release fd;
                 true)
               (fun () ->
-                Eio.Promise.await lapsed;
+                Eio.Promise.await (Lazy.force lapsed);
                 false)
         end);
     if not !acquired then raise (refused ());
