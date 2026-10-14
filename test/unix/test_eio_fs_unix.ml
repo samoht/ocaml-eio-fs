@@ -2140,6 +2140,16 @@ let test_lock_over_a_process_local_backend_serializes_fibers () =
     "the rendezvous is the backend's own regular file" true
     ((Eio.Path.stat ~follow:false lock).kind = `Regular_file)
 
+(* A bound is a wait's: an acquisition nobody holds against waits for nothing,
+   so it answers without the system clock the bound would run on. The mock
+   backend handles no system clock, so a bound started anyway raises there. *)
+let test_lock_bounded_and_uncontended_needs_no_clock () =
+  with_in_memory_fs @@ fun fs ->
+  let ran = ref 0 in
+  Eio_fs_unix.with_lock ~block:(`For 30.) (fs / "lock") (fun () -> incr ran);
+  Eio_fs_unix.with_lock ~block:(`For 30.) (fs / "lock") (fun () -> incr ran);
+  Alcotest.(check int) "both critical sections ran" 2 !ran
+
 (* Holding under the mutex alone is not a licence to skip what the name is
    weighed for: the in-memory backend has links too, and a link at the lock
    name is not the lock's own file whatever the exclusion behind it is. *)
@@ -3027,6 +3037,8 @@ let suite =
         `Quick test_lock_over_a_process_local_backend_serializes_fibers;
       Alcotest.test_case "a process-local backend still refuses a symlink"
         `Quick test_lock_over_a_process_local_backend_refuses_a_symlink;
+      Alcotest.test_case "an uncontended bounded lock needs no clock" `Quick
+        test_lock_bounded_and_uncontended_needs_no_clock;
       Alcotest.test_case
         "lock serializes fibers over a wrapped process-local backend" `Quick
         test_lock_over_a_wrapped_process_local_backend_serializes_fibers;
