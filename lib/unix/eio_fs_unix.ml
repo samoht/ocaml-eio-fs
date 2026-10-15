@@ -1,7 +1,9 @@
 external is_darwin : unit -> bool = "caml_eio_fs_is_darwin"
 
-external flock_exclusive_native : Unix.file_descr -> bool -> unit
-  = "caml_eio_fs_flock_exclusive"
+type flock_mode = Exclusive | Shared
+
+external flock_native : Unix.file_descr -> flock_mode -> bool -> unit
+  = "caml_eio_fs_flock"
 
 external flock_unlock_native : Unix.file_descr -> unit
   = "caml_eio_fs_flock_unlock"
@@ -561,6 +563,8 @@ type lock_key = int64 * int64
 type local_lock = {
   mutex : Eio.Mutex.t;
   mutable users : int;
+  mutable readers : int;
+  changed : Eio.Condition.t;
   mutable holding : bool;
       (** A fiber holds [mutex] and may hold the record lock. *)
   mutable parked : Unix.file_descr list;
@@ -587,6 +591,8 @@ let shared_mutex table key =
         {
           mutex = Eio.Mutex.create ();
           users = 1;
+          readers = 0;
+          changed = Eio.Condition.create ();
           holding = false;
           parked = [];
           file = None;
@@ -742,15 +748,42 @@ let take_mutex ?on_wait ~patience ~refused ~on_taken mutex =
     ~wait:(fun () -> Eio.Mutex.lock mutex)
     ()
 
-let use_mutex ?on_wait ~patience ~refused mutex fn =
-  let locked = ref false in
-  Fun.protect
-    ~finally:(fun () -> if !locked then Eio.Mutex.unlock mutex)
-    (fun () ->
-      take_mutex ?on_wait ~patience ~refused
-        ~on_taken:(fun () -> locked := true)
-        mutex;
-      fn ())
+let unlock_local local =
+  Eio.Mutex.unlock local.mutex;
+  Eio.Condition.broadcast local.changed
+
+(* Readers share the existing inode gate, but each takes its own kernel lock.
+   The gate excludes record-lock users too, whose locks are process-owned. *)
+let take_shared_local ~patience ~refused ~on_wait ~on_taken local =
+  let try_take () =
+    let acquired =
+      Stdlib.Mutex.protect tables_mutex @@ fun () ->
+      if local.readers > 0 || Eio.Mutex.try_lock local.mutex then begin
+        local.readers <- local.readers + 1;
+        true
+      end
+      else false
+    in
+    if acquired then Eio.Condition.broadcast local.changed;
+    acquired
+  in
+  let wait () =
+    Eio.Condition.loop_no_mutex local.changed (fun () ->
+        if try_take () then Some () else None)
+  in
+  take_available ~on_wait ~patience ~refused ~try_take ~wait
+    ~on_taken:(fun () ->
+      let active = Atomic.make true in
+      on_taken (fun () ->
+          if Atomic.exchange active false then begin
+            let last =
+              Stdlib.Mutex.protect tables_mutex @@ fun () ->
+              local.readers <- local.readers - 1;
+              local.readers = 0
+            in
+            if last then unlock_local local
+          end))
+    ()
 
 (* Entering is queued too, on a mutex keyed by the caller's name: the stat or
    the open that keys the file suspends, so without this the order fibers
@@ -936,10 +969,6 @@ let settle ~name ~opened ~contents ~file path =
   check_locked_file ~name ~opened path;
   Option.iter (update_lock_contents file) contents
 
-let run_held ~name ~opened ~contents ~file path fn =
-  settle ~name ~opened ~contents ~file path;
-  fn ()
-
 let block_patience ~sw = function
   | `Yes -> (Wait, Wait)
   | `No -> (Refuse, Refuse)
@@ -986,14 +1015,17 @@ let open_keyed ~taken ~key open_rendezvous =
   (file, opened)
 
 module Flock = struct
-  let rec acquire fd ~nonblocking =
-    match flock_exclusive_native fd nonblocking with
+  let rec acquire ~shared fd ~nonblocking =
+    match
+      flock_native fd (if shared then Shared else Exclusive) nonblocking
+    with
     | () -> ()
-    | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire fd ~nonblocking
+    | exception Unix.Unix_error (Unix.EINTR, _, _) ->
+        acquire ~shared fd ~nonblocking
 
-  let flock fd ~nonblocking =
+  let flock ~shared fd ~nonblocking =
     Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
-        acquire fd ~nonblocking)
+        acquire ~shared fd ~nonblocking)
 
   (* The kernel's blocking [flock], which answers when the holder lets go, on a
      thread of its own: a request in the kernel cannot be withdrawn, so a
@@ -1001,14 +1033,14 @@ module Flock = struct
      asks through a duplicate of [fd], which shares its open file description
      and so the lock the kernel grants, and closes it once answered: a lock
      granted after the cancel goes when the caller's [fd] closes too. *)
-  let await_release fd =
+  let await_release ~shared fd =
     let copy = Unix.dup ~cloexec:true fd in
     let answer, set_answer = Eio.Promise.create () in
     let _ : Thread.t =
       Thread.create
         (fun () ->
           let granted =
-            match acquire copy ~nonblocking:false with
+            match acquire ~shared copy ~nonblocking:false with
             | () -> Ok ()
             | exception (Unix.Unix_error _ as e) -> Error e
           in
@@ -1018,11 +1050,11 @@ module Flock = struct
     in
     match Eio.Promise.await answer with Ok () -> () | Error e -> raise e
 
-  let use_os_lock ~patience ~refused ~on_wait fd fn =
+  let use_os_lock ~shared ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in
     let ask ~nonblocking =
       Eio.Cancel.protect @@ fun () ->
-      match flock fd ~nonblocking with
+      match flock ~shared fd ~nonblocking with
       | () -> acquired := true
       | exception
           Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
@@ -1034,7 +1066,7 @@ module Flock = struct
         ask ~nonblocking:true;
         if not !acquired then begin
           on_wait ();
-          await_release fd;
+          await_release ~shared fd;
           acquired := true
         end
     | Refuse -> ask ~nonblocking:true
@@ -1046,7 +1078,7 @@ module Flock = struct
           acquired :=
             Eio.Fiber.first
               (fun () ->
-                await_release fd;
+                await_release ~shared fd;
                 true)
               (fun () ->
                 Eio.Promise.await (Lazy.force lapsed);
@@ -1061,6 +1093,19 @@ end
 let take_record_lock ~taken ~patience ~on_wait ~name file path =
   match Eio_unix.Resource.fd_opt file with
   | Some fd ->
+      (* Darwin's record locks already conflict with BSD flock; taking both
+         on one descriptor would conflict with our own lock. Linux keeps the
+         two families independent, so its record-lock owner takes both. *)
+      if not (is_darwin ()) then
+        Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock" fd (fun raw_fd ->
+            Flock.use_os_lock ~shared:false ~patience
+              ~refused:(fun () ->
+                refusal ~name ~holder:(held_by_a_process raw_fd) file)
+              ~on_wait raw_fd
+              (fun () ->
+                taken (fun () ->
+                    Eio_unix.Fd.use_exn "Eio_fs_unix.with_lock.unlock" fd
+                      flock_unlock_native)));
       take_os_lock ~patience
         ~refused:(fun () ->
           let holder =
@@ -1088,12 +1133,56 @@ let take_record_lock ~taken ~patience ~on_wait ~name file path =
    refused. [block] is answered per half: the mutex is held by a fiber, the
    record lock by another process; its bound is kept on a switch of its own,
    which ends with the acquisition. *)
-let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
+let take_inode_gate ~taken ~shared ~patience ~on_wait ~name ~opened_first local
+    =
+  let release_reader = ref ignore in
+  let entered = ref false in
+  Option.iter
+    (fun (file, _) ->
+      taken (fun () -> if not !entered then let_go_of local file))
+    opened_first;
+  let refused () =
+    match opened_first with
+    | Some (file, _) -> refusal ~name ~holder:(held_by_a_fiber ()) file
+    | None -> refused_by_a_fiber ~name local
+  in
+  if shared then
+    take_shared_local ~patience ~refused ~on_wait local
+      ~on_taken:(fun release ->
+        entered := true;
+        release_reader := release;
+        taken release)
+  else begin
+    take_mutex ~on_wait ~patience ~refused
+      ~on_taken:(fun () ->
+        entered := true;
+        taken (fun () -> unlock_local local))
+      local.mutex;
+    start_holding local;
+    taken (fun () -> stop_holding local)
+  end;
+  !release_reader
+
+let take_lease_lock ~shared ~patience ~on_wait ~name file =
+  match Eio_unix.Resource.fd_opt file with
+  | Some fd ->
+      Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.acquire" fd @@ fun raw_fd ->
+      Flock.use_os_lock ~shared ~patience
+        ~refused:(fun () -> refusal ~name ~holder:None file)
+        ~on_wait raw_fd ignore
+  | None ->
+      Fmt.invalid_arg
+        "Eio_fs_unix.Lease: %s: the rendezvous carries no Unix file descriptor"
+        name
+
+let rec acquire ~sw ?lease
+    ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents ?(on_wait = ignore) path =
   let name = lock_name path in
   let steps = ref [] in
   let taken give_back = steps := give_back :: !steps in
+  let shared = lease = Some `Shared in
   let open_rendezvous () =
     let file = open_lock_file ~sw ~name ~create path in
     (file, (Eio.File.stat file : Eio.File.Stat.t))
@@ -1104,37 +1193,33 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
     let key, opened_first = key_of_name ~taken ~name path open_rendezvous in
     let local = shared_mutex local_locks key in
     taken (fun () -> done_with_shared_mutex local_locks key local);
-    let entered = ref false in
-    Option.iter
-      (fun (file, _) ->
-        taken (fun () -> if not !entered then let_go_of local file))
-      opened_first;
-    take_mutex ~on_wait ~patience:fibers
-      ~refused:(fun () ->
-        match opened_first with
-        | Some (file, _) -> refusal ~name ~holder:(held_by_a_fiber ()) file
-        | None -> refused_by_a_fiber ~name local)
-      ~on_taken:(fun () ->
-        entered := true;
-        taken (fun () -> Eio.Mutex.unlock local.mutex))
-      local.mutex;
-    start_holding local;
-    taken (fun () -> stop_holding local);
+    let release_reader =
+      take_inode_gate ~taken ~shared ~patience:fibers ~on_wait ~name
+        ~opened_first local
+    in
     let file, (opened : Eio.File.Stat.t) =
       match opened_first with
       | Some opened -> opened
       | None -> open_keyed ~taken ~key open_rendezvous
     in
-    set_held_file local (Some (file :> Eio.File.ro_ty Eio.Resource.t));
-    taken (fun () -> set_held_file local None);
-    take_record_lock ~taken ~patience:processes ~on_wait ~name file path;
+    if not shared then begin
+      set_held_file local (Some (file :> Eio.File.ro_ty Eio.Resource.t));
+      taken (fun () -> set_held_file local None)
+    end;
+    (* An explicitly unlocked reader may finish while another fiber holds a
+       record lock. Closing its descriptor must not drop that writer's lock. *)
+    taken (fun () -> let_go_of local file);
+    (match lease with
+    | None ->
+        take_record_lock ~taken ~patience:processes ~on_wait ~name file path
+    | Some _ -> take_lease_lock ~shared ~patience:processes ~on_wait ~name file);
     settle ~name ~opened ~contents ~file path;
-    file
+    (file, release_reader)
   with
-  | file -> (file, fun () -> let_go steps)
+  | file, release_reader -> (file, (fun () -> let_go steps), release_reader)
   | exception Renamed ->
       let_go steps;
-      acquire ~sw ~block ~create ?contents ~on_wait path
+      acquire ~sw ?lease ~block ~create ?contents ~on_wait path
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       let_go steps;
@@ -1142,7 +1227,7 @@ let rec acquire ~sw ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
 
 let with_lock ?block ?create ?contents ?on_wait path fn =
   Eio.Switch.run @@ fun sw ->
-  let _, let_go = acquire ~sw ?block ?create ?contents ?on_wait path in
+  let _, let_go, _ = acquire ~sw ?block ?create ?contents ?on_wait path in
   Fun.protect ~finally:let_go fn
 
 (* A held lock is an acquisition whose giving back waits for {!Held.release}
@@ -1173,7 +1258,7 @@ module Held = struct
             Option.iter (update_lock_contents file) contents)
 
   let take ~sw ?block ?create ?contents ?on_wait path =
-    let file, let_go = acquire ~sw ?block ?create ?contents ?on_wait path in
+    let file, let_go, _ = acquire ~sw ?block ?create ?contents ?on_wait path in
     let t =
       {
         name = lock_name path;
@@ -1307,53 +1392,31 @@ let rec probe_at ~attempts path =
 let probe path = probe_at ~attempts:probe_attempts path
 
 module Lease = struct
-  type t = { fd : Eio_unix.Fd.t }
+  type t = { fd : Eio_unix.Fd.t; release_reader : unit -> unit }
 
   let fd t = t.fd
 
   let unlock t =
-    Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native
+    Eio.Cancel.protect @@ fun () ->
+    Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native;
+    t.release_reader ()
 
-  let with_exclusive ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
-      ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
-        `If_missing 0o600) ?contents ?(on_wait = ignore) path fn =
-    let name = lock_name path in
+  let with_mode ~lease ?block ?create ?contents ?on_wait path fn =
     Eio.Switch.run @@ fun sw ->
-    let fibers, processes =
-      match block with
-      | `Yes -> (Wait, Wait)
-      | `No -> (Refuse, Refuse)
-      | `Fibers -> (Wait, Refuse)
-      | `For seconds ->
-          let until = budget ~sw seconds in
-          (until, until)
+    let file, let_go, release_reader =
+      acquire ~sw ~lease ?block ?create ?contents ?on_wait path
     in
-    let file, (opened : Eio.File.Stat.t) =
-      in_entry_order name @@ fun () ->
-      check_lock_name ~name path;
-      let file = open_lock_file ~sw ~name ~create path in
-      (file, Eio.File.stat file)
-    in
-    use_local_lock (opened.dev, opened.ino) @@ fun { mutex; _ } ->
-    use_mutex ~on_wait ~patience:fibers
-      ~refused:(fun () -> refusal ~name ~holder:(held_by_a_fiber ()) file)
-      mutex
-    @@ fun () ->
+    Fun.protect ~finally:let_go @@ fun () ->
     match Eio_unix.Resource.fd_opt file with
-    | Some fd ->
-        Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.with_exclusive" fd
-        @@ fun raw_fd ->
-        (* The kernel names no holder of an [flock]. *)
-        Flock.use_os_lock ~patience:processes
-          ~refused:(fun () -> refusal ~name ~holder:None file)
-          ~on_wait raw_fd
-        @@ fun () ->
-        run_held ~name ~opened ~contents ~file path (fun () -> fn { fd })
+    | Some fd -> fn { fd; release_reader }
     | None ->
-        Fmt.invalid_arg
-          "Eio_fs_unix.Lease.with_exclusive: %s: the rendezvous carries no \
-           Unix file descriptor"
-          name
+        invalid_arg "Eio_fs_unix.Lease: acquired descriptor is unavailable"
+
+  let with_exclusive ?block ?create ?contents ?on_wait path fn =
+    with_mode ~lease:`Exclusive ?block ?create ?contents ?on_wait path fn
+
+  let with_shared ?block ?create ?on_wait path fn =
+    with_mode ~lease:`Shared ?block ?create ?on_wait path fn
 end
 
 (* A backend-free component takes its critical section as an

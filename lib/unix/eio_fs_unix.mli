@@ -235,15 +235,21 @@ val with_lock :
     {!Lock_unavailable}, [`Fibers] waits only for a fiber of this process, and
     [`For seconds] waits up to a monotonic bound. Locks are coordinated between
     fibers by device and inode, and between processes by the POSIX record lock.
+    It also excludes {!Lease} readers and writers. On Linux, where BSD [flock]
+    and POSIX record locks are independent, it takes an exclusive [flock] too;
+    on Darwin the record lock already conflicts with leases.
 
-    With [`Yes] or [`For seconds], a lock another process holds is waited for by
-    the kernel's blocking request (POSIX [fcntl] [F_SETLKW]), which answers when
-    that process lets go: the lock is asked for once without waiting,
-    [on_wait ()] is called once if it is held (it does nothing by default), and
-    the request follows. A cancelled wait withdraws the request and answers at
-    the cancel, and [`For seconds] withdraws it at its bound. With [`Yes],
-    [`Fibers] or [`For seconds], a lock a fiber of this process holds is waited
-    for in this process, and [on_wait ()] is called before that wait too.
+    With [`Yes] or [`For seconds], a POSIX record lock another process holds is
+    waited for by the kernel's blocking request ([fcntl] [F_SETLKW]), which
+    answers when that process lets go: the lock is asked for once without
+    waiting, [on_wait ()] is called once if it is held (it does nothing by
+    default), and the request follows. A cancelled wait withdraws the request
+    and answers at the cancel, and [`For seconds] withdraws it at its bound.
+    With [`Yes], [`Fibers] or [`For seconds], a lock a fiber of this process
+    holds is waited for in this process, and [on_wait ()] is called before that
+    wait too. A wait for a BSD lease on Linux uses the cancellable wait of
+    {!Lease.with_exclusive}; the outstanding kernel request ends once granted,
+    with its private descriptor closed without entering [fn].
 
     [path] must be the lock's own regular file: a link, a directory, a FIFO, or
     a name that took the entry between resolution and open is refused with
@@ -364,8 +370,9 @@ module Lease : sig
   (** [unlock lease] lets go of [lease] by the kernel's [flock] [LOCK_UN] on its
       open file description, so every descriptor sharing that description, one a
       supervisor inherited included, holds nothing from then on. The descriptors
-      stay open; the callback that holds [lease] still returns to let go of the
-      lease within this process. *)
+      stay open. An exclusive callback still returns to let go of its
+      process-local admission; a shared acquisition gives that admission back
+      immediately. *)
 
   val with_exclusive :
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
@@ -418,6 +425,24 @@ module Lease : sig
         path is not its own regular file.
       @raise Invalid_argument when the filesystem provides no Unix descriptor.
       @raise Unix.Unix_error as [flock]. *)
+
+  val with_shared :
+    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?on_wait:(unit -> unit) ->
+    _ Eio.Path.t ->
+    (t -> 'a) ->
+    'a
+  (** [with_shared path fn] acquires a shared BSD [flock] on an independent open
+      file description. Readers may overlap, including fibers of this process.
+      An exclusive lease or {!with_lock} excludes these readers. The creation,
+      wait, cancellation and path checks are those of {!with_exclusive}; readers
+      do not replace the rendezvous contents.
+
+      Returning closes the callback's descriptor without unlocking. An inherited
+      descriptor keeps the hold until its last copy closes. {!unlock} releases
+      this reader's hold and its process-local admission immediately, without
+      releasing independently acquired readers. *)
 end
 
 val lock_section :
