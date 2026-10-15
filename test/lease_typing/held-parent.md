@@ -36,7 +36,7 @@ must remain rejected independently of the missing operation.
 # let string_path : Eio.Fs.dir_ty Eio.Path.t = "parent/leaf";;
 Line 1, characters 46-59:
 Error: This constant has type string but an expression was expected of type
-         Eio.Fs.dir_ty Eio.Path.t = Eio.Fs.dir_ty Eio.Fs.dir * string
+         Eio.Fs.dir_ty Eio.Path.t = Eio.Fs.dir_ty Eio.Std.r * string
 ```
 
 Typing does not prove descriptor lifetime or confinement. The callback's
