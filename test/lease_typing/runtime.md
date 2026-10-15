@@ -1,7 +1,14 @@
 # Shared lease runtime contract
 
 Each block executes its assertions when the public shared operation exists.
-The first case checks independent open file descriptions in one process;
+The first case checks independent open file descriptions in one process.
+An explicitly unlocked reader stays inside its callback until another fiber
+has entered the canonical POSIX writer. It then returns and closes its old
+descriptor while that writer remains live: a raw native record-lock probe
+must still refuse, both at the same pathname and through a hardlink alias.
+The callback close must not drop a later POSIX holder of the same inode.
+
+The first case also checks cancellation and path refusals;
 the second uses real fork inheritance and owner `_exit`, with pipe barriers.
 There is no fixture implementation of locking. BSD `flock(2)` shared locks
 exclude exclusive locks; close releases an inherited open-file-description
@@ -42,6 +49,23 @@ lock only at the final descriptor, while `LOCK_UN` releases it explicitly.
           (refused (fun () -> Eio_fs_unix.Lease.with_shared ~block:`No path (fun _ -> ())));
         probe "--try-eio-fs-lock" lock 3) [ lock; alias ]);
     probe "--try-eio-fs-lock" lock 0;
+    List.iter (fun reader_path ->
+      let unlocked, announce_unlock = Eio.Promise.create () in
+      let writer_started, announce_writer = Eio.Promise.create () in
+      let reader_closed, announce_close = Eio.Promise.create () in
+      Eio.Fiber.both
+        (fun () ->
+          Eio_fs_unix.Lease.with_shared reader_path (fun lease ->
+            Eio_fs_unix.Lease.unlock lease;
+            Eio.Promise.resolve announce_unlock ();
+            Eio.Promise.await writer_started);
+          Eio.Promise.resolve announce_close ())
+        (fun () ->
+          Eio.Promise.await unlocked;
+          Eio_fs_unix.with_lock ~block:`No lock (fun () ->
+            Eio.Promise.resolve announce_writer ();
+            Eio.Promise.await reader_closed;
+            probe "--try-eio-fs-lock" lock 3))) [ lock; alias ];
     let entered = ref false in
     Eio_fs_unix.Lease.with_shared ~block:`No lock (fun first ->
       require "writer excludes a single reader" (refused exclusive);
