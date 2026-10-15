@@ -53,6 +53,17 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
       as [clonefile]: [dst] exists, [src] does not, permission is denied.
     @raise Invalid_argument if a path has no native Unix representation. *)
 
+(** {2 Removable trees} *)
+
+val grant_owner : _ Eio.Path.t -> unit
+(** [grant_owner p] grants its owner read, write and search on the directory [p]
+    and on each directory under it, so that every entry of the tree can be
+    unlinked: a tree that a program made read-only, then left when it was
+    killed, refuses any removal. Symbolic links are not followed, so the walk
+    stays in [p]'s tree. A directory that cannot be granted or read is left as
+    it is, for the removal to name; a [p] that is not a directory is left alone.
+    It costs a stat per entry and a listing per directory. *)
+
 (** {2 The sparse map} *)
 
 val seek_data : Unix.file_descr -> int64 -> int64 option
