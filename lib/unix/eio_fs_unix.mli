@@ -546,6 +546,19 @@ end
     identity before descending. The last component is never followed either. The
     directories a run opens are held for the run only. *)
 module Batch : sig
+  val with_parent : _ Eio.Path.t -> (Eio.Fs.dir_ty Eio.Path.t -> 'a) -> 'a
+  (** [with_parent path fn] calls [fn] with the final leaf of [path] beneath
+      borrowed non-symlink parent capabilities. The observed and opened
+      directory identities must agree. Renaming a held parent cannot redirect
+      the leaf. The callback's result or exception passes through unchanged.
+      Borrowed parents are released on either exit; the caller's root remains
+      usable. A final symbolic link remains the final leaf.
+
+      @raise Eio.Io
+        with {!Eio.Fs.Permission_denied} for invalid path components, a
+        non-directory parent or an identity mismatch; with {!Eio.Fs.Not_found}
+        for a missing parent. The leaf must not be used after [fn] returns. *)
+
   type t
   (** The type for a directory that batches run beneath. *)
 

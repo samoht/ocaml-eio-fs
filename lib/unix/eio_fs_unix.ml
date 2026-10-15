@@ -1702,57 +1702,81 @@ module Batch = struct
     | exception Unix.Unix_error (code, call, arg) ->
         Error (`Unix (code, call, arg))
 
-  (* Descriptorless backends use the same operation vocabulary. Hold each
-     parent separately and verify its identity after opening, so a replacement
-     cannot redirect an operation through a symbolic link. *)
-  let portable_parent root path fn =
-    let parents, leaf = split path in
-    let rec descend dir = function
+  type Eio.Exn.Backend.t += Unsafe_parent of string
+
+  let () =
+    Eio.Exn.Backend.register_pp (fun f -> function
+      | Unsafe_parent reason ->
+          Fmt.string f reason;
+          true
+      | _ -> false)
+
+  let with_parent (input : _ Eio.Path.t) fn =
+    let root, path = (input :> Eio.Fs.dir_ty Eio.Path.t) in
+    let denied reason =
+      raise (Eio.Fs.err (Eio.Fs.Permission_denied (Unsafe_parent reason)))
+    in
+    let parents, leaf =
+      match split path with
+      | parts -> parts
+      | exception Refused reason -> denied reason
+    in
+    let rec descend (dir : Eio.Fs.dir_ty Eio.Path.t) = function
       | [] -> fn Eio.Path.(dir / leaf)
       | name :: rest ->
           let next = Eio.Path.(dir / name) in
           let before = Eio.Path.stat ~follow:false next in
-          (match before.kind with
-          | `Symbolic_link -> fail_refused "%S is a symbolic link" path
-          | `Directory -> ()
-          | _ -> raise (Unix.Unix_error (Unix.ENOTDIR, "open", path)));
+          if before.kind <> `Directory then
+            denied (Fmt.str "%S has a non-directory parent" path);
           Eio.Path.with_open_dir next (fun held ->
               let after = Eio.Path.stat ~follow:false held in
               if
                 not
                   (Int64.equal before.dev after.dev
-                  && Int64.equal before.ino after.ino)
-              then fail_refused "%S changed while opening its parent" path;
-              descend held rest)
+                  && Int64.equal before.ino after.ino
+                  && after.kind = `Directory)
+              then denied (Fmt.str "%S changed while opening its parent" path);
+              descend (held :> Eio.Fs.dir_ty Eio.Path.t) rest)
     in
-    descend root parents
+    match parents with
+    | [] ->
+        Eio.Path.with_open_dir
+          Eio.Path.(of_dir root / ".")
+          (fun held -> descend (held :> Eio.Fs.dir_ty Eio.Path.t) [])
+    | _ -> descend (Eio.Path.of_dir root) parents
 
   let portable root = function
     | Mkdir { path; perm } ->
-        portable_parent root path (Eio.Path.mkdir ~perm);
+        with_parent Eio.Path.(root / path) (Eio.Path.mkdir ~perm);
         Done
     | Create { path; perm; contents } ->
-        portable_parent root path (fun p ->
+        with_parent
+          Eio.Path.(root / path)
+          (fun p ->
             Eio.Path.save ~follow:false ~create:(`Exclusive perm) p contents);
         Done
     | Symlink { path; target } ->
-        portable_parent root path (Eio.Path.symlink ~link_to:target);
+        with_parent Eio.Path.(root / path) (Eio.Path.symlink ~link_to:target);
         Done
     | Unlink { path; dir } ->
-        portable_parent root path (fun p ->
+        with_parent
+          Eio.Path.(root / path)
+          (fun p ->
             if dir then Eio.Path.rmdir p
             else if Eio.Path.kind ~follow:false p = `Directory then
               raise (Unix.Unix_error (Unix.EISDIR, "unlink", path))
             else Eio.Path.unlink p);
         Done
     | Rename { src; dst } ->
-        portable_parent root src (fun src ->
-            portable_parent root dst (Eio.Path.rename src));
+        with_parent
+          Eio.Path.(root / src)
+          (fun src -> with_parent Eio.Path.(root / dst) (Eio.Path.rename src));
         Done
     | Link _ -> fail_refused "hard links require a native directory"
     | Lstat path ->
-        portable_parent root path (fun p ->
-            Stat (Eio.Path.stat ~follow:false p))
+        with_parent
+          Eio.Path.(root / path)
+          (fun p -> Stat (Eio.Path.stat ~follow:false p))
 
   let portable_attempt root op =
     match portable root op with
