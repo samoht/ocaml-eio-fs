@@ -703,17 +703,17 @@ let budget ~sw seconds =
 (* [on_taken] runs the moment the mutex is held, so a caller records how to
    give it back before anything else can raise. A wait behind a holder, bounded
    or not, calls [on_wait ()] first. *)
-let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
+let take_available ?(on_wait = ignore) ~patience ~refused ~on_taken ~try_take
+    ~wait () =
   match patience with
   | Wait ->
-      if not (Eio.Mutex.try_lock mutex) then begin
+      if not (try_take ()) then begin
         on_wait ();
-        Eio.Mutex.lock mutex
+        wait ()
       end;
       on_taken ()
-  | Refuse ->
-      if Eio.Mutex.try_lock mutex then on_taken () else raise (refused ())
-  | Until _ when Eio.Mutex.try_lock mutex -> on_taken ()
+  | Refuse -> if try_take () then on_taken () else raise (refused ())
+  | Until _ when try_take () -> on_taken ()
   | Until lapsed ->
       on_wait ();
       (* [Fiber.first] cancels the loser, and a fiber cancelled inside
@@ -727,7 +727,7 @@ let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
       let granted =
         Eio.Fiber.first
           (fun () ->
-            Eio.Mutex.lock mutex;
+            wait ();
             taken := true;
             true)
           (fun () ->
@@ -735,6 +735,12 @@ let take_mutex ?(on_wait = ignore) ~patience ~refused ~on_taken mutex =
             false)
       in
       if granted || !taken then on_taken () else raise (refused ())
+
+let take_mutex ?on_wait ~patience ~refused ~on_taken mutex =
+  take_available ?on_wait ~patience ~refused ~on_taken
+    ~try_take:(fun () -> Eio.Mutex.try_lock mutex)
+    ~wait:(fun () -> Eio.Mutex.lock mutex)
+    ()
 
 let use_mutex ?on_wait ~patience ~refused mutex fn =
   let locked = ref false in
@@ -978,6 +984,77 @@ let open_keyed ~taken ~key open_rendezvous =
     raise_notrace Renamed);
   taken (fun () -> Eio.Resource.close file);
   (file, opened)
+
+module Flock = struct
+  let rec acquire fd ~nonblocking =
+    match flock_exclusive_native fd nonblocking with
+    | () -> ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire fd ~nonblocking
+
+  let flock fd ~nonblocking =
+    Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
+        acquire fd ~nonblocking)
+
+  (* The kernel's blocking [flock], which answers when the holder lets go, on a
+     thread of its own: a request in the kernel cannot be withdrawn, so a
+     cancelled caller leaves it to that thread and answers at once. The thread
+     asks through a duplicate of [fd], which shares its open file description
+     and so the lock the kernel grants, and closes it once answered: a lock
+     granted after the cancel goes when the caller's [fd] closes too. *)
+  let await_release fd =
+    let copy = Unix.dup ~cloexec:true fd in
+    let answer, set_answer = Eio.Promise.create () in
+    let _ : Thread.t =
+      Thread.create
+        (fun () ->
+          let granted =
+            match acquire copy ~nonblocking:false with
+            | () -> Ok ()
+            | exception (Unix.Unix_error _ as e) -> Error e
+          in
+          Unix.close copy;
+          Eio.Promise.resolve set_answer granted)
+        ()
+    in
+    match Eio.Promise.await answer with Ok () -> () | Error e -> raise e
+
+  let use_os_lock ~patience ~refused ~on_wait fd fn =
+    let acquired = ref false in
+    let ask ~nonblocking =
+      Eio.Cancel.protect @@ fun () ->
+      match flock fd ~nonblocking with
+      | () -> acquired := true
+      | exception
+          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
+        ->
+          ()
+    in
+    (match patience with
+    | Wait ->
+        ask ~nonblocking:true;
+        if not !acquired then begin
+          on_wait ();
+          await_release fd;
+          acquired := true
+        end
+    | Refuse -> ask ~nonblocking:true
+    | Until lapsed ->
+        ask ~nonblocking:true;
+        if (not !acquired) && not (Eio.Promise.is_resolved (Lazy.force lapsed))
+        then begin
+          on_wait ();
+          acquired :=
+            Eio.Fiber.first
+              (fun () ->
+                await_release fd;
+                true)
+              (fun () ->
+                Eio.Promise.await (Lazy.force lapsed);
+                false)
+        end);
+    if not !acquired then raise (refused ());
+    fn ()
+end
 
 (* The record lock on the rendezvous's descriptor. A rendezvous with none has
    no record lock to take, which only a process-local backend allows. *)
@@ -1237,75 +1314,6 @@ module Lease = struct
   let unlock t =
     Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native
 
-  let rec acquire fd ~nonblocking =
-    match flock_exclusive_native fd nonblocking with
-    | () -> ()
-    | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire fd ~nonblocking
-
-  let flock fd ~nonblocking =
-    Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
-        acquire fd ~nonblocking)
-
-  (* The kernel's blocking [flock], which answers when the holder lets go, on a
-     thread of its own: a request in the kernel cannot be withdrawn, so a
-     cancelled caller leaves it to that thread and answers at once. The thread
-     asks through a duplicate of [fd], which shares its open file description
-     and so the lock the kernel grants, and closes it once answered: a lock
-     granted after the cancel goes when the caller's [fd] closes too. *)
-  let await_release fd =
-    let copy = Unix.dup ~cloexec:true fd in
-    let answer, set_answer = Eio.Promise.create () in
-    let _ : Thread.t =
-      Thread.create
-        (fun () ->
-          let granted =
-            match acquire copy ~nonblocking:false with
-            | () -> Ok ()
-            | exception (Unix.Unix_error _ as e) -> Error e
-          in
-          Unix.close copy;
-          Eio.Promise.resolve set_answer granted)
-        ()
-    in
-    match Eio.Promise.await answer with Ok () -> () | Error e -> raise e
-
-  let use_os_lock ~patience ~refused ~on_wait fd fn =
-    let acquired = ref false in
-    let ask ~nonblocking =
-      Eio.Cancel.protect @@ fun () ->
-      match flock fd ~nonblocking with
-      | () -> acquired := true
-      | exception
-          Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
-        ->
-          ()
-    in
-    (match patience with
-    | Wait ->
-        ask ~nonblocking:true;
-        if not !acquired then begin
-          on_wait ();
-          await_release fd;
-          acquired := true
-        end
-    | Refuse -> ask ~nonblocking:true
-    | Until lapsed ->
-        ask ~nonblocking:true;
-        if (not !acquired) && not (Eio.Promise.is_resolved (Lazy.force lapsed))
-        then begin
-          on_wait ();
-          acquired :=
-            Eio.Fiber.first
-              (fun () ->
-                await_release fd;
-                true)
-              (fun () ->
-                Eio.Promise.await (Lazy.force lapsed);
-                false)
-        end);
-    if not !acquired then raise (refused ());
-    fn ()
-
   let with_exclusive ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
       ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
         `If_missing 0o600) ?contents ?(on_wait = ignore) path fn =
@@ -1336,7 +1344,7 @@ module Lease = struct
         Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.with_exclusive" fd
         @@ fun raw_fd ->
         (* The kernel names no holder of an [flock]. *)
-        use_os_lock ~patience:processes
+        Flock.use_os_lock ~patience:processes
           ~refused:(fun () -> refusal ~name ~holder:None file)
           ~on_wait raw_fd
         @@ fun () ->
