@@ -215,7 +215,13 @@ type fs = {
 type t = fs
 
 module Fd = struct
-  type t = { fs : fs; num : Num.t }
+  type t = { fs : fs; num : Num.t; mutable closed : bool }
+
+  let v fs num = { fs; num; closed = false }
+
+  (* A closed handle answers on its own state, never by its number, which the
+     next open may have been handed. *)
+  let num t = if t.closed then Error.badf () else t.num
 end
 
 module Dir = struct
@@ -409,12 +415,12 @@ module Filesystem = struct
         in
         if is_confined ~root:cwd resource_path then r
         else Error.permission_denied resource_path
-    | Dir.Dir_fd { fs; num } ->
+    | Dir.Dir_fd ({ fs; _ } as fd) ->
         (* Confined to the descriptor's directory. A directory fd closed with
            its switch is EBADF, as for a real O_DIRECTORY fd, never a silent
            success. *)
         let dir =
-          match read_fd_table fs (Fd_table.find_opt num) with
+          match read_fd_table fs (Fd_table.find_opt (Fd.num fd)) with
           | Some d -> d
           | None -> Error.badf ()
         in
@@ -435,8 +441,11 @@ let v ?(cwd = "/") () =
 (* Closing an already-closed handle does nothing, as [Eio.Resource.close]
    specifies and eio's posix backend does. A handle with two owners, a caller
    closing early in front of its switch, is the ordinary reason. *)
-let close { Fd.fs; num } =
-  update_fd_table fs @@ fun fds -> Fd_table.remove num fds
+let close (fd : Fd.t) =
+  if not fd.closed then begin
+    fd.closed <- true;
+    update_fd_table fd.fs @@ fun fds -> Fd_table.remove fd.num fds
+  end
 
 (* open(2): opening an existing file requires the permission bits the access
    mode asks for; the mode given at creation does not restrict the creating
@@ -493,7 +502,7 @@ let openat ~mode ~sw dir_fd path flags =
   | false ->
       update_fd_table_with_result fs @@ fun fds ->
       let num = next_fd_of_fds fds in
-      let fd = { Fd.fs; num } in
+      let fd = Fd.v fs num in
       let r = Filesystem.lookup ~follow dir_fd path in
       refuse_link r;
       check_access path flags r;
@@ -510,7 +519,7 @@ let openat ~mode ~sw dir_fd path flags =
       in
       update_fd_table_with_result fs @@ fun fds ->
       let num = next_fd_of_fds fds in
-      let fd = { Fd.fs; num } in
+      let fd = Fd.v fs num in
       let r =
         try Option.some @@ Filesystem.lookup ~follow dir_fd path
         with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
@@ -716,7 +725,8 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       Resource.Dir { src with entries = without old_name src.entries }
   end
 
-let stat { Fd.fs; num = fd } =
+let stat ({ Fd.fs; _ } as t) =
+  let fd = Fd.num t in
   read_fd_table fs @@ fun fds ->
   match Fd_table.find_opt fd fds with
   | None -> Error.badf ()
@@ -745,7 +755,8 @@ let blit_and_grow ~src ~dst ~off =
    [Eio.Path.open_in] on a directory is legal and the portable directory
    barrier depends on it -- so the operations below refuse one with EISDIR, as
    read(2) and write(2) do. *)
-let writev { Fd.fs; num = fd } bufs =
+let writev ({ Fd.fs; _ } as t) bufs =
+  let fd = Fd.num t in
   update_fd_table_with_result fs @@ fun fds ->
   let () =
     update_entry fd fds @@ fun r ->
@@ -783,7 +794,8 @@ let writev { Fd.fs; num = fd } bufs =
   in
   (Cstruct.length (Cstruct.concat bufs), fds)
 
-let readv { Fd.fs; num = fd } bufs =
+let readv ({ Fd.fs; _ } as t) bufs =
+  let fd = Fd.num t in
   update_fd_table_with_result fs @@ fun fds ->
   let read = ref 0 in
   let () =
@@ -809,7 +821,8 @@ let readv { Fd.fs; num = fd } bufs =
 
 (* Positioned reads and writes address an explicit [file_offset] and never move
    the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
-let preadv { Fd.fs; num = fd } ~file_offset bufs =
+let preadv ({ Fd.fs; _ } as t) ~file_offset bufs =
+  let fd = Fd.num t in
   read_fd_table fs @@ fun fds ->
   match Fd_table.find_opt fd fds |> Option.map ( ! ) with
   | None -> Error.badf ()
@@ -832,7 +845,8 @@ let preadv { Fd.fs; num = fd } ~file_offset bufs =
       end
   | Some r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
 
-let pwritev { Fd.fs; num = fd } ~file_offset bufs =
+let pwritev ({ Fd.fs; _ } as t) ~file_offset bufs =
+  let fd = Fd.num t in
   update_fd_table_with_result fs @@ fun fds ->
   let written = ref 0 in
   let () =
@@ -853,7 +867,8 @@ let pwritev { Fd.fs; num = fd } ~file_offset bufs =
   in
   (!written, fds)
 
-let seek_fd { Fd.fs; num = fd } off cmd =
+let seek_fd ({ Fd.fs; _ } as t) off cmd =
+  let fd = Fd.num t in
   update_fd_table_with_result fs @@ fun fds ->
   let result = ref Optint.Int63.zero in
   let () =
@@ -874,7 +889,8 @@ let seek_fd { Fd.fs; num = fd } off cmd =
   in
   (!result, fds)
 
-let truncate_fd { Fd.fs; num = fd } len =
+let truncate_fd ({ Fd.fs; _ } as t) len =
+  let fd = Fd.num t in
   update_fd_table fs @@ fun fds ->
   update_entry
     ~if_missing:(fun () -> ignore (Error.badf () : 'a))
