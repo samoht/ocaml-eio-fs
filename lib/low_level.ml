@@ -465,6 +465,9 @@ let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
 (* Create [path] in its parent directory, register the new file in the
    filesystem, and return its resource. *)
 let new_file ~follow ~mode dir_fd path =
+  (* A path in directory syntax names a directory, which O_CREAT never makes:
+     macOS answers ENOENT, Linux EISDIR. *)
+  if String.equal (Eio_fs_path.to_dir_path path) path then Error.not_found path;
   let dir, fname = dir_base path in
   let rdir = Filesystem.lookup ~follow dir_fd dir in
   let dir =
