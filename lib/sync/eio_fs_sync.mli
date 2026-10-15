@@ -113,7 +113,7 @@ val publish :
   'a Eio.Path.t ->
   (Eio.Flow.sink_ty Eio.Resource.t -> 'b) ->
   'b
-(** [publish ~config ~mode ~rename path write] publishes [path]'s contents
+(** [publish ~config ~mode ~rename ~tmp path write] publishes [path]'s contents
     atomically and durably: [write] streams into a temporary, which is fsynced,
     moved to [path], and whose directory is barriered with {!sync_parent}.
 
@@ -122,11 +122,15 @@ val publish :
     operation. [rename] defaults to {!Rename.capability}; POSIX callers use the
     backend provided by [Eio_fs_unix.exclusive_rename].
 
-    An omitted [tmp] is a fresh sibling name, opened exclusively; an explicit
-    one is also exclusive, must not exist, must differ from [path] and live on
-    the same filesystem. On a failure of [write], the sync or the rename, the
-    temporary is removed and [path] stays intact; a barrier failure is reported
-    after the rename, the new file visible with uncertain durability.
+    An omitted [tmp] is a fresh sibling name, opened exclusively and drawn
+    again, at most 127 times, while the name is taken. An explicit one is also
+    exclusive, must not exist, must differ from [path] and live on the same
+    filesystem, and is never drawn again: a taken name raises [Already_exists].
+    A process killed between the create and the rename leaves the temporary in
+    place, so a caller naming [tmp] owns every way that name can already be
+    taken. On a failure of [write], the sync or the rename, the temporary is
+    removed and [path] stays intact; a barrier failure is reported after the
+    rename, the new file visible with uncertain durability.
     {!type-config.field-durable} [false] keeps only the atomicity. *)
 
 val save :
