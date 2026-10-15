@@ -84,8 +84,22 @@ let try_lock path =
   | () -> exit 0
   | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> exit 3
 
+let try_with_lock path =
+  let code =
+    Eio_main.run @@ fun env ->
+    match
+      Eio_fs_unix.with_lock ~block:`No
+        Eio.Path.(Eio.Stdenv.fs env / path)
+        (fun () -> ())
+    with
+    | () -> 0
+    | exception Eio_fs_unix.Lock_unavailable _ -> 3
+  in
+  exit code
+
 let () =
   match Array.to_list Sys.argv with
+  | [ _; "--try-eio-fs-with-lock"; path ] -> try_with_lock path
   | [ _; arg; path ] when String.equal arg held_lock_arg -> held_lock path
   | [ _; arg; kind; path ] when String.equal arg until_release_arg ->
       hold_until_release kind path
