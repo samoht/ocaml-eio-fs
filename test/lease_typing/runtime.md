@@ -133,7 +133,6 @@ lock only at the final descriptor, while `LOCK_UN` releases it explicitly.
       [ "link"; "directory"; "fifo" ];
     require "reader refusal leaves symlink target unchanged"
       (Eio.Path.load Eio.Path.(dir / "target") = "unchanged");;
-- : unit = ()
 ```
 
 The owner takes a real shared lease, forks a reader which inherits its
@@ -209,5 +208,4 @@ reporting completion. Both child waits have a two-second bound.
       then failwith "inherited reader did not end after final descriptor close";
       Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()));
     ;;
-- : unit = ()
 ```
