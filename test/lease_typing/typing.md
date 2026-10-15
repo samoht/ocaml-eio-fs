@@ -31,9 +31,9 @@ The existing `Lease.t`, `fd` and `unlock` operations serve both modes.
     Eio_fs_unix.Lease.with_shared;;
 val shared :
   ?block:[ `Fibers | `For of float | `No | `Yes ] ->
-  ?create:[ `If_missing of Eio.File.Unix_perm.t | `Never ] ->
+  ?create:[ `If_missing of int | `Never ] ->
   ?on_wait:(unit -> unit) ->
-  'a Eio.Path.t -> (Eio_fs_unix.Lease.t -> 'b) -> 'b = <fun>
+  [> Eio.Fs.dir_ty ] Eio.Path.t -> (Eio_fs_unix.Lease.t -> 'a) -> 'a = <fun>
 ```
 
 The inherited descriptor is the canonical lease descriptor, and explicit

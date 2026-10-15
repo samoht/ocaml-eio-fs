@@ -23,11 +23,15 @@ lock only at the final descriptor, while `LOCK_UN` releases it explicitly.
       | () -> false
       | exception Eio_fs_unix.Lock_unavailable _ -> true in
     let exclusive () = Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()) in
+    let rec reap pid =
+      match Unix.waitpid [] pid with
+      | result -> result
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap pid in
     let probe mode path expected =
       let pid = Unix.create_process "../unix/test.exe"
         [| "../unix/test.exe"; mode; Eio.Path.native_exn path |]
         Unix.stdin Unix.stdout Unix.stderr in
-      let _, status = Unix.waitpid [] pid in
+      let _, status = reap pid in
       require ("native cross-API probe " ^ mode) (status = Unix.WEXITED expected) in
     Eio_fs_unix.with_lock lock (fun () -> ());
     let alias = Eio.Path.(dir / "alias") in
@@ -120,14 +124,27 @@ reporting completion. Both child waits have a two-second bound.
     let announced, announce = Unix.pipe ~cloexec:true () in
     let gate, release = Unix.pipe ~cloexec:true () in
     let finished, finish = Unix.pipe ~cloexec:true () in
+    let rec reap pid =
+      match Unix.waitpid [] pid with
+      | result -> result
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap pid in
+    let ready fd =
+      let until = Unix.gettimeofday () +. 2. in
+      let rec wait () =
+        let remaining = Float.max 0. (until -. Unix.gettimeofday ()) in
+        match Unix.select [ fd ] [] [] remaining with
+        | ([], [], []) -> false
+        | _ -> true
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
+      wait () in
     let byte fd expected =
-      if Unix.select [ fd ] [] [] 2. = ([], [], []) then failwith "shared inherited pipe bound";
+      if not (ready fd) then failwith "shared inherited pipe bound";
       let b = Bytes.create 1 in
       if Unix.read fd b 0 1 <> 1 || Bytes.get b 0 <> expected then failwith "shared inherited pipe evidence" in
     let owner = Unix.fork () in
     if owner = 0 then begin
       Unix.close announced; Unix.close release; Unix.close finished;
-      Eio_main.run (fun env ->
+      (try Eio_main.run (fun env ->
         Eio_fs_unix.Lease.with_shared ~block:`No Eio.Path.(Eio.Stdenv.fs env / rendezvous_name) (fun lease ->
           let raw = Eio_unix.Fd.use_exn "shared owner death spec" (Eio_fs_unix.Lease.fd lease) Fun.id in
           let child = Unix.fork () in
@@ -139,18 +156,17 @@ reporting completion. Both child waits have a two-second bound.
           Unix.close gate; Unix.close finish;
           ignore (Unix.write_substring announce "R" 0 1);
           Unix.close announce;
-          Unix._exit 0));
-      Unix._exit 4
+          Unix._exit 0)) with _ -> Unix._exit 4)
     end;
     Unix.close announce; Unix.close gate; Unix.close finish;
     let released = ref false and reaped = ref false in
     Fun.protect ~finally:(fun () ->
       if not !released then (try ignore (Unix.write_substring release "X" 0 1) with Unix.Unix_error _ -> ());
       Unix.close release; Unix.close announced; Unix.close finished;
-      if not !reaped then ignore (Unix.waitpid [] owner);
+      if not !reaped then ignore (reap owner);
       Sys.remove rendezvous_name) @@ fun () ->
     byte announced 'R';
-    let _, status = Unix.waitpid [] owner in reaped := true;
+    let _, status = reap owner in reaped := true;
     if status <> Unix.WEXITED 0 then failwith "shared lease owner did not exit inside callback";
     Eio_main.run (fun env ->
       let lock = Eio.Path.(Eio.Stdenv.fs env / rendezvous_name) in
@@ -160,12 +176,12 @@ reporting completion. Both child waits have a two-second bound.
       let probe = Unix.create_process "../unix/test.exe"
         [| "../unix/test.exe"; "--try-eio-fs-with-lock"; rendezvous_name |]
         Unix.stdin Unix.stdout Unix.stderr in
-      let _, status = Unix.waitpid [] probe in
+      let _, status = reap probe in
       if status <> Unix.WEXITED 3 then failwith "canonical POSIX writer bypasses inherited shared reader";
       ignore (Unix.write_substring release "X" 0 1); released := true;
       byte finished 'D';
       let eof = Bytes.create 1 in
-      if Unix.select [ finished ] [] [] 2. = ([], [], []) || Unix.read finished eof 0 1 <> 0
+      if not (ready finished) || Unix.read finished eof 0 1 <> 0
       then failwith "inherited reader did not end after final descriptor close";
       Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()));
     ;;
