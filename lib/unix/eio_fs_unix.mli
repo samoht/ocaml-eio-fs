@@ -536,14 +536,15 @@ end
     operations beneath one directory in a single hop and answers each one
     separately.
 
-    Every path is relative to the batch's directory and resolved one component
-    at a time with [openat(O_DIRECTORY | O_NOFOLLOW)], as [eio_posix] resolves a
-    path where the kernel has no [RESOLVE_BENEATH]. The confinement is stricter
-    than {!Eio.Path}'s: an absolute path, an empty, [.] or [..] component, a NUL
-    byte, or a symbolic link before the last component is refused, never
-    followed, so no operation reaches outside the directory. The last component
-    is never followed either. The directories a run opens are held for the run
-    only. *)
+    Every path is relative to the batch's directory. Native directories resolve
+    one component at a time with [openat(O_DIRECTORY | O_NOFOLLOW)], as
+    [eio_posix] resolves a path where the kernel has no [RESOLVE_BENEATH]. The
+    confinement is stricter than {!Eio.Path}'s: an absolute path, an empty, [.]
+    or [..] component, a NUL byte, or a symbolic link before the last component
+    is refused, never followed, so no operation reaches outside the directory.
+    Descriptorless backends hold each Eio parent capability and verify its
+    identity before descending. The last component is never followed either. The
+    directories a run opens are held for the run only. *)
 module Batch : sig
   type t
   (** The type for a directory that batches run beneath. *)
@@ -551,10 +552,12 @@ module Batch : sig
   val v : sw:Eio.Switch.t -> _ Eio.Path.t -> t
   (** [v ~sw dir] opens [dir], resolved by {!Eio.Path}'s own confinement, and
       holds it until [sw] finishes. A wrapper such as {!Eio_fs.Chaos} observes
-      the open and the batch then runs beneath the directory it wraps.
+      the open and the batch then runs beneath the directory it wraps. An
+      already-open directory is held through its dot entry, without an empty
+      open pathname. Descriptorless backends use Eio operations through held
+      parent capabilities.
 
-      @raise Eio.Io when [dir] cannot be opened as a directory.
-      @raise Invalid_argument if the backend provides no POSIX descriptor. *)
+      @raise Eio.Io when [dir] cannot be opened as a directory. *)
 
   type op =
     | Mkdir of { path : string; perm : int }
@@ -573,7 +576,7 @@ module Batch : sig
     | Link of { src : string; dst : string }
         (** [linkat(2)] making [dst] a second name for [src]; both paths are
             confined, and a symbolic link at [src] is linked itself, never
-            followed. *)
+            followed. Descriptorless backends refuse hard links. *)
     | Lstat of string  (** [fstatat(2)] with [AT_SYMLINK_NOFOLLOW]. *)
 
   type outcome = Done | Stat of Eio.File.Stat.t

@@ -1529,16 +1529,24 @@ module Batch = struct
   external lstat_native : Unix.file_descr -> string -> raw_stat
     = "caml_eio_fs_batch_lstat"
 
-  type t = { fd : Eio_unix.Fd.t }
+  type t =
+    | Native of Eio_unix.Fd.t
+    | Portable of Eio.Fs.dir_ty Eio.Path.t * bool ref
 
-  let v ~sw dir =
-    (* Opening [dir] through the supplied capability is the path operation a
-       wrapper observes; its already-open base then yields the descriptor. *)
-    let opened, _ = Eio.Path.open_dir ~sw dir in
+  let v ~sw (dir : [> Eio.Fs.dir_ty ] Eio.Path.t) =
+    let dir = (dir :> Eio.Fs.dir_ty Eio.Path.t) in
+    let opened =
+      match dir with
+      | root, "" -> fst (Eio.Path.open_dir ~sw Eio.Path.(of_dir root / "."))
+      | _ -> fst (Eio.Path.open_dir ~sw dir)
+    in
     let file = Eio.Path.open_in ~sw (Eio.Path.of_dir (unwrapped_dir opened)) in
     match Eio_unix.Resource.fd_opt file with
-    | Some fd -> { fd }
-    | None -> invalid_arg "Eio_fs_unix.Batch.v: native directory required"
+    | Some fd -> Native fd
+    | None ->
+        let live = ref true in
+        Eio.Switch.on_release sw (fun () -> live := false);
+        Portable (Eio.Path.of_dir (opened :> Eio.Fs.dir_ty Eio.Resource.t), live)
 
   type op =
     | Mkdir of { path : string; perm : int }
@@ -1694,11 +1702,81 @@ module Batch = struct
     | exception Unix.Unix_error (code, call, arg) ->
         Error (`Unix (code, call, arg))
 
+  (* Descriptorless backends use the same operation vocabulary. Hold each
+     parent separately and verify its identity after opening, so a replacement
+     cannot redirect an operation through a symbolic link. *)
+  let portable_parent root path fn =
+    let parents, leaf = split path in
+    let rec descend dir = function
+      | [] -> fn Eio.Path.(dir / leaf)
+      | name :: rest ->
+          let next = Eio.Path.(dir / name) in
+          let before = Eio.Path.stat ~follow:false next in
+          (match before.kind with
+          | `Symbolic_link -> fail_refused "%S is a symbolic link" path
+          | `Directory -> ()
+          | _ -> raise (Unix.Unix_error (Unix.ENOTDIR, "open", path)));
+          Eio.Path.with_open_dir next (fun held ->
+              let after = Eio.Path.stat ~follow:false held in
+              if
+                not
+                  (Int64.equal before.dev after.dev
+                  && Int64.equal before.ino after.ino)
+              then fail_refused "%S changed while opening its parent" path;
+              descend held rest)
+    in
+    descend root parents
+
+  let portable root = function
+    | Mkdir { path; perm } ->
+        portable_parent root path (Eio.Path.mkdir ~perm);
+        Done
+    | Create { path; perm; contents } ->
+        portable_parent root path (fun p ->
+            Eio.Path.save ~follow:false ~create:(`Exclusive perm) p contents);
+        Done
+    | Symlink { path; target } ->
+        portable_parent root path (Eio.Path.symlink ~link_to:target);
+        Done
+    | Unlink { path; dir } ->
+        portable_parent root path (fun p ->
+            if dir then Eio.Path.rmdir p
+            else if Eio.Path.kind ~follow:false p = `Directory then
+              raise (Unix.Unix_error (Unix.EISDIR, "unlink", path))
+            else Eio.Path.unlink p);
+        Done
+    | Rename { src; dst } ->
+        portable_parent root src (fun src ->
+            portable_parent root dst (Eio.Path.rename src));
+        Done
+    | Link _ -> fail_refused "hard links require a native directory"
+    | Lstat path ->
+        portable_parent root path (fun p ->
+            Stat (Eio.Path.stat ~follow:false p))
+
+  let portable_attempt root op =
+    match portable root op with
+    | outcome -> Ok outcome
+    | exception Refused reason -> Error (`Refused reason)
+    | exception Unix.Unix_error (code, call, arg) ->
+        Error (`Unix (code, call, arg))
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) ->
+        Error (`Unix (Unix.EEXIST, "batch", ""))
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+        Error (`Unix (Unix.ENOENT, "batch", ""))
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) ->
+        Error (`Unix (Unix.EACCES, "batch", ""))
+    | exception Eio.Io (err, _) ->
+        Error (`Refused (Fmt.str "%a" Eio.Exn.pp_err err))
+
   let run t ops =
-    match ops with
-    | [] -> []
-    | ops ->
-        Eio_unix.Fd.use_exn "Eio_fs_unix.Batch.run" t.fd @@ fun root ->
+    match (t, ops) with
+    | _, [] -> []
+    | Portable (_, live), _ when not !live ->
+        invalid_arg "Eio_fs_unix.Batch.run: switch finished"
+    | Portable (root, _), ops -> List.map (portable_attempt root) ops
+    | Native fd, ops ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.Batch.run" fd @@ fun root ->
         hop @@ fun () ->
         let run = { root; dirs = Hashtbl.create 16 } in
         Fun.protect
