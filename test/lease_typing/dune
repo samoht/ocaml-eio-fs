@@ -1,4 +1,4 @@
 (mdx
- (files typing.md runtime.md)
+ (files typing.md runtime.md held-parent.md)
  (deps ../unix/test.exe)
  (libraries eio-fs.unix eio eio.core eio.unix eio_main unix))
