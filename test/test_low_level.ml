@@ -117,6 +117,38 @@ let test_subtree_fd_dies_with_switch () =
       Alcotest.fail "stale directory fd still resolves after its switch exited"
   | exception Eio.Io _ -> ()
 
+(* close(2): "the file descriptor is deallocated" and the next open may be
+   handed the same number. A handle answers on its own state: closing it a
+   second time does nothing (as [Eio.Resource.close] specifies), and using it
+   is EBADF, whatever file has taken its number since. Each case opens [a],
+   closes it, then opens [b], which takes the number [a] had. *)
+let with_reused_number env fn =
+  let fs = env#fs in
+  Eio.Switch.run @@ fun sw ->
+  let a = Eio.Path.open_out ~sw ~create:(`Exclusive 0o644) (fs / "a") in
+  Eio.Resource.close a;
+  let b = Eio.Path.open_out ~sw ~create:(`Exclusive 0o644) (fs / "b") in
+  fn a b
+
+let test_stale_close_spares_reused_fd () =
+  with_env @@ fun env ->
+  with_reused_number env (fun a b ->
+      Eio.Resource.close a;
+      Eio.Flow.copy_string "hello" b);
+  Alcotest.(check string)
+    "the open handle kept its file" "hello"
+    (Eio.Path.load (env#fs / "b"))
+
+let test_closed_handle_write_refused () =
+  with_env @@ fun env ->
+  with_reused_number env (fun a _ ->
+      match Eio.Flow.copy_string "stale" a with
+      | () -> Alcotest.fail "a write through a closed handle succeeded"
+      | exception Eio.Io _ -> ());
+  Alcotest.(check string)
+    "the file holding the number is untouched" ""
+    (Eio.Path.load (env#fs / "b"))
+
 (* {2 Descriptors that are not regular files}
 
    Opening a directory as a flow is a supported operation: eio-fs.sync reaches a
@@ -200,6 +232,10 @@ let suite =
         test_chmod_restores_writability;
       Alcotest.test_case "subtree fd dies with switch" `Quick
         test_subtree_fd_dies_with_switch;
+      Alcotest.test_case "stale close spares a reused fd" `Quick
+        test_stale_close_spares_reused_fd;
+      Alcotest.test_case "closed handle write refused" `Quick
+        test_closed_handle_write_refused;
       Alcotest.test_case "read directory fd" `Quick test_read_directory_fd;
       Alcotest.test_case "write directory fd" `Quick test_write_directory_fd;
       Alcotest.test_case "create under regular file" `Quick
