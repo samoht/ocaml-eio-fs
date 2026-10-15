@@ -196,6 +196,22 @@ let test_create_under_regular_file () =
   expect_eio_io "creating a file under a regular file" (fun () ->
       Eio.Path.save ~create:(`Or_truncate 0o600) (env#fs / "reg/child") "y")
 
+(* open(2) with O_CREAT on a missing path in directory syntax ("x/", "x/.")
+   creates nothing: a trailing separator names a directory, which O_CREAT
+   never makes. Linux answers EISDIR and macOS ENOENT, so the case pins the
+   [Eio.Io] and that no entry appears, not which of the two. *)
+let test_create_directory_syntax () =
+  with_env @@ fun env ->
+  List.iter
+    (fun spelling ->
+      expect_eio_io (Fmt.str "creating %S" spelling) (fun () ->
+          Eio.Path.save ~create:(`Exclusive 0o600) (env#fs / spelling) "y");
+      Alcotest.(check bool)
+        (Fmt.str "creating %S made no entry" spelling)
+        true
+        (Eio.Path.kind ~follow:false (env#fs / "x") = `Not_found))
+    [ "x/"; "x/." ]
+
 (* ENOTDIR is an error of the filesystem's own model, not a caller mistake:
    with a regular file in the tree, every directory operation that walks
    through it must answer through [Eio.Io], not an [Invalid_argument] this
@@ -240,6 +256,8 @@ let suite =
       Alcotest.test_case "write directory fd" `Quick test_write_directory_fd;
       Alcotest.test_case "create under regular file" `Quick
         test_create_under_regular_file;
+      Alcotest.test_case "create in directory syntax" `Quick
+        test_create_directory_syntax;
       Alcotest.test_case "directory ops under a regular file" `Quick
         test_dir_ops_under_regular_file;
     ] )
