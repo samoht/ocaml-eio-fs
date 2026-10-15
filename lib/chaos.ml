@@ -508,10 +508,7 @@ let rec remove_at (Base_dir ((module B), bv) as owner) path =
         | names ->
             List.iter
               (fun name ->
-                let child =
-                  if String.equal path "" then name
-                  else Filename.concat path name
-                in
+                let child = Eio_fs_path.append path name in
                 remove_at owner child)
               names;
             clear ()
@@ -1030,9 +1027,7 @@ module Crash = struct
         let entries =
           B.read_dir bv path |> List.sort String.compare
           |> List.map (fun name ->
-              let child =
-                if String.equal path "" then name else Filename.concat path name
-              in
+              let child = Eio_fs_path.append path name in
               (name, snapshot_at owner child))
         in
         Dir { perm; entries }
@@ -1054,9 +1049,7 @@ module Crash = struct
         if not (String.equal path "") then B.mkdir bv ~perm path;
         List.iter
           (fun (name, child) ->
-            let child_path =
-              if String.equal path "" then name else Filename.concat path name
-            in
+            let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
           entries
 
@@ -1064,16 +1057,12 @@ module Crash = struct
     | Dir { perm; entries } ->
         B.read_dir bv path
         |> List.iter (fun name ->
-            let child =
-              if String.equal path "" then name else Filename.concat path name
-            in
+            let child = Eio_fs_path.append path name in
             remove_at owner child);
         if not (String.equal path "") then B.chmod bv ~follow:true ~perm path;
         List.iter
           (fun (name, child) ->
-            let child_path =
-              if String.equal path "" then name else Filename.concat path name
-            in
+            let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
           entries
     | File _ | Link _ ->
@@ -1550,7 +1539,7 @@ module Crash = struct
 
   (* Compose a path opened through a subtree with the subtree's own path from
      the wrap root. *)
-  let at prefix path = if prefix = "" then path else Filename.concat prefix path
+  let at prefix path = Eio_fs_path.append prefix path
 
   let file_key (Base_dir ((module B), bv)) path =
     match B.native bv path with Some native -> native | None -> path

@@ -460,11 +460,12 @@ let check_access path flags r =
       Error.permission_denied path
   | _ -> ()
 
+let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
+
 (* Create [path] in its parent directory, register the new file in the
    filesystem, and return its resource. *)
 let new_file ~follow ~mode dir_fd path =
-  let fname = Filename.basename path in
-  let dir = Filename.dirname path in
+  let dir, fname = dir_base path in
   let rdir = Filesystem.lookup ~follow dir_fd dir in
   let dir =
     match !rdir with
@@ -555,8 +556,6 @@ let chown ~follow ?uid ?gid dir_fd path =
   let uid = Option.value ~default:s.uid uid in
   let gid = Option.value ~default:s.gid gid in
   r := Resource.set_stat !r { s with uid; gid }
-
-let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
 
 let unlink dir_fd path =
   let path = check_path path in
