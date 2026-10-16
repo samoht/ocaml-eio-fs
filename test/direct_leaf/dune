@@ -1,3 +1,12 @@
 (mdx
  (files direct-leaf.md)
- (libraries eio-fs.unix eio_fs eio.mock eio eio.core eio.unix eio_main unix))
+ (libraries
+  hermetic.eio
+  eio-fs.unix
+  eio_fs
+  eio.mock
+  eio
+  eio.core
+  eio.unix
+  eio_main
+  unix))
