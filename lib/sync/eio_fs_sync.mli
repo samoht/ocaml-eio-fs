@@ -140,6 +140,30 @@ val save :
     ceiling is [s]'s length, [perm] defaults to [0o644] and [durable] to [true].
 *)
 
+val append_lines :
+  ?durable:bool ->
+  ?perm:Eio.File.Unix_perm.t ->
+  _ Eio.Path.t ->
+  string list ->
+  unit
+(** [append_lines ~durable ~perm path lines] appends each of [lines] to the file
+    at [path], each ended by LF, in one write, as a log of JSON Lines or any
+    other line-per-record file is appended to. A missing file is created with
+    mode [perm] (defaults to [0o644]).
+
+    A file whose last byte is not LF ends in a line torn by a crash part way
+    through an append. That line is ended first, so the first of [lines] starts
+    a line of its own: the torn bytes stay, as a line a reader refuses as it
+    refuses any malformed one, and no line appended after them is read as their
+    continuation. A file that is empty or ends in LF is appended to as it is.
+
+    If [durable] is [true] (the default), the file is fsynced after the write,
+    and the directory holding it too when the call created it. Appends from two
+    writers are not ordered with each other: a caller with several takes a
+    {!Lock} around each.
+
+    @raise Invalid_argument if a line holds LF. *)
+
 val publish_generation :
   durable:bool ->
   ?perm:Eio.File.Unix_perm.t ->
