@@ -410,6 +410,70 @@ let test_save () =
   Eio_fs_sync.save p "";
   Alcotest.(check string) "empty" "" (Eio.Path.load p)
 
+(* -- Appending lines -- *)
+
+let with_mem f =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env -> f (env#fs / "log.jsonl")
+
+let test_append_creates () =
+  with_mem @@ fun p ->
+  Eio_fs_sync.append_lines p [ {|{"a":1}|}; {|{"b":2}|} ];
+  Alcotest.(check string) "created" "{\"a\":1}\n{\"b\":2}\n" (Eio.Path.load p);
+  Eio_fs_sync.append_lines ~durable:false p [ {|{"c":3}|} ];
+  Alcotest.(check string)
+    "appended" "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n" (Eio.Path.load p)
+
+(* A crash part way through an append leaves a last line with no LF. The
+   next line starts on a line of its own, so it is not read as the torn
+   line's continuation, and the torn bytes stay as they were. *)
+let test_append_repairs_a_torn_line () =
+  with_mem @@ fun p ->
+  Eio.Path.save ~create:(`Exclusive 0o644) p "{\"a\":1}\n{\"b\":";
+  Eio_fs_sync.append_lines p [ {|{"c":3}|} ];
+  Alcotest.(check string)
+    "torn line ended" "{\"a\":1}\n{\"b\":\n{\"c\":3}\n" (Eio.Path.load p);
+  Eio_fs_sync.append_lines p [ {|{"d":4}|} ];
+  Alcotest.(check string)
+    "an LF is not added twice" "{\"a\":1}\n{\"b\":\n{\"c\":3}\n{\"d\":4}\n"
+    (Eio.Path.load p)
+
+let test_append_to_empty () =
+  with_mem @@ fun p ->
+  Eio.Path.save ~create:(`Exclusive 0o644) p "";
+  Eio_fs_sync.append_lines p [ "x" ];
+  Alcotest.(check string) "no leading LF" "x\n" (Eio.Path.load p)
+
+let test_append_nothing () =
+  with_mem @@ fun p ->
+  Eio_fs_sync.append_lines p [];
+  Alcotest.(check bool)
+    "no file" true
+    (Eio.Path.kind ~follow:true p = `Not_found)
+
+let test_append_refuses_lf () =
+  with_mem @@ fun p ->
+  Eio.Path.save ~create:(`Exclusive 0o644) p "a\n";
+  (match Eio_fs_sync.append_lines p [ "b"; "c\nd" ] with
+  | () -> Alcotest.fail "a line holding LF was appended"
+  | exception Invalid_argument _ -> ());
+  Alcotest.(check string) "unchanged" "a\n" (Eio.Path.load p)
+
+let test_append_posix () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-sync-append" "" in
+  Sys.remove dir;
+  Eio.Path.mkdir ~perm:0o755 (fs / dir);
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / dir))
+  @@ fun () ->
+  let p = fs / dir / "log.jsonl" in
+  Eio_fs_sync.append_lines p [ "1" ];
+  Eio.Path.with_open_out ~append:true ~create:`Never p (fun f ->
+      Eio.Flow.copy_string "2" f);
+  Eio_fs_sync.append_lines p [ "3" ];
+  Alcotest.(check string) "repaired" "1\n2\n3\n" (Eio.Path.load p)
+
 let suite =
   ( "eio_fs_sync",
     [
@@ -419,6 +483,14 @@ let suite =
         test_exclusive_publication_survives_crash;
       Alcotest.test_case "registered backend" `Quick test_registered_backend;
       Alcotest.test_case "save a string" `Quick test_save;
+      Alcotest.test_case "append lines" `Quick test_append_creates;
+      Alcotest.test_case "append ends a torn line" `Quick
+        test_append_repairs_a_torn_line;
+      Alcotest.test_case "append to an empty file" `Quick test_append_to_empty;
+      Alcotest.test_case "append nothing" `Quick test_append_nothing;
+      Alcotest.test_case "append refuses a line holding LF" `Quick
+        test_append_refuses_lf;
+      Alcotest.test_case "append on posix" `Quick test_append_posix;
       Alcotest.test_case "posix needs no registration" `Quick
         test_posix_needs_no_registration;
       Alcotest.test_case "published mode ignores the umask" `Quick

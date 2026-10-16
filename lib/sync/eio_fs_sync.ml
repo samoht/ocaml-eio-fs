@@ -214,6 +214,52 @@ let save ?(durable = true) ?(perm = 0o644) path s =
   let config = { durable; perm; max_bytes = Int64.of_int (String.length s) } in
   publish ~config path (fun sink -> Eio.Flow.copy_string s sink)
 
+(* A crash part way through an append leaves the file's last line without its
+   LF. Whatever follows it would be read as the end of that line, so the line
+   is ended first: the torn bytes become a line of their own, which a reader
+   refuses as it refuses any malformed one, and nothing written after them is
+   lost with them. *)
+let ends_torn path =
+  Eio.Switch.run @@ fun sw ->
+  match Eio.Path.open_in ~sw path with
+  | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> false
+  | file ->
+      let size = Optint.Int63.to_int (Eio.File.size file) in
+      size > 0
+      &&
+      let last = Cstruct.create 1 in
+      Eio.File.pread_exact file
+        ~file_offset:(Optint.Int63.of_int (size - 1))
+        [ last ];
+      not (Char.equal (Cstruct.get_char last 0) '\n')
+
+let append_lines ?(durable = true) ?(perm = 0o644) path lines =
+  List.iter
+    (fun l ->
+      if String.contains l '\n' then
+        invalid_arg "Eio_fs_sync.append_lines: a line holds LF")
+    lines;
+  let exists =
+    match Eio.Path.kind ~follow:true path with `Not_found -> false | _ -> true
+  in
+  let torn = exists && ends_torn path in
+  let b = Buffer.create 256 in
+  if torn then Buffer.add_char b '\n';
+  List.iter
+    (fun l ->
+      Buffer.add_string b l;
+      Buffer.add_char b '\n')
+    lines;
+  if Buffer.length b > 0 then begin
+    Eio.Switch.run (fun sw ->
+        let file =
+          Eio.Path.open_out ~sw ~append:true ~create:(`If_missing perm) path
+        in
+        Eio.Flow.copy_string (Buffer.contents b) file;
+        if durable then sync_file file);
+    if durable && not exists then sync_parent path
+  end
+
 (* A file opened read-only still names the inode fsync(2) flushes. A registered
    barrier answers first; the POSIX backends expose their sync on every handle,
    which is the route [fsync_handle] probes. *)
