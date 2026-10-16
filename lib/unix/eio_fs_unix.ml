@@ -1727,7 +1727,7 @@ module Batch = struct
           let next = Eio.Path.(dir / name) in
           let before = Eio.Path.stat ~follow:false next in
           if before.kind <> `Directory then
-            denied (Fmt.str "%S has a non-directory parent" path);
+            Fmt.kstr denied "%S has a non-directory parent" path;
           Eio.Path.with_open_dir next (fun held ->
               let after = Eio.Path.stat ~follow:false held in
               if
@@ -1735,7 +1735,7 @@ module Batch = struct
                   (Int64.equal before.dev after.dev
                   && Int64.equal before.ino after.ino
                   && after.kind = `Directory)
-              then denied (Fmt.str "%S changed while opening its parent" path);
+              then Fmt.kstr denied "%S changed while opening its parent" path;
               descend (held :> Eio.Fs.dir_ty Eio.Path.t) rest)
     in
     match parents with
