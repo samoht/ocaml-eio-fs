@@ -2919,7 +2919,7 @@ let test_lease_refusal_names_a_fiber () =
       Alcotest.(check bool)
         ("no pid as a foreign holder: " ^ said)
         false
-        (has (Fmt.str "process %d" (Unix.getpid ())))
+        (Fmt.kstr has "process %d" (Unix.getpid ()))
 
 let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
