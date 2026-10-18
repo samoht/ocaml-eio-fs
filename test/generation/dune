@@ -4,4 +4,12 @@
 
 (test
  (name test)
- (libraries eio eio.mock eio_fs eio-fs.sync alcotest fmt))
+ (libraries
+  eio
+  eio.mock
+  eio_main
+  eio_fs
+  eio-fs.sync
+  eio-fs.unix
+  alcotest
+  fmt))

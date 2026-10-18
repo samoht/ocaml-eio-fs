@@ -235,6 +235,86 @@ let test_refuses_plain_directory () =
     "the directory is untouched" "legacy"
     (Eio.Path.load (fs / "out" / "x"))
 
+let with_posix fn =
+  Eio_main.run @@ fun env ->
+  let root = Eio.Stdenv.fs env / Filename.temp_dir "generation-readonly-" "" in
+  Fun.protect
+    ~finally:(fun () ->
+      Eio_fs_unix.grant_owner root;
+      Eio.Path.rmtree root)
+    (fun () -> fn root)
+
+let readonly tree dir =
+  populate tree dir;
+  Eio.Path.chmod ~follow:false ~perm:0o555 (dir / "readonly")
+
+(* rename(2) can switch a rootfs whose entries are not writable. Reclaiming the
+   old owned generation must work too, without following its foreign links. *)
+let test_posix_readonly_reclaimed () =
+  with_posix @@ fun root ->
+  populate [ ("foreign/kept", "outside the generation") ] root;
+  Eio.Path.chmod ~follow:false ~perm:0o500 (root / "foreign");
+  let foreign = Eio.Path.stat ~follow:false (root / "foreign") in
+  Eio_fs_sync.publish_generation ~durable:true (root / "out") (fun dir ->
+      readonly [ ("readonly/file", "old rootfs") ] dir;
+      Eio.Path.symlink ~link_to:"../foreign" (dir / "link"));
+  let old = Eio.Path.read_link (root / "out") in
+  Eio_fs_sync.publish_generation ~durable:true (root / "out")
+    (readonly [ ("readonly/file", "complete replacement") ]);
+  Alcotest.(check string)
+    "replacement is complete" "complete replacement"
+    (Eio.Path.load (root / "out/readonly/file"));
+  Alcotest.(check int)
+    "the published directory retains its mode" 0o555
+    ((Eio.Path.stat ~follow:false (root / "out/readonly")).perm land 0o777);
+  Alcotest.(check bool)
+    "old read-only generation is reclaimed" false
+    (Eio.Path.is_directory (root / old));
+  let actual = Eio.Path.stat ~follow:false (root / "foreign") in
+  Alcotest.(check (pair int64 int64))
+    "foreign directory identity is untouched" (foreign.dev, foreign.ino)
+    (actual.dev, actual.ino);
+  Alcotest.(check int)
+    "foreign directory permissions are untouched" 0o500 (actual.perm land 0o777);
+  Alcotest.(check string)
+    "foreign link target is untouched" "outside the generation"
+    (Eio.Path.load (root / "foreign/kept"))
+
+(* Failed population can already have copied read-only directories. Removing
+   those staged entries must leave the previous generation and modes intact. *)
+let test_posix_readonly_failed_populate () =
+  with_posix @@ fun root ->
+  Eio_fs_sync.publish_generation ~durable:true (root / "out")
+    (readonly [ ("readonly/file", "previous complete rootfs") ]);
+  let target = Eio.Path.read_link (root / "out") in
+  let before = Eio.Path.stat ~follow:false (root / target) in
+  let entries = List.sort String.compare (Eio.Path.read_dir root) in
+  (match
+     Eio_fs_sync.publish_generation ~durable:true (root / "out") (fun dir ->
+         readonly [ ("readonly/file", "never published") ] dir;
+         failwith "fixture population failed")
+   with
+  | () -> Alcotest.fail "a failed population was published"
+  | exception Failure why ->
+      Alcotest.(check string)
+        "the original error is preserved" "fixture population failed" why);
+  Alcotest.(check (list string))
+    "the read-only stage is fully removed" entries
+    (List.sort String.compare (Eio.Path.read_dir root));
+  Alcotest.(check string)
+    "the exact old pointer remains" target
+    (Eio.Path.read_link (root / "out"));
+  let actual = Eio.Path.stat ~follow:false (root / target) in
+  Alcotest.(check (pair int64 int64))
+    "the previous generation identity remains" (before.dev, before.ino)
+    (actual.dev, actual.ino);
+  Alcotest.(check int)
+    "old permissions are not changed before publication" 0o555
+    ((Eio.Path.stat ~follow:false (root / "out/readonly")).perm land 0o777);
+  Alcotest.(check string)
+    "old content remains complete" "previous complete rootfs"
+    (Eio.Path.load (root / "out/readonly/file"))
+
 let suite =
   ( "generation",
     [
@@ -253,4 +333,8 @@ let suite =
         test_failed_populate;
       Alcotest.test_case "plain directory refused" `Quick
         test_refuses_plain_directory;
+      Alcotest.test_case "POSIX read-only generation reclaimed" `Quick
+        test_posix_readonly_reclaimed;
+      Alcotest.test_case "POSIX failed read-only population leaves no stage"
+        `Quick test_posix_readonly_failed_populate;
     ] )
