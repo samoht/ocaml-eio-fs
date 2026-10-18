@@ -22,7 +22,7 @@ let test_append before lines =
     let got =
       String.split_on_char '\n' (String.sub after 0 (String.length after - 1))
     in
-    if last (List.length lines) got <> lines then
+    if not (List.equal String.equal (last (List.length lines) got) lines) then
       failf "the appended lines are not the file's last: %S" after
   end
 
