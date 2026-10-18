@@ -2921,6 +2921,39 @@ let test_lease_refusal_names_a_fiber () =
         false
         (Fmt.kstr has "process %d" (Unix.getpid ()))
 
+let test_switch_lease_release () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lease" in
+  Eio.Switch.run @@ fun sw ->
+  let lease = Eio_fs_unix.Lease.take ~sw lock in
+  (match Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ()) with
+  | () -> Alcotest.fail "a contender acquired the switch's lease"
+  | exception Eio_fs_unix.Lock_unavailable _ -> ());
+  Eio_fs_unix.Lease.release lease;
+  Eio_fs_unix.Lease.release lease;
+  Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ())
+
+let test_switch_lease_exception () =
+  with_real_dir @@ fun dir ->
+  let lock = dir / "lease" in
+  let exception End in
+  (match
+     Eio.Switch.run (fun sw ->
+         ignore (Eio_fs_unix.Lease.take ~sw lock);
+         raise End)
+   with
+  | () -> Alcotest.fail "the holder exception disappeared"
+  | exception End -> ());
+  Eio_fs_unix.Lease.with_exclusive ~block:`No lock (fun _ -> ())
+
+let test_switch_lease_cancel () =
+  let take ~on_wait lock fn =
+    Eio.Switch.run @@ fun sw ->
+    ignore (Eio_fs_unix.Lease.take ~sw ~on_wait lock);
+    fn ()
+  in
+  a_wait_is_cancellable ~kind:"lease" take ~free:lease_free ()
+
 let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
     test_lease_survives_owner_close_until_inherited_descriptor_closes
@@ -2934,6 +2967,12 @@ let lease_suite = ("lease", [ lease_test_case; lease_unlock_test_case ])
 let suite =
   ( "eio_fs_unix",
     [
+      Alcotest.test_case "a switch lease releases once" `Quick
+        test_switch_lease_release;
+      Alcotest.test_case "a switch lease ends on exception" `Quick
+        test_switch_lease_exception;
+      Alcotest.test_case "a switch lease acquisition is cancellable" `Quick
+        test_switch_lease_cancel;
       Alcotest.test_case "a byte-range lock leaves the offset" `Quick
         test_lock_range;
       Alcotest.test_case "exclusive rename refuses existing names" `Quick

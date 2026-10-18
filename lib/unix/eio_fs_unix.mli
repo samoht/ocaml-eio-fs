@@ -385,6 +385,25 @@ module Lease : sig
       process-local admission; a shared acquisition gives that admission back
       immediately. *)
 
+  val take :
+    sw:Eio.Switch.t ->
+    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?contents:string ->
+    ?on_wait:(unit -> unit) ->
+    _ Eio.Path.t ->
+    t
+  (** [take ~sw path] acquires the exclusive lease described by
+      {!with_exclusive}. Its descriptor and process-local admission remain held
+      until {!release} or [sw]'s release hooks run. Acquisition has the same
+      cancellation and refusal behavior as {!with_exclusive}. *)
+
+  val release : t -> unit
+  (** [release lease] closes this holder's descriptor and gives back its
+      process-local admission. Repeated calls do nothing. An inherited copy of
+      the descriptor keeps its kernel lease until its last copy closes; use
+      {!unlock} to release the shared open file description immediately. *)
+
   val with_exclusive :
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->

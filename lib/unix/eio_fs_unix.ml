@@ -1403,7 +1403,11 @@ let rec probe_at ~attempts path =
 let probe path = probe_at ~attempts:probe_attempts path
 
 module Lease = struct
-  type t = { fd : Eio_unix.Fd.t; release_reader : unit -> unit }
+  type t = {
+    fd : Eio_unix.Fd.t;
+    release_reader : unit -> unit;
+    let_go : unit -> unit;
+  }
 
   let fd t = t.fd
 
@@ -1412,16 +1416,28 @@ module Lease = struct
     Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native;
     t.release_reader ()
 
-  let with_mode ~lease ?block ?create ?contents ?on_wait path fn =
-    Eio.Switch.run @@ fun sw ->
+  let release t = t.let_go ()
+
+  let take_mode ~sw ~lease ?block ?create ?contents ?on_wait path =
     let file, let_go, release_reader =
       acquire ~sw ~lease ?block ?create ?contents ?on_wait path
     in
-    Fun.protect ~finally:let_go @@ fun () ->
     match Eio_unix.Resource.fd_opt file with
-    | Some fd -> fn { fd; release_reader }
+    | Some fd ->
+        let t = { fd; release_reader; let_go } in
+        Eio.Switch.on_release sw (fun () -> release t);
+        t
     | None ->
+        let_go ();
         invalid_arg "Eio_fs_unix.Lease: acquired descriptor is unavailable"
+
+  let take ~sw ?block ?create ?contents ?on_wait path =
+    take_mode ~sw ~lease:`Exclusive ?block ?create ?contents ?on_wait path
+
+  let with_mode ~lease ?block ?create ?contents ?on_wait path fn =
+    Eio.Switch.run @@ fun sw ->
+    let t = take_mode ~sw ~lease ?block ?create ?contents ?on_wait path in
+    Fun.protect ~finally:(fun () -> release t) (fun () -> fn t)
 
   let with_exclusive ?block ?create ?contents ?on_wait path fn =
     with_mode ~lease:`Exclusive ?block ?create ?contents ?on_wait path fn
