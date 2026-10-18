@@ -1,0 +1,4 @@
+(mdx
+ (package eio-fs)
+ (files contract.md)
+ (libraries eio-fs.unix eio eio.core eio.unix))
