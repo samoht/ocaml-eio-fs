@@ -17,11 +17,6 @@
   alcotest))
 
 (rule
- (alias guarded-link)
+ (aliases runtest guarded-link)
  (action
   (run %{exe:test.exe} test "^link$")))
-
-(alias
- (name runtest)
- (deps
-  (alias guarded-link)))
