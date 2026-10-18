@@ -334,9 +334,53 @@ let owned_generation ~name target =
   | Some owner -> String.equal owner name
   | None -> false
 
+type Eio.Exn.Backend.t += Changed_generation of string
+
+let () =
+  Eio.Exn.Backend.register_pp (fun ppf -> function
+    | Changed_generation why ->
+        Fmt.string ppf why;
+        true
+    | _ -> false)
+
+let fail_generation_changed path before actual =
+  Fmt.kstr
+    (fun why ->
+      raise (Eio.Fs.err (Eio.Fs.Permission_denied (Changed_generation why))))
+    "generation %a was a %a inode %Ld:%Ld, now a %a inode %Ld:%Ld" Eio.Path.pp
+    path Eio.File.Stat.pp_kind before.Eio.File.Stat.kind before.dev before.ino
+    Eio.File.Stat.pp_kind actual.Eio.File.Stat.kind actual.dev actual.ino
+
+(* Only an unreferenced generation owned by this publication reaches here.
+   Grant its directories the permissions removal needs, without changing file
+   modes or following a symbolic link. Re-rooting on the opened parent keeps
+   every descendant within that capability. *)
+let rec reclaim_entry path =
+  match Eio.Path.stat ~follow:false path with
+  | before when before.kind = `Directory ->
+      if (not (is_modeless (fst path))) && before.perm land 0o700 <> 0o700 then
+        Eio.Path.chmod ~follow:false ~perm:(before.perm lor 0o700) path;
+      Eio.Path.with_subtree path (fun dir ->
+          let actual = Eio.Path.stat ~follow:false dir in
+          if (not (same_file before actual)) || actual.kind <> `Directory then
+            fail_generation_changed path before actual;
+          List.iter
+            (fun name -> reclaim_entry Eio.Path.(dir / name))
+            (Eio.Path.read_dir dir));
+      Eio.Path.rmdir path
+  | _ -> Eio.Path.unlink path
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+
+let reclaim path =
+  match Eio.Path.split path with
+  | Some (parent, name) ->
+      Eio.Path.with_subtree parent (fun parent ->
+          reclaim_entry Eio.Path.(parent / name))
+  | None ->
+      invalid_arg "Eio_fs_sync.publish_generation: generation has no parent"
+
 let discard p =
-  Eio.Cancel.protect @@ fun () ->
-  try Eio.Path.rmtree ~missing_ok:true p with Eio.Io _ -> ()
+  Eio.Cancel.protect @@ fun () -> try reclaim p with Eio.Io _ -> ()
 
 (* Stage a fresh sibling generation, commit it whole, rename a pointer to it
    over the published name, commit that, then reclaim the generation the old
@@ -385,7 +429,7 @@ let publish_generation ~durable ?(perm = 0o755) path populate =
   if durable then sync_dir parent;
   (match previous with
   | Some target when owned_generation ~name target ->
-      Eio.Path.rmtree ~missing_ok:true Eio.Path.(parent / target)
+      reclaim Eio.Path.(parent / target)
   | Some _ | None -> ());
   result
 

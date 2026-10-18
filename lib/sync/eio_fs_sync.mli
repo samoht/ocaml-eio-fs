@@ -183,6 +183,11 @@ val publish_generation :
     the previous generation is removed only once the switch is committed.
     [durable] [false] keeps only the atomicity.
 
+    Reclaiming an owned old or failed staged generation grants its directories
+    owner read, write and search permission when necessary. Files and symbolic
+    link targets are not changed. A failure before the switch never changes the
+    previous generation's permissions.
+
     [path] must be absent or a symbolic link: anything else raises
     [Invalid_argument] before [populate] runs, and is left as it was. A
     generation is a hidden sibling, a dot, [path]'s basename, [".gen."] and a
