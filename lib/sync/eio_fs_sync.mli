@@ -133,6 +133,31 @@ val publish :
     rename, the new file visible with uncertain durability.
     {!type-config.field-durable} [false] keeps only the atomicity. *)
 
+val publish_sparse :
+  config:config ->
+  ?mode:[ `Replace | `Exclusive ] ->
+  ?rename:Rename.t ->
+  ?tmp:'a Eio.Path.t ->
+  size_bytes:int64 ->
+  'a Eio.Path.t ->
+  (int64 * Cstruct.t) list ->
+  unit
+(** [publish_sparse ~config ~size_bytes path spans] publishes a file with
+    logical size [size_bytes] and ordered, disjoint [(offset, data)] extents.
+    Unwritten gaps read as zeros; only the supplied data is written. The caller
+    must retain the buffers without mutating them until the call returns.
+
+    The temporary, modes, barriers, exclusive rename and failure cleanup are
+    those of {!publish}. The logical size must fit the file-offset type and
+    {!type-config.field-max_bytes}; every extent must lie within that size. All
+    bounds and ordering are checked before any filesystem operation.
+
+    @raise Limit_exceeded if [size_bytes] exceeds the byte ceiling.
+    @raise Invalid_argument
+      for a negative or unrepresentable size, negative offsets, unordered or
+      overlapping extents, or data outside the logical file. A negative
+      {!type-config.field-max_bytes} is refused as by {!publish}. *)
+
 val save :
   ?durable:bool -> ?perm:Eio.File.Unix_perm.t -> _ Eio.Path.t -> string -> unit
 (** [save ~durable ~perm path s] is {!publish} of the string [s] at [path]:

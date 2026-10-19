@@ -1,6 +1,16 @@
 (test
  (name test)
- (libraries eio eio.mock eio_main eio_fs eio-fs.sync alcotest unix))
+ (libraries
+  eio
+  eio.mock
+  eio_main
+  eio_fs
+  eio-fs.sync
+  eio-fs.unix
+  cstruct
+  optint
+  alcotest
+  unix))
 
 (mdx
  (package eio-fs)

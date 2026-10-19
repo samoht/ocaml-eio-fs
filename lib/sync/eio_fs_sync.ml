@@ -172,10 +172,7 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
               (not (is_modeless tmp_resource))
               && not (Int.equal (tmp_stat.perm land 0o7777) config.perm)
             then Eio.Path.chmod ~follow:false ~perm:config.perm tmp;
-            let sink = (file :> Eio.Flow.sink_ty Eio.Resource.t) in
-            let result =
-              write (bounded_sink ~max_bytes:config.max_bytes sink)
-            in
+            let result = write file in
             if config.durable then sync_file file;
             result)
       in
@@ -190,12 +187,15 @@ let produce ~config ~requested_tmp ((dir, target) as path) write =
   in
   produce 0
 
+let check_config config =
+  if Int64.compare config.max_bytes 0L < 0 then
+    invalid_arg "Eio_fs_sync.publish: max_bytes must be non-negative"
+
 (* Write a temporary, push its bytes to stable storage, rename it over the
    target, and barrier the target's directory. *)
-let publish ~config ?(mode = `Replace) ?(rename = Rename.capability)
+let publish_file ~config ?(mode = `Replace) ?(rename = Rename.capability)
     ?tmp:requested_tmp path write =
-  if Int64.compare config.max_bytes 0L < 0 then
-    invalid_arg "Eio_fs_sync.publish: max_bytes must be non-negative";
+  check_config config;
   let tmp, owned, cleanup, result = produce ~config ~requested_tmp path write in
   (try
      Eio.Cancel.protect @@ fun () ->
@@ -208,6 +208,56 @@ let publish ~config ?(mode = `Replace) ?(rename = Rename.capability)
      cleanup ();
      raise e);
   result
+
+let publish ~config ?mode ?rename ?tmp path write =
+  publish_file ~config ?mode ?rename ?tmp path (fun file ->
+      let sink = (file :> Eio.Flow.sink_ty Eio.Resource.t) in
+      write (bounded_sink ~max_bytes:config.max_bytes sink))
+
+(* Validate before creating a temporary. Subtract before comparing lengths,
+   so an adversarial offset cannot wrap the end calculation. Disjoint ordered
+   extents also bound total bytes written by the logical size. *)
+let publish_sparse ~config ?mode ?rename ?tmp ~size_bytes path spans =
+  check_config config;
+  if Int64.compare size_bytes 0L < 0 then
+    Fmt.invalid_arg "Eio_fs_sync.publish_sparse: negative logical size %Ld"
+      size_bytes;
+  if Int64.compare size_bytes (Optint.Int63.to_int64 Optint.Int63.max_int) > 0
+  then
+    Fmt.invalid_arg
+      "Eio_fs_sync.publish_sparse: logical size %Ld exceeds file offsets"
+      size_bytes;
+  if Int64.compare size_bytes config.max_bytes > 0 then
+    raise
+      (Limit_exceeded { max_bytes = config.max_bytes; attempted = size_bytes });
+  let rec validate previous = function
+    | [] -> ()
+    | (offset, data) :: rest ->
+        let length = Int64.of_int (Cstruct.length data) in
+        if Int64.compare offset previous < 0 then
+          Fmt.invalid_arg
+            "Eio_fs_sync.publish_sparse: extent at %Ld precedes prior end %Ld"
+            offset previous;
+        if
+          Int64.compare offset size_bytes > 0
+          || Int64.compare length (Int64.sub size_bytes offset) > 0
+        then
+          Fmt.invalid_arg
+            "Eio_fs_sync.publish_sparse: %Ld-byte extent at %Ld exceeds \
+             logical size %Ld"
+            length offset size_bytes;
+        validate (Int64.add offset length) rest
+  in
+  validate 0L spans;
+  publish_file ~config ?mode ?rename ?tmp path (fun file ->
+      Eio.File.truncate file (Optint.Int63.of_int64 size_bytes);
+      List.iter
+        (fun (offset, data) ->
+          if not (Cstruct.is_empty data) then
+            Eio.File.pwrite_all file
+              ~file_offset:(Optint.Int63.of_int64 offset)
+              [ data ])
+        spans)
 
 (* A string is its own ceiling. *)
 let save ?(durable = true) ?(perm = 0o644) path s =

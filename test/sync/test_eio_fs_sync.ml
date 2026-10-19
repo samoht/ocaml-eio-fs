@@ -474,9 +474,244 @@ let test_append_posix () =
   Eio_fs_sync.append_lines p [ "3" ];
   Alcotest.(check string) "repaired" "1\n2\n3\n" (Eio.Path.load p)
 
+(* POSIX truncate leaves unwritten ranges zero. The independent operation
+   trace pins the data extents, so filling those gaps with zero writes fails
+   even if the published bytes still look right. *)
+let test_sparse_cost size =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir =
+    fs / Filename.get_temp_dir_name () / Eio_fs_sync.fresh_name "sparse"
+  in
+  Eio.Path.mkdir ~perm:0o700 dir;
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree dir) @@ fun () ->
+  let writes = ref [] in
+  let schedule =
+    Eio_fs.Chaos.Schedule.observing
+      (fun (op : Eio_fs.Chaos.Op.t) ->
+        if op.kind = `Write then
+          writes := (op.file_offset, op.length) :: !writes)
+      Eio_fs.Chaos.Schedule.empty
+  in
+  let observed = Eio_fs.Chaos.wrap schedule dir in
+  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst observed)) @@ fun () ->
+  Eio_fs_sync.publish_sparse
+    ~config:(config (Int64.of_int size))
+    ~rename:Eio_fs_unix.exclusive_rename ~mode:`Exclusive
+    ~size_bytes:(Int64.of_int size) (observed / "image")
+    [
+      (0L, Cstruct.of_string "HDR");
+      (Int64.of_int (size - 4), Cstruct.of_string "TAIL");
+    ];
+  Alcotest.(check (list (pair int int)))
+    "only seven supplied bytes are written, independent of logical size"
+    [ (0, 3); (size - 4, 4) ]
+    (List.rev !writes);
+  Eio.Path.with_open_in (dir / "image") @@ fun file ->
+  Alcotest.(check int64)
+    "logical size" (Int64.of_int size)
+    (Optint.Int63.to_int64 (Eio.File.size file));
+  let read offset length =
+    let data = Cstruct.create length in
+    Eio.File.pread_exact file ~file_offset:(Optint.Int63.of_int offset) [ data ];
+    Cstruct.to_string data
+  in
+  Alcotest.(check string) "header" "HDR" (read 0 3);
+  Alcotest.(check string)
+    "hole reads as zero" (String.make 4 '\000') (read 4096 4);
+  Alcotest.(check string) "tail at the final extent" "TAIL" (read (size - 4) 4)
+
+let test_sparse_bounds_before_io () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let operations = ref [] in
+  let schedule =
+    Eio_fs.Chaos.Schedule.observing
+      (fun op -> operations := op :: !operations)
+      Eio_fs.Chaos.Schedule.empty
+  in
+  let fs = Eio_fs.Chaos.wrap schedule env#fs in
+  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
+  let byte = Cstruct.of_string "x" in
+  List.iter
+    (fun (name, ceiling, size, spans, limit) ->
+      operations := [];
+      (match
+         Eio_fs_sync.publish_sparse ~config:(config ceiling) ~size_bytes:size
+           (fs / "image") spans
+       with
+      | () -> Alcotest.failf "%s was accepted" name
+      | exception Eio_fs_sync.Limit_exceeded { max_bytes; attempted } when limit
+        ->
+          Alcotest.(check int64) "ceiling" ceiling max_bytes;
+          Alcotest.(check int64) "attempted logical size" size attempted
+      | exception Invalid_argument _ when not limit -> ());
+      Alcotest.(check int)
+        (name ^ " refuses before any filesystem operation")
+        0 (List.length !operations))
+    [
+      ("logical ceiling", 7L, 8L, [], true);
+      ("negative ceiling", -1L, 0L, [], false);
+      ("negative size", 8L, -1L, [], false);
+      ("unrepresentable size", Int64.max_int, Int64.max_int, [], false);
+      ("negative offset", 8L, 8L, [ (-1L, byte) ], false);
+      ("offset beyond end", 8L, 8L, [ (Int64.max_int, byte) ], false);
+      ("data beyond end", 8L, 8L, [ (8L, byte) ], false);
+      ("overlap", 8L, 8L, [ (0L, byte); (0L, byte) ], false);
+      ("unordered", 8L, 8L, [ (2L, byte); (0L, byte) ], false);
+    ]
+
+let test_sparse_exclusive () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o600) (fs / "image") "foreign bytes";
+  Eio.Path.symlink ~link_to:"missing" (fs / "link");
+  List.iter
+    (fun name ->
+      (match
+         Eio_fs_sync.publish_sparse ~config:(config 16L) ~mode:`Exclusive
+           ~size_bytes:16L (fs / name)
+           [ (0L, Cstruct.of_string "new") ]
+       with
+      | () -> Alcotest.failf "sparse publication replaced %s" name
+      | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+      Alcotest.(check string)
+        "foreign file retained byte for byte" "foreign bytes"
+        (Eio.Path.load (fs / "image"));
+      Alcotest.(check string)
+        "dangling symlink retained" "missing"
+        (Eio.Path.read_link (fs / "link"));
+      Alcotest.(check (list string))
+        "no failed-publication temporary remains" [ "image"; "link" ]
+        (List.sort String.compare (Eio.Path.read_dir fs)))
+    [ "image"; "link" ]
+
+let test_sparse_write_failure () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (env#fs / "image") "foreign bytes";
+  let schedule =
+    Eio_fs.Chaos.Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Write; path = "draft" };
+          fault = Torn_write 1;
+        };
+      ]
+  in
+  let fs = Eio_fs.Chaos.wrap schedule env#fs in
+  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
+  (match
+     Eio_fs_sync.publish_sparse ~config:(config 16L) ~tmp:(fs / "draft")
+       ~size_bytes:16L (fs / "image")
+       [ (4L, Cstruct.of_string "new") ]
+   with
+  | () -> Alcotest.fail "torn extent was published"
+  | exception Eio.Io _ -> ());
+  Alcotest.(check string)
+    "failed producer preserves the target" "foreign bytes"
+    (Eio.Path.load (env#fs / "image"));
+  Alcotest.(check bool)
+    "failed temporary removed" true
+    (Eio.Path.kind ~follow:false (env#fs / "draft") = `Not_found)
+
+let test_sparse_durable_and_empty () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio_fs_sync.publish_sparse ~config:(config 16L) ~mode:`Exclusive
+    ~size_bytes:16L (fs / "image")
+    [ (0L, Cstruct.of_string "HDR"); (12L, Cstruct.of_string "TAIL") ];
+  Eio_fs_sync.publish_sparse ~config:(config 0L) ~mode:`Exclusive ~size_bytes:0L
+    (fs / "empty") [];
+  Crash.crash ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "sparse bytes survive file and directory barriers"
+    ("HDR" ^ String.make 9 '\000' ^ "TAIL")
+    (Eio.Path.load (post / "image"));
+  Alcotest.(check string)
+    "zero-size file survives" ""
+    (Eio.Path.load (post / "empty"))
+
+let test_sparse_cancellation () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (env#fs / "image") "foreign bytes";
+  let ready, start = Eio.Promise.create () in
+  let blocked, hold = Eio.Promise.create () in
+  let schedule =
+    Eio_fs.Chaos.Schedule.observing
+      (fun (op : Eio_fs.Chaos.Op.t) ->
+        if op.kind = `Write then begin
+          Eio.Promise.resolve start ();
+          Eio.Promise.await blocked
+        end)
+      Eio_fs.Chaos.Schedule.empty
+  in
+  let fs = Eio_fs.Chaos.wrap schedule env#fs in
+  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
+  Eio.Fiber.first
+    (fun () ->
+      Eio_fs_sync.publish_sparse ~config:(config 16L) ~tmp:(fs / "draft")
+        ~size_bytes:16L (fs / "image")
+        [ (4L, Cstruct.of_string "new") ];
+      Alcotest.fail "gated producer completed before cancellation")
+    (fun () -> Eio.Promise.await ready);
+  Eio.Promise.resolve hold ();
+  Alcotest.(check string)
+    "cancelled producer preserves target bytes" "foreign bytes"
+    (Eio.Path.load (env#fs / "image"));
+  Alcotest.(check bool)
+    "cancelled temporary removed" true
+    (Eio.Path.kind ~follow:false (env#fs / "draft") = `Not_found)
+
+exception Publication_origin
+
+let[@inline never] raise_publication_origin () = raise Publication_origin
+
+let test_error_backtrace generation () =
+  let previous = Printexc.backtrace_status () in
+  Printexc.record_backtrace true;
+  Fun.protect ~finally:(fun () -> Printexc.record_backtrace previous)
+  @@ fun () ->
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  match
+    if generation then
+      Eio_fs_sync.publish_generation ~durable:false (env#fs / "generation")
+        (fun _ -> raise_publication_origin ())
+    else
+      Eio_fs_sync.publish ~config:(config 1L) (env#fs / "image") (fun _ ->
+          raise_publication_origin ())
+  with
+  | () -> Alcotest.fail "producer exception was swallowed"
+  | exception Publication_origin ->
+      let trace = Printexc.get_raw_backtrace () in
+      Alcotest.(check bool)
+        "cleanup retains the producer's original throw site" true
+        (contains ~affix:"raise_publication_origin"
+           (Printexc.raw_backtrace_to_string trace))
+
 let suite =
   ( "eio_fs_sync",
     [
+      Alcotest.test_case "sparse 8 MiB extents and cost" `Quick (fun () ->
+          test_sparse_cost (8 * 1024 * 1024));
+      Alcotest.test_case "sparse 80 MiB extents and cost" `Quick (fun () ->
+          test_sparse_cost (80 * 1024 * 1024));
+      Alcotest.test_case "sparse bounds precede all IO" `Quick
+        test_sparse_bounds_before_io;
+      Alcotest.test_case "sparse exclusive publication" `Quick
+        test_sparse_exclusive;
+      Alcotest.test_case "sparse write failure" `Quick test_sparse_write_failure;
+      Alcotest.test_case "sparse durable and empty files" `Quick
+        test_sparse_durable_and_empty;
+      Alcotest.test_case "sparse cancellation removes temporary" `Quick
+        test_sparse_cancellation;
       Alcotest.test_case "exclusive publication refuses existing names" `Quick
         test_exclusive_publication;
       Alcotest.test_case "exclusive publication survives crash" `Quick
@@ -521,6 +756,10 @@ let suite =
         `Quick test_sync_file_without_a_registration_syncs_the_file;
       Alcotest.test_case "file barrier reaches the crash model" `Quick
         test_sync_file_reaches_the_crash_model;
+      Alcotest.test_case "file cleanup retains producer backtrace" `Quick
+        (test_error_backtrace false);
+      Alcotest.test_case "generation cleanup retains producer backtrace" `Quick
+        (test_error_backtrace true);
     ] )
 
 module Links = struct
