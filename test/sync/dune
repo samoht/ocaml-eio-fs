@@ -1,3 +1,8 @@
 (test
  (name test)
  (libraries eio eio.mock eio_main eio_fs eio-fs.sync alcotest unix))
+
+(mdx
+ (package eio-fs)
+ (files sparse-typing.md)
+ (libraries eio-fs.sync eio cstruct))
