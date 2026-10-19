@@ -40,6 +40,17 @@ val sync_parent : _ Eio.Path.t -> unit
 
     @raise Eio.Io as {!sync_dir}, on the directory the barrier lands on. *)
 
+val mkdirs :
+  ?exists_ok:bool -> perm:Eio.File.Unix_perm.t -> _ Eio.Path.t -> unit
+(** [mkdirs ~exists_ok ~perm p] is {!Eio.Path.mkdirs} with each entry it creates
+    made durable: the directory holding it is barriered with {!sync_parent}
+    right after the create, outermost first. A barrier on the last directory
+    alone would not do: an entry of a directory whose own entry is not durable
+    is lost with it. A directory already there is neither created nor barriered,
+    and with [exists_ok] (default [false]) [p] itself may already be one.
+
+    @raise Eio.Io as {!Eio.Path.mkdir} and {!sync_dir} raise. *)
+
 type (_, _, _) Eio.Resource.pi +=
   | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
         (** The operation a file-capable backend registers in its resource

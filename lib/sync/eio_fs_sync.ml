@@ -42,6 +42,20 @@ let sync_parent p =
   | Some (parent, _) -> sync_dir parent
   | None -> sync_dir p
 
+(* [Eio.Path.mkdirs] with a barrier after each entry it creates, outermost
+   first, so a new directory's entry is committed only once its parent's is. *)
+let rec mkdirs ?(exists_ok = false) ~perm p =
+  Option.iter
+    (fun (parent, _) ->
+      if not (Eio.Path.is_directory parent) then
+        mkdirs ~exists_ok:true ~perm parent)
+    (Eio.Path.split p);
+  match Eio.Path.mkdir ~perm p with
+  | () -> sync_parent p
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _)
+    when exists_ok && Eio.Path.is_directory p ->
+      ()
+
 (* The file-data barrier. A file is itself the resource, so its operation takes
    no name. A registered barrier is answered whole: syncing the file behind it
    would be a barrier the wrapper never recorded. *)
