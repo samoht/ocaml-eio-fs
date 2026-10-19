@@ -27,7 +27,7 @@ let test_append before lines =
   end
 
 let suite =
-  ( "append",
+  ( "eio_fs_sync",
     [
       test_case "appended lines are the last" [ bytes; list no_lf ] test_append;
     ] )
