@@ -506,9 +506,71 @@ let test_tree_labels_each_node_by_its_last_component () =
     (render ~depth:1 (fs / "d"));
   Alcotest.(check string) "depth 0 prints nothing" "" (render ~depth:0 fs)
 
+(* Eio 1.4 Resource.close: closing prevents new operations, repeated close
+   succeeds, and a switch may still release a handle closed by its caller. *)
+let expect_closed what fn =
+  match fn () with
+  | _ -> Alcotest.failf "%s succeeded through a closed directory" what
+  | exception (Eio.Io _ | Invalid_argument _) -> ()
+
+let test_root_close_invalidates_aliases () =
+  Eio_mock.Backend.run @@ fun () ->
+  let root = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o700 (root / "child");
+  write (root / "child") "payload" "the child keeps its bytes";
+  Eio.Switch.run @@ fun sw ->
+  let child = Eio.Path.open_dir ~sw (root / "child") in
+  let alias = root in
+  Alcotest.(check (list string))
+    "the root worked before close" [ "child" ] (Eio.Path.read_dir root);
+  Eio.Resource.close (fst root);
+  Eio.Resource.close (fst alias);
+  expect_closed "read_dir" (fun () -> Eio.Path.read_dir alias);
+  expect_closed "mkdir" (fun () -> Eio.Path.mkdir ~perm:0o700 (alias / "new"));
+  Alcotest.(check string)
+    "closing a root does not close an existing child"
+    "the child keeps its bytes"
+    (Eio.Path.load (child / "payload"))
+
+let test_directory_close_then_switch_release () =
+  with_fs @@ fun fs ->
+  Eio.Path.mkdir ~perm:0o700 (fs / "child");
+  write (fs / "child") "payload" "the original bytes";
+  Eio.Switch.run @@ fun sw ->
+  let child = Eio.Path.open_dir ~sw (fs / "child") in
+  Alcotest.(check string)
+    "the open directory worked before close" "the original bytes"
+    (Eio.Path.load (child / "payload"));
+  Eio.Resource.close (fst child);
+  Eio.Resource.close (fst child);
+  expect_closed "load" (fun () -> Eio.Path.load (child / "payload"));
+  expect_closed "rename target" (fun () ->
+      Eio.Path.rename (fs / "child" / "payload") (child / "moved"));
+  Alcotest.(check string)
+    "closed target refusal preserves the source" "the original bytes"
+    (Eio.Path.load (fs / "child" / "payload"))
+
+let test_directory_close_after_switch_release () =
+  with_fs @@ fun fs ->
+  Eio.Path.mkdir ~perm:0o700 (fs / "child");
+  let child = ref None in
+  Eio.Switch.run (fun sw ->
+      child := Some (Eio.Path.open_dir ~sw (fs / "child")));
+  let child = Option.get !child in
+  Eio.Resource.close (fst child);
+  Eio.Resource.close (fst child);
+  expect_closed "read_dir after switch release" (fun () ->
+      Eio.Path.read_dir child)
+
 let suite =
   ( "eio_fs",
     [
+      Alcotest.test_case "root close invalidates aliases" `Quick
+        test_root_close_invalidates_aliases;
+      Alcotest.test_case "directory close then switch release" `Quick
+        test_directory_close_then_switch_release;
+      Alcotest.test_case "directory close after switch release" `Quick
+        test_directory_close_after_switch_release;
       Alcotest.test_case "write/read" `Quick test_write_read;
       Alcotest.test_case "v roots share no file" `Quick
         test_v_roots_share_no_file;
