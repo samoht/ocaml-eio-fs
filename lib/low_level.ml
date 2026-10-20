@@ -218,6 +218,7 @@ module Fd = struct
   type t = { fs : fs; num : Num.t; mutable closed : bool }
 
   let v fs num = { fs; num; closed = false }
+  let closed t = t.closed
 
   (* A closed handle answers on its own state, never by its number, which the
      next open may have been handed. *)

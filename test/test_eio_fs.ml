@@ -511,7 +511,7 @@ let test_tree_labels_each_node_by_its_last_component () =
 let expect_closed what fn =
   match fn () with
   | _ -> Alcotest.failf "%s succeeded through a closed directory" what
-  | exception (Eio.Io _ | Invalid_argument _) -> ()
+  | exception Eio.Io _ -> ()
 
 let test_root_close_invalidates_aliases () =
   Eio_mock.Backend.run @@ fun () ->

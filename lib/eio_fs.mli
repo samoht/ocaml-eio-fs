@@ -72,7 +72,9 @@ end
 (** An in-memory filesystem for {!Eio}. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [v ()] is the root of a fresh, empty in-memory filesystem. *)
+  (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
+      capability prevents further operations through its aliases. Directories
+      already opened from it keep their own lifetimes. *)
 
   val load :
     ?filter:('a Eio.Path.t -> bool) ->

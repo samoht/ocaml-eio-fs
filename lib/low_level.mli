@@ -3,6 +3,12 @@
     This is an internal interface: the functions mirror the POSIX [*at] calls,
     each resolving against the file system its directory belongs to. *)
 
+module Error : sig
+  val badf : unit -> 'a
+  (** [badf ()] raises the backend I/O error for a closed descriptor or
+      directory capability. *)
+end
+
 (** Flags for {!openat}. *)
 module Open_flags : sig
   val o_rdonly : int
@@ -48,6 +54,10 @@ val v : ?cwd:string -> unit -> t
 module Fd : sig
   type t
   (** The type for file descriptors, each open on one file system. *)
+
+  val closed : t -> bool
+  (** [closed fd] is whether the descriptor has been closed, either explicitly
+      or by its owning switch. *)
 end
 
 (** Directory descriptors. *)
@@ -56,6 +66,10 @@ module Dir : sig
       system's root, its current directory, or an open descriptor. *)
   type fd = Fs of t | Cwd of t | Dir_fd of Fd.t
 end
+
+val close : Fd.t -> unit
+(** [close fd] releases [fd]. Closing an already closed descriptor does nothing.
+*)
 
 val openat : mode:int -> sw:Eio.Switch.t -> Dir.fd -> string -> int -> Fd.t
 (** [openat ~mode ~sw dir path flags] opens [path] relative to [dir] with the

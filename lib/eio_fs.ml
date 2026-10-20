@@ -182,6 +182,7 @@ module Fs = struct
 
     val v : label:string -> path:string -> dir_fd -> t
     val fd : t -> dir_fd
+    val close : t -> unit
 
     val rename_exclusive :
       t ->
@@ -190,10 +191,31 @@ module Fs = struct
       target:Eio_fs_sync.Rename.path ->
       unit
   end = struct
-    type t = { fd : dir_fd; dir_path : string; label : string }
+    type t = {
+      fd : dir_fd;
+      dir_path : string;
+      label : string;
+      mutable root_closed : bool;
+    }
 
-    let fd t = t.fd
-    let v ~label ~path:dir_path fd = { fd; dir_path; label }
+    (* Descriptor state belongs to the descriptor, including switch release.
+       Only descriptor-free root and cwd capabilities need their own flag. *)
+    let closed t =
+      match t.fd with
+      | Fs _ | Cwd _ -> t.root_closed
+      | Dir_fd fd -> Low_level.Fd.closed fd
+
+    let fd t =
+      if closed t then Low_level.Error.badf ();
+      t.fd
+
+    let close t =
+      match t.fd with
+      | Fs _ | Cwd _ -> t.root_closed <- true
+      | Dir_fd fd -> Low_level.close fd
+
+    let v ~label ~path:dir_path fd =
+      { fd; dir_path; label; root_closed = false }
 
     (* [~follow:false] refuses a symlink at [path] itself, as O_NOFOLLOW. *)
     let nofollow ~follow flags =
@@ -201,7 +223,7 @@ module Fs = struct
 
     let open_in t ~sw ~follow path =
       let flags = nofollow ~follow Low_level.Open_flags.o_rdonly in
-      let fd = Low_level.openat ~mode:0 ~sw t.fd path flags in
+      let fd = Low_level.openat ~mode:0 ~sw (fd t) path flags in
       (Low_level.Flow.of_fd fd :> Eio.File.ro_ty Eio.Resource.t)
 
     let open_out t ~sw ~follow ~append ~create path =
@@ -216,39 +238,39 @@ module Fs = struct
         if append then Low_level.Open_flags.(flags + o_append) else flags
       in
       let flags = nofollow ~follow Low_level.Open_flags.(flags + o_rdwr) in
-      match Low_level.openat ~sw ~mode t.fd path flags with
+      match Low_level.openat ~sw ~mode (fd t) path flags with
       | fd -> (Low_level.Flow.of_fd fd :> Eio.File.rw_ty r)
 
-    let mkdir t ~perm path = Low_level.mkdirat ~perm t.fd path
-    let unlink t path = Low_level.unlink t.fd path
-    let rmdir t path = Low_level.rmdir t.fd path
-    let stat t ~follow path = Low_level.statat ~follow t.fd path
-    let read_dir t path = Low_level.read_dir t.fd path
-    let read_link t path = Low_level.read_link t.fd path
-    let chmod t ~follow ~perm path = Low_level.chmod ~follow t.fd ~perm path
+    let mkdir t ~perm path = Low_level.mkdirat ~perm (fd t) path
+    let unlink t path = Low_level.unlink (fd t) path
+    let rmdir t path = Low_level.rmdir (fd t) path
+    let stat t ~follow path = Low_level.statat ~follow (fd t) path
+    let read_dir t path = Low_level.read_dir (fd t) path
+    let read_link t path = Low_level.read_link (fd t) path
+    let chmod t ~follow ~perm path = Low_level.chmod ~follow (fd t) ~perm path
 
     let chown ~follow ?uid ?gid t path =
-      Low_level.chown ~follow ?uid ?gid t.fd path
+      Low_level.chown ~follow ?uid ?gid (fd t) path
 
     let with_dir_entries t path fn =
-      fn (Low_level.read_dir_entries t.fd path |> List.to_seq)
+      fn (Low_level.read_dir_entries (fd t) path |> List.to_seq)
 
     let rename t old_path (new_dir : [> Eio.Fs.dir_ty ] Eio.Std.r) new_path =
       match as_memfs_dir new_dir with
       | None -> invalid_arg "Target is not an eio_mem directory"
-      | Some new_dir -> Low_level.rename t.fd old_path new_dir new_path
+      | Some new_dir -> Low_level.rename (fd t) old_path new_dir new_path
 
     let rename_exclusive t _backend ~source ~target:(new_dir, new_path) =
       match as_memfs_dir new_dir with
       | None -> invalid_arg "Target is not an eio_mem directory"
       | Some new_dir ->
-          Low_level.rename ~replace:false t.fd source new_dir new_path
+          Low_level.rename ~replace:false (fd t) source new_dir new_path
 
-    let symlink ~link_to t path = Low_level.symlinkat ~link_to t.fd path
+    let symlink ~link_to t path = Low_level.symlinkat ~link_to (fd t) path
 
     let open_dir t ~sw path =
       let flags = Low_level.Open_flags.(o_rdonly + o_directory) in
-      let fd = Low_level.openat ~sw ~mode:0 t.fd path flags in
+      let fd = Low_level.openat ~sw ~mode:0 (fd t) path flags in
       let label = last_component path in
       let full_path = Eio_fs_path.append t.dir_path path in
       let d = v ~label ~path:full_path (Low_level.Dir.Dir_fd fd) in
@@ -263,7 +285,9 @@ module Fs = struct
        at an unrelated real location -- a native open of "./x" resolves
        against the process cwd -- so a barrier or lock taken "natively" on an
        in-memory directory would silently hit the real filesystem. *)
-    let native _ _ = None
+    let native t _ =
+      ignore (fd t);
+      None
 
     (* The in-memory tree names its entries the way the POSIX backend does,
        so it splits and joins paths by the same syntax. *)
@@ -280,6 +304,7 @@ module Fs = struct
       Eio.Resource.handler
         [
           H (Eio.Fs.Pi.Dir, (module Dir));
+          H (Eio.Resource.Close, Dir.close);
           H (Memfs_dir, Dir.fd);
           H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
           H
@@ -292,12 +317,16 @@ module Fs = struct
                 Nofollow.run ~max_bytes ~validate ~stat ~read:(fun buffer ->
                     Eio.Flow.single_read file buffer) );
           (* Volatile storage: the strongest barrier it has is nothing. *)
-          H (Eio_fs_sync.Dir_sync, fun _ ~path:_ -> ());
+          H (Eio_fs_sync.Dir_sync, fun t ~path:_ -> ignore (Dir.fd t));
           (* The tree lives in this process's heap. It answers no native path
              and hands out no descriptor, so nothing outside this process can
              reach a file of it: an exclusion between fibers here is the whole
              exclusion these files admit. *)
-          H (Eio_fs_sync.Process_local, fun _ -> true);
+          H
+            ( Eio_fs_sync.Process_local,
+              fun t ->
+                ignore (Dir.fd t);
+                true );
         ]
   end
 
