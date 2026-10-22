@@ -114,6 +114,12 @@ module Crunch : sig
 
       @raise Invalid_argument if [dir] is not a directory. *)
 
+  val find : t -> string -> string option
+  (** [find entries path] is the contents of the file at [path] in [entries], if
+      there is one. [path] is absolute within the image, as {!scan} records it;
+      a symbolic link is not followed. A program that embeds fixtures reads them
+      with it and needs no filesystem. *)
+
   val load : t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [load entries] is the root of a new in-memory filesystem holding
       [entries], with their permissions and symbolic links. *)

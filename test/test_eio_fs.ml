@@ -329,6 +329,27 @@ module Crunch = struct
     | _ -> Alcotest.fail "scan accepted a non-directory"
     | exception Invalid_argument _ -> ()
 
+  (* [find] answers a file's contents by its image path, and nothing for a
+   directory, a symbolic link or a path not in the image: an implementation that
+   matched on the name alone would answer "/a"'s contents for "/sub/a". *)
+  let test_find () =
+    let entries =
+      Eio_fs.Crunch.
+        [
+          Dir { path = "/"; perm = 0o755 };
+          File { path = "/a"; perm = 0o644; contents = "top" };
+          Dir { path = "/sub"; perm = 0o755 };
+          File { path = "/sub/a"; perm = 0o644; contents = "nested" };
+          Symlink { path = "/l"; target = "a" };
+        ]
+    in
+    let find = Eio_fs.Crunch.find entries in
+    Alcotest.(check (option string)) "/a" (Some "top") (find "/a");
+    Alcotest.(check (option string)) "/sub/a" (Some "nested") (find "/sub/a");
+    Alcotest.(check (option string)) "directory" None (find "/sub");
+    Alcotest.(check (option string)) "symbolic link" None (find "/l");
+    Alcotest.(check (option string)) "absent" None (find "/b")
+
   (* The generated source is byte-exact, including OCaml string escaping of
    quotes, newlines and non-printable bytes. *)
   let test_source () =
@@ -375,6 +396,7 @@ module Crunch = struct
         Alcotest.test_case "copy on write" `Quick test_copy_on_write;
         Alcotest.test_case "embedded pread" `Quick test_embedded_pread;
         Alcotest.test_case "scan rejects file" `Quick test_scan_rejects_file;
+        Alcotest.test_case "find" `Quick test_find;
         Alcotest.test_case "source" `Quick test_source;
         Alcotest.test_case "interface" `Quick test_interface;
       ] )

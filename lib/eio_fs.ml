@@ -439,6 +439,12 @@ module Crunch = struct
     walk ~follow:true root "/";
     List.rev !entries
 
+  let find entries path =
+    List.find_map
+      (function
+        | File f when String.equal f.path path -> Some f.contents | _ -> None)
+      entries
+
   let load entries =
     let t = Low_level.v () in
     let fs = Fs.fs t in
