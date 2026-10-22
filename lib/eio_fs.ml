@@ -20,24 +20,12 @@ module Nofollow = struct
   type error = [ `Invalid of string | `Too_large ]
   type result = (Cstruct.t, error) Stdlib.result
 
-  type reader =
-    sw:Eio.Switch.t ->
-    path:string ->
-    max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Stdlib.result) ->
-    result
-
-  type (_, _, _) Eio.Resource.pi +=
-    | Read : ('t, 't -> reader, [> `Nofollow_read ]) Eio.Resource.pi
-
-  let find (Eio.Resource.T (t, ops)) =
-    match Eio.Resource.get_opt ops Read with
-    | None -> None
-    | Some reader -> Some (reader t)
+  let check_bound max_bytes =
+    if max_bytes < 0 || max_bytes = max_int then
+      invalid_arg "Eio_fs.Nofollow: invalid byte bound"
 
   let run ~max_bytes ~validate ~stat ~read =
-    if max_bytes < 0 || max_bytes = max_int then
-      invalid_arg "Eio_fs.Nofollow: invalid byte bound";
+    check_bound max_bytes;
     match validate stat with
     | Error reason -> Error (`Invalid reason)
     | Ok () ->
@@ -61,6 +49,13 @@ module Nofollow = struct
               returned := true;
               Ok (Cstruct.sub buffer 0 length)
             end)
+
+  let read_file ~max_bytes ~validate path =
+    check_bound max_bytes;
+    Eio.Switch.run @@ fun sw ->
+    let file = Eio.Path.open_in ~sw ~follow:false path in
+    run ~max_bytes ~validate ~stat:(Eio.File.stat file)
+      ~read:(Eio.Flow.single_read file)
 end
 
 module Path = struct
@@ -307,15 +302,6 @@ module Fs = struct
           H (Eio.Resource.Close, Dir.close);
           H (Memfs_dir, Dir.fd);
           H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
-          H
-            ( Nofollow.Read,
-              fun (t : Dir.t) ~sw ~path ~max_bytes ~validate ->
-                let flags = Low_level.Open_flags.(o_rdonly + o_nofollow) in
-                let fd = Low_level.openat ~mode:0 ~sw (Dir.fd t) path flags in
-                let file = Low_level.Flow.of_fd fd in
-                let stat = Eio.File.stat file in
-                Nofollow.run ~max_bytes ~validate ~stat ~read:(fun buffer ->
-                    Eio.Flow.single_read file buffer) );
           (* Volatile storage: the strongest barrier it has is nothing. *)
           H (Eio_fs_sync.Dir_sync, fun t ~path:_ -> ignore (Dir.fd t));
           (* The tree lives in this process's heap. It answers no native path

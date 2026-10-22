@@ -6,23 +6,32 @@
     ({!Chaos}). Each call to {!Fs.v}, {!Fs.load}, {!Crunch.load} or {!run} makes
     a filesystem of its own: two of them share no file. *)
 
-(** Backend support for descriptor-bound, bounded reads that refuse a symbolic
-    link at the final path component. The user-facing POSIX operation is
-    {!Eio_fs_unix.read_file_nofollow}; this module lets another directory
-    backend provide the same operation without exposing its descriptor. *)
+(** Bounded reads that refuse a symbolic link at the final path component. *)
 module Nofollow : sig
   type error = [ `Invalid of string | `Too_large ]
   type result = (Cstruct.t, error) Result.t
 
-  type reader =
-    sw:Eio.Switch.t ->
-    path:string ->
+  val read_file :
     max_bytes:int ->
     validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
+    _ Eio.Path.t ->
     result
+  (** [read_file ~max_bytes ~validate path] opens [path] as
+      [Eio.Path.open_in ~follow:false] does, validates the opened file's
+      {!Eio.File.stat} with [validate], and reads through end-of-file with one
+      byte of lookahead past [max_bytes]. Validation happens before any byte is
+      read. The returned [Cstruct.t] belongs to the caller and can be
+      overwritten after use.
 
-  val find : _ Eio.Resource.t -> reader option
-  (** [find dir] is the no-follow reader registered by [dir]'s backend. *)
+      Prefix components keep ordinary {!Eio.Path} resolution and confinement;
+      only the final component is refused when it is a symbolic link. Every
+      backend that honours [~follow:false] gets the same refusal, and a wrapper
+      such as {!Chaos} observes the one open.
+
+      @raise Invalid_argument if [max_bytes] is negative or [max_int].
+      @raise Eio.Io
+        when the open or read fails, including when the final component is a
+        symbolic link. *)
 
   val run :
     max_bytes:int ->
@@ -30,10 +39,13 @@ module Nofollow : sig
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
     result
-  (** [run] validates [stat] before asking [read] for bytes and reads through
-      end-of-file with one byte of lookahead past [max_bytes]. A rejected or
-      partially read buffer is overwritten before the function returns or
-      raises. This is the common implementation for directory backends. *)
+  (** [run ~max_bytes ~validate ~stat ~read] validates [stat] before asking
+      [read] for bytes and reads through end-of-file with one byte of lookahead
+      past [max_bytes]. A rejected or partially read buffer is overwritten
+      before the function returns or raises. It is {!read_file}'s read, for a
+      caller that opened the file another way.
+
+      @raise Invalid_argument if [max_bytes] is negative or [max_int]. *)
 end
 
 (** Helpers over standard {!Eio.Path} values. The lexical arithmetic on the

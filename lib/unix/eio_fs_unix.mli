@@ -123,29 +123,6 @@ val sync_file : _ Eio.File.rw -> unit
 
     @raise Unix.Unix_error as [fsync]. *)
 
-val read_file_nofollow :
-  max_bytes:int ->
-  validate:(Eio.File.Stat.t -> (unit, string) result) ->
-  _ Eio.Path.t ->
-  Eio_fs.Nofollow.result
-(** [read_file_nofollow ~max_bytes ~validate path] opens [path] through its
-    directory capability while refusing a symbolic link at the final component,
-    validates the opened descriptor with [validate], and reads through
-    end-of-file with a one-byte bound lookahead. Validation happens before any
-    byte is read. The returned [Cstruct.t] belongs to the caller and can be
-    overwritten after use.
-
-    Prefix components retain ordinary {!Eio.Path} resolution and confinement;
-    only the final component is opened with [O_NOFOLLOW].
-
-    @raise Invalid_argument
-      if [max_bytes] is negative or [max_int], [path] names no final component,
-      or the directory backend provides neither the registered operation nor a
-      POSIX descriptor.
-    @raise Eio.Io
-      when the open or read fails, including when the final component is a
-      symbolic link. *)
-
 val import_file :
   sw:Eio.Switch.t ->
   close_unix:bool ->
