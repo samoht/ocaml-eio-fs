@@ -250,6 +250,9 @@ module Fs = struct
     let with_dir_entries t path fn =
       fn (Low_level.read_dir_entries (fd t) path |> List.to_seq)
 
+    (* Volatile storage: the strongest barrier it has is nothing. *)
+    let sync_dir t _ = ignore (fd t)
+
     let rename t old_path (new_dir : [> Eio.Fs.dir_ty ] Eio.Std.r) new_path =
       match as_memfs_dir new_dir with
       | None -> invalid_arg "Target is not an eio_mem directory"
@@ -302,8 +305,7 @@ module Fs = struct
           H (Eio.Resource.Close, Dir.close);
           H (Memfs_dir, Dir.fd);
           H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
-          (* Volatile storage: the strongest barrier it has is nothing. *)
-          H (Eio_fs_sync.Dir_sync, fun t ~path:_ -> ignore (Dir.fd t));
+          H (Eio_fs_sync.Dir_sync, fun t ~path -> Dir.sync_dir t path);
           (* The tree lives in this process's heap. It answers no native path
              and hands out no descriptor, so nothing outside this process can
              reach a file of it: an exclusion between fibers here is the whole

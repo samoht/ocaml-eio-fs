@@ -1738,6 +1738,15 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.chown ~follow ?uid ?gid bv path
 
+    (* A directory barrier commits the entries of the directory it names,
+       exactly as the platform's directory fsync would, and the journal is
+       asked root-relative so a barrier issued through a staging subtree still
+       names the same directory. After the power cut it fails like every other
+       operation. *)
+    let sync_dir d path =
+      if d.dctl.crashed then raise_power_lost ();
+      commit_dir d.dctl ~dir:(at d.dprefix path)
+
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.native bv path
@@ -1767,16 +1776,7 @@ module Crash = struct
           ( Eio_fs_sync.Process_local,
             fun d -> Eio_fs_sync.is_process_local d.dbase );
         H (Eio_fs_sync.Modeless, fun d -> Eio_fs_sync.is_modeless d.dbase);
-        (* A store's directory barrier commits the entries of the directory it
-           names, exactly as the platform's directory fsync would, and the
-           journal is asked root-relative so a barrier issued through a staging
-           subtree still names the same directory. After the power cut it fails
-           like every other operation. *)
-        H
-          ( Eio_fs_sync.Dir_sync,
-            fun d ~path ->
-              if d.dctl.crashed then raise_power_lost ();
-              commit_dir d.dctl ~dir:(at d.dprefix path) );
+        H (Eio_fs_sync.Dir_sync, fun d ~path -> Cdir_impl.sync_dir d path);
       ]
 
   let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
