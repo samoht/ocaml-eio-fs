@@ -64,6 +64,22 @@ val grant_owner : _ Eio.Path.t -> unit
     it is, for the removal to name; a [p] that is not a directory is left alone.
     It costs a stat per entry and a listing per directory. *)
 
+(** {2 Positioned reads} *)
+
+val pread :
+  Unix.file_descr -> file_offset:int -> bytes -> pos:int -> len:int -> int
+(** [pread fd ~file_offset buf ~pos ~len] reads up to [len] bytes of [fd] from
+    byte [file_offset] into [buf] at [pos], and is the count read, [0] at the
+    end of the file. This is POSIX [pread], which [Unix] does not bind: one
+    call, and [fd]'s own offset is left where it was, so readers sharing [fd]
+    need no lock. A read takes at most 65536 bytes, and is retried on [EINTR].
+    Other threads run during the call.
+
+    @raise Invalid_argument
+      if [file_offset], [pos] or [len] is negative or [pos + len] is past the
+      end of [buf].
+    @raise Unix.Unix_error as [pread]. *)
+
 (** {2 The sparse map} *)
 
 val seek_data : Unix.file_descr -> int64 -> int64 option

@@ -38,6 +38,14 @@ let range_holder fd ~at ~len =
 external pread_head : Unix.file_descr -> int -> string
   = "caml_eio_fs_pread_head"
 
+external pread_native : Unix.file_descr -> int -> bytes -> int -> int -> int
+  = "caml_eio_fs_pread"
+
+let pread fd ~file_offset buf ~pos ~len =
+  if file_offset < 0 || pos < 0 || len < 0 || pos > Bytes.length buf - len then
+    invalid_arg "Eio_fs_unix.pread";
+  pread_native fd file_offset buf pos len
+
 type record_lock_wait
 
 external record_lock_wait_start :

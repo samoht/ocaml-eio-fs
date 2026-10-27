@@ -200,6 +200,36 @@ CAMLprim value caml_eio_fs_pread_head(value fd_v, value len_v)
   CAMLreturn(result);
 }
 
+/* Up to [len] bytes of [fd] from byte [off] into [buf] at [pos], with pread(2):
+   one call, and the descriptor's offset untouched, so two readers sharing it
+   need no lock between a seek and a read. The bytes land in a stack buffer
+   while the runtime lock is released and are copied in after, since the heap
+   may move [buf] meanwhile; [len] is capped at that buffer's size. The count
+   read, 0 at the end of the file. */
+#define EIO_FS_PREAD_MAX 65536
+
+CAMLprim value caml_eio_fs_pread(value fd_v, value off_v, value buf_v,
+                                 value pos_v, value len_v)
+{
+  CAMLparam5(fd_v, off_v, buf_v, pos_v, len_v);
+  char stack[EIO_FS_PREAD_MAX];
+  int fd = Int_val(fd_v);
+  off_t off = (off_t)Long_val(off_v);
+  size_t len = Long_val(len_v);
+  ssize_t n;
+  if (len > EIO_FS_PREAD_MAX)
+    len = EIO_FS_PREAD_MAX;
+  do {
+    caml_enter_blocking_section();
+    n = pread(fd, stack, len, off);
+    caml_leave_blocking_section();
+  } while (n == -1 && errno == EINTR);
+  if (n == -1)
+    caml_unix_error(errno, "pread", Nothing);
+  memcpy(&Byte(buf_v, Long_val(pos_v)), stack, n);
+  CAMLreturn(Val_long(n));
+}
+
 /* The process holding a record lock that would refuse an exclusive lock over
    the whole file (POSIX fcntl F_GETLK), or 0 when none does. F_GETLK answers
    about other processes only: this process's own locks never conflict. */

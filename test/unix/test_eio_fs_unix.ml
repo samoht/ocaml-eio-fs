@@ -431,6 +431,37 @@ let test_statvfs_reports_raw_block_capacity () =
     "free blocks do not exceed total" true
     (Int64.compare usage.free_blocks usage.total_blocks <= 0)
 
+(* ---- positioned reads ---- *)
+
+(* POSIX pread: the bytes at the offset asked, the count read, 0 at the end of
+   the file, and the descriptor's own offset where it was. A pread written as a
+   seek and a read passes the first three and fails the last. *)
+let test_pread_leaves_the_offset () =
+  with_real_dir_env @@ fun _env dir ->
+  let path = Eio.Path.native_exn (dir / "pread.bin") in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let text = "0123456789abcdef" in
+  let n = Unix.write_substring fd text 0 (String.length text) in
+  Alcotest.(check int) "the whole text was written" (String.length text) n;
+  ignore (Unix.lseek fd 3 Unix.SEEK_SET : int);
+  let buf = Bytes.make 8 '.' in
+  let got = Eio_fs_unix.pread fd ~file_offset:10 buf ~pos:2 ~len:4 in
+  Alcotest.(check int) "four bytes read" 4 got;
+  Alcotest.(check string)
+    "the bytes at offset 10, at pos 2" "..abcd.." (Bytes.to_string buf);
+  Alcotest.(check int)
+    "the descriptor's offset is untouched" 3
+    (Unix.lseek fd 0 Unix.SEEK_CUR);
+  let got = Eio_fs_unix.pread fd ~file_offset:14 buf ~pos:0 ~len:8 in
+  Alcotest.(check int) "a read across the end takes what is there" 2 got;
+  Alcotest.(check int)
+    "a read at the end is 0" 0
+    (Eio_fs_unix.pread fd ~file_offset:16 buf ~pos:0 ~len:8);
+  Alcotest.check_raises "a range past the buffer is refused"
+    (Invalid_argument "Eio_fs_unix.pread") (fun () ->
+      ignore (Eio_fs_unix.pread fd ~file_offset:0 buf ~pos:6 ~len:4 : int))
+
 (* ---- the sparse map ----
 
    A file with a hole in it, built by writing at two offsets far enough apart
@@ -2893,6 +2924,8 @@ let suite =
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
+      Alcotest.test_case "pread leaves the descriptor's offset" `Quick
+        test_pread_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
         test_seek_data_and_hole_walk_the_file;
       Alcotest.test_case "extents report the physical map" `Quick
