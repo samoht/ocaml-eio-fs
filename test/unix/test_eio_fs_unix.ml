@@ -2604,6 +2604,38 @@ let test_path_usage_counts_the_files_a_copy_would_move () =
     "which is no more than the tree allocates" true
     (Int64.compare usage.apparent_bytes usage.allocated_bytes <= 0)
 
+(* The walk usage reads, given to a caller: each entry once, with its own
+   stat, a symbolic link as itself and never what it names. *)
+let test_path_iter_visits_each_entry_once () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "sub");
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "a") "a";
+  Eio.Path.save ~create:(`Or_truncate 0o644) (dir / "sub/b") "payload";
+  Eio.Path.symlink ~link_to:"sub" (dir / "link");
+  let seen = ref [] in
+  Eio_fs.Path.iter ~max_fibers:2
+    (fun path (stat : Eio.File.Stat.t) ->
+      let name = if path == dir then "." else Filename.basename (snd path) in
+      let kind =
+        match stat.kind with
+        | `Directory -> "dir"
+        | `Regular_file -> "file"
+        | `Symbolic_link -> "link"
+        | _ -> "other"
+      in
+      seen := (name, kind) :: !seen)
+    dir;
+  Alcotest.(check (list (pair string string)))
+    "every entry, once"
+    [
+      (".", "dir");
+      ("a", "file");
+      ("b", "file");
+      ("link", "link");
+      ("sub", "dir");
+    ]
+    (List.sort compare !seen)
+
 (* An empty tree has nothing to move, and says so rather than reporting the
    directory that holds nothing as content. *)
 let test_path_usage_of_an_empty_tree_moves_nothing () =
@@ -3105,6 +3137,8 @@ let suite =
         test_path_usage_counts_allocated_tree_without_following_links;
       Alcotest.test_case "path usage counts what a copy would move" `Quick
         test_path_usage_counts_the_files_a_copy_would_move;
+      Alcotest.test_case "path iter visits each entry once" `Quick
+        test_path_iter_visits_each_entry_once;
       Alcotest.test_case "path usage of an empty tree moves nothing" `Quick
         test_path_usage_of_an_empty_tree_moves_nothing;
       Alcotest.test_case "xattr(7) values round-trip byte for byte" `Quick

@@ -116,26 +116,24 @@ module Path = struct
   let empty =
     { allocated_bytes = 0L; apparent_bytes = 0L; files = 0; latest_mtime = 0. }
 
-  let usage_entry path =
+  (* [f] on [path] and its stat, then the entries below it when it is a
+     directory. *)
+  let visit f path =
     let stat = Eio.Path.stat ~follow:false path in
-    let children =
-      if stat.kind <> `Directory then []
-      else
-        Eio.Path.read_dir path
-        |> List.rev_map (fun name -> Eio.Path.(path / name))
-    in
-    (own stat, children)
+    f path stat;
+    if stat.kind <> `Directory then []
+    else
+      Eio.Path.read_dir path
+      |> List.rev_map (fun name -> Eio.Path.(path / name))
 
-  let usage_batch paths =
+  let batch f paths =
     List.fold_left
-      (fun (total, next) path ->
-        let entry, children = usage_entry path in
-        (add total entry, List.rev_append children next))
-      (empty, []) paths
+      (fun next path -> List.rev_append (visit f path) next)
+      [] paths
 
   (* Partition the level first so the number of fibers is bounded structurally;
      each worker then performs its share sequentially. *)
-  let usage_level ~max_fibers paths =
+  let level ~max_fibers f paths =
     let worker_count = Int.min max_fibers (List.length paths) in
     let work = Array.make worker_count [] in
     List.iteri
@@ -144,24 +142,21 @@ module Path = struct
         work.(worker) <- path :: work.(worker))
       paths;
     match Array.to_list work with
-    | [ batch ] -> [ usage_batch batch ]
-    | batches -> Eio.Fiber.List.map usage_batch batches
+    | [ paths ] -> batch f paths
+    | batches -> List.concat (Eio.Fiber.List.map (batch f) batches)
 
-  let usage ?(max_fibers = 32) path =
-    if max_fibers <= 0 then invalid_arg "Eio_fs.Path.usage: max_fibers <= 0";
-    let rec loop total = function
-      | [] -> total
-      | level ->
-          let batches = usage_level ~max_fibers level in
-          let total, next =
-            List.fold_left
-              (fun (total, next) (batch, children) ->
-                (add total batch, List.rev_append children next))
-              (total, []) batches
-          in
-          loop total next
+  let iter ?(max_fibers = 32) f path =
+    if max_fibers <= 0 then invalid_arg "Eio_fs.Path.iter: max_fibers <= 0";
+    let rec loop = function
+      | [] -> ()
+      | paths -> loop (level ~max_fibers f paths)
     in
-    loop empty [ path ]
+    loop [ path ]
+
+  let usage ?max_fibers path =
+    let total = ref empty in
+    iter ?max_fibers (fun _ stat -> total := add !total (own stat)) path;
+    !total
 
   (* The native spelling names a host file; [Eio.Path.pp] renders through the
      capability label, which is all an in-memory path has. *)

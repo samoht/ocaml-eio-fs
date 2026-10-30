@@ -78,6 +78,22 @@ module Path : sig
 
       @raise Invalid_argument if [max_fibers] is not positive. *)
 
+  val iter :
+    ?max_fibers:int ->
+    ('a Eio.Path.t -> Eio.File.Stat.t -> unit) ->
+    'a Eio.Path.t ->
+    unit
+  (** [iter f path] is [f p stat] for [path] and each of its descendants [p],
+      with [stat] its one [Eio.Path.stat ~follow:false]: symbolic links are not
+      followed. A directory's [f] runs before its entries are read. The walk is
+      breadth-first, at most [max_fibers] workers per level (default [32]),
+      {!usage}'s walk.
+
+      Filesystem errors and those [f] raises are propagated, the walk's other
+      workers cancelled.
+
+      @raise Invalid_argument if [max_fibers] is not positive. *)
+
   val name : _ Eio.Path.t -> string
   (** [name path] is what [path] is called outside the program: its native
       spelling when the capability has one, and the rendering {!Eio.Path.pp}
