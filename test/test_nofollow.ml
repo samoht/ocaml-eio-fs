@@ -180,6 +180,70 @@ let test_read_nofollow_wipes_a_failed_read () =
         (String.make (String.length wiped) '\000')
         wiped
 
+(* The bound is what a file may hold, not what a read costs. A caller bounds an
+   untrusted file generously, and a six-byte file read under a one-mebibyte
+   bound must not take a mebibyte for it: the buffer offered is the size the
+   opened descriptor reports, plus the one byte that tells growth from the end.
+   An implementation that allocates the bound up front offers 1048577 here. *)
+let test_read_nofollow_costs_the_file_not_the_bound () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "small") "secret";
+  let stat = Eio.Path.stat ~follow:false (dir / "small") in
+  let offered = ref [] in
+  let remaining = ref "secret" in
+  let read buffer =
+    offered := Cstruct.length buffer :: !offered;
+    let n = min (Cstruct.length buffer) (String.length !remaining) in
+    Cstruct.blit_from_string !remaining 0 buffer 0 n;
+    remaining := String.sub !remaining n (String.length !remaining - n);
+    n
+  in
+  (match
+     Eio_fs.Nofollow.run ~max_bytes:(1024 * 1024) ~validate:regular_file ~stat
+       ~read
+   with
+  | Ok bytes ->
+      Alcotest.(check string)
+        "the small file is read whole" "secret" (Cstruct.to_string bytes)
+  | Error _ -> Alcotest.fail "the small file was refused");
+  Alcotest.(check int)
+    "the largest buffer offered is the file's size plus one" 7
+    (List.fold_left max 0 !offered)
+
+(* A file that grows past the size its descriptor reported is still read to the
+   bound, so sizing the buffer from the descriptor loses no byte the bound
+   admits, and a file growing past the bound is still refused. *)
+let test_read_nofollow_follows_growth_to_the_bound () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (dir / "growing") "ab";
+  let stat = Eio.Path.stat ~follow:false (dir / "growing") in
+  let feed contents =
+    let remaining = ref contents in
+    fun buffer ->
+      let n = min (Cstruct.length buffer) (String.length !remaining) in
+      Cstruct.blit_from_string !remaining 0 buffer 0 n;
+      remaining := String.sub !remaining n (String.length !remaining - n);
+      n
+  in
+  let grown = String.make 100 'g' in
+  (match
+     Eio_fs.Nofollow.run ~max_bytes:100 ~validate:regular_file ~stat
+       ~read:(feed grown)
+   with
+  | Ok bytes ->
+      Alcotest.(check string)
+        "growth up to the bound is read" grown (Cstruct.to_string bytes)
+  | Error _ -> Alcotest.fail "growth within the bound was refused");
+  match
+    Eio_fs.Nofollow.run ~max_bytes:100 ~validate:regular_file ~stat
+      ~read:(feed (grown ^ "!"))
+  with
+  | Ok bytes ->
+      Cstruct.memset bytes 0;
+      Alcotest.fail "growth past the bound was read"
+  | Error `Too_large -> ()
+  | Error (`Invalid reason) -> Alcotest.failf "growth was invalid: %s" reason
+
 let suite =
   ( "nofollow",
     [
@@ -199,6 +263,10 @@ let suite =
         test_read_nofollow_is_one_open_through_its_wrapper;
       Alcotest.test_case "validates a FIFO before reading" `Quick
         test_read_nofollow_validates_a_fifo_before_reading;
+      Alcotest.test_case "costs the file, not the bound" `Quick
+        test_read_nofollow_costs_the_file_not_the_bound;
+      Alcotest.test_case "follows growth to the bound" `Quick
+        test_read_nofollow_follows_growth_to_the_bound;
       Alcotest.test_case "wipes a failed read" `Quick
         test_read_nofollow_wipes_a_failed_read;
     ] )
