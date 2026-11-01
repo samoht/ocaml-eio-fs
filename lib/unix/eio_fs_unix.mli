@@ -380,7 +380,7 @@ module Lease : sig
 
   val take :
     sw:Eio.Switch.t ->
-    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
     ?on_wait:(unit -> unit) ->
@@ -398,7 +398,7 @@ module Lease : sig
       {!unlock} to release the shared open file description immediately. *)
 
   val with_exclusive :
-    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
     ?on_wait:(unit -> unit) ->
@@ -416,6 +416,13 @@ module Lease : sig
       {!Eio.Fs.Not_found} when absent. [contents], when present, replaces the
       rendezvous contents while the lease is held. [block] selects the wait
       policy used by {!with_lock}.
+
+      With [block] [`Readers], a lease only shared holders hold is waited for as
+      with [`Yes], and one an exclusive holder holds is refused as with [`No]: a
+      reader's look, a shared lease taken and let go at once, delays the take
+      and never refuses it. The holders are read by a shared lease tried without
+      waiting once the take is refused, so an exclusive holder that takes the
+      lease in that instant is waited for in turn.
 
       With [block] [`Yes] or [`For seconds], a lease another process holds is
       waited for by the kernel's blocking [flock], which answers when that

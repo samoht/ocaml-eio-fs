@@ -1376,6 +1376,8 @@ module Lease = struct
     let_go : unit -> unit;
   }
 
+  type block = [ `Yes | `No | `Fibers | `For of float ]
+
   let fd t = t.fd
 
   let unlock t =
@@ -1385,7 +1387,7 @@ module Lease = struct
 
   let release t = t.let_go ()
 
-  let take_mode ~sw ~lease ?block ?create ?contents ?on_wait path =
+  let taken ~sw ~lease ?block ?create ?contents ?on_wait path =
     let file, let_go, release_reader =
       acquire ~sw ~lease ?block ?create ?contents ?on_wait path
     in
@@ -1397,6 +1399,31 @@ module Lease = struct
     | None ->
         let_go ();
         invalid_arg "Eio_fs_unix.Lease: acquired descriptor is unavailable"
+
+  (* Whether only shared holders hold [path]: a shared lease tried without
+     waiting and let go at once is granted beside them, and refused by an
+     exclusive holder. An absent rendezvous has none. *)
+  let only_shared path =
+    match
+      Eio.Switch.run @@ fun sw ->
+      release (taken ~sw ~lease:`Shared ~block:`No ~create:`Never path)
+    with
+    | () -> true
+    | exception Lock_unavailable _ -> false
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> true
+
+  let take_mode ~sw ~lease ?block ?create ?contents ?on_wait path =
+    match block with
+    | Some `Readers -> (
+        match taken ~sw ~lease ~block:`No ?create ?contents path with
+        | t -> t
+        | exception (Lock_unavailable _ as refused) ->
+            if only_shared path then
+              taken ~sw ~lease ~block:`Yes ?create ?contents ?on_wait path
+            else raise refused)
+    | Some (#block as block) ->
+        taken ~sw ~lease ~block ?create ?contents ?on_wait path
+    | None -> taken ~sw ~lease ?create ?contents ?on_wait path
 
   let take ~sw ?block ?create ?contents ?on_wait path =
     take_mode ~sw ~lease:`Exclusive ?block ?create ?contents ?on_wait path

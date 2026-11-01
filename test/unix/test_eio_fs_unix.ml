@@ -2859,6 +2859,39 @@ let test_switch_lease_cancel () =
   in
   a_wait_is_cancellable ~kind:"lease" take ~free:lease_free ()
 
+(* A reader's look at a lease, a shared lease taken and let go at once, is
+   waited for by an exclusive take with [`Readers], which takes the lease
+   once the look lets go; an exclusive holder refuses it. A take that read
+   the look as a holder, as [`No] does, refuses a lease nobody keeps: the
+   failure mq's lease takers, build slots and run lock met under readers. *)
+let test_lease_waits_out_readers () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "readers" in
+  let looking, looked = Eio.Promise.create () in
+  let waiting, waited = Eio.Promise.create () in
+  let entered = ref false in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.Lease.with_shared lock (fun _ ->
+          Eio.Promise.resolve looked ();
+          Eio.Promise.await waiting))
+    (fun () ->
+      Eio.Promise.await looking;
+      Eio_fs_unix.Lease.with_exclusive ~block:`Readers
+        ~on_wait:(fun () -> Eio.Promise.resolve waited ())
+        lock
+        (fun _ -> entered := true));
+  Alcotest.(check bool) "taken once the look let go" true !entered;
+  Alcotest.(check bool)
+    "it said it waits" true
+    (Option.is_some (Eio.Promise.peek waiting));
+  Eio_fs_unix.Lease.with_exclusive lock (fun _ ->
+      match
+        Eio_fs_unix.Lease.with_exclusive ~block:`Readers lock (fun _ -> ())
+      with
+      | () -> Alcotest.fail "an exclusive holder did not refuse the take"
+      | exception Eio_fs_unix.Lock_unavailable _ -> ())
+
 let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
     test_lease_survives_owner_close_until_inherited_descriptor_closes
@@ -2867,7 +2900,12 @@ let lease_unlock_test_case =
   Alcotest.test_case "an unlocked lease frees its inheritor" `Quick
     test_lease_unlock_frees_inherited_descriptor
 
-let lease_suite = ("lease", [ lease_test_case; lease_unlock_test_case ])
+let lease_readers_test_case =
+  Alcotest.test_case "a lease taker waits out a reader's look" `Quick
+    test_lease_waits_out_readers
+
+let lease_suite =
+  ("lease", [ lease_test_case; lease_unlock_test_case; lease_readers_test_case ])
 
 let suite =
   ( "eio_fs_unix",
@@ -2943,6 +2981,7 @@ let suite =
         test_lock_wait_does_not_block_eio;
       lease_test_case;
       lease_unlock_test_case;
+      lease_readers_test_case;
       Alcotest.test_case "a record lock wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"record" take_record);
       Alcotest.test_case "a record lock wait answers at a cancel" `Quick
