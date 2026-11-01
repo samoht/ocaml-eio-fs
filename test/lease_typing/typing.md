@@ -45,3 +45,12 @@ val descriptor : Eio_fs_unix.Lease.t -> Eio_unix.Fd.t = <fun>
 # let release lease = Eio_fs_unix.Lease.unlock lease;;
 val release : Eio_fs_unix.Lease.t -> unit = <fun>
 ```
+
+An exclusive take that meets a reader's look, a shared lease taken and let
+go at once, waits it out with `block: \`Readers` and is refused only by an
+exclusive holder: the look delays the take and never refuses it.
+
+```ocaml
+# fun path -> Eio_fs_unix.Lease.with_exclusive ~block:`Readers path ignore;;
+- : [> Eio.Fs.dir_ty ] Eio.Path.t -> unit = <fun>
+```

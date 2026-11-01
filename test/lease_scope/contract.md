@@ -7,7 +7,7 @@ still explicitly releases the shared open-file-description hold.
 ```ocaml
 let take :
     sw:Eio.Switch.t ->
-    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
+    ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string -> ?on_wait:(unit -> unit) ->
     _ Eio.Path.t -> Eio_fs_unix.Lease.t =
