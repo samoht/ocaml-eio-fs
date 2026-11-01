@@ -1,7 +1,9 @@
-; Its own executable, and its own directory so it stays the only test stanza
-; in one: it names [Eio_fs_sync.mkdirs], which does not exist yet, so this is
-; the only thing in the package that fails to build until the primitive lands.
+; Native crash regressions and the typing specification use the same public API.
 
 (test
  (name test)
- (libraries eio eio.mock eio_fs eio-fs.sync alcotest))
+ (libraries eio eio.mock eio_main eio_fs eio-fs.sync eio-fs.unix alcotest))
+
+(mdx
+ (files typing.md)
+ (libraries hermetic.eio eio-fs.sync eio eio.core))
