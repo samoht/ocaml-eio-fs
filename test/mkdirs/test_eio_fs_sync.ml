@@ -121,7 +121,8 @@ let test_racing_prefix () =
   let schedule =
     Chaos.Schedule.observing
       (fun (op : Chaos.Op.t) ->
-        if op.kind = `Stat && op.path = parent_path && not !raced then (
+        if op.kind = `Stat && String.equal op.path parent_path && not !raced
+        then (
           raced := true;
           Eio.Path.mkdir ~perm:0o755 (fs / "a" / "b")))
       Chaos.Schedule.empty

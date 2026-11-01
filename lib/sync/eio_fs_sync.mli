@@ -42,12 +42,20 @@ val sync_parent : _ Eio.Path.t -> unit
 
 val mkdirs :
   ?exists_ok:bool -> perm:Eio.File.Unix_perm.t -> _ Eio.Path.t -> unit
-(** [mkdirs ~exists_ok ~perm p] is {!Eio.Path.mkdirs} with each entry it creates
-    made durable: the directory holding it is barriered with {!sync_parent}
-    right after the create, outermost first. A barrier on the last directory
-    alone would not do: an entry of a directory whose own entry is not durable
-    is lost with it. A directory already there is neither created nor barriered,
-    and with [exists_ok] (default [false]) [p] itself may already be one.
+(** [mkdirs ~exists_ok ~perm p] creates [p] and its missing ancestors,
+    establishing the durability of every traversed directory entry, parent
+    first, with {!sync_parent}. Existing ancestors are barriered too: they may
+    be visible after a previous writer's barrier failed. An accepted existing
+    target is also barriered, so retry can establish its durability.
+
+    The directory capability root must itself already be durable; this operation
+    never acquires or barriers its parent outside the capability. [exists_ok]
+    defaults to [false]; with [true], [p] may already be a directory. Existing
+    permissions are unchanged. A file is never accepted as a directory.
+
+    The number of directory barriers is linear in the traversed path depth. A
+    failure can leave created directories visible with uncertain durability; a
+    successful retry with [exists_ok] reissues the required barriers.
 
     @raise Eio.Io as {!Eio.Path.mkdir} and {!sync_dir} raise. *)
 
