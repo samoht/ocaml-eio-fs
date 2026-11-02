@@ -502,9 +502,28 @@ let test_open_dir_not_a_directory () =
   let d = Eio.Path.open_dir ~sw (fs / "ld") in
   Alcotest.(check (list string)) "through a link" [] (Eio.Path.read_dir d)
 
+(* lseek(2) to a negative offset fails with EINVAL and leaves the offset;
+   one past the end is allowed, and a read there is at end of file. *)
+let test_seek_bounds () =
+  with_env @@ fun env ->
+  let path = env#fs / "f" in
+  Eio.Path.save ~create:(`Exclusive 0o644) path "abc";
+  Eio.Path.with_open_in path @@ fun f ->
+  ignore (Eio.File.seek f (Optint.Int63.of_int 1) `Set : Optint.Int63.t);
+  expect_eio_io "a negative offset" (fun () ->
+      ignore (Eio.File.seek f (Optint.Int63.of_int (-1)) `Set : Optint.Int63.t));
+  expect_eio_io "before the start" (fun () ->
+      ignore (Eio.File.seek f (Optint.Int63.of_int (-2)) `Cur : Optint.Int63.t));
+  Alcotest.(check string) "the offset stayed" "bc" (read_exactly f 2);
+  ignore (Eio.File.seek f (Optint.Int63.of_int 10) `Set : Optint.Int63.t);
+  match Eio.Flow.single_read f (Cstruct.create 4) with
+  | n -> Alcotest.failf "read %d bytes past the end" n
+  | exception End_of_file -> ()
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "seek bounds" `Quick test_seek_bounds;
       Alcotest.test_case "open_dir on a file" `Quick
         test_open_dir_not_a_directory;
       Alcotest.test_case "absolute symbolic link" `Quick test_absolute_symlink;
