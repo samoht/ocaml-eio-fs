@@ -563,8 +563,9 @@ let with_real_dir fn =
   Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / name))
   @@ fun () -> Eio.Path.with_open_dir (fs / name) fn
 
-(* A wrapper retains the backend's capabilities as well as its directory
-   operations: a real child still opens its cwd through the base backend. *)
+(* A wrapper carries over none of the backend's own interfaces: a host
+   directory behind it is no working directory a child is started in, the
+   child being a way around the schedule. *)
 let test_real_child_cwd () =
   Eio_main.run @@ fun env ->
   Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. @@ fun () ->
@@ -578,13 +579,13 @@ let test_real_child_cwd () =
     (fs / name / "payload")
     "the child's exact cwd payload\n";
   let chaos = Chaos.wrap Schedule.empty (fs / name) in
-  let got =
+  match
     Eio.Process.parse_out
       (Eio.Stdenv.process_mgr env)
       ~cwd:chaos Eio.Buf_read.take_all [ "cat"; "payload" ]
-  in
-  Alcotest.(check string)
-    "native child reads wrapped cwd" "the child's exact cwd payload\n" got
+  with
+  | got -> Alcotest.failf "a child ran in the wrapped directory: %S" got
+  | exception Invalid_argument _ -> ()
 
 let swap_on_open path target =
   Schedule.scripted
@@ -1699,24 +1700,25 @@ let test_crash_rename_revert_real () =
 
 (* {2 The model's authority is the wrapper, not the descriptor}
 
-   Over a host directory the wrapper hands back the base's own file, and a
-   consumer that needs the descriptor underneath -- to take a record lock, to
-   give a launcher a console -- gets the host's. That descriptor names the same
-   bytes the model is tracking, so what it is for has to be settled: it carries
-   the operations the operating system offers on an open file, and it is not a
-   second way into the durability journal. A write issued on it is not a write
-   the model saw; a barrier issued on it is not the model's barrier. The two
-   runs below take the descriptor the wrapper carried over -- the same open
-   file its own writes go through -- and put it next to those writes under the
-   two policies that tell them apart. *)
+   Over a host directory the wrapper hands eio-fs.unix, and no other caller,
+   the host's descriptor beneath a file it opened, to take a record lock on.
+   That descriptor names the same bytes the model is tracking, so what it is
+   for has to be settled: it carries the operations the operating system
+   offers on an open file, and it is not a second way into the durability
+   journal. A write issued on it is not a write the model saw; a barrier issued
+   on it is not the model's barrier. The two runs below take that descriptor
+   -- the same open file the wrapper's own writes go through -- and put it next
+   to those writes under the two policies that tell them apart. *)
 
-(* A file opened through the wrapper over a host directory carries the host's
-   descriptor; a run that could not take it would be testing nothing, so the
-   absence is a failure and not a skip. *)
+(* A file opened through the wrapper over a host directory has the host's
+   descriptor beneath it; a run that could not take it would be testing
+   nothing, so the absence is a failure and not a skip. *)
 let carried_over_fd file =
-  match Eio_unix.Resource.fd_opt file with
+  match
+    Option.bind (Eio_fs_internal.base_file file) Eio_unix.Resource.fd_opt
+  with
   | Some fd -> fd
-  | None -> Alcotest.fail "the wrapper carried no descriptor over"
+  | None -> Alcotest.fail "no descriptor beneath the wrapper's file"
 
 (* Survive-everything keeps every change the journal holds, so what is missing
    from the recovered image is exactly what never entered the journal. The live

@@ -8,6 +8,7 @@
   eio.utils
   eio-fs.path
   eio-fs.sync
+  eio_fs_internal
   fmt
   cstruct
   optint))

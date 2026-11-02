@@ -178,17 +178,18 @@ end
 
 val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 (** [wrap schedule base] is [base] with operations perturbed by [schedule];
-    opened files and subdirectories stay wrapped and share [schedule]. The
-    base's other directory capabilities remain available, including a native
-    process working directory. Operations issued directly through those backend
-    capabilities or by a child process do not consult [schedule]; faults cover
-    the wrapped directory and file operations, not native descriptor syscalls.
+    opened files and subdirectories stay wrapped and share [schedule].
 
-    The wrapper answers for the base it was given: it reports the base's
-    {!Eio_fs_sync.Process_local}, and a file opened read-write carries the
-    base's descriptor where there is one. Every opened file, a read-only one
-    included, registers {!Eio_fs_sync.File_sync} so a barrier through it reaches
-    the schedule's own sync. *)
+    The wrapper and every file and subdirectory it opens hold [base] out of
+    reach: each is a value of its own bound to the wrapper's interfaces only, so
+    code handed the wrapper cannot rebuild a handler that reaches [base] and
+    steps around [schedule]. It answers {!Eio_fs_sync.Process_local} and
+    {!Eio_fs_sync.Modeless} as [base] does, and every opened file, a read-only
+    one included, registers {!Eio_fs_sync.File_sync} so a barrier through it
+    reaches the schedule's own sync. A backend's own interfaces are not carried
+    over: a wrapper over a host directory is no native working directory for a
+    child process, and its files hand out no host descriptor, except to
+    [eio-fs.unix], which takes a lock on the descriptor beneath. *)
 
 (** A power-loss durability model over a base directory capability.
 
@@ -284,11 +285,13 @@ module Crash : sig
       subdirectories opened through it stay wrapped and share [t]. The tree
       under [base] when [wrap] is called is [t]'s durable starting image.
 
-      The model's authority is the wrapper, not a carried descriptor: a write or
-      barrier issued on the descriptor is not in the journal. A file's writes
-      stay un-synced until {!Eio.File.sync} or {!Eio_fs_sync.sync_file} reaches
-      it through the wrapper. A crash rebuilds the tree from the model, so a
-      change made outside the wrapper is gone from the post-crash image.
+      As for {!Chaos.wrap}, the wrapper and what it opens hold [base] out of
+      reach, so every write that reaches [base] through them enters the journal.
+      A file's writes stay un-synced until {!Eio.File.sync} or
+      {!Eio_fs_sync.sync_file} reaches it through the wrapper. A crash rebuilds
+      the tree from the model, so a change made outside the wrapper, by name or
+      on the host descriptor [eio-fs.unix] locks, is gone from the post-crash
+      image.
 
       @raise Invalid_argument
         if the tree under [base] holds an entry that is neither a regular file,
@@ -333,13 +336,9 @@ end
 
 (**/**)
 
-(* For this package's tests and eio-fs.unix only. *)
+(* For this package's tests. It hands out nothing a schedule's holder could
+   not reach by running an operation through a wrapper. *)
 module Private : sig
   val next : Schedule.t -> Op.t -> Fault.t option
   (* [next t op] advances [t] by one operation and is the fault to inject. *)
-
-  val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
-  (* [base_dir dir] is the directory {!wrap} wraps, when [dir] is a wrapper; a
-     backend extension reads it only after the wrapper has observed the path
-     operation preceding its own. *)
 end

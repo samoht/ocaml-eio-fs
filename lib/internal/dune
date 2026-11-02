@@ -1,0 +1,9 @@
+; eio-fs's own handle on what its wrappers wrap. It is attached to the
+; package and has no public name, so dune lets this package's libraries and
+; tests name it and no one else: a caller handed an Eio_fs.Chaos wrapper finds
+; nothing public to unwrap it by.
+
+(library
+ (name eio_fs_internal)
+ (package eio-fs)
+ (libraries hermetic eio))

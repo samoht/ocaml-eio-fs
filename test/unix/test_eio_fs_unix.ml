@@ -323,10 +323,10 @@ let test_import_file () =
     "the descriptor outlives the switch" 6 (Unix.fstat raw).st_size
 
 (* The same ordering in the shape a store publishes in, over the real
-   filesystem it runs on. The crash wrapper's file carries the host's own
-   descriptor, so a barrier that reached for it would be a real F_FULLFSYNC
-   the model never recorded -- and [Drop_unsynced] would then drop the image
-   bytes the store was told had reached the platter.
+   filesystem it runs on. The crash wrapper's file hands its caller no host
+   descriptor, so the barrier reaches the model's own sync and not a real
+   F_FULLFSYNC the model never recorded -- after which [Drop_unsynced] would
+   drop the image bytes the store was told had reached the platter.
 
    Two files take the same cut, and only one is barriered. The unbarriered one
    is the control: it says the model still drops what no barrier covered, so
@@ -344,8 +344,8 @@ let test_sync_file_under_the_crash_model_survives_the_cut () =
       Eio.Path.open_out ~sw ~create:(`If_missing 0o644) (wdir / name)
     in
     Alcotest.(check bool)
-      "the wrapped file carries the host descriptor" true
-      (Option.is_some (Eio_unix.Resource.fd_opt file));
+      "the wrapped file hands out no host descriptor" true
+      (Option.is_none (Eio_unix.Resource.fd_opt file));
     Eio.Flow.copy_string payload file;
     if barrier then Eio_fs_unix.sync_file file
   in
@@ -2304,8 +2304,9 @@ let test_lock_is_granted_in_the_order_fibers_entered () =
    real host directory to put a store's durability under test, and the file it
    hands back is that directory's own file. Its exclusion is the host's record
    lock -- any process opens the file by name and takes it -- and the wrapper
-   has none of its own to offer instead, so the descriptor passes through and
-   the lock a store takes under the model is the lock it takes in production.
+   has none of its own to offer instead, so it hands the descriptor beneath to
+   this library, and to no caller, and the lock a store takes under the model
+   is the lock it takes in production.
 
    Another process holds the record lock on that same host file throughout, so
    a non-blocking acquisition through the wrapper has one answer, and it names
@@ -2322,8 +2323,8 @@ let test_lock_through_a_crash_wrapper_takes_the_host_lock () =
     Eio.Path.open_out ~sw ~create:(`If_missing 0o600) (wrapped / "probe")
   in
   Alcotest.(check bool)
-    "a file opened through the wrapper carries the host's descriptor" true
-    (Option.is_some (Eio_unix.Resource.fd_opt file));
+    "a file opened through the wrapper hands its caller no descriptor" true
+    (Option.is_none (Eio_unix.Resource.fd_opt file));
   match Eio_fs_unix.with_lock ~block:`No (wrapped / "lock") (fun () -> ()) with
   | () ->
       Alcotest.fail

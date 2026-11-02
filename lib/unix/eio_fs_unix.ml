@@ -198,10 +198,21 @@ let barrier =
   let module B = Eio_fs_sync.Barrier.Make (Full_barrier) in
   B.v ()
 
+(* The directory beneath any wrapper of this package in front of [dir]. A
+   wrapper hands its base to this package alone, through an interface no
+   other library can name. *)
 let rec unwrapped_dir dir =
-  match Eio_fs.Chaos.Private.base_dir dir with
+  match Eio_fs_internal.base_dir dir with
   | Some base -> unwrapped_dir base
   | None -> dir
+
+(* The host descriptor beneath [file], through any wrapper of this package in
+   front of it: the descriptor a lock is taken on. *)
+let rec file_fd : 'a. 'a Eio.Resource.t -> Eio_unix.Fd.t option =
+ fun file ->
+  match Eio_unix.Resource.fd_opt file with
+  | Some _ as fd -> fd
+  | None -> Option.bind (Eio_fs_internal.base_file file) file_fd
 
 external rename_exclusive_at :
   Unix.file_descr -> string -> Unix.file_descr -> string -> unit
@@ -631,7 +642,7 @@ let use_local_lock (key : lock_key) fn = use_shared_mutex local_locks key fn
    while a fiber of this process holds the file: it hands the descriptor to
    that holder, which closes it once its own record lock is released. *)
 let let_go_of local file =
-  match Eio_unix.Resource.fd_opt file with
+  match file_fd file with
   | None -> ()
   | Some fd -> (
       let park = Stdlib.Mutex.protect tables_mutex @@ fun () -> local.holding in
@@ -684,7 +695,7 @@ let with_held_file local ~otherwise fn =
   match file with
   | None -> otherwise ()
   | Some file -> (
-      match Eio_unix.Resource.fd_opt file with
+      match file_fd file with
       | None -> fn file None
       | Some fd ->
           Eio_unix.Fd.use fd ~if_closed:otherwise (fun unix ->
@@ -1103,7 +1114,7 @@ end
 (* The record lock on the rendezvous's descriptor. A rendezvous with none has
    no record lock to take, which only a process-local backend allows. *)
 let take_record_lock ~taken ~patience ~on_wait ~name file path =
-  match Eio_unix.Resource.fd_opt file with
+  match file_fd file with
   | Some fd ->
       (* Darwin's record locks already conflict with BSD flock; taking both
          on one descriptor would conflict with our own lock. Linux keeps the
@@ -1176,7 +1187,7 @@ let take_inode_gate ~taken ~shared ~patience ~on_wait ~name ~opened_first local
   !release_reader
 
 let take_lease_lock ~shared ~patience ~on_wait ~name file =
-  match Eio_unix.Resource.fd_opt file with
+  match file_fd file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.acquire" fd @@ fun raw_fd ->
       Flock.use_os_lock ~shared ~patience
@@ -1288,7 +1299,7 @@ module Held = struct
      dropped it; a process that took it in between is named, and nothing is
      written. *)
   let take_back t file =
-    match Eio_unix.Resource.fd_opt file with
+    match file_fd file with
     | None -> ()
     | Some fd ->
         take_os_lock ~patience:Refuse
@@ -1319,7 +1330,7 @@ let probe_file ~name file (opened : Eio.File.Stat.t) =
   use_local_lock (opened.dev, opened.ino) @@ fun local ->
   Fun.protect ~finally:(fun () -> let_go_of local file) @@ fun () ->
   let another =
-    match Eio_unix.Resource.fd_opt file with
+    match file_fd file with
     | None -> None
     | Some fd -> Eio_unix.Fd.use_exn "Eio_fs_unix.probe" fd held_by_a_process
   in
@@ -1423,7 +1434,7 @@ module Lease = struct
     let file, let_go, release_reader =
       acquire ~sw ~lease ?block ?create ?contents ?on_wait path
     in
-    match Eio_unix.Resource.fd_opt file with
+    match file_fd file with
     | Some fd ->
         let t = { fd; release_reader; let_go } in
         Eio.Switch.on_release sw (fun () -> release t);

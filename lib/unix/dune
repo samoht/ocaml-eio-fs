@@ -21,6 +21,7 @@
   eio-fs
   eio-fs.path
   eio-fs.sync
+  eio_fs_internal
   cstruct
   fmt
   optint
