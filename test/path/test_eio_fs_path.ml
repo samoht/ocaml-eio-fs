@@ -112,9 +112,36 @@ let test_to_dir_path () =
       ("/a/b", "/a/b/");
     ]
 
+(* [is_rooted] answers whether [path] names [root] or something below it. A
+   relative root is the directory a relative path starts from, so a path that
+   still climbs out of it once normalised is not below it, whatever the root's
+   own spelling. *)
+let test_is_rooted () =
+  List.iter
+    (fun (root, path, expected) ->
+      Alcotest.(check bool)
+        (Fmt.str "is_rooted ~root:%S %S" root path)
+        expected (P.is_rooted ~root path))
+    [
+      ("/a", "/a/b", true);
+      ("/a", "/a/../b", false);
+      ("/", "/../x", true);
+      ("a", "a/b", true);
+      ("a", "a/../../x", false);
+      (".", "x", true);
+      (".", "../secret", false);
+      ("", "../../etc/passwd", false);
+      ("a/..", "../x", false);
+      ("..", "../x", true);
+      ("..", "../../x", false);
+      ("../a", "../a/b", true);
+    ]
+
 let suite =
   ( "eio_fs_path",
     [
+      Alcotest.test_case "is_rooted stays below a relative root" `Quick
+        test_is_rooted;
       Alcotest.test_case "to_dir_path keeps the directory" `Quick
         test_to_dir_path;
       Alcotest.test_case "parent is lexical" `Quick test_parent;
