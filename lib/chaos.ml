@@ -955,11 +955,17 @@ module Crash = struct
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The backing store handed back after a crash. *)
 
+  (* Where an open subtree sits: the boxed directory the controller was wrapped
+     over and the subtree's path from it. A rename through the wrapper moves
+     it with its directory, as it moves a tracked file. *)
+  type place = { mutable proot : boxed; mutable prefix : string }
+
   type t = {
     policy : policy;
     trigger : trigger;
     mutable base : base_dir option;
     files : (string, fstate) Hashtbl.t;
+    mutable subtrees : place list;
     mutable log : entry list; (* newest first *)
     mutable metadata : metadata_entry list; (* newest first *)
     mutable durable_tree : tree option;
@@ -1563,16 +1569,16 @@ module Crash = struct
     in
     rw_boxed (module Crw_impl) state ~base
 
-  (* [droot] is the boxed directory the controller was wrapped over and
-     [dprefix] this directory's path from it: tracked files are addressed
-     through the long-lived root so a crash can rewrite them after any
-     intermediate staging subtree is closed. *)
+  (* [dplace] is where this directory sits under the boxed directory the
+     controller was wrapped over: tracked files are addressed through that
+     long-lived root so a crash can rewrite them after any intermediate staging
+     subtree is closed, and a subtree held across the rename of its directory
+     follows it there, as the descriptor beneath it does. *)
   type cdir = {
     dctl : t;
     dbase : Eio.Fs.dir_ty r;
     dboxed : boxed;
-    droot : boxed;
-    dprefix : string;
+    dplace : place;
   }
 
   (* Expose the whole crash directory so a rename whose target is itself a
@@ -1636,7 +1642,21 @@ module Crash = struct
         else if replaced then
           ctl.log <- List.filter (fun e -> not (e.efs == fs)) ctl.log
         else Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs)
-      states
+      states;
+    List.iter
+      (fun place ->
+        if
+          place.proot == old_owner
+          && path_is_at_or_under ~parent:old_rel place.prefix
+        then begin
+          let suffix =
+            String.sub place.prefix (String.length old_rel)
+              (String.length place.prefix - String.length old_rel)
+          in
+          place.proot <- new_owner;
+          place.prefix <- new_rel ^ suffix
+        end)
+      ctl.subtrees
 
   (* After the crash nothing reaches the store: a killed process does nothing
      more, so every operation through the wrapper fails, a directory operation
@@ -1650,15 +1670,16 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let fs =
-        Hashtbl.find_opt d.dctl.files (file_key d.droot (at d.dprefix path))
+        Hashtbl.find_opt d.dctl.files
+          (file_key d.dplace.proot (at d.dplace.prefix path))
       in
       wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw ~follow path)
 
     let open_out d ~sw ~follow ~append ~create path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let rel = at d.dprefix path in
-      let key = file_key d.droot rel in
+      let rel = at d.dplace.prefix path in
+      let key = file_key d.dplace.proot rel in
       let existed =
         match B.stat bv ~follow:false path with
         | _ -> true
@@ -1673,9 +1694,9 @@ module Crash = struct
             fs.perm <- perm;
             fs
         | None ->
-            let fs = { owner = d.droot; rel; perm; durable = prev } in
+            let fs = { owner = d.dplace.proot; rel; perm; durable = prev } in
             Hashtbl.replace d.dctl.files key fs;
-            if existed then locate_preexisting d.dctl (fs, d.droot, rel);
+            if existed then locate_preexisting d.dctl (fs, d.dplace.proot, rel);
             fs
       in
       (* An unsynced truncation of pre-existing durable data is itself a change
@@ -1692,7 +1713,8 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let sub = B.open_subtree bv ~sw path in
-      !crash_dir_hook d.dctl ~root:d.droot ~prefix:(at d.dprefix path)
+      !crash_dir_hook d.dctl ~root:d.dplace.proot
+        ~prefix:(at d.dplace.prefix path)
         ~base:(sub :> Eio.Fs.dir_ty r)
 
     let stat d ~follow path =
@@ -1704,7 +1726,7 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.mkdir bv ~perm path;
-      let rel = at d.dprefix path in
+      let rel = at d.dplace.prefix path in
       record_metadata d.dctl ~path:rel ~kind:Mkdir;
       bump_metadata d.dctl ~path:rel ~kind:Mkdir
 
@@ -1722,8 +1744,8 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.unlink bv path;
-      let rel = at d.dprefix path in
-      Hashtbl.remove d.dctl.files (file_key d.droot rel);
+      let rel = at d.dplace.prefix path in
+      Hashtbl.remove d.dctl.files (file_key d.dplace.proot rel);
       record_metadata d.dctl ~path:rel ~kind:Unlink;
       bump_metadata d.dctl ~path:rel ~kind:Unlink
 
@@ -1731,7 +1753,7 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.rmdir bv path;
-      let rel = at d.dprefix path in
+      let rel = at d.dplace.prefix path in
       record_metadata d.dctl ~path:rel ~kind:Rmdir;
       bump_metadata d.dctl ~path:rel ~kind:Rmdir
 
@@ -1747,12 +1769,12 @@ module Crash = struct
         | None -> (new_dir :> Eio.Fs.dir_ty r)
       in
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let old_rel = at d.dprefix old_path in
+      let old_rel = at d.dplace.prefix old_path in
       (* A crash-wrapped target rehomes the file root-relative, so its rewrite
          does not depend on the target subtree staying open. *)
       let owner, rel =
         match target_cdir with
-        | Some cd -> (cd.droot, at cd.dprefix new_path)
+        | Some cd -> (cd.dplace.proot, at cd.dplace.prefix new_path)
         | None -> (box_dir target, new_path)
       in
       (match exclusive with
@@ -1763,7 +1785,7 @@ module Crash = struct
       (* A successful rename moves the durability identity with the file. If a
          tracked target was replaced, its pending writes no longer describe a
          reachable file and must not be replayed after a crash. *)
-      move_state d.dctl ~old_owner:d.droot ~old_rel ~new_owner:owner
+      move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
         ~new_rel:rel;
       let kind = Rename { dest = rel } in
       record_metadata d.dctl ~path:old_rel ~kind;
@@ -1784,7 +1806,7 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.symlink ~link_to bv path;
-      let rel = at d.dprefix path in
+      let rel = at d.dplace.prefix path in
       let kind = Symlink { target = link_to } in
       record_metadata d.dctl ~path:rel ~kind;
       bump_metadata d.dctl ~path:rel ~kind
@@ -1806,7 +1828,7 @@ module Crash = struct
        operation. *)
     let sync_dir d path =
       if d.dctl.crashed then raise_power_lost ();
-      commit_dir d.dctl ~dir:(at d.dprefix path)
+      commit_dir d.dctl ~dir:(at d.dplace.prefix path)
 
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -1841,14 +1863,10 @@ module Crash = struct
       ]
 
   let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
+    let place = { proot = root; prefix } in
+    ctl.subtrees <- place :: ctl.subtrees;
     (Eio.Resource.T
-       ( {
-           dctl = ctl;
-           dbase = base;
-           dboxed = box_dir base;
-           droot = root;
-           dprefix = prefix;
-         },
+       ( { dctl = ctl; dbase = base; dboxed = box_dir base; dplace = place },
          cdir_handler )
       :> [ `Close | Eio.Fs.dir_ty ] r)
 
@@ -1866,6 +1884,7 @@ module Crash = struct
       metadata = [];
       durable_tree = None;
       durable_locations = [];
+      subtrees = [];
       seq = 0;
       ops = 0;
       crashed = false;
