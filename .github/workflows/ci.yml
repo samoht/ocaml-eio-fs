@@ -22,6 +22,10 @@ jobs:
         ocaml-compiler: ['5.3', '5.4', '5.5']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Eio_main falls back from eio_linux to eio_posix when io_uring is
+    # refused. Naming the backend makes the Linux jobs run eio_linux or fail.
+    env:
+      EIO_BACKEND: ${{ matrix.os == 'ubuntu-latest' && 'linux' || '' }}
     steps:
       - uses: actions/checkout@v4
 
