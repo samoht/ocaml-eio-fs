@@ -284,7 +284,10 @@ let take_v n bufs =
   in
   if n <= 0 then [] else go [] n bufs
 
-let clamp lo hi n = max lo (min hi n)
+(* [n] within [[lo, hi]], and [hi] when the range is empty: a fault that
+   shortens an operation never asks for more bytes than it offers, so a short
+   read of an empty buffer reads it whole. *)
+let clamp lo hi n = min hi (max lo n)
 
 let close_resource r =
   let (Eio.Resource.T (v, ops)) = r in

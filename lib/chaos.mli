@@ -44,7 +44,7 @@ module Fault : sig
   type t =
     | Short_read of int
         (** Deliver at most [max 1 n] bytes of the requested read, forcing the
-            caller to loop. *)
+            caller to loop. A read of an empty buffer is left whole. *)
     | Read_error of code
         (** Deliver nothing and raise [code], on a read or a directory read. *)
     | Short_write of int
