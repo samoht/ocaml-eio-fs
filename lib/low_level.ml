@@ -46,6 +46,9 @@ module Error = struct
     let exn = Eio.Exn.create Eio.Fs.(E (Permission_denied (Eio_fs path))) in
     raise exn
 
+  (* ELOOP, which Eio raises as [Symlink]. *)
+  let symlink_loop () = raise (Eio.Fs.err Eio.Fs.Symlink)
+
   let badf () =
     let exn = Eio.Exn.create (Eio.Exn.X (Eio_fs "Bad file descriptor")) in
     raise exn
@@ -311,7 +314,16 @@ module Filesystem = struct
   let check_confinement ~root p =
     if is_confined ~root p then () else Error.permission_denied p
 
-  let rec find_entry_relative_to_dir ~check ~follow fs dir (path : string) =
+  (* path_resolution(7): a resolution follows at most [max_follows] symbolic
+     links, as Linux and eio_posix do, and then fails with ELOOP. *)
+  let max_follows = 40
+
+  let follow_link follows =
+    if !follows <= 0 then Error.symlink_loop ();
+    decr follows
+
+  let rec find_entry_relative_to_dir ~follows ~check ~follow fs dir
+      (path : string) =
     let confinement_dir = as_dir ~label:"confinement-dir" !dir in
     let confinement_path = absolute_path fs confinement_dir in
     let check_confinement parent resource_name =
@@ -331,8 +343,10 @@ module Filesystem = struct
       | [] -> (
           match !r with
           | Resource.Symlink s when follow ->
+              follow_link follows;
               if check then check_confinement dir s.link_to;
-              find_entry_relative_to_dir ~check ~follow fs parent s.link_to
+              find_entry_relative_to_dir ~follows ~check ~follow fs parent
+                s.link_to
           | _ ->
               let parent_path =
                 absolute_path fs (as_dir ~label:"find-loop" !parent)
@@ -346,7 +360,7 @@ module Filesystem = struct
       | seg :: segs -> (
           if check then check_confinement dir seg;
           let entries, resolved_dir =
-            entries_exn
+            entries_exn ~follows
               ~check:(if check then Some (check_confinement dir) else None)
               ~follow ~parent fs r
           in
@@ -370,18 +384,19 @@ module Filesystem = struct
     in
     loop ~parent dir (Eio_fs_path.segs path)
 
-  and entries_exn ~check ~follow ~parent fs :
+  and entries_exn ~follows ~check ~follow ~parent fs :
       resource ref -> (Inode.t * string) list * resource ref =
    fun r ->
     match !r with
     | Resource.Dir dir -> (dir.entries, r)
     | Symlink sym ->
+        follow_link follows;
         Option.iter (fun f -> f sym.link_to) check;
         let _, r =
-          find_entry_relative_to_dir ~check:(Option.is_some check) ~follow fs
-            parent sym.link_to
+          find_entry_relative_to_dir ~follows ~check:(Option.is_some check)
+            ~follow fs parent sym.link_to
         in
-        entries_exn ~check ~follow ~parent fs r
+        entries_exn ~follows ~check ~follow ~parent fs r
     (* Walking through a non-directory: POSIX ENOTDIR, surfaced as an [Eio.Io]
          rather than a bare [Failure]. *)
     | r -> Fmt.kstr Error.not_found "not a directory: %a" Resource.pp r
@@ -389,6 +404,7 @@ module Filesystem = struct
   let lookup ~follow dir_fd path =
     let { tree; cwd; _ } = Dir.fs dir_fd in
     let root = Entries.find 0L tree in
+    let follows = ref max_follows in
     match dir_fd with
     | Dir.Fs _ ->
         (* Full access: a relative path resolves against the current
@@ -397,16 +413,18 @@ module Filesystem = struct
           if Eio_fs_path.is_abs path then path else Eio_fs_path.append cwd path
         in
         let _, r =
-          find_entry_relative_to_dir ~check:false ~follow tree root path
+          find_entry_relative_to_dir ~follows ~check:false ~follow tree root
+            path
         in
         r
     | Dir.Cwd _ ->
         (* Confined to the current directory. *)
         let _, cwddir =
-          find_entry_relative_to_dir ~check:false ~follow tree root cwd
+          find_entry_relative_to_dir ~follows ~check:false ~follow tree root cwd
         in
         let resource_path, r =
-          find_entry_relative_to_dir ~check:true ~follow tree cwddir path
+          find_entry_relative_to_dir ~follows ~check:true ~follow tree cwddir
+            path
         in
         if is_confined ~root:cwd resource_path then r
         else Error.permission_denied resource_path
@@ -416,7 +434,7 @@ module Filesystem = struct
            success. *)
         let dir = resource_of fd in
         let resource_path, r =
-          find_entry_relative_to_dir ~check:true ~follow tree dir path
+          find_entry_relative_to_dir ~follows ~check:true ~follow tree dir path
         in
         if
           is_confined

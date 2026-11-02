@@ -349,9 +349,24 @@ let test_symlink_chain_limit () =
   expect_io_error "too many symbolic links" (fun () ->
       ignore (Eio.Path.load last : string))
 
+(* A loop never resolves: a link to itself and two links to each other fail
+   with ELOOP, as the last component and as a directory on the way. *)
+let test_symlink_loop () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.symlink ~link_to:"self" (fs / "self");
+  Eio.Path.symlink ~link_to:"b" (fs / "a");
+  Eio.Path.symlink ~link_to:"a" (fs / "b");
+  List.iter
+    (fun path ->
+      expect_io_error "too many symbolic links" (fun () ->
+          ignore (Eio.Path.load (fs / path) : string)))
+    [ "self"; "a"; "self/x"; "a/x" ]
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "symbolic link loop" `Quick test_symlink_loop;
       Alcotest.test_case "symbolic link chain limit" `Quick
         test_symlink_chain_limit;
       Alcotest.test_case "shared across domains" `Quick
