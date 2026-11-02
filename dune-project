@@ -32,7 +32,6 @@
   (hermetic (>= 0.1.0))
   (ocaml (>= 5.3))
   (eio (>= 1.6))
-  (eio_posix (>= 1.6))
   fmt
   cstruct
   optint

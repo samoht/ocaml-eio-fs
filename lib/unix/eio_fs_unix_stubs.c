@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -814,7 +815,8 @@ CAMLprim value caml_eio_fs_clone_tree(value src_v, value dst_v)
 
    Each stub is one call of a Batch operation: it copies its arguments out of
    the OCaml heap, releases the runtime for the system calls and raises
-   Unix_error on failure. Batch.run calls them from one system thread. */
+   Unix_error on failure. Batch.run calls them from one system thread; Link
+   calls openat, mkdirat, symlinkat and fstatat one per system thread. */
 
 #include <sys/stat.h>
 
@@ -994,38 +996,19 @@ CAMLprim value caml_eio_fs_batch_link(value srcfd_v, value src_v,
   CAMLreturn(Val_unit);
 }
 
-/* The result is a block of 15 fields in the order of Batch.raw_stat: ten
-   boxed int64 (dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks)
-   and three boxed doubles (atime, mtime, ctime). */
-CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
+/* [st] as a block of 13 fields in the order of At.stat: ten boxed int64
+   (dev, ino, mode, nlink, uid, gid, rdev, size, blksize, blocks) and three
+   boxed doubles, the times [at], [mt] and [ct]. */
+static value eio_fs_stat_value(const struct stat *st, double at, double mt,
+                               double ct)
 {
-  CAMLparam2(dirfd_v, name_v);
+  CAMLparam0();
   CAMLlocal2(res, v);
-  caml_unix_check_path(name_v, "fstatat");
-  char *name = caml_stat_strdup(String_val(name_v));
-  struct stat st;
-  int r;
-  caml_release_runtime_system();
-  r = fstatat(Int_val(dirfd_v), name, &st, AT_SYMLINK_NOFOLLOW);
-  int saved_errno = errno;
-  caml_acquire_runtime_system();
-  caml_stat_free(name);
-  if (r == -1)
-    caml_unix_error(saved_errno, "fstatat", name_v);
-#if defined(__APPLE__)
-  double at = st.st_atimespec.tv_sec + st.st_atimespec.tv_nsec / 1e9;
-  double mt = st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec / 1e9;
-  double ct = st.st_ctimespec.tv_sec + st.st_ctimespec.tv_nsec / 1e9;
-#else
-  double at = st.st_atim.tv_sec + st.st_atim.tv_nsec / 1e9;
-  double mt = st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9;
-  double ct = st.st_ctim.tv_sec + st.st_ctim.tv_nsec / 1e9;
-#endif
-  int64_t ints[10] = {(int64_t)st.st_dev,    (int64_t)st.st_ino,
-                      (int64_t)st.st_mode,   (int64_t)st.st_nlink,
-                      (int64_t)st.st_uid,    (int64_t)st.st_gid,
-                      (int64_t)st.st_rdev,   (int64_t)st.st_size,
-                      (int64_t)st.st_blksize, (int64_t)st.st_blocks};
+  int64_t ints[10] = {(int64_t)st->st_dev,    (int64_t)st->st_ino,
+                      (int64_t)st->st_mode,   (int64_t)st->st_nlink,
+                      (int64_t)st->st_uid,    (int64_t)st->st_gid,
+                      (int64_t)st->st_rdev,   (int64_t)st->st_size,
+                      (int64_t)st->st_blksize, (int64_t)st->st_blocks};
   double times[3] = {at, mt, ct};
   res = caml_alloc_tuple(13);
   for (int i = 0; i < 10; i++) {
@@ -1037,4 +1020,123 @@ CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
     Store_field(res, 10 + i, v);
   }
   CAMLreturn(res);
+}
+
+#if defined(__APPLE__)
+#define EIO_FS_ATIME(st) ((st).st_atimespec)
+#define EIO_FS_MTIME(st) ((st).st_mtimespec)
+#define EIO_FS_CTIME(st) ((st).st_ctimespec)
+#else
+#define EIO_FS_ATIME(st) ((st).st_atim)
+#define EIO_FS_MTIME(st) ((st).st_mtim)
+#define EIO_FS_CTIME(st) ((st).st_ctim)
+#endif
+
+CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  caml_unix_check_path(name_v, "fstatat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  struct stat st;
+  int r;
+  caml_release_runtime_system();
+  r = fstatat(Int_val(dirfd_v), name, &st, AT_SYMLINK_NOFOLLOW);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "fstatat", name_v);
+  double at = EIO_FS_ATIME(st).tv_sec + EIO_FS_ATIME(st).tv_nsec / 1e9;
+  double mt = EIO_FS_MTIME(st).tv_sec + EIO_FS_MTIME(st).tv_nsec / 1e9;
+  double ct = EIO_FS_CTIME(st).tv_sec + EIO_FS_CTIME(st).tv_nsec / 1e9;
+  CAMLreturn(eio_fs_stat_value(&st, at, mt, ct));
+}
+
+/* --- Calls beneath a held directory, for Link ---
+
+   Each is the one system call it names on a descriptor the caller keeps
+   open, so they work under any Eio backend: the caller makes them from a
+   system thread and the runtime is released around the call. */
+
+/* [t] in seconds, its whole part kept at [t]'s own second where the sum
+   rounds up to the next one, as Eio's own stat does. */
+static double eio_fs_timestamp(struct timespec t)
+{
+  double s = (double)t.tv_sec;
+  double f = s + (double)t.tv_nsec / 1e9;
+  return floor(f) == s ? f : nextafter(f, -INFINITY);
+}
+
+CAMLprim value caml_eio_fs_fstat(value fd_v)
+{
+  CAMLparam1(fd_v);
+  struct stat st;
+  int r;
+  caml_release_runtime_system();
+  r = fstat(Int_val(fd_v), &st);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  if (r == -1)
+    caml_unix_error(saved_errno, "fstat", Nothing);
+  CAMLreturn(eio_fs_stat_value(&st, eio_fs_timestamp(EIO_FS_ATIME(st)),
+                               eio_fs_timestamp(EIO_FS_MTIME(st)),
+                               eio_fs_timestamp(EIO_FS_CTIME(st))));
+}
+
+/* The entry [name] beneath [dirfd] opened read-only, never through a
+   symbolic link (O_NOFOLLOW) and without waiting for a FIFO's writer
+   (O_NONBLOCK). */
+CAMLprim value caml_eio_fs_open_leaf(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  caml_unix_check_path(name_v, "openat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int fd;
+  caml_release_runtime_system();
+  do {
+    fd = openat(Int_val(dirfd_v), name,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+  } while (fd == -1 && errno == EINTR);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (fd == -1)
+    caml_unix_error(saved_errno, "openat", name_v);
+  CAMLreturn(Val_int(fd));
+}
+
+/* The target of the symbolic link [name] beneath [dirfd], read into a
+   buffer that grows until the target fits. */
+CAMLprim value caml_eio_fs_readlinkat(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  CAMLlocal1(result);
+  caml_unix_check_path(name_v, "readlinkat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int dirfd = Int_val(dirfd_v);
+  size_t size = 1024;
+  for (;;) {
+    char *buf = malloc(size);
+    if (buf == NULL) {
+      caml_stat_free(name);
+      caml_raise_out_of_memory();
+    }
+    caml_release_runtime_system();
+    ssize_t n = readlinkat(dirfd, name, buf, size);
+    int saved_errno = errno;
+    caml_acquire_runtime_system();
+    if (n == -1) {
+      free(buf);
+      caml_stat_free(name);
+      caml_unix_error(saved_errno, "readlinkat", name_v);
+    }
+    if ((size_t)n < size) {
+      result = caml_alloc_initialized_string(n, buf);
+      free(buf);
+      caml_stat_free(name);
+      CAMLreturn(result);
+    }
+    free(buf);
+    size *= 4;
+  }
 }

@@ -164,41 +164,6 @@ let sync_file file =
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
           full_fsync fd)
 
-let float_of_time seconds nanoseconds =
-  let seconds = Int64.to_float seconds in
-  let value = seconds +. (float nanoseconds /. 1e9) in
-  if floor value = seconds then value else Float.pred value
-
-let stat_of_fd fd =
-  let stat = Eio_posix.Low_level.create_stat () in
-  Eio_posix.Low_level.fstat ~buf:stat fd;
-  Eio.File.Stat.
-    {
-      dev = Eio_posix.Low_level.dev stat;
-      ino = Eio_posix.Low_level.ino stat;
-      kind = Eio_posix.Low_level.kind stat;
-      perm = Eio_posix.Low_level.perm stat;
-      nlink = Eio_posix.Low_level.nlink stat;
-      uid = Eio_posix.Low_level.uid stat;
-      gid = Eio_posix.Low_level.gid stat;
-      rdev = Eio_posix.Low_level.rdev stat;
-      size = Eio_posix.Low_level.size stat |> Optint.Int63.of_int64;
-      blksize = Eio_posix.Low_level.blksize stat;
-      blocks = Eio_posix.Low_level.blocks stat;
-      atime =
-        float_of_time
-          (Eio_posix.Low_level.atime_sec stat)
-          (Eio_posix.Low_level.atime_nsec stat);
-      mtime =
-        float_of_time
-          (Eio_posix.Low_level.mtime_sec stat)
-          (Eio_posix.Low_level.mtime_nsec stat);
-      ctime =
-        float_of_time
-          (Eio_posix.Low_level.ctime_sec stat)
-          (Eio_posix.Low_level.ctime_nsec stat);
-    }
-
 let rec unwrapped_dir dir =
   match Eio_fs.Chaos.Private.base_dir dir with
   | Some base -> unwrapped_dir base
@@ -258,16 +223,83 @@ module Rename_backend = Eio_fs_sync.Rename.Make (Exclusive_rename)
 
 let exclusive_rename = Rename_backend.v ()
 
-module Link = struct
-  module Low = Eio_posix.Low_level
-
-  type t = {
-    parent : Eio_unix.Fd.t;
-    sw : Eio.Switch.t;
-    name : string;
-    path : string;
+(* System calls on descriptors and beneath directory descriptors, each the
+   one call its name says, with the runtime released around it. They block, so
+   a fiber makes them from a system thread; they perform no effect, so any Eio
+   backend runs them. *)
+module At = struct
+  type stat = {
+    dev : int64;
+    ino : int64;
+    mode : int64;
+    nlink : int64;
+    uid : int64;
+    gid : int64;
+    rdev : int64;
+    size : int64;
+    blksize : int64;
+    blocks : int64;
+    atime : float;
+    mtime : float;
+    ctime : float;
   }
 
+  (* [openat(O_RDONLY | O_DIRECTORY | O_NOFOLLOW)]. *)
+  external open_dir : Unix.file_descr -> string -> Unix.file_descr
+    = "caml_eio_fs_batch_open_dir"
+
+  (* [openat(O_RDONLY | O_NOFOLLOW | O_NONBLOCK)]. *)
+  external open_leaf : Unix.file_descr -> string -> Unix.file_descr
+    = "caml_eio_fs_open_leaf"
+
+  external mkdir : Unix.file_descr -> string -> int -> unit
+    = "caml_eio_fs_batch_mkdir"
+
+  external symlink : string -> Unix.file_descr -> string -> unit
+    = "caml_eio_fs_batch_symlink"
+
+  external read_link : Unix.file_descr -> string -> string
+    = "caml_eio_fs_readlinkat"
+
+  (* [fstatat(AT_SYMLINK_NOFOLLOW)]. *)
+  external lstat : Unix.file_descr -> string -> stat = "caml_eio_fs_batch_lstat"
+
+  (* [fstat], its times to the nanosecond as Eio's own stat has them. *)
+  external fstat : Unix.file_descr -> stat = "caml_eio_fs_fstat"
+
+  let kind_of_mode mode =
+    match mode land 0o170000 with
+    | 0o040000 -> `Directory
+    | 0o100000 -> `Regular_file
+    | 0o120000 -> `Symbolic_link
+    | 0o010000 -> `Fifo
+    | 0o020000 -> `Character_special
+    | 0o060000 -> `Block_device
+    | 0o140000 -> `Socket
+    | _ -> `Unknown
+
+  let to_stat (r : stat) : Eio.File.Stat.t =
+    let mode = Int64.to_int r.mode in
+    {
+      dev = r.dev;
+      ino = r.ino;
+      kind = kind_of_mode mode;
+      perm = mode land 0o7777;
+      nlink = r.nlink;
+      uid = r.uid;
+      gid = r.gid;
+      rdev = r.rdev;
+      size = Optint.Int63.of_int64 r.size;
+      blksize = r.blksize;
+      blocks = r.blocks;
+      atime = r.atime;
+      mtime = r.mtime;
+      ctime = r.ctime;
+    }
+end
+
+module Link = struct
+  type t = { parent : Eio_unix.Fd.t; name : string; path : string }
   type publication = Created | Present
 
   let err_refused path reason =
@@ -283,6 +315,12 @@ module Link = struct
       match Eio_fs_path.canonical ("/" ^ path) with
       | Ok parts -> Ok parts
       | Error _ -> Error "expected a non-empty canonical path without NUL"
+
+  (* [fn] applied to [dir]'s descriptor on a system thread, [dir] kept open
+     meanwhile. *)
+  let at dir fn =
+    Eio_unix.Fd.use_exn "Eio_fs_unix.Link" dir @@ fun dir ->
+    Eio_unix.run_in_systhread ~label:"eio-fs-link" (fun () -> fn dir)
 
   let with_parent ?mkdir ~root ~path fn =
     let original = Eio_fs.Path.name Eio.Path.(root / path) in
@@ -302,12 +340,10 @@ module Link = struct
           in
           let rec descend fd = function
             | [] -> assert false
-            | [ name ] -> { parent = fd; sw; name; path = original }
+            | [ name ] -> { parent = fd; name; path = original }
             | name :: rest ->
-                let parent = Low.Fd fd in
                 let open_component () =
-                  Low.openat ~sw ~mode:0 parent name
-                    Low.Open_flags.(rdonly + directory + nofollow)
+                  at fd (fun dir -> At.open_dir dir name)
                 in
                 let next =
                   match open_component () with
@@ -317,11 +353,11 @@ module Link = struct
                       | None ->
                           raise (Unix.Unix_error (Unix.ENOENT, "openat", name))
                       | Some mode ->
-                          (try Low.mkdir ~mode parent name
+                          (try at fd (fun dir -> At.mkdir dir name mode)
                            with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
                           open_component ())
                 in
-                descend next rest
+                descend (Eio_unix.Fd.of_unix ~sw ~close_unix:true next) rest
           in
           descend descriptor components
         in
@@ -338,13 +374,11 @@ module Link = struct
         match opened with Error _ as error -> error | Ok handle -> fn handle)
 
   let publish t ~target =
-    let parent = Low.Fd t.parent in
     let existing () =
-      let stat = Low.create_stat () in
-      Low.fstatat ~buf:stat ~follow:false parent t.name;
-      match Low.kind stat with
+      let stat = at t.parent (fun dir -> At.lstat dir t.name) in
+      match At.kind_of_mode (Int64.to_int stat.mode) with
       | `Symbolic_link ->
-          let held = Low.read_link parent t.name in
+          let held = at t.parent (fun dir -> At.read_link dir t.name) in
           if String.equal held target then Ok Present
           else
             err_refused t.path
@@ -357,7 +391,7 @@ module Link = struct
       err_refused t.path "target must be non-empty and contain no NUL"
     else
       match
-        match Low.symlink ~link_to:target parent t.name with
+        match at t.parent (fun dir -> At.symlink target dir t.name) with
         | () -> Ok Created
         | exception Unix.Unix_error (Unix.EEXIST, _, _) -> existing ()
       with
@@ -367,14 +401,17 @@ module Link = struct
             (Fmt.str "%s %s: %s" operation argument (Unix.error_message code))
       | exception (Eio.Io _ as ex) -> err_refused t.path (Printexc.to_string ex)
 
+  let rec read_into fd (buffer : Cstruct.t) =
+    match Unix.read_bigarray fd buffer.buffer buffer.off buffer.len with
+    | got -> got
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_into fd buffer
+
+  (* The leaf is opened, weighed and read on system threads, one per call, so
+     a cancel is seen between reads; it is closed before the result. *)
   let read_regular ?(max_bytes = max_int) t =
     let err_read fmt = Fmt.kstr (fun message -> Error message) fmt in
-    let parent = Low.Fd t.parent in
     let opened =
-      match
-        Low.openat ~sw:t.sw ~mode:0 parent t.name
-          Low.Open_flags.(rdonly + nofollow)
-      with
+      match at t.parent (fun dir -> At.open_leaf dir t.name) with
       | fd -> Ok (Some fd)
       | exception Unix.Unix_error (Unix.ENOENT, _, _) -> Ok None
       | exception Unix.Unix_error (code, operation, argument) ->
@@ -387,7 +424,13 @@ module Link = struct
     | Error _ as error -> error
     | Ok None -> Ok None
     | Ok (Some fd) -> (
-        let stat = stat_of_fd fd in
+        Fun.protect ~finally:(fun () ->
+            try Unix.close fd with Unix.Unix_error _ -> ())
+        @@ fun () ->
+        let in_systhread fn =
+          Eio_unix.run_in_systhread ~label:"eio-fs-link-read" fn
+        in
+        let stat = At.to_stat (in_systhread (fun () -> At.fstat fd)) in
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
           err_read "%s is not a regular file" t.path
@@ -401,7 +444,7 @@ module Link = struct
             Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)
               ~validate:(fun _ -> Ok ())
               ~stat
-              ~read:(fun buffer -> Low.readv fd [| buffer |])
+              ~read:(fun buffer -> in_systhread (fun () -> read_into fd buffer))
           with
           | Ok bytes -> Ok (Some (Cstruct.to_string bytes))
           | Error `Too_large -> err_read "%s changed size while read" t.path
@@ -1459,17 +1502,8 @@ let set_xattr path name v =
   lsetxattr native name v
 
 module Batch = struct
-  external open_dir_native : Unix.file_descr -> string -> Unix.file_descr
-    = "caml_eio_fs_batch_open_dir"
-
   external create_native : Unix.file_descr -> string -> int -> string -> unit
     = "caml_eio_fs_batch_create"
-
-  external mkdir_native : Unix.file_descr -> string -> int -> unit
-    = "caml_eio_fs_batch_mkdir"
-
-  external symlink_native : string -> Unix.file_descr -> string -> unit
-    = "caml_eio_fs_batch_symlink"
 
   external unlink_native : Unix.file_descr -> string -> bool -> unit
     = "caml_eio_fs_batch_unlink"
@@ -1481,25 +1515,6 @@ module Batch = struct
   external link_native :
     Unix.file_descr -> string -> Unix.file_descr -> string -> unit
     = "caml_eio_fs_batch_link"
-
-  type raw_stat = {
-    dev : int64;
-    ino : int64;
-    mode : int64;
-    nlink : int64;
-    uid : int64;
-    gid : int64;
-    rdev : int64;
-    size : int64;
-    blksize : int64;
-    blocks : int64;
-    atime : float;
-    mtime : float;
-    ctime : float;
-  }
-
-  external lstat_native : Unix.file_descr -> string -> raw_stat
-    = "caml_eio_fs_batch_lstat"
 
   type t =
     | Native of Eio_unix.Fd.t
@@ -1567,36 +1582,6 @@ module Batch = struct
       | leaf :: rev_parents -> (List.rev rev_parents, leaf)
       | [] -> fail_refused "empty path"
 
-  let kind_of_mode mode =
-    match mode land 0o170000 with
-    | 0o040000 -> `Directory
-    | 0o100000 -> `Regular_file
-    | 0o120000 -> `Symbolic_link
-    | 0o010000 -> `Fifo
-    | 0o020000 -> `Character_special
-    | 0o060000 -> `Block_device
-    | 0o140000 -> `Socket
-    | _ -> `Unknown
-
-  let stat_of_raw (r : raw_stat) : Eio.File.Stat.t =
-    let mode = Int64.to_int r.mode in
-    {
-      dev = r.dev;
-      ino = r.ino;
-      kind = kind_of_mode mode;
-      perm = mode land 0o7777;
-      nlink = r.nlink;
-      uid = r.uid;
-      gid = r.gid;
-      rdev = r.rdev;
-      size = Optint.Int63.of_int64 r.size;
-      blksize = r.blksize;
-      blocks = r.blocks;
-      atime = r.atime;
-      mtime = r.mtime;
-      ctime = r.ctime;
-    }
-
   (* The directories one run has opened, by their path beneath the root. A
      rename or a directory removal may move or delete any of them, so either
      empties the table. *)
@@ -1618,16 +1603,16 @@ module Batch = struct
       match Hashtbl.find_opt run.dirs key with
       | Some fd -> (fd, key)
       | None -> (
-          match open_dir_native fd name with
+          match At.open_dir fd name with
           | next ->
               Hashtbl.add run.dirs key next;
               (next, key)
           | exception
               (Unix.Unix_error ((Unix.ELOOP | Unix.ENOTDIR | Unix.EMLINK), _, _)
                as e) -> (
-              match lstat_native fd name with
+              match At.lstat fd name with
               | { mode; _ }
-                when kind_of_mode (Int64.to_int mode) = `Symbolic_link ->
+                when At.kind_of_mode (Int64.to_int mode) = `Symbolic_link ->
                   fail_refused "%S is a symbolic link" key
               | _ | (exception Unix.Unix_error _) -> raise e))
     in
@@ -1637,7 +1622,7 @@ module Batch = struct
   let perform run = function
     | Mkdir { path; perm } ->
         let dir, leaf = parent run path in
-        mkdir_native dir leaf perm;
+        At.mkdir dir leaf perm;
         Done
     | Create { path; perm; contents } ->
         let dir, leaf = parent run path in
@@ -1645,7 +1630,7 @@ module Batch = struct
         Done
     | Symlink { path; target } ->
         let dir, leaf = parent run path in
-        symlink_native target dir leaf;
+        At.symlink target dir leaf;
         Done
     | Unlink { path; dir = is_dir } ->
         let dir, leaf = parent run path in
@@ -1665,7 +1650,7 @@ module Batch = struct
         Done
     | Lstat path ->
         let dir, leaf = parent run path in
-        Stat (stat_of_raw (lstat_native dir leaf))
+        Stat (At.to_stat (At.lstat dir leaf))
 
   let attempt run op =
     match perform run op with
