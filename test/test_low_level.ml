@@ -394,9 +394,60 @@ let test_create_over_dangling_link () =
     "the link is still a link" "missing"
     (Eio.Path.read_link (fs / "l"))
 
+(* {2 rename(2) between kinds}
+
+   rename(2) refuses to move a directory into its own subtree (EINVAL), a
+   directory over a non-empty directory (ENOTEMPTY), a non-directory over a
+   directory (EISDIR) and a directory over a non-directory (ENOTDIR), and
+   leaves both names as they were. A directory over an empty directory
+   replaces it. *)
+
+let kind fs path = Eio.Path.kind ~follow:false (fs / path)
+
+let test_rename_refusals () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdirs ~perm:0o755 (fs / "a/b");
+  Eio.Path.mkdirs ~perm:0o755 (fs / "full/z");
+  Eio.Path.mkdir ~perm:0o755 (fs / "empty");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "f";
+  let refused what src dst =
+    expect_eio_io what (fun () -> Eio.Path.rename (fs / src) (fs / dst));
+    Alcotest.(check bool)
+      (what ^ ": the source stays")
+      true
+      (kind fs src <> `Not_found)
+  in
+  refused "into its own subtree" "a" "a/b/c";
+  refused "onto itself below" "a" "a/b";
+  refused "over a non-empty directory" "a" "full";
+  refused "a file over a directory" "f" "empty";
+  refused "a directory over a file" "a" "f";
+  Alcotest.(check bool) "the subtree is intact" true (kind fs "a/b" = `Directory);
+  Alcotest.(check string) "the file is intact" "f" (Eio.Path.load (fs / "f"));
+  Eio.Path.rename (fs / "a") (fs / "empty");
+  Alcotest.(check bool)
+    "a directory replaces an empty one" true
+    (kind fs "empty/b" = `Directory && kind fs "a" = `Not_found)
+
+(* A moved directory's parent is its new parent: a path resolved inside it
+   from a capability confined to the new parent stays inside that parent. *)
+let test_rename_moves_parent_link () =
+  with_env ~cwd:"/q" @@ fun env ->
+  Eio.Path.mkdirs ~perm:0o755 (env#fs / "/p/m");
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "/q");
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/p/m/f") "x";
+  Eio.Path.rename (env#fs / "/p/m") (env#fs / "/q/m");
+  Alcotest.(check string)
+    "reached from the new parent" "x"
+    (Eio.Path.load (env#cwd / "m/f"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "rename refusals" `Quick test_rename_refusals;
+      Alcotest.test_case "rename moves the parent link" `Quick
+        test_rename_moves_parent_link;
       Alcotest.test_case "create over a dangling link" `Quick
         test_create_over_dangling_link;
       Alcotest.test_case "symbolic link loop" `Quick test_symlink_loop;
