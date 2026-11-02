@@ -168,7 +168,10 @@ module Fs : sig
       is not copied; it is traced with [Eio.traceln].
 
       @raise Invalid_argument if [path] is not a directory.
-      @raise Eio.Io if [path] or an entry under it cannot be read. *)
+      @raise Eio.Io
+        if [path] or an entry under it cannot be read, or a regular file is
+        replaced between the stat that found it and the open that copies it:
+        that open does not follow a link. *)
 end
 
 (** Compile-time file embedding for the in-memory filesystem, in the style of

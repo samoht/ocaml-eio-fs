@@ -404,10 +404,17 @@ module Fs = struct
       | `Regular_file ->
           if not (filter v) then ()
           else
+            (* Opened without following and checked again once open, so what
+               is copied is the regular file the stat saw, not whatever took
+               its name in between. *)
+            Eio.Path.with_open_in ~follow:false v @@ fun i ->
+            let opened = Eio.File.stat i in
+            if opened.kind <> `Regular_file || opened.ino <> stat.ino then
+              Fmt.kstr Low_level.Error.err "%a changed while it was copied"
+                Eio.Path.pp v;
             Eio.Path.with_open_out ~create:(`If_missing stat.perm)
               (switch_filesystem v)
-            @@ fun o ->
-            Eio.Path.with_open_in v @@ fun i -> Eio.Flow.copy i o
+            @@ fun o -> Eio.Flow.copy i o
       | `Directory ->
           if filter v then begin
             Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm

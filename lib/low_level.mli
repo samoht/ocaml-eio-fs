@@ -7,6 +7,10 @@ module Error : sig
   val badf : unit -> 'a
   (** [badf ()] raises the backend I/O error for a closed descriptor or
       directory capability. *)
+
+  val err : string -> 'a
+  (** [err msg] raises the backend I/O error [msg], for a failure Eio.Fs has no
+      constructor for. *)
 end
 
 (** Flags for {!openat}. *)
