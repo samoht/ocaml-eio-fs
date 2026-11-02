@@ -321,10 +321,7 @@ let append_lines ?(durable = true) ?(perm = 0o644) path lines =
       if String.contains l '\n' then
         invalid_arg "Eio_fs_sync.append_lines: a line holds LF")
     lines;
-  let exists =
-    match Eio.Path.kind ~follow:true path with `Not_found -> false | _ -> true
-  in
-  let torn = exists && ends_torn path in
+  let torn = ends_torn path in
   let b = Buffer.create 256 in
   if torn then Buffer.add_char b '\n';
   List.iter
@@ -339,7 +336,10 @@ let append_lines ?(durable = true) ?(perm = 0o644) path lines =
         in
         Eio.Flow.copy_string (Buffer.contents b) file;
         if durable then sync_file file);
-    if durable && not exists then sync_parent path
+    (* Every durable append barriers the directory, not only the one that
+       created the file: when that one's barrier failed, nothing else would
+       ever make the entry durable. *)
+    if durable then sync_parent path
   end
 
 (* A file opened read-only still names the inode fsync(2) flushes. A registered

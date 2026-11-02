@@ -242,9 +242,10 @@ val append_lines :
     continuation. A file that is empty or ends in LF is appended to as it is.
 
     With [durable] (defaults to [true]), the file is fsynced after the write,
-    and the directory holding it too when the call created it. Appends from two
-    writers are not ordered with each other: a caller with several takes a
-    {!Lock} around each.
+    then the directory holding it, on every call: a directory barrier that
+    failed on the call that created the file is issued again by the next one.
+    Appends from two writers are not ordered with each other: a caller with
+    several takes a {!Lock} around each.
 
     @raise Invalid_argument if a line holds LF, before anything is written.
     @raise Eio.Io as the open, the write and the barriers raise. *)
