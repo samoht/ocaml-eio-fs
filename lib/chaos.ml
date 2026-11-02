@@ -84,6 +84,38 @@ module Fault = struct
     | Swap_symlink x, Swap_symlink y -> String.equal x y
     | _ -> false
 
+  let code_rank = function
+    | `Enoent -> 0
+    | `Eacces -> 1
+    | `Enospc -> 2
+    | `Eio -> 3
+
+  let rank = function
+    | Short_read _ -> 0
+    | Read_error _ -> 1
+    | Short_write _ -> 2
+    | Torn_write _ -> 3
+    | Write_error _ -> 4
+    | Sync_error _ -> 5
+    | Open_error _ -> 6
+    | Stat_error _ -> 7
+    | Swap_symlink _ -> 8
+
+  let compare a b =
+    match (a, b) with
+    | Short_read x, Short_read y
+    | Short_write x, Short_write y
+    | Torn_write x, Torn_write y ->
+        Int.compare x y
+    | Read_error x, Read_error y
+    | Write_error x, Write_error y
+    | Sync_error x, Sync_error y
+    | Open_error x, Open_error y
+    | Stat_error x, Stat_error y ->
+        Int.compare (code_rank x) (code_rank y)
+    | Swap_symlink x, Swap_symlink y -> String.compare x y
+    | _ -> Int.compare (rank a) (rank b)
+
   let pp ppf = function
     | Short_read n -> Fmt.pf ppf "short-read(%d)" n
     | Read_error c -> Fmt.pf ppf "read-error(%s)" (code_name c)

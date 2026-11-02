@@ -70,6 +70,10 @@ module Fault : sig
   (** [equal f0 f1] is [true] iff [f0] and [f1] are the same constructor with
       equal arguments. *)
 
+  val compare : t -> t -> int
+  (** [compare] is a total order on faults compatible with {!equal}: by
+      constructor in declaration order, then by argument. *)
+
   val pp : t Fmt.t
   (** [pp] formats a fault for logs and test failures. *)
 end

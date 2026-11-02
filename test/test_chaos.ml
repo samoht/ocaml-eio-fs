@@ -241,6 +241,39 @@ let test_read_only_file_sync () =
       barrier ();
       expect_io "the scheduled sync failure" barrier
 
+(* [Fault.compare] orders faults by constructor, then by argument, and agrees
+   with [Fault.equal]. *)
+let test_fault_compare () =
+  let faults =
+    Fault.
+      [
+        Short_read 1;
+        Short_read 2;
+        Read_error `Enoent;
+        Read_error `Eio;
+        Short_write 3;
+        Torn_write 0;
+        Write_error `Enospc;
+        Sync_error `Eio;
+        Open_error `Eacces;
+        Stat_error `Enoent;
+        Swap_symlink "a";
+        Swap_symlink "b";
+      ]
+  in
+  List.iteri
+    (fun i a ->
+      List.iteri
+        (fun j b ->
+          let c = Fault.compare a b in
+          Alcotest.(check int)
+            (Fmt.str "%a vs %a" Fault.pp a Fault.pp b)
+            (Int.compare i j)
+            (if c < 0 then -1 else if c > 0 then 1 else 0);
+          Alcotest.(check bool) "agrees with equal" (Fault.equal a b) (c = 0))
+        faults)
+    faults
+
 let test_open_error () =
   let sched =
     Schedule.scripted
@@ -1828,6 +1861,7 @@ let suite =
       Alcotest.test_case "write error" `Quick test_write_error;
       Alcotest.test_case "sync error" `Quick test_sync_error;
       Alcotest.test_case "read-only file sync" `Quick test_read_only_file_sync;
+      Alcotest.test_case "fault compare" `Quick test_fault_compare;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "real child cwd" `Quick test_real_child_cwd;
