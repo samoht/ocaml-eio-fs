@@ -6,8 +6,8 @@
     {!canonical} refuses one instead. *)
 
 val is_abs : string -> bool
-(** [is_abs path] is whether [path] starts at the root, which is whether it
-    opens with a separator. *)
+(** [is_abs path] is [true] iff [path] starts at the root, that is iff it opens
+    with a separator. *)
 
 val is_rel : string -> bool
 (** [is_rel path] is [not (is_abs path)]. *)
@@ -16,7 +16,7 @@ val segs : string -> string list
 (** [segs path] is [path] cut at every separator, empty segments kept: an
     absolute path opens with one, a directory path ends with one, and a doubled
     separator is one of its own. It is the inverse of joining with ["/"], so
-    nothing about the spelling is lost. *)
+    nothing about the spelling is lost: [segs ""] is [[""]]. *)
 
 val normalize : string -> string
 (** [normalize path] is [path] with its empty and ["."] segments dropped and its
@@ -25,20 +25,23 @@ val normalize : string -> string
     that would climb above an absolute root is dropped; one at the head of a
     relative path is kept, there being nothing to resolve it against. Directory
     syntax survives: a [path] ending in a separator, a ["."] or a [".."] is
-    answered ending in a separator. *)
+    answered ending in a separator. A path left with no segment is ["/"] when
+    absolute and ["."] otherwise, so [normalize ""] is ["."] and [normalize "."]
+    is ["./"]. *)
 
 val append : string -> string -> string
 (** [append base path] is [path] resolved against [base]: [path] itself when it
-    is absolute, and [base] and [path] joined by a single separator otherwise.
-*)
+    is absolute, and otherwise [base] and [path] joined by a separator, added
+    only when [base] is not empty and does not already end in one. *)
 
 val to_dir_path : string -> string
-(** [to_dir_path path] is [path] in directory syntax: ending in a separator, and
-    unchanged when it already does. *)
+(** [to_dir_path path] is [path] in directory syntax: [path] ending in a
+    separator, and unchanged when it already does. [to_dir_path ""] is ["/"]. *)
 
 val basename : string -> string
 (** [basename path] is [path]'s last component, ignoring trailing separators,
-    and [""] for a path that has none: a root, ["."] or [".."]. *)
+    and [""] for a path that has none: the empty path, a root, ["."] or [".."].
+*)
 
 val parent : string -> string
 (** [parent path] is the directory holding [path], in directory syntax and
@@ -50,15 +53,20 @@ val parent : string -> string
 
 val components : string -> string list
 (** [components path] are the segments {!normalize} leaves, its empty and ["."]
-    segments dropped. Two spellings of one path have one answer here, which is
-    what makes it the thing to compare two paths by. *)
+    segments dropped. Two spellings of one path have equal components. An
+    absolute and a relative path can too ([components "/a"] and [components "a"]
+    are both [["a"]]), so a comparison checks {!is_abs} as well, as {!is_rooted}
+    does. *)
 
 val is_rooted : root:string -> string -> bool
-(** [is_rooted ~root path] is whether [path] names [root] or something under it,
-    compared by {!components}, so neither spelling matters. An absolute [root]
-    and a relative [path] are never rooted in one another: they are named from
-    different places and nothing here knows where. *)
+(** [is_rooted ~root path] is [true] iff [root] and [path] are both absolute or
+    both relative and the {!components} of [root] are a prefix of those of
+    [path]: [path] names [root] or something under it, whatever the spelling of
+    either. An absolute [root] and a relative [path] are never rooted in one
+    another: they are named from different places and nothing here knows where.
+*)
 
+(** The type for the reasons {!canonical} refuses a path. *)
 type refusal =
   | Not_a_path  (** Empty, or holding a NUL byte. *)
   | Relative  (** Does not start at the root. *)
@@ -66,10 +74,15 @@ type refusal =
   | Not_canonical  (** Names something, by a spelling that is not its own. *)
 
 val canonical : string -> (string list, refusal) result
-(** [canonical path] are the components of [path] when it is absolute and
-    already canonical, and why it is not otherwise. It refuses rather than
-    rewrites: rewriting [a/b/..] to [a] names a different directory wherever [b]
-    is a symbolic link, so a caller resolving components under [O_NOFOLLOW]
-    needs the refusal. A ["."], [".."] or any spelling whose components do not
-    rejoin to exactly the string given is {!Not_canonical}; a NUL byte is
-    {!Not_a_path}. *)
+(** [canonical path] is [Ok cs], [cs] the components of [path], when [path] is
+    absolute and already canonical, and otherwise [Error r] with [r] the first
+    of these that holds:
+    - {!Not_a_path} if [path] is empty or holds a NUL byte.
+    - {!Relative} if [path] does not start with a separator.
+    - {!Root} if [path] has no segment but empty ones (["/"], ["//"]).
+    - {!Not_canonical} if a segment is ["."] or [".."], or if an empty segment
+      follows the leading one (a trailing or doubled separator).
+
+    It refuses rather than rewrites: rewriting [a/b/..] to [a] names a different
+    directory wherever [b] is a symbolic link, so a caller resolving components
+    under [O_NOFOLLOW] needs the refusal. *)
