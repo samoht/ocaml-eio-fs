@@ -468,7 +468,7 @@ module Crunch = struct
     walk ~follow:true root "/";
     List.rev !entries
 
-  let find entries path =
+  let find path entries =
     List.find_map
       (function
         | File f when String.equal f.path path -> Some f.contents | _ -> None)

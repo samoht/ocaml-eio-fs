@@ -343,7 +343,7 @@ module Crunch = struct
           Symlink { path = "/l"; target = "a" };
         ]
     in
-    let find = Eio_fs.Crunch.find entries in
+    let find path = Eio_fs.Crunch.find path entries in
     Alcotest.(check (option string)) "/a" (Some "top") (find "/a");
     Alcotest.(check (option string)) "/sub/a" (Some "nested") (find "/sub/a");
     Alcotest.(check (option string)) "directory" None (find "/sub");

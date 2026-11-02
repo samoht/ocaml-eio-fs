@@ -173,8 +173,8 @@ module Crunch : sig
 
       @raise Invalid_argument if [dir] is not a directory. *)
 
-  val find : t -> string -> string option
-  (** [find entries path] is [Some contents] for the first {!File} at [path] in
+  val find : string -> t -> string option
+  (** [find path entries] is [Some contents] for the first {!File} at [path] in
       [entries], and [None] if there is none. [path] is absolute within the
       image, as {!scan} records it, and compared as a string; a symbolic link is
       not followed. A program that embeds fixtures reads them with it and needs
