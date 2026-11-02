@@ -1960,9 +1960,23 @@ let test_crash_file_hides_its_base () =
             Alcotest.failf "without binding %d, a write the journal missed" k
       | exception _ -> ())
 
+(* A rename from a directory of the base backend into a Chaos directory
+   lands in the tree both share, as a rename between two directories of one
+   in-memory filesystem does. *)
+let test_rename_into_a_wrapper () =
+  with_chaos Schedule.empty @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "a") "moved";
+  Eio.Path.rename (raw / "a") (chaos / "b");
+  Alcotest.(check string) "at its new name" "moved" (Eio.Path.load (raw / "b"));
+  Alcotest.(check bool)
+    "gone from its old name" true
+    (Eio.Path.kind ~follow:false (raw / "a") = `Not_found)
+
 let suite =
   ( "chaos",
     [
+      Alcotest.test_case "rename into a wrapper" `Quick
+        test_rename_into_a_wrapper;
       Alcotest.test_case "a wrapped directory hides its base" `Quick
         test_wrapped_dir_hides_its_base;
       Alcotest.test_case "a wrapped file hides its base" `Quick
