@@ -470,9 +470,27 @@ let test_rmdir_symlink () =
       Eio.Path.rmdir (fs / "ld"));
   Alcotest.(check (list string)) "both stay" [ "d"; "ld" ] (names fs)
 
+(* An absolute symbolic link resolves from the root of the file system, as
+   the last component and as a directory on the way, not from the directory
+   holding the link. *)
+let test_absolute_symlink () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdirs ~perm:0o755 (fs / "/d/e");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/target") "root";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/d/target") "d";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/d/e/f") "e";
+  Eio.Path.symlink ~link_to:"/target" (fs / "/d/l");
+  Eio.Path.symlink ~link_to:"/d/e" (fs / "/d/e/le");
+  Alcotest.(check string)
+    "the last component" "root"
+    (Eio.Path.load (fs / "/d/l"));
+  Alcotest.(check string) "on the way" "e" (Eio.Path.load (fs / "/d/e/le/f"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "absolute symbolic link" `Quick test_absolute_symlink;
       Alcotest.test_case "rmdir on a symbolic link" `Quick test_rmdir_symlink;
       Alcotest.test_case "unlink" `Quick test_unlink;
       Alcotest.test_case "rename refusals" `Quick test_rename_refusals;
