@@ -201,7 +201,8 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =
-    | Data  (** A write or truncation; offset and length locate it. *)
+    | Data  (** A write; its offset and length locate it. *)
+    | Truncate  (** A truncation; its offset is the new length. *)
     | Create  (** The open that created the file. *)
     | Mkdir  (** A new directory. *)
     | Unlink  (** A removed file or symbolic link. *)
@@ -213,10 +214,10 @@ module Crash : sig
     path : string;  (** The path the change was made at, as opened. *)
     kind : op_kind;  (** What the change is. *)
     offset : int;
-        (** The byte offset of a {!Data} write, the new length of a truncation,
+        (** The byte offset of a {!Data} write, the new length of a {!Truncate},
             and [0] for a directory operation. *)
     length : int;
-        (** The byte length of a {!Data} write, and [0] for a truncation or a
+        (** The byte length of a {!Data} write, and [0] for a {!Truncate} or a
             directory operation. *)
     seq : int;  (** The change's position in program order. *)
   }

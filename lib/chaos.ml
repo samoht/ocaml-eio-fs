@@ -864,7 +864,7 @@ module Crash = struct
 
   (* [Write] carries a copy of the committed bytes so a crash can replay the
      survivors onto the durable baseline. *)
-  type change = Write of { offset : int; data : Cstruct.t } | Truncate of int
+  type change = Write of { offset : int; data : Cstruct.t } | Resize of int
 
   (* [durable] is the content as of the last [sync]; the pending changes live in
      the controller's log. [owner] and [rel] locate the file under the wrapped
@@ -883,6 +883,7 @@ module Crash = struct
      scripted survival predicate. *)
   type op_kind =
     | Data
+    | Truncate
     | Create
     | Mkdir
     | Unlink
@@ -892,11 +893,13 @@ module Crash = struct
 
   let equal_op_kind (a : op_kind) b =
     match (a, b) with
-    | Data, Data | Create, Create | Mkdir, Mkdir -> true
+    | Data, Data | Truncate, Truncate | Create, Create | Mkdir, Mkdir -> true
     | Unlink, Unlink | Rmdir, Rmdir -> true
     | Symlink a, Symlink b -> String.equal a.target b.target
     | Rename a, Rename b -> String.equal a.dest b.dest
-    | (Data | Create | Mkdir | Unlink | Rmdir | Symlink _ | Rename _), _ ->
+    | ( ( Data | Truncate | Create | Mkdir | Unlink | Rmdir | Symlink _
+        | Rename _ ),
+        _ ) ->
         false
 
   type unsynced = {
@@ -996,8 +999,14 @@ module Crash = struct
           length = Cstruct.length data;
           seq = e.seq;
         }
-    | Truncate n ->
-        { path = e.efs.rel; kind = Data; offset = n; length = 0; seq = e.seq }
+    | Resize n ->
+        {
+          path = e.efs.rel;
+          kind = Truncate;
+          offset = n;
+          length = 0;
+          seq = e.seq;
+        }
 
   let unsynced ctl =
     let data = List.map to_unsynced ctl.log in
@@ -1008,7 +1017,7 @@ module Crash = struct
 
   let apply buf = function
     | Write { offset; data } -> grow_blit buf ~offset data
-    | Truncate n -> resize buf n
+    | Resize n -> resize buf n
 
   (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
      staged read-only or write-only cannot be reopened O_RDWR, so grant the
@@ -1550,7 +1559,7 @@ module Crash = struct
       guard cf;
       let fs = fstate_of cf in
       Eio.File.truncate (writable cf) len;
-      clog_change cf.ctl fs (Truncate (Optint.Int63.to_int len));
+      clog_change cf.ctl fs (Resize (Optint.Int63.to_int len));
       bump cf.ctl fs ~kind:`Write ~offset:0 ~len:0
   end
 
@@ -1686,7 +1695,7 @@ module Crash = struct
       (* An unsynced truncation of pre-existing durable data is itself a change
          that a crash may lose. *)
       if is_trunc create && Cstruct.length prev > 0 then
-        clog_change d.dctl fs (Truncate 0);
+        clog_change d.dctl fs (Resize 0);
       if not existed then begin
         record_metadata d.dctl ~path:rel ~kind:Create;
         bump_metadata d.dctl ~path:rel ~kind:Create
@@ -1900,6 +1909,7 @@ module Crash = struct
   let pp_unsynced ppf u =
     match u.kind with
     | Data -> Fmt.pf ppf "%s @%d+%d #%d" u.path u.offset u.length u.seq
+    | Truncate -> Fmt.pf ppf "truncate %s to %d #%d" u.path u.offset u.seq
     | Create -> Fmt.pf ppf "create %s #%d" u.path u.seq
     | Mkdir -> Fmt.pf ppf "mkdir %s #%d" u.path u.seq
     | Unlink -> Fmt.pf ppf "unlink %s #%d" u.path u.seq
