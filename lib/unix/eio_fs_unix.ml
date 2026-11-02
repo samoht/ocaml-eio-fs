@@ -1278,10 +1278,6 @@ module Held = struct
         update_lock_contents file contents
 end
 
-let hold ~sw ?block ?create ?contents ?on_wait path =
-  let (_ : Held.t) = Held.take ~sw ?block ?create ?contents ?on_wait path in
-  ()
-
 (* The kernel is asked first: it names another process holding the record
    lock, and a fiber of this process waiting for that process holds the mutex
    and not the lock. A fiber holder is this process, which the kernel never

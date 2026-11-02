@@ -302,21 +302,6 @@ val with_lock :
       if the opened rendezvous carries no Unix descriptor and its backend is not
       {!Eio_fs_sync.Process_local}. *)
 
-val hold :
-  sw:Eio.Switch.t ->
-  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
-  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
-  ?contents:string ->
-  ?on_wait:(unit -> unit) ->
-  _ Eio.Path.t ->
-  unit
-(** [hold ~sw path] is {!with_lock} over [path] for the rest of [sw]'s life: it
-    returns once the lock is taken, and the lock is released when [sw] finishes.
-    [block], [create], [contents] and [on_wait] are as {!with_lock}'s.
-
-    @raise Lock_unavailable as {!with_lock} does.
-    @raise Eio.Io as {!with_lock} does. *)
-
 val probe : _ Eio.Path.t -> [ `Free of string | `Held of refusal ]
 (** [probe path] is the lock over [path] as an acquisition would find it now,
     taken without acquiring it: [`Held r] names its holder as a refusal does,

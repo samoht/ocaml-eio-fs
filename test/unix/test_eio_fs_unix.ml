@@ -1534,14 +1534,15 @@ let test_probe_of_a_lock_file_replaced () =
   Alcotest.(check bool)
     "the file was replaced between the open and the stat" true !replaced
 
-(* A hold is a lock for the rest of a switch: taken when [hold] returns, still
-   held while the switch runs, and let go when it finishes. *)
+(* A held lock not released lasts the rest of its switch: taken when [take]
+   returns, still held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
   let record = "held for the switch\n" in
   Eio.Switch.run (fun sw ->
-      Eio_fs_unix.hold ~sw ~contents:record lock;
+      ignore
+        (Eio_fs_unix.Held.take ~sw ~contents:record lock : Eio_fs_unix.Held.t);
       match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
       | () -> Alcotest.fail "a lock held for the switch was granted"
       | exception Eio_fs_unix.Lock_unavailable refused ->
@@ -1563,8 +1564,9 @@ let test_hold_refusal_names_the_holding_process () =
   Eio.Switch.run @@ fun sw ->
   let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   ( Eio.Switch.run @@ fun hold_sw ->
-    match Eio_fs_unix.hold ~sw:hold_sw ~block:`No lock with
-    | () -> Alcotest.fail "a hold was granted over another process's lock"
+    match Eio_fs_unix.Held.take ~sw:hold_sw ~block:`No lock with
+    | (_ : Eio_fs_unix.Held.t) ->
+        Alcotest.fail "a hold was granted over another process's lock"
     | exception Eio_fs_unix.Lock_unavailable refused ->
         Alcotest.(check (option int))
           "the holder the refusal carries"
