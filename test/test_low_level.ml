@@ -533,9 +533,101 @@ let test_confined_absolute_path () =
   expect_io_error "permission denied" (fun () ->
       ignore (Eio.Path.load Eio.Path.(d / "/f") : string))
 
+(* A directory opened below the root reaches nothing above it, whatever links
+   it holds. A link to an absolute path is refused, as eio_posix refuses one
+   through a confined capability, and so is a [..] that climbs past the
+   directory from inside a link's target, on the way or as the last
+   component. *)
+let test_confined_link_climb () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdirs ~perm:0o755 (fs / "/a/b/sub");
+  Eio.Path.mkdirs ~perm:0o755 (fs / "/a/c");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/a/secret") "secret";
+  Eio.Switch.run @@ fun sw ->
+  let b = Eio.Path.open_dir ~sw (fs / "/a/b") in
+  Eio.Path.symlink ~link_to:"/a/b/.." (b / "M");
+  Eio.Path.symlink ~link_to:"/a/b/M" (b / "L");
+  Eio.Path.symlink ~link_to:"../.." (b / "sub/U");
+  Eio.Path.symlink ~link_to:"sub/U" (b / "V");
+  List.iter
+    (fun path ->
+      match Eio.Path.read_dir (b / path) with
+      | names ->
+          Alcotest.failf "read_dir %S answered [%s]" path
+            (String.concat "; " names)
+      | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ())
+    [ "M"; "L"; "L/c"; "sub/U"; "V"; "V/c" ];
+  expect_io_error "permission denied" (fun () ->
+      ignore (Eio.Path.load (b / "L/secret") : string));
+  expect_io_error "permission denied" (fun () ->
+      Eio.Path.save ~create:(`Or_truncate 0o644) (b / "V/secret") "x");
+  expect_io_error "permission denied" (fun () ->
+      Eio.Switch.run @@ fun sw -> ignore (Eio.Path.open_dir ~sw (b / "L")));
+  expect_io_error "permission denied" (fun () ->
+      Eio.Switch.run @@ fun sw -> ignore (Eio.Path.open_dir ~sw (b / "V")));
+  Alcotest.(check string)
+    "the file above is untouched" "secret"
+    (Eio.Path.load (fs / "/a/secret"))
+
+(* A refusal names what the caller asked for, never where the capability sits
+   in the file system: a holder of a directory learns nothing of the path
+   above it from an error. *)
+let test_refusal_hides_location () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdirs ~perm:0o755 (fs / "/hidden/place/d");
+  Eio.Switch.run @@ fun sw ->
+  let d = Eio.Path.open_dir ~sw (fs / "/hidden/place/d") in
+  Eio.Path.symlink ~link_to:"/hidden" (d / "abs");
+  List.iter
+    (fun path ->
+      match Eio.Path.stat ~follow:true (d / path) with
+      | _ -> Alcotest.failf "%S was not refused" path
+      | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied e), _) ->
+          let message = Fmt.str "%a" Eio.Exn.Backend.pp e in
+          let mentions word =
+            let n = String.length word in
+            let rec at i =
+              i + n <= String.length message
+              && (String.equal (String.sub message i n) word || at (i + 1))
+            in
+            at 0
+          in
+          Alcotest.(check bool)
+            (Fmt.str "%S: %s names no directory above" path message)
+            false
+            (mentions "hidden" || mentions "place"))
+    [ ".."; "../d"; "abs"; "abs/place" ]
+
+(* path_resolution(7): a [..] after a symbolic link climbs from the link's
+   target, not from the directory holding the link, through full access and
+   through a confined directory alike. *)
+let test_dotdot_after_link () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdirs ~perm:0o755 (fs / "/d/e/f");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/x") "/x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/d/x") "/d/x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/d/e/x") "/d/e/x";
+  Eio.Path.symlink ~link_to:"d/e" (fs / "/s");
+  Alcotest.(check string) "full access" "/d/x" (Eio.Path.load (fs / "/s/../x"));
+  Eio.Switch.run @@ fun sw ->
+  let d = Eio.Path.open_dir ~sw (fs / "/d") in
+  Eio.Path.symlink ~link_to:"e/f" (d / "t");
+  Alcotest.(check string) "confined" "/d/e/x" (Eio.Path.load (d / "t/../x"));
+  Eio.Path.save ~create:(`Exclusive 0o644) (d / "t/../y") "made";
+  Alcotest.(check string)
+    "created beside the target" "made"
+    (Eio.Path.load (fs / "/d/e/y"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "confined link climb" `Quick test_confined_link_climb;
+      Alcotest.test_case "refusal hides the location" `Quick
+        test_refusal_hides_location;
+      Alcotest.test_case "dot-dot after a link" `Quick test_dotdot_after_link;
       Alcotest.test_case "confined absolute path" `Quick
         test_confined_absolute_path;
       Alcotest.test_case "seek bounds" `Quick test_seek_bounds;
