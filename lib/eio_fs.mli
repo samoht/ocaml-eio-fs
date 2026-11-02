@@ -18,14 +18,11 @@ module Nofollow : sig
     | `Too_large  (** The file holds more than [max_bytes] bytes. *) ]
   (** The type for read refusals. *)
 
-  type result = (Cstruct.t, error) Result.t
-  (** The type for read results: the file's bytes, or why they were refused. *)
-
   val read_file :
     max_bytes:int ->
     validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
     _ Eio.Path.t ->
-    result
+    (Cstruct.t, error) result
   (** [read_file ~max_bytes ~validate path] opens [path] as
       [Eio.Path.open_in ~follow:false] does, validates the opened file's
       {!Eio.File.stat} with [validate], and reads through end-of-file with one
@@ -50,7 +47,7 @@ module Nofollow : sig
     validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
-    result
+    (Cstruct.t, error) result
   (** [run ~max_bytes ~validate ~stat ~read] validates [stat] before asking
       [read] for bytes and reads through end-of-file with one byte of lookahead
       past [max_bytes]. The buffer offered to [read] starts at [stat]'s size

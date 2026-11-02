@@ -19,7 +19,6 @@ open Eio.Std
 
 module Nofollow = struct
   type error = [ `Invalid of string | `Too_large ]
-  type result = (Cstruct.t, error) Stdlib.result
 
   let check_bound max_bytes =
     if max_bytes < 0 || max_bytes = max_int then
