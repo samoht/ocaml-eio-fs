@@ -190,6 +190,62 @@ let test_admission () =
   Alcotest.(check (list string))
     "no admission side effects" [] (Eio.Path.read_dir root)
 
+let read ?max_bytes root path =
+  Link.with_parent ~root ~path (Link.read_regular ?max_bytes)
+
+let read_refused ~kind root path =
+  match read root path with
+  | Ok _ -> Alcotest.failf "read %S" path
+  | Error message ->
+      Alcotest.(check bool) kind true (contains kind message);
+      Alcotest.(check bool)
+        "names the path" true
+        (contains (Eio_fs.Path.name (root / path)) message)
+
+let test_read_regular () =
+  with_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o755 (root / "packages");
+  Eio.Path.save ~create:(`Exclusive 0o600) (root / "packages/library") "bytes";
+  Alcotest.(check (option string))
+    "the file's bytes" (Some "bytes")
+    (get (read root "packages/library"));
+  Alcotest.(check (option string))
+    "an absent entry" None
+    (get (read root "packages/absent"))
+
+let test_read_symlink_leaf () =
+  with_dir @@ fun root ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (root / "target") "bytes";
+  Eio.Path.symlink ~link_to:"target" (root / "library");
+  match read root "library" with
+  | Ok _ -> Alcotest.fail "read through a symbolic link"
+  | Error message ->
+      Alcotest.(check bool)
+        "names the path" true
+        (contains (Eio_fs.Path.name (root / "library")) message)
+
+let test_read_directory_leaf () =
+  with_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o755 (root / "library");
+  read_refused ~kind:"not a regular file" root "library"
+
+(* A FIFO with no writer is refused at once: the open does not wait for one. *)
+let test_read_fifo_leaf () =
+  with_dir @@ fun root ->
+  Unix.mkfifo (Eio.Path.native_exn (root / "library")) 0o600;
+  read_refused ~kind:"not a regular file" root "library"
+
+let test_read_too_large () =
+  with_dir @@ fun root ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (root / "library") "12345";
+  match read ~max_bytes:4 root "library" with
+  | Ok _ -> Alcotest.fail "read past the bound"
+  | Error message ->
+      Alcotest.(check bool) "too large" true (contains "too large" message);
+      Alcotest.(check (option string))
+        "at the bound" (Some "12345")
+        (get (read ~max_bytes:5 root "library"))
+
 let suite =
   ( "link",
     List.map
@@ -209,4 +265,9 @@ let suite =
         ("parent replacement race", test_parent_race);
         ("foreign leaf race", test_leaf_race);
         ("path admission", test_admission);
+        ("read a regular file", test_read_regular);
+        ("read refuses a symlink leaf", test_read_symlink_leaf);
+        ("read refuses a directory leaf", test_read_directory_leaf);
+        ("read refuses a FIFO leaf without blocking", test_read_fifo_leaf);
+        ("read refuses a file over the bound", test_read_too_large);
       ] )
