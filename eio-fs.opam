@@ -13,19 +13,19 @@ Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
 maintainer: ["Thomas Gazagnaire <thomas@gazagnaire.org>"]
 authors: ["Thomas Leonard" "Patrick Ferris"]
 license: "ISC"
-tags: ["org:blacksun" "os" "hermetic:eio-boundary" "area:10011777"]
-homepage: "https://tangled.org/gazagnaire.org/ocaml-eio-fs"
-bug-reports: "https://tangled.org/gazagnaire.org/ocaml-eio-fs/issues"
+tags: ["eio" "filesystem" "in-memory"]
+homepage: "https://github.com/samoht/ocaml-eio-fs"
+bug-reports: "https://github.com/samoht/ocaml-eio-fs/issues"
 depends: [
   "dune" {>= "3.21"}
-  "hermetic"
-  "ocaml" {>= "5.1"}
+  "hermetic" {>= "0.1.0"}
+  "ocaml" {>= "5.3"}
   "eio" {>= "1.6"}
-  "eio_posix" {>= "1.0"}
+  "eio_posix" {>= "1.6"}
   "fmt"
   "cstruct"
   "optint"
-  "console"
+  "console" {>= "0.9.0"}
   "cmdliner"
   "eio_main"
   "mdx" {with-test}
@@ -48,9 +48,5 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://tangled.org/gazagnaire.org/ocaml-eio-fs"
+dev-repo: "git+https://github.com/samoht/ocaml-eio-fs.git"
 x-maintenance-intent: ["(latest)"]
-pin-depends: [
-  ["cstruct.6.2.0" "git+https://github.com/samoht/ocaml-cstruct.git#d1e1f46bd0711d301a613411ef325160c0d8b21c"]
-  ["optint.0.3.0" "git+https://github.com/samoht/optint.git#ffb8eb0e3bbfca3089bc5b015cc5dfab8c0f8dd3"]
-]

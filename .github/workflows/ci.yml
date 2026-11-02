@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# hermetic is pinned from its repository until it is on opam.
+env:
+  HERMETIC_PIN: https://github.com/samoht/ocaml-hermetic.git
+
+jobs:
+  build:
+    name: Build and test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        ocaml-compiler: ['5.3', '5.4', '5.5']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+      - run: opam pin add -n hermetic "$HERMETIC_PIN"
+      - run: opam install . --deps-only --with-test
+      - run: opam exec -- dune build
+      - run: opam exec -- dune test
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.4'
+
+      - run: opam pin add -n hermetic "$HERMETIC_PIN"
+      - run: opam install . --deps-only --with-doc
+      - run: opam install odoc
+      - run: opam exec -- dune build @doc
+
+  lint-fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.4'
+
+      - uses: ocaml/setup-ocaml/lint-fmt@v3

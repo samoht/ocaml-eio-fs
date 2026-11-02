@@ -13,12 +13,12 @@
 (authors "Thomas Leonard" "Patrick Ferris")
 (maintainers "Thomas Gazagnaire <thomas@gazagnaire.org>")
 
-(source (tangled gazagnaire.org/ocaml-eio-fs))
+(source (github samoht/ocaml-eio-fs))
 
 (package
  (name eio-fs)
  (synopsis "Filesystem helpers and an in-memory backend for Eio")
- (tags (org:blacksun os hermetic:eio-boundary area:10011777))
+ (tags (eio filesystem in-memory))
  (description
   "Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
    [Eio_fs.Fs.v ()] creates a fresh filesystem, [Eio_fs.Fs.load] populates it
@@ -29,14 +29,14 @@
    (https://tangled.org/patrick.sirref.org/eio_mem), which is itself derived
    from the Eio filesystem interfaces.")
  (depends
-  hermetic
-  (ocaml (>= 5.1))
+  (hermetic (>= 0.1.0))
+  (ocaml (>= 5.3))
   (eio (>= 1.6))
-  (eio_posix (>= 1.0))
+  (eio_posix (>= 1.6))
   fmt
   cstruct
   optint
-  console
+  (console (>= 0.9.0))
   cmdliner
   eio_main
   (mdx :with-test)
