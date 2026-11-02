@@ -1844,9 +1844,90 @@ let test_crash_after_write_trigger () =
     "uncommitted file gone after auto-crash" true
     (absent (post / "img"))
 
+(* {2 A wrapper hands out nothing behind it}
+
+   Code under test given a wrapper holds that wrapper and nothing more: no
+   handler it can rebuild from the wrapper's own reaches the base, so no
+   operation steps around the schedule or the journal. Each case drops one
+   binding at a time from what the wrapper hands back and asks the rest for
+   what the dropped one answered. *)
+
+(* [r] with its [k]th binding dropped, for each [k]. *)
+let each_without (Eio.Resource.T (v, ops)) fn =
+  let bindings = Eio.Resource.bindings ops in
+  List.iteri
+    (fun k _ ->
+      let rest = List.filteri (fun i _ -> i <> k) bindings in
+      fn k (Eio.Resource.T (v, Eio.Resource.handler rest)))
+    bindings
+
+let every_op fault =
+  Schedule.scripted
+    (List.init 64 (fun n -> { Schedule.trigger = Nth_op (n + 1); fault }))
+
+let test_wrapped_dir_hides_its_base () =
+  with_chaos (every_op (Open_error `Eacces)) @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "base";
+  let dir, path = chaos in
+  each_without dir (fun k stripped ->
+      let stripped = (stripped :> Eio.Fs.dir_ty Eio.Resource.t) in
+      (match Eio.Path.load ((stripped, path) / "f") with
+      | data ->
+          Alcotest.failf "without binding %d, a read past the schedule: %S" k
+            data
+      | exception _ -> ());
+      match
+        Eio.Path.save ~create:(`Or_truncate 0o644) ((stripped, path) / "f") "x"
+      with
+      | () -> Alcotest.failf "without binding %d, a write past the schedule" k
+      | exception _ -> ());
+  Alcotest.(check string)
+    "the base is untouched" "base"
+    (Eio.Path.load (raw / "f"))
+
+let test_wrapped_file_hides_its_base () =
+  with_chaos (every_op (Write_error `Eio)) @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "base";
+  Eio.Path.with_open_out ~create:`Never (chaos / "f") @@ fun file ->
+  each_without file (fun k stripped ->
+      let stripped = (stripped :> Eio.File.rw_ty Eio.Resource.t) in
+      match Eio.Flow.copy_string "x" stripped with
+      | () -> Alcotest.failf "without binding %d, a write past the schedule" k
+      | exception _ -> ());
+  Alcotest.(check string)
+    "the base is untouched" "base"
+    (Eio.Path.load (raw / "f"))
+
+(* A write that reaches the store reaches the journal: a handler rebuilt from
+   a crash wrapper's file either refuses the write or journals it. *)
+let test_crash_file_hides_its_base () =
+  let ctl = Crash.v () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") @@ fun file ->
+  let journalled () =
+    List.length
+      (List.filter
+         (fun (u : Crash.unsynced) -> u.kind = Crash.Data)
+         (Crash.unsynced ctl))
+  in
+  each_without file (fun k stripped ->
+      let stripped = (stripped :> Eio.File.rw_ty Eio.Resource.t) in
+      let before = journalled () in
+      match Eio.Flow.copy_string "x" stripped with
+      | () ->
+          if journalled () = before then
+            Alcotest.failf "without binding %d, a write the journal missed" k
+      | exception _ -> ())
+
 let suite =
   ( "chaos",
     [
+      Alcotest.test_case "a wrapped directory hides its base" `Quick
+        test_wrapped_dir_hides_its_base;
+      Alcotest.test_case "a wrapped file hides its base" `Quick
+        test_wrapped_file_hides_its_base;
+      Alcotest.test_case "crash: a wrapped file hides its base" `Quick
+        test_crash_file_hides_its_base;
       Alcotest.test_case "short read" `Quick test_short_read;
       Alcotest.test_case "short read of an empty buffer" `Quick
         test_short_read_empty;
