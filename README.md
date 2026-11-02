@@ -8,7 +8,7 @@ a disk or in memory. Tests often want them in memory, and so does a unikernel,
 which has no filesystem at all. This library provides that in-memory backend.
 `Eio_fs.Fs.v ()` returns the root of a new, empty filesystem in memory.
 `Eio_fs.Fs.load` returns the root of a new one holding a copy of a directory
-tree, and `Eio_fs.Fs.tree` prints any `Eio.Path` tree. Two of these
+tree, and `Eio_fs.Path.pp_tree` prints any `Eio.Path` tree. Two of these
 filesystems share no file.
 
 For crash-consistency tests, `Eio_fs.Chaos` wraps a directory and injects

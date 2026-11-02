@@ -492,7 +492,7 @@ let test_name_falls_back_to_the_eio_rendering () =
     "the name is what Eio.Path.pp renders the path as" "<fs:hello.txt>"
     (Eio_fs.Path.name path)
 
-(* [Fs.tree] labels every node by the last component of its own path, a
+(* [Path.pp_tree] labels every node by the last component of its own path, a
    symbolic link by that component and its target, and the root by the path the
    caller handed in -- for the root of this backend, the directory itself. The
    labels are path arithmetic on the path each node was reached by, and nothing
@@ -510,7 +510,7 @@ let test_tree_labels_each_node_by_its_last_component () =
   Eio.Path.mkdir ~perm:0o755 (fs / "d");
   write fs "d/a" "x";
   Eio.Path.symlink ~link_to:"a" (fs / "d/l");
-  let render ~depth path = Fmt.str "%a" (Eio_fs.Fs.tree ~depth) path in
+  let render ~depth path = Fmt.str "%a" (Eio_fs.Path.pp_tree ~depth) path in
   Alcotest.(check string)
     "the root of the capability is named as the backend spells it"
     ("." ^ "\n" ^ last_branch ^ "d")

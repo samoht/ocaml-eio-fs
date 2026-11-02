@@ -3,8 +3,9 @@
 Initial release.
 
 - `Eio_fs.Fs`, an in-memory backend for `Eio.Path`: `v` creates an empty
-  filesystem, `load` copies a directory tree into a new one, and `tree`
-  prints any `Eio.Path` tree.
+  filesystem, and `load` copies a directory tree into a new one.
+- `Eio_fs.Path`, operations on any `Eio.Path`: the disk usage of a tree,
+  a walk, and `pp_tree`, which prints a tree as tree(1) lists it.
 - `Eio_fs.Chaos`, a directory wrapper that injects short and torn writes,
   failed syncs and power loss, for crash-consistency tests.
 - `eio-fs.sync`, durable file operations: atomic publication by a temporary

@@ -78,6 +78,13 @@ module Nofollow = struct
       ~read:(Eio.Flow.single_read file)
 end
 
+(* A path with no last component is called by the whole of itself: "/" is
+   "/", ".." is "..", and the empty path is ".". *)
+let last_component path =
+  match Eio_fs_path.basename path with
+  | "" -> if String.equal path "" then "." else path
+  | base -> base
+
 module Path = struct
   type usage = {
     allocated_bytes : int64;
@@ -165,17 +172,52 @@ module Path = struct
     match Eio.Path.native path with
     | Some native -> native
     | None -> Fmt.str "%a" Eio.Path.pp path
+
+  type node = Node of string * node list
+
+  (* Each child is drawn behind the guides of its ancestors: a branch, and
+     below it a rule while siblings follow, as tree(1) draws them. *)
+  let rec pp_children ppf guides = function
+    | [] -> ()
+    | [ child ] -> pp_child ppf guides "\u{2514}\u{2500}\u{2500} " "    " child
+    | child :: rest ->
+        pp_child ppf guides "\u{251C}\u{2500}\u{2500} " "\u{2502}   " child;
+        pp_children ppf guides rest
+
+  and pp_child ppf guides branch rule (Node (label, children)) =
+    Fmt.pf ppf "@,%s%s%s" guides branch label;
+    pp_children ppf (guides ^ rule) children
+
+  let pp_tree ~depth =
+    let name (_, p) = last_component p in
+    let rec node depth path =
+      match Eio.Path.kind ~follow:false path with
+      | `Regular_file -> Some (Node (name path, []))
+      | `Directory ->
+          let children =
+            if depth <= 1 then []
+            else
+              Eio.Path.read_dir path
+              |> List.filter_map (fun child ->
+                  node (depth - 1) Eio.Path.(path / child))
+          in
+          Some (Node (name path, children))
+      | `Symbolic_link ->
+          Some (Node (name path ^ " -> " ^ Eio.Path.read_link path, []))
+      | _ -> None
+    in
+    fun ppf path ->
+      if depth > 0 then
+        Option.iter
+          (fun (Node (label, children)) ->
+            Fmt.pf ppf "@[<v>%s%a@]" label
+              (fun ppf -> pp_children ppf "")
+              children)
+          (node depth path)
 end
 
 module Fs = struct
   type dir_fd = Low_level.Dir.fd
-
-  (* A path with no last component is called by the whole of itself: "/" is
-     "/", ".." is "..", and the empty path is ".". *)
-  let last_component path =
-    match Eio_fs_path.basename path with
-    | "" -> if String.equal path "" then "." else path
-    | base -> base
 
   (* A rename hands back a plain [Eio.Fs.dir]; this checks the new location is
      within its sandbox. *)
@@ -380,48 +422,6 @@ module Fs = struct
     in
     make_fs path;
     (fs, "/")
-
-  type node = Node of string * node list
-
-  (* Each child is drawn behind the guides of its ancestors: a branch, and
-     below it a rule while siblings follow, as tree(1) draws them. *)
-  let rec pp_children ppf guides = function
-    | [] -> ()
-    | [ child ] -> pp_child ppf guides "\u{2514}\u{2500}\u{2500} " "    " child
-    | child :: rest ->
-        pp_child ppf guides "\u{251C}\u{2500}\u{2500} " "\u{2502}   " child;
-        pp_children ppf guides rest
-
-  and pp_child ppf guides branch rule (Node (label, children)) =
-    Fmt.pf ppf "@,%s%s%s" guides branch label;
-    pp_children ppf (guides ^ rule) children
-
-  let tree ~depth =
-    let name (_, p) = last_component p in
-    let rec node depth path =
-      match Eio.Path.kind ~follow:false path with
-      | `Regular_file -> Some (Node (name path, []))
-      | `Directory ->
-          let children =
-            if depth <= 1 then []
-            else
-              Eio.Path.read_dir path
-              |> List.filter_map (fun child ->
-                  node (depth - 1) Eio.Path.(path / child))
-          in
-          Some (Node (name path, children))
-      | `Symbolic_link ->
-          Some (Node (name path ^ " -> " ^ Eio.Path.read_link path, []))
-      | _ -> None
-    in
-    fun ppf path ->
-      if depth > 0 then
-        Option.iter
-          (fun (Node (label, children)) ->
-            Fmt.pf ppf "@[<v>%s%a@]" label
-              (fun ppf -> pp_children ppf "")
-              children)
-          (node depth path)
 end
 
 module Crunch = struct

@@ -98,6 +98,12 @@ module Path : sig
   (** [name path] is what [path] is called outside the program: its native
       spelling when the capability has one, and the rendering {!Eio.Path.pp}
       gives it when not. *)
+
+  val pp_tree : depth:int -> _ Eio.Path.t Fmt.t
+  (** [pp_tree ~depth] formats a path and what is under it [depth] levels deep,
+      as tree(1) lists it: each entry by its last component, a symbolic link as
+      [name -> target], not followed. [depth = 1] is the path alone, and
+      [depth <= 0] prints nothing. *)
 end
 
 (** An in-memory filesystem for {!Eio}. *)
@@ -122,11 +128,6 @@ module Fs : sig
       is not copied; it is traced with [Eio.traceln].
 
       Raises [Eio.Io] if [path] or an entry under it cannot be read. *)
-
-  val tree : depth:int -> _ Eio.Path.t Fmt.t
-  (** [tree ~depth] formats a path as a [tree]-like listing [depth] levels deep:
-      [depth = 1] is the path alone, and [depth <= 0] prints nothing. Symbolic
-      links are shown as [name -> target] and are not followed. *)
 end
 
 (** Compile-time file embedding for the in-memory filesystem, in the style of

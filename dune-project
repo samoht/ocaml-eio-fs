@@ -22,7 +22,7 @@
  (description
   "Helpers for standard [Eio.Path] values and an in-memory filesystem backend.
    [Eio_fs.Fs.v ()] creates a fresh filesystem, [Eio_fs.Fs.load] populates it
-   from an existing directory tree, and [Eio_fs.Fs.tree] renders a filesystem
+   from an existing directory tree, and [Eio_fs.Path.pp_tree] renders a filesystem
    tree. The [eio-fs-crunch] binary embeds a directory tree as an OCaml
    module that rebuilds it in memory at runtime, in the style of ocaml-crunch.
    Adapted from Patrick Ferris's eio_mem
