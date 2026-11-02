@@ -322,6 +322,11 @@ module Filesystem = struct
     if !follows <= 0 then Error.symlink_loop ();
     decr follows
 
+  (* The directory a symbolic link's target resolves from: the root for an
+     absolute target, the directory holding the link otherwise. *)
+  let link_base fs ~parent link_to =
+    if Eio_fs_path.is_abs link_to then Entries.find 0L fs else parent
+
   let rec find_entry_relative_to_dir ~follows ~check ~follow fs dir
       (path : string) =
     let confinement_dir = as_dir ~label:"confinement-dir" !dir in
@@ -345,7 +350,8 @@ module Filesystem = struct
           | Resource.Symlink s when follow ->
               follow_link follows;
               if check then check_confinement dir s.link_to;
-              find_entry_relative_to_dir ~follows ~check ~follow fs parent
+              find_entry_relative_to_dir ~follows ~check ~follow fs
+                (link_base fs ~parent s.link_to)
                 s.link_to
           | _ ->
               let parent_path =
@@ -394,7 +400,9 @@ module Filesystem = struct
         Option.iter (fun f -> f sym.link_to) check;
         let _, r =
           find_entry_relative_to_dir ~follows ~check:(Option.is_some check)
-            ~follow fs parent sym.link_to
+            ~follow fs
+            (link_base fs ~parent sym.link_to)
+            sym.link_to
         in
         entries_exn ~follows ~check ~follow ~parent fs r
     (* Walking through a non-directory: POSIX ENOTDIR, surfaced as an [Eio.Io]
