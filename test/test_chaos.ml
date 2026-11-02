@@ -1294,6 +1294,45 @@ let test_crash_dir_rename_committed_moves () =
     "staging directory absent" true
     (absent (post / "stage"))
 
+(* A subtree held open across the rename of its directory follows the
+   directory, as a descriptor does: a file opened through it afterwards is
+   the file under the new name, and the model tracks it there. A Drop_unsynced
+   crash so drops that file's unsynced write and leaves the new entry at the
+   old name to its own bytes. *)
+let test_crash_held_subtree_follows_a_rename () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+  Crash.sync_metadata ctl;
+  Eio.Switch.run (fun sw ->
+      let stage = Eio.Path.open_dir ~sw (fs / "stage") in
+      Eio.Path.rename (fs / "stage") (fs / "final");
+      Eio.Path.mkdir ~perm:0o755 (fs / "stage");
+      Crash.sync_metadata ctl;
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644) (stage / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "synced" ];
+          Eio.File.sync file;
+          Crash.sync_metadata ctl;
+          Eio.Path.save ~create:(`Exclusive 0o644)
+            (fs / "stage" / "img")
+            "other";
+          Eio.Path.with_open_out ~create:`Never
+            (fs / "stage" / "img")
+            Eio.File.sync;
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "LOST!!" ]);
+      Eio.Path.mkdir ~perm:0o755 (fs / "later");
+      Crash.sync_metadata ctl);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the held subtree's file keeps what it synced" "synced"
+    (Eio.Path.load (post / "final" / "img"));
+  Alcotest.(check string)
+    "the entry at the old name keeps its own bytes" "other"
+    (Eio.Path.load (post / "stage" / "img"))
+
 (* Metadata survival is a prefix of program order: refusing an early directory
    op drops everything after it, even ops the predicate would accept, because
    a journal never commits out of order. *)
@@ -2043,6 +2082,8 @@ let suite =
         test_crash_dir_rename_uncommitted_reverts;
       Alcotest.test_case "crash: dir rename committed moves" `Quick
         test_crash_dir_rename_committed_moves;
+      Alcotest.test_case "crash: a held subtree follows a rename" `Quick
+        test_crash_held_subtree_follows_a_rename;
       Alcotest.test_case "crash: survive prefix rule" `Quick
         test_crash_survive_prefix_rule;
       Alcotest.test_case "crash: nth-op counts dir ops" `Quick
