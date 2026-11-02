@@ -542,8 +542,14 @@ let open_locked ~mode dir_fd path flags =
   let append = Open_flags.(mem o_append flags) in
   let truncate = Open_flags.(mem o_trunc flags) in
   let nofollow = Open_flags.(mem o_nofollow flags) in
+  let directory = Open_flags.(mem o_directory flags) in
   let fs = Dir.fs dir_fd in
   let opened r =
+    (match !r with
+    | Resource.Dir _ -> ()
+    (* O_DIRECTORY on anything else: ENOTDIR. *)
+    | _ when directory -> Error.err ("open: not a directory: " ^ path)
+    | _ -> ());
     check_access path flags r;
     if truncate then truncate_file r;
     r
