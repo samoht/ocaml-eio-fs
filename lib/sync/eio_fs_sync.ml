@@ -153,9 +153,11 @@ let bounded_sink ~max_bytes sink =
   let ops = Eio.Flow.Pi.sink (module Bounded_sink) in
   Eio.Resource.T (Bounded_sink.{ sink; max_bytes; written = 0L }, ops)
 
-(* The salt keeps a temporary left by a crashed process from colliding with
-   this one's. It decides only a name that is created exclusively and retried,
-   never a result, so its entropy is taken from the system. *)
+(* A name this process makes must differ from every other process's,
+   including one that crashed and left its temporaries behind: not every name
+   is created exclusively and retried. So the salt takes its entropy from the
+   system, which the prelude refuses because it makes results unrepeatable;
+   here it decides a name and nothing else. *)
 let tmp_salt =
   Stdlib_original.Random.State.bits
     (Stdlib_original.Random.State.make_self_init ())
