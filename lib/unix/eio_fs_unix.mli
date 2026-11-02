@@ -604,14 +604,18 @@ module Link : sig
 
   val read_regular : ?max_bytes:int -> t -> (string option, string) result
   (** [read_regular ~max_bytes parent] opens the final entry beneath the held
-      parent with [O_NOFOLLOW | O_NONBLOCK] and is [Ok (Some s)], [s] the bytes
-      read from that descriptor, or [Ok None] if the entry is absent. It is
-      [Error msg] for a symbolic link or another non-regular entry (a FIFO is
-      refused without waiting for a writer), a file of more than [max_bytes]
-      bytes (defaults to [max_int]) or one that grows beyond its size at open,
-      and a failed open. The descriptor is closed before the result. The
-      enclosing {!val-with_parent} refuses symbolic links at every parent
-      component.
+      parent with [O_NOFOLLOW | O_NONBLOCK | O_NOCTTY] and is [Ok (Some s)], [s]
+      the bytes read from that descriptor, or [Ok None] if the entry is absent.
+      It is [Error msg] for a symbolic link or another non-regular entry (a FIFO
+      is refused without waiting for a writer, and a terminal never becomes the
+      controlling one), a file of more than [max_bytes] bytes (defaults to
+      [max_int]) or one that grows beyond its size at open, and a failed open.
+      The descriptor is closed before the result. The enclosing
+      {!val-with_parent} refuses symbolic links at every parent component.
+
+      {b Warning.} A hard link is the file it names, wherever its other names
+      are: a regular file linked beneath the parent from outside the root is
+      read. Only a process that can write both directories makes such a link.
 
       @raise Unix.Unix_error if the opened entry cannot be stated or read. *)
 end

@@ -102,7 +102,9 @@ let test_sync_dir_refuses_a_name_a_link_took () =
   | () ->
       Alcotest.fail
         "the barrier reported a directory the caller never named durable"
-  | exception (Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) as e) ->
+  | exception
+      (Eio.Io (Eio.Fs.E (Eio.Fs.Symlink | Eio.Fs.Permission_denied _), _) as e)
+    ->
       Alcotest.(check bool)
         "the refusal names the directory it was asked to barrier" true
         (mentions ~needle:"store" (Printexc.to_string e))
