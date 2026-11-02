@@ -756,42 +756,27 @@ let blit_and_grow ~src ~dst ~off =
 let writev ({ Fd.fs; _ } as t) bufs =
   let fd = Fd.num t in
   update_fd_table_with_result fs @@ fun fds ->
+  let src = Cstruct.concat bufs in
   let () =
     update_entry fd fds @@ fun r ->
     match !r with
     | File e ->
-        let size = e.stat.size in
-        if t.append then t.pos <- size;
-        (* If the position is equal to the size then we just append. *)
-        if Optint.Int63.equal size t.pos then
-          (* We do it one buf at a time so we can simulate some concurrency... *)
-          List.iter
-            (fun buf ->
-              let contents =
-                File.Buffer (Cstruct.concat [ File.buffer e.contents; buf ])
-              in
-              let new_size = Optint.Int63.of_int @@ File.length contents in
-              let stat = { e.stat with size = new_size } in
-              r := File { e with stat; contents };
-              t.pos <- new_size;
-              Eio.Fiber.yield ())
-            bufs
-        else
-          (* Position is less than the size, so need to merge contents. *)
-          let src = Cstruct.concat bufs in
-          let contents =
-            File.Buffer
-              (blit_and_grow ~src ~dst:(File.buffer e.contents)
-                 ~off:(Optint.Int63.to_int t.pos))
-          in
-          let new_size = Optint.Int63.of_int @@ File.length contents in
-          let stat = { e.stat with size = new_size } in
-          r := File { e with stat; contents };
-          t.pos <-
-            Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src))
+        (* The buffers are one contiguous run, written at the offset or, for
+           an append descriptor, at the end. *)
+        if t.append then t.pos <- e.stat.size;
+        let contents =
+          File.Buffer
+            (blit_and_grow ~src ~dst:(File.buffer e.contents)
+               ~off:(Optint.Int63.to_int t.pos))
+        in
+        let new_size = Optint.Int63.of_int @@ File.length contents in
+        let stat = { e.stat with size = new_size } in
+        r := File { e with stat; contents };
+        t.pos <-
+          Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src))
     | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
   in
-  (Cstruct.length (Cstruct.concat bufs), fds)
+  (Cstruct.length src, fds)
 
 let readv ({ Fd.fs; _ } as t) bufs =
   let fd = Fd.num t in
