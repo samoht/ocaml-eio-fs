@@ -28,7 +28,6 @@ let test_exclusive_create () =
 
 let test_cwd_parent_escape () =
   with_env ~cwd:"/sandbox" @@ fun env ->
-  Eio.Path.mkdir ~perm:0o700 Eio.Path.(env#fs / "/sandbox");
   Eio.Path.save ~create:(`Or_truncate 0o600)
     Eio.Path.(env#fs / "/outside")
     "secret";
@@ -37,7 +36,6 @@ let test_cwd_parent_escape () =
 
 let test_cwd_symlink_escape () =
   with_env ~cwd:"/sandbox" @@ fun env ->
-  Eio.Path.mkdir ~perm:0o700 Eio.Path.(env#fs / "/sandbox");
   Eio.Path.save ~create:(`Or_truncate 0o600)
     Eio.Path.(env#fs / "/outside")
     "secret";

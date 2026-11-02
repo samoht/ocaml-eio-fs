@@ -130,14 +130,18 @@ module Fs : sig
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [load ~filter path] is the root of a new in-memory filesystem holding a
       copy of the directory tree at [path], at the same path from its root:
-      [load (dir / "a/b")] holds [/a/b]. [filter] (defaults to [fun _ -> true])
-      is called on [path] and every path below it before it is copied: a path
-      for which it is [false] is not copied, nor anything under it. [path] can
-      be on any filesystem, an in-memory one included.
+      [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a symbolic
+      link; the entries below it are copied as they are, a link kept a link.
+      [filter] (defaults to [fun _ -> true]) is called on [path], then on every
+      path below it, before anything of it is copied: a path for which it is
+      [false] is not copied, nor anything under it, so a refused [path] is an
+      empty filesystem. [path] can be on any filesystem, an in-memory one
+      included.
 
       An entry that is neither a regular file, a directory nor a symbolic link
       is not copied; it is traced with [Eio.traceln].
 
+      @raise Invalid_argument if [path] is not a directory.
       @raise Eio.Io if [path] or an entry under it cannot be read. *)
 end
 
@@ -208,7 +212,10 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 val run : ?cwd:string -> (stdenv -> 'a) -> 'a
 (** [run ~cwd fn] is [fn env], with [env] holding the root and the current
     directory of a new in-memory filesystem; the current directory is the
-    absolute path [cwd] (defaults to ["/"]).
+    absolute path [cwd] (defaults to ["/"]), made with its missing ancestors,
+    mode [0o755], before [fn] runs.
 
     {b Note.} This does not install an effect handler; wrap the call in
-    something like [Eio_mock.Backend.run]. *)
+    something like [Eio_mock.Backend.run].
+
+    @raise Invalid_argument if [cwd] is not an absolute path. *)

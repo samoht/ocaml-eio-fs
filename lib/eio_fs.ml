@@ -388,11 +388,15 @@ module Fs = struct
 
   let v () = (fs (Low_level.v ()), "/")
 
+  (* The root is followed and must be a directory; the filter is asked about
+     it before anything is made, and every entry below it is copied as it is,
+     a link kept a link. *)
   let load ?(filter = fun _ -> true) path =
+    let stat = Eio.Path.stat ~follow:true path in
+    if stat.kind <> `Directory then
+      Fmt.invalid_arg "Eio_fs.Fs.load: %a is not a directory" Eio.Path.pp path;
     let t = Low_level.v () in
     let fs = fs t in
-    let stat = Eio.Path.stat ~follow:true path in
-    Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm (fs, snd path);
     let switch_filesystem (_, path) = (fs, path) in
     let rec make_fs v =
       let stat = Eio.Path.stat ~follow:false v in
@@ -419,7 +423,12 @@ module Fs = struct
             Eio.Path.symlink ~link_to (switch_filesystem v)
       | _ -> Eio.traceln "Skipping %a" Eio.Path.pp v
     in
-    make_fs path;
+    if filter path then begin
+      Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm (fs, snd path);
+      List.iter
+        (fun name -> make_fs Eio.Path.(path / name))
+        (Eio.Path.read_dir path)
+    end;
     (fs, "/")
 end
 
@@ -513,9 +522,12 @@ module Chaos = Chaos
 
 type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 
-let run ?cwd fn =
-  let t = Low_level.v ?cwd () in
+let run ?(cwd = "/") fn =
+  if not (Eio_fs_path.is_abs cwd) then
+    Fmt.invalid_arg "Eio_fs.run: the cwd %S is not an absolute path" cwd;
+  let t = Low_level.v ~cwd () in
   let fs = (Eio.Path.of_dir (Fs.fs t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 Eio.Path.(fs / cwd);
   let cwd = (Eio.Path.of_dir (Fs.cwd t) :> Eio.Fs.dir_ty Eio.Path.t) in
   fn
     object
