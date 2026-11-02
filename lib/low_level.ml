@@ -478,14 +478,35 @@ let check_access path flags r =
 
 let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
 
+(* The entry [path] names, its last component not followed, or [None] when
+   that component is missing. *)
+let lookup_entry dir_fd path =
+  match Filesystem.lookup ~follow:false dir_fd path with
+  | r -> Some r
+  | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> None
+
+(* The path the symbolic link [path] to [link_to] resolves to. *)
+let link_target path link_to =
+  check_path (Eio_fs_path.append (Eio_fs_path.parent path) link_to)
+
+(* Create the entry [path] with [add parent name] unless its name is taken,
+   by a dangling symbolic link included: EEXIST, as mkdir(2) and symlink(2)
+   answer. *)
+let create_entry dir_fd path add =
+  match lookup_entry dir_fd path with
+  | Some _ -> Error.already_exists path
+  | None ->
+      let dir, base = dir_base path in
+      add (Filesystem.lookup ~follow:true dir_fd dir) base
+
 (* Create [path] in its parent directory, register the new file in the
    filesystem, and return its resource. *)
-let new_file ~follow ~mode dir_fd path =
+let new_file ~mode dir_fd path =
   (* A path in directory syntax names a directory, which O_CREAT never makes:
      macOS answers ENOENT, Linux EISDIR. *)
   if String.equal (Eio_fs_path.to_dir_path path) path then Error.not_found path;
   let dir, fname = dir_base path in
-  let rdir = Filesystem.lookup ~follow dir_fd dir in
+  let rdir = Filesystem.lookup ~follow:true dir_fd dir in
   let dir =
     match !rdir with
     | Resource.Dir d -> d
@@ -513,40 +534,42 @@ let open_locked ~mode dir_fd path flags =
   let append = Open_flags.(mem o_append flags) in
   let truncate = Open_flags.(mem o_trunc flags) in
   let nofollow = Open_flags.(mem o_nofollow flags) in
-  let follow = not nofollow in
-  let refuse_link r =
-    match !r with
-    | Resource.Symlink _ when nofollow -> Error.permission_denied path
-    | _ -> ()
-  in
   let fs = Dir.fs dir_fd in
+  let opened r =
+    check_access path flags r;
+    if truncate then truncate_file r;
+    r
+  in
   let r =
     match is_create || is_excl with
-    | false ->
-        let r = Filesystem.lookup ~follow dir_fd path in
-        refuse_link r;
-        check_access path flags r;
-        if truncate then truncate_file r;
-        r
-    | true -> (
-        let () =
-          try
-            if is_excl then
-              let _ = Filesystem.lookup ~follow dir_fd path in
-              Error.already_exists path
-          with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> ()
+    | false -> (
+        let r = Filesystem.lookup ~follow:(not nofollow) dir_fd path in
+        match !r with
+        (* O_NOFOLLOW on a symbolic link: ELOOP. *)
+        | Resource.Symlink _ -> Error.symlink_loop ()
+        | _ -> opened r)
+    | true ->
+        (* O_CREAT looks at the last component without following it. A
+           symbolic link there, dangling or not, makes O_EXCL fail with EEXIST
+           and O_NOFOLLOW with ELOOP; otherwise the open follows it and, when
+           its target is missing, creates that target. *)
+        let follows = ref Filesystem.max_follows in
+        let rec create path =
+          match lookup_entry dir_fd path with
+          | None -> new_file ~mode dir_fd path
+          | Some _ when is_excl -> Error.already_exists path
+          | Some r -> (
+              match !r with
+              | Resource.Symlink _ when nofollow -> Error.symlink_loop ()
+              | Resource.Symlink s -> (
+                  match Filesystem.lookup ~follow:true dir_fd path with
+                  | r -> opened r
+                  | exception Eio.Io (Eio.Fs.E (Not_found _), _) ->
+                      Filesystem.follow_link follows;
+                      create (link_target path s.link_to))
+              | _ -> opened r)
         in
-        let r =
-          try Option.some @@ Filesystem.lookup ~follow dir_fd path
-          with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
-        in
-        match r with
-        | Some r ->
-            refuse_link r;
-            check_access path flags r;
-            if truncate then truncate_file r;
-            r
-        | None -> new_file ~follow ~mode dir_fd path)
+        create path
   in
   let num = next_fd_of_fds fs.fds in
   fs.fds <- Fd_table.add num r fs.fds;
@@ -604,13 +627,7 @@ let mkdirat dir_fd ~perm path =
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
-  try
-    let _ = Filesystem.lookup ~follow:true dir_fd path in
-    Error.already_exists path
-  with Eio.Io (Eio.Fs.(E (Not_found _)), _) ->
-    let dir, base = dir_base path in
-    let r = Filesystem.lookup ~follow:true dir_fd dir in
-    mkdir r base
+  create_entry dir_fd path mkdir
 
 let embed dir_fd ~perm path ~contents =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -628,13 +645,7 @@ let embed dir_fd ~perm path ~contents =
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
     r := Dir { d with entries = (stat.ino, name) :: d.entries }
   in
-  try
-    let _ = Filesystem.lookup ~follow:true dir_fd path in
-    Error.already_exists path
-  with Eio.Io (Eio.Fs.(E (Not_found _)), _) ->
-    let dir, base = dir_base path in
-    let r = Filesystem.lookup ~follow:true dir_fd dir in
-    add r base
+  create_entry dir_fd path add
 
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -649,13 +660,7 @@ let symlinkat ~link_to dir_fd path =
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
-  try
-    let _ = Filesystem.lookup ~follow:true dir_fd path in
-    Error.already_exists path
-  with Eio.Io (Eio.Fs.(E (Not_found _)), _) ->
-    let dir, base = dir_base path in
-    let r = Filesystem.lookup ~follow:true dir_fd dir in
-    symlink r base
+  create_entry dir_fd path symlink
 
 let read_link dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
