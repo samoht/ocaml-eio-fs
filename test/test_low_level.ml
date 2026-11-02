@@ -230,9 +230,56 @@ let test_dir_ops_under_regular_file () =
   expect_io_error "not found" (fun () ->
       ignore (Eio.Path.read_dir (fs / "reg" / "sub") : string list))
 
+(* {2 The file offset belongs to the open file description}
+
+   open(2) makes a new open file description, with its own offset and its own
+   O_APPEND flag: opening a file a second time moves no other descriptor's
+   offset, and every write through an O_APPEND descriptor lands at the end of
+   the file, wherever its offset was. *)
+
+let read_exactly flow n =
+  let buf = Cstruct.create n in
+  Eio.Flow.read_exact flow buf;
+  Cstruct.to_string buf
+
+let test_second_open_keeps_offset () =
+  with_env @@ fun env ->
+  let path = env#fs / "f" in
+  Eio.Path.save ~create:(`Exclusive 0o644) path "abcdef";
+  Eio.Switch.run @@ fun sw ->
+  let w = Eio.Path.open_out ~sw ~create:`Never path in
+  Eio.Flow.copy_string "AB" w;
+  let r = Eio.Path.open_in ~sw path in
+  Alcotest.(check string) "first read" "AB" (read_exactly r 2);
+  let _other = Eio.Path.open_in ~sw path in
+  Eio.Flow.copy_string "CD" w;
+  Alcotest.(check string) "the reader kept its offset" "CD" (read_exactly r 2);
+  Alcotest.(check string)
+    "the writer kept its offset" "ABCDef" (Eio.Path.load path)
+
+let test_append_writes_at_end () =
+  with_env @@ fun env ->
+  let path = env#fs / "log" in
+  Eio.Path.save ~create:(`Exclusive 0o644) path "abc";
+  Eio.Switch.run @@ fun sw ->
+  let a = Eio.Path.open_out ~sw ~append:true ~create:`Never path in
+  let _other = Eio.Path.open_in ~sw path in
+  Eio.Flow.copy_string "def" a;
+  ignore (Eio.File.seek a (Optint.Int63.of_int 0) `Set : Optint.Int63.t);
+  Eio.Flow.copy_string "ghi" a;
+  let w = Eio.Path.open_out ~sw ~create:`Never path in
+  Eio.Flow.copy_string "X" w;
+  Eio.Flow.copy_string "jkl" a;
+  Alcotest.(check string)
+    "every append landed at the end" "Xbcdefghijkl" (Eio.Path.load path)
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "a second open keeps the offset" `Quick
+        test_second_open_keeps_offset;
+      Alcotest.test_case "append writes at the end" `Quick
+        test_append_writes_at_end;
       Alcotest.test_case "missing file" `Quick test_missing_file;
       Alcotest.test_case "exclusive create" `Quick test_exclusive_create;
       Alcotest.test_case "cwd parent escape" `Quick test_cwd_parent_escape;
