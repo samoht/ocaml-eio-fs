@@ -44,7 +44,7 @@ let append base path =
 
 let to_dir_path path =
   let len = String.length path in
-  if len > 0 && path.[len - 1] = '/' then path else path ^ "/"
+  if len = 0 then "./" else if path.[len - 1] = '/' then path else path ^ "/"
 
 let without_trailing_slashes path =
   let rec last_non_slash i =

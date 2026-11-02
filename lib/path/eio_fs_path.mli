@@ -36,7 +36,8 @@ val append : string -> string -> string
 
 val to_dir_path : string -> string
 (** [to_dir_path path] is [path] in directory syntax: [path] ending in a
-    separator, and unchanged when it already does. [to_dir_path ""] is ["/"]. *)
+    separator, and unchanged when it already does. The empty path is the current
+    directory, as Eio reads it, so [to_dir_path ""] is ["./"]. *)
 
 val basename : string -> string
 (** [basename path] is [path]'s last component, ignoring trailing separators,
