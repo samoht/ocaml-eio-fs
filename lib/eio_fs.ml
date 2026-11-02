@@ -350,9 +350,8 @@ module Fs = struct
   let load ?(filter = fun _ -> true) path =
     let t = Low_level.v () in
     let fs = fs t in
-    let start = Eio.Path.native_exn path in
     let stat = Eio.Path.stat ~follow:true path in
-    Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm (fs, start);
+    Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm (fs, snd path);
     let switch_filesystem (_, path) = (fs, path) in
     let rec make_fs v =
       let stat = Eio.Path.stat ~follow:false v in
@@ -365,12 +364,13 @@ module Fs = struct
             @@ fun o ->
             Eio.Path.with_open_in v @@ fun i -> Eio.Flow.copy i o
       | `Directory ->
-          if not (filter v) then ()
-          else
+          if filter v then begin
             Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm
               (switch_filesystem v);
-          let fnames = Eio.Path.read_dir v in
-          List.iter (fun fname -> make_fs Eio.Path.(v / fname)) fnames
+            List.iter
+              (fun fname -> make_fs Eio.Path.(v / fname))
+              (Eio.Path.read_dir v)
+          end
       | `Symbolic_link ->
           if not (filter v) then ()
           else

@@ -112,9 +112,16 @@ module Fs : sig
     'a Eio.Path.t ->
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [load ~filter path] is the root of a new in-memory filesystem holding a
-      copy of the directory tree at [path], under the same absolute path.
-      [filter] is called on every path and the path is copied only if it returns
-      [true] (defaults to [fun _ -> true]). *)
+      copy of the directory tree at [path], at the same path from its root:
+      [load (dir / "a/b")] holds [/a/b]. [filter] (defaults to [fun _ -> true])
+      is called on [path] and every path below it before it is copied: a path
+      for which it is [false] is not copied, nor anything under it. [path] can
+      be on any filesystem, an in-memory one included.
+
+      An entry that is neither a regular file, a directory nor a symbolic link
+      is not copied; it is traced with [Eio.traceln].
+
+      Raises [Eio.Io] if [path] or an entry under it cannot be read. *)
 
   val tree : depth:int -> _ Eio.Path.t Fmt.t
   (** [tree ~depth] formats a path as a [tree]-like listing [depth] levels deep:
@@ -141,7 +148,9 @@ module Crunch : sig
   val scan : _ Eio.Path.t -> t
   (** [scan dir] serializes the directory tree rooted at [dir]. The root is
       recorded as [Dir { path = "/"; _ }], entries follow in depth-first sorted
-      order, and symbolic links are recorded without being followed.
+      order, and symbolic links are recorded without being followed. An entry
+      that is neither a regular file, a directory nor a symbolic link is not
+      recorded; it is traced with [Eio.traceln].
 
       @raise Invalid_argument if [dir] is not a directory. *)
 
