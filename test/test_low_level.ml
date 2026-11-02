@@ -363,9 +363,42 @@ let test_symlink_loop () =
           ignore (Eio.Path.load (fs / path) : string)))
     [ "self"; "a"; "self/x"; "a/x" ]
 
+(* {2 Creating over a dangling symbolic link}
+
+   A symbolic link whose target is missing still occupies its name. open(2)
+   with O_CREAT | O_EXCL, mkdir(2) and symlink(2) fail with EEXIST on it;
+   O_CREAT alone follows it and creates the target; O_NOFOLLOW refuses it with
+   ELOOP. None of them adds a second entry of that name. *)
+
+let names dir = List.sort String.compare (Eio.Path.read_dir dir)
+
+let test_create_over_dangling_link () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.symlink ~link_to:"missing" (fs / "l");
+  expect_io_error "already exists" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (fs / "l") "x");
+  expect_io_error "already exists" (fun () ->
+      Eio.Path.mkdir ~perm:0o755 (fs / "l"));
+  expect_io_error "already exists" (fun () ->
+      Eio.Path.symlink ~link_to:"other" (fs / "l"));
+  expect_io_error "too many symbolic links" (fun () ->
+      Eio.Path.with_open_out ~follow:false ~create:(`If_missing 0o644)
+        (fs / "l") ignore);
+  Alcotest.(check (list string)) "only the link" [ "l" ] (names fs);
+  Eio.Path.save ~create:(`If_missing 0o644) (fs / "l") "x";
+  Alcotest.(check (list string))
+    "the target was created" [ "l"; "missing" ] (names fs);
+  Alcotest.(check string) "through the link" "x" (Eio.Path.load (fs / "l"));
+  Alcotest.(check string)
+    "the link is still a link" "missing"
+    (Eio.Path.read_link (fs / "l"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "create over a dangling link" `Quick
+        test_create_over_dangling_link;
       Alcotest.test_case "symbolic link loop" `Quick test_symlink_loop;
       Alcotest.test_case "symbolic link chain limit" `Quick
         test_symlink_chain_limit;
