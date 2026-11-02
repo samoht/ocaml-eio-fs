@@ -290,9 +290,30 @@ let test_vectored_write () =
       Alcotest.(check int) "bytes overwritten" 4 n);
   Alcotest.(check string) "inside the file" "HELLo world" (Eio.Path.load path)
 
+(* A descriptor opened by one fiber while another is in the middle of a read
+   stays open: a read never writes back a descriptor table it read before
+   letting the other fiber run. *)
+let test_open_during_read () =
+  with_env @@ fun env ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "src") "data";
+  Eio.Switch.run @@ fun sw ->
+  let src = Eio.Path.open_in ~sw (env#fs / "src") in
+  Eio.Fiber.both
+    (fun () -> ignore (read_exactly src 4 : string))
+    (fun () ->
+      let dst =
+        Eio.Path.open_out ~sw ~create:(`Exclusive 0o644) (env#fs / "dst")
+      in
+      Eio.Fiber.yield ();
+      Eio.Flow.copy_string "x" dst);
+  Alcotest.(check string)
+    "the write went through" "x"
+    (Eio.Path.load (env#fs / "dst"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "open during a read" `Quick test_open_during_read;
       Alcotest.test_case "vectored write" `Quick test_vectored_write;
       Alcotest.test_case "a second open keeps the offset" `Quick
         test_second_open_keeps_offset;
