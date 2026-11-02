@@ -189,12 +189,14 @@ module Entries = Map.Make (Inode)
 
 (* One file system: its tree by inode, the descriptors open on it, the last
    inode it numbered, and the directory a relative path resolves against.
-   Nothing is shared between two of them. *)
+   Nothing is shared between two of them. [lock] serialises the operations on
+   it, so fibers of several domains may share one. *)
 type fs = {
   mutable tree : resource ref Entries.t;
   mutable fds : resource ref Fd_table.t;
   mutable last_ino : Inode.t;
   cwd : string;
+  lock : Mutex.t;
 }
 
 type t = fs
@@ -226,19 +228,16 @@ module Dir = struct
   let fs = function Fs fs | Cwd fs -> fs | Dir_fd fd -> fd.fs
 end
 
-let update_fd_table_with_result fs fn =
-  let v, fds = fn fs.fds in
-  fs.fds <- fds;
-  v
+(* Each operation runs whole under its file system's lock and never yields
+   inside it: no other fiber, in this domain or another, sees the tree or the
+   descriptor table half updated, nor writes back a table read before it. *)
+let locked fs fn = Mutex.protect fs.lock fn
 
-let update_fd_table fs fn =
-  let () = update_fd_table_with_result fs (fun fds -> ((), fn fds)) in
-  ()
-
-let update_entry ?(if_missing = fun () -> ()) fd fds fn =
-  match Fd_table.find_opt fd fds with None -> if_missing () | Some e -> fn e
-
-let read_fd_table fs fn = fn fs.fds
+(* The resource the live descriptor [t] is open on. *)
+let resource_of (t : Fd.t) =
+  match Fd_table.find_opt (Fd.num t) t.fs.fds with
+  | Some r -> r
+  | None -> Error.badf ()
 
 let default_stat =
   Eio.File.Stat.
@@ -411,15 +410,11 @@ module Filesystem = struct
         in
         if is_confined ~root:cwd resource_path then r
         else Error.permission_denied resource_path
-    | Dir.Dir_fd ({ fs; _ } as fd) ->
+    | Dir.Dir_fd fd ->
         (* Confined to the descriptor's directory. A directory fd closed with
            its switch is EBADF, as for a real O_DIRECTORY fd, never a silent
            success. *)
-        let dir =
-          match read_fd_table fs (Fd_table.find_opt (Fd.num fd)) with
-          | Some d -> d
-          | None -> Error.badf ()
-        in
+        let dir = resource_of fd in
         let resource_path, r =
           find_entry_relative_to_dir ~check:true ~follow tree dir path
         in
@@ -432,15 +427,22 @@ module Filesystem = struct
 end
 
 let v ?(cwd = "/") () =
-  { tree = Filesystem.empty (); fds = Fd_table.empty; last_ino = 0L; cwd }
+  {
+    tree = Filesystem.empty ();
+    fds = Fd_table.empty;
+    last_ino = 0L;
+    cwd;
+    lock = Mutex.create ();
+  }
 
 (* Closing an already-closed handle does nothing, as [Eio.Resource.close]
    specifies and eio's posix backend does. A handle with two owners, a caller
    closing early in front of its switch, is the ordinary reason. *)
 let close (fd : Fd.t) =
+  locked fd.fs @@ fun () ->
   if not fd.closed then begin
     fd.closed <- true;
-    update_fd_table fd.fs @@ fun fds -> Fd_table.remove fd.num fds
+    fd.fs.fds <- Fd_table.remove fd.num fd.fs.fds
   end
 
 (* open(2): opening an existing file requires the permission bits the access
@@ -484,7 +486,9 @@ let new_file ~follow ~mode dir_fd path =
   Filesystem.add_file fs f.stat.ino file;
   file
 
-let openat ~mode ~sw dir_fd path flags =
+(* The descriptor is registered with [sw] once the lock is released: a
+   finished switch runs [close] at once, which takes the lock. *)
+let open_locked ~mode dir_fd path flags =
   let path = check_path path in
   let is_create = Open_flags.(mem o_creat flags) in
   let is_excl = Open_flags.(mem o_excl flags) in
@@ -498,57 +502,59 @@ let openat ~mode ~sw dir_fd path flags =
     | _ -> ()
   in
   let fs = Dir.fs dir_fd in
-  match is_create || is_excl with
-  | false ->
-      update_fd_table_with_result fs @@ fun fds ->
-      let num = next_fd_of_fds fds in
-      let fd = Fd.v ~append fs num in
-      let r = Filesystem.lookup ~follow dir_fd path in
-      refuse_link r;
-      check_access path flags r;
-      if truncate then truncate_file r;
-      Eio.Switch.on_release sw (fun () -> close fd);
-      (fd, Fd_table.add num r fds)
-  | true -> (
-      let () =
-        try
-          if is_excl then
-            let _ = Filesystem.lookup ~follow dir_fd path in
-            Error.already_exists path
-        with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> ()
-      in
-      update_fd_table_with_result fs @@ fun fds ->
-      let num = next_fd_of_fds fds in
-      let fd = Fd.v ~append fs num in
-      let r =
-        try Option.some @@ Filesystem.lookup ~follow dir_fd path
-        with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
-      in
-      match r with
-      | Some r ->
-          refuse_link r;
-          check_access path flags r;
-          let fds = Fd_table.add num r fds in
-          if truncate then truncate_file r;
-          Eio.Switch.on_release sw (fun () -> close fd);
-          (fd, fds)
-      | None ->
-          let file = new_file ~follow ~mode dir_fd path in
-          let fds = Fd_table.add num file fds in
-          Eio.Switch.on_release sw (fun () -> close fd);
-          (fd, fds))
+  let r =
+    match is_create || is_excl with
+    | false ->
+        let r = Filesystem.lookup ~follow dir_fd path in
+        refuse_link r;
+        check_access path flags r;
+        if truncate then truncate_file r;
+        r
+    | true -> (
+        let () =
+          try
+            if is_excl then
+              let _ = Filesystem.lookup ~follow dir_fd path in
+              Error.already_exists path
+          with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> ()
+        in
+        let r =
+          try Option.some @@ Filesystem.lookup ~follow dir_fd path
+          with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
+        in
+        match r with
+        | Some r ->
+            refuse_link r;
+            check_access path flags r;
+            if truncate then truncate_file r;
+            r
+        | None -> new_file ~follow ~mode dir_fd path)
+  in
+  let num = next_fd_of_fds fs.fds in
+  fs.fds <- Fd_table.add num r fs.fds;
+  Fd.v ~append fs num
+
+let openat ~mode ~sw dir_fd path flags =
+  let fd =
+    locked (Dir.fs dir_fd) @@ fun () -> open_locked ~mode dir_fd path flags
+  in
+  Eio.Switch.on_release sw (fun () -> close fd);
+  fd
 
 let statat ~follow dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let f = Filesystem.lookup ~follow dir_fd path in
   Resource.stat !f
 
 let chmod ~follow dir_fd ~perm path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow dir_fd path in
   r := Resource.set_stat !r { (Resource.stat !r) with perm }
 
 let chown ~follow ?uid ?gid dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow dir_fd path in
   let s = Resource.stat !r in
@@ -557,6 +563,7 @@ let chown ~follow ?uid ?gid dir_fd path =
   r := Resource.set_stat !r { s with uid; gid }
 
 let unlink dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let dir, base = dir_base path in
   let r = Filesystem.lookup ~follow:false dir_fd dir in
@@ -567,6 +574,7 @@ let unlink dir_fd path =
   r := Resource.Dir { d with entries }
 
 let mkdirat dir_fd ~perm path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let fs = Dir.fs dir_fd in
   let mkdir r name =
@@ -587,6 +595,7 @@ let mkdirat dir_fd ~perm path =
     mkdir r base
 
 let embed dir_fd ~perm path ~contents =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let fs = Dir.fs dir_fd in
   let add r name =
@@ -610,6 +619,7 @@ let embed dir_fd ~perm path ~contents =
     add r base
 
 let symlinkat ~link_to dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let fs = Dir.fs dir_fd in
   let symlink r name =
@@ -630,6 +640,7 @@ let symlinkat ~link_to dir_fd path =
     symlink r base
 
 let read_link dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow:false dir_fd path in
   match !r with
@@ -637,6 +648,7 @@ let read_link dir_fd path =
   | r -> Fmt.kstr Error.err "not a symlink: %a" Resource.pp r
 
 let read_dir dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow:true dir_fd path in
   match !r with
@@ -646,6 +658,7 @@ let read_dir dir_fd path =
   | _ -> Error.err "Not a directory"
 
 let read_dir_entries dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow:true dir_fd path in
   match !r with
@@ -662,6 +675,7 @@ let read_dir_entries dir_fd path =
   | _ -> Error.err "Not a directory"
 
 let rmdir dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
   let r = Filesystem.lookup ~follow:true dir_fd path in
   match !r with
@@ -682,6 +696,7 @@ let rmdir dir_fd path =
   | _ -> Error.err "Not a directory"
 
 let rename ?(replace = true) dir_fd old_path new_dir new_path =
+  locked (Dir.fs dir_fd) @@ fun () ->
   let old_path = check_path old_path in
   let new_path = check_path new_path in
   (* rename(2) does not move an entry between two file systems: EXDEV, which
@@ -723,12 +738,7 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       Resource.Dir { src with entries = without old_name src.entries }
   end
 
-let stat ({ Fd.fs; _ } as t) =
-  let fd = Fd.num t in
-  read_fd_table fs @@ fun fds ->
-  match Fd_table.find_opt fd fds with
-  | None -> Error.badf ()
-  | Some r -> Resource.stat !r
+let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 
 (* TODO: update access times *)
 
@@ -753,64 +763,53 @@ let blit_and_grow ~src ~dst ~off =
    [Eio.Path.open_in] on a directory is legal and the portable directory
    barrier depends on it -- so the operations below refuse one with EISDIR, as
    read(2) and write(2) do. *)
-let writev ({ Fd.fs; _ } as t) bufs =
-  let fd = Fd.num t in
-  update_fd_table_with_result fs @@ fun fds ->
-  let src = Cstruct.concat bufs in
-  let () =
-    update_entry fd fds @@ fun r ->
-    match !r with
-    | File e ->
-        (* The buffers are one contiguous run, written at the offset or, for
-           an append descriptor, at the end. *)
-        if t.append then t.pos <- e.stat.size;
-        let contents =
-          File.Buffer
-            (blit_and_grow ~src ~dst:(File.buffer e.contents)
-               ~off:(Optint.Int63.to_int t.pos))
-        in
-        let new_size = Optint.Int63.of_int @@ File.length contents in
-        let stat = { e.stat with size = new_size } in
-        r := File { e with stat; contents };
-        t.pos <-
-          Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src))
-    | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
-  in
-  (Cstruct.length src, fds)
+let writev t bufs =
+  locked t.Fd.fs @@ fun () ->
+  let r = resource_of t in
+  match !r with
+  | File e ->
+      (* The buffers are one contiguous run, written at the offset or, for an
+         append descriptor, at the end. *)
+      let src = Cstruct.concat bufs in
+      if t.append then t.pos <- e.stat.size;
+      let contents =
+        File.Buffer
+          (blit_and_grow ~src ~dst:(File.buffer e.contents)
+             ~off:(Optint.Int63.to_int t.pos))
+      in
+      let new_size = Optint.Int63.of_int @@ File.length contents in
+      let stat = { e.stat with size = new_size } in
+      r := File { e with stat; contents };
+      t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
+      Cstruct.length src
+  | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
 
-let readv ({ Fd.fs; _ } as t) bufs =
-  let fd = Fd.num t in
-  update_fd_table_with_result fs @@ fun fds ->
-  let read = ref 0 in
-  let () =
-    update_entry fd fds @@ fun r ->
-    match !r with
-    | File e ->
-        let pos = ref t.pos in
-        let size = Optint.Int63.to_int e.stat.size in
-        List.iter
-          (fun buf ->
-            let len = Cstruct.length buf in
-            let posi = Optint.Int63.to_int !pos in
-            let actual_len = max 0 (min len (size - posi)) in
-            File.blit e.contents ~src_off:posi buf ~dst_off:0 ~len:actual_len;
-            pos := Optint.Int63.add !pos (Optint.Int63.of_int actual_len);
-            read := !read + actual_len;
-            Eio.Fiber.yield ())
-          bufs;
-        t.pos <- !pos
-    | r -> Fmt.kstr Error.err "readv: not a file: %a" Resource.pp r
-  in
-  (!read, fds)
+let readv t bufs =
+  locked t.Fd.fs @@ fun () ->
+  match !(resource_of t) with
+  | File e ->
+      let read = ref 0 in
+      let pos = ref t.pos in
+      let size = Optint.Int63.to_int e.stat.size in
+      List.iter
+        (fun buf ->
+          let len = Cstruct.length buf in
+          let posi = Optint.Int63.to_int !pos in
+          let actual_len = max 0 (min len (size - posi)) in
+          File.blit e.contents ~src_off:posi buf ~dst_off:0 ~len:actual_len;
+          pos := Optint.Int63.add !pos (Optint.Int63.of_int actual_len);
+          read := !read + actual_len)
+        bufs;
+      t.pos <- !pos;
+      !read
+  | r -> Fmt.kstr Error.err "readv: not a file: %a" Resource.pp r
 
 (* Positioned reads and writes address an explicit [file_offset] and never move
    the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
-let preadv ({ Fd.fs; _ } as t) ~file_offset bufs =
-  let fd = Fd.num t in
-  read_fd_table fs @@ fun fds ->
-  match Fd_table.find_opt fd fds |> Option.map ( ! ) with
-  | None -> Error.badf ()
-  | Some (Resource.File e) ->
+let preadv t ~file_offset bufs =
+  locked t.Fd.fs @@ fun () ->
+  match !(resource_of t) with
+  | Resource.File e ->
       let size = File.length e.contents in
       let start = Optint.Int63.to_int file_offset in
       if start >= size then raise End_of_file
@@ -827,75 +826,57 @@ let preadv ({ Fd.fs; _ } as t) ~file_offset bufs =
           bufs;
         if !read = 0 then raise End_of_file else !read
       end
-  | Some r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
+  | r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
 
-let pwritev ({ Fd.fs; _ } as t) ~file_offset bufs =
-  let fd = Fd.num t in
-  update_fd_table_with_result fs @@ fun fds ->
-  let written = ref 0 in
-  let () =
-    update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
-    @@ fun r ->
-    match !r with
-    | Resource.File e ->
-        let src = Cstruct.concat bufs in
-        let off = Optint.Int63.to_int file_offset in
-        let contents =
-          File.Buffer (blit_and_grow ~src ~dst:(File.buffer e.contents) ~off)
-        in
-        let new_size = Optint.Int63.of_int (File.length contents) in
-        let stat = { e.stat with size = new_size } in
-        r := Resource.File { e with contents; stat };
-        written := Cstruct.length src
-    | r -> Fmt.kstr Error.err "pwrite: not a file: %a" Resource.pp r
-  in
-  (!written, fds)
+let pwritev t ~file_offset bufs =
+  locked t.Fd.fs @@ fun () ->
+  let r = resource_of t in
+  match !r with
+  | Resource.File e ->
+      let src = Cstruct.concat bufs in
+      let off = Optint.Int63.to_int file_offset in
+      let contents =
+        File.Buffer (blit_and_grow ~src ~dst:(File.buffer e.contents) ~off)
+      in
+      let new_size = Optint.Int63.of_int (File.length contents) in
+      let stat = { e.stat with size = new_size } in
+      r := Resource.File { e with contents; stat };
+      Cstruct.length src
+  | r -> Fmt.kstr Error.err "pwrite: not a file: %a" Resource.pp r
 
-let seek_fd ({ Fd.fs; _ } as t) off cmd =
-  let fd = Fd.num t in
-  update_fd_table_with_result fs @@ fun fds ->
-  let result = ref Optint.Int63.zero in
-  let () =
-    update_entry ~if_missing:(fun () -> ignore (Error.badf () : 'a)) fd fds
-    @@ fun r ->
-    match !r with
-    | Resource.File e ->
-        let base =
-          match cmd with
-          | `Set -> Optint.Int63.zero
-          | `Cur -> t.pos
-          | `End -> e.stat.size
-        in
-        let newpos = Optint.Int63.add base off in
-        t.pos <- newpos;
-        result := newpos
-    | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
-  in
-  (!result, fds)
+let seek_fd t off cmd =
+  locked t.Fd.fs @@ fun () ->
+  match !(resource_of t) with
+  | Resource.File e ->
+      let base =
+        match cmd with
+        | `Set -> Optint.Int63.zero
+        | `Cur -> t.pos
+        | `End -> e.stat.size
+      in
+      let newpos = Optint.Int63.add base off in
+      t.pos <- newpos;
+      newpos
+  | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
 
-let truncate_fd ({ Fd.fs; _ } as t) len =
-  let fd = Fd.num t in
-  update_fd_table fs @@ fun fds ->
-  update_entry
-    ~if_missing:(fun () -> ignore (Error.badf () : 'a))
-    fd fds
-    (fun r ->
-      match !r with
-      | Resource.File e ->
-          let target = Optint.Int63.to_int len in
-          let cur = File.length e.contents in
-          let contents =
-            if target = cur then e.contents
-            else begin
-              let c = Cstruct.create target in
-              File.blit e.contents ~src_off:0 c ~dst_off:0 ~len:(min cur target);
-              File.Buffer c
-            end
-          in
-          let stat = { e.stat with size = Optint.Int63.of_int target } in
-          r := Resource.File { e with contents; stat }
-      | r -> Fmt.kstr Error.err "truncate: not a file: %a" Resource.pp r);
-  fds
+let truncate_fd t len =
+  locked t.Fd.fs @@ fun () ->
+  let r = resource_of t in
+  match !r with
+  | Resource.File e ->
+      let target = Optint.Int63.to_int len in
+      let cur = File.length e.contents in
+      let contents =
+        if target = cur then e.contents
+        else begin
+          let c = Cstruct.create target in
+          File.blit e.contents ~src_off:0 c ~dst_off:0 ~len:(min cur target);
+          File.Buffer c
+        end
+      in
+      let stat = { e.stat with size = Optint.Int63.of_int target } in
+      r := Resource.File { e with contents; stat }
+  | r -> Fmt.kstr Error.err "truncate: not a file: %a" Resource.pp r
 
 module Flow = struct
   module Impl = struct

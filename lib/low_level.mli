@@ -44,7 +44,8 @@ end
 
 type t
 (** The type for in-memory file systems: a tree and the descriptors open on it.
-    Two file systems share neither. *)
+    Two file systems share neither. Each operation below runs whole under a lock
+    of its file system, so fibers of several domains may share one. *)
 
 val v : ?cwd:string -> unit -> t
 (** [v ~cwd ()] is a new file system holding only an empty root directory, whose

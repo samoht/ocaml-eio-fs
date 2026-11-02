@@ -310,9 +310,29 @@ let test_open_during_read () =
     "the write went through" "x"
     (Eio.Path.load (env#fs / "dst"))
 
+(* One file system may be shared by fibers of several domains: entries two
+   domains create at once in one directory are all there afterwards. *)
+let test_shared_across_domains () =
+  with_env @@ fun env ->
+  let n = 300 in
+  let create prefix () =
+    Eio_mock.Backend.run @@ fun () ->
+    for i = 1 to n do
+      Eio.Path.mkdir ~perm:0o755 (env#fs / Fmt.str "%s%d" prefix i)
+    done
+  in
+  let other = Domain.spawn (create "a") in
+  create "b" ();
+  Domain.join other;
+  Alcotest.(check int)
+    "every entry" (2 * n)
+    (List.length (Eio.Path.read_dir env#fs))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "shared across domains" `Quick
+        test_shared_across_domains;
       Alcotest.test_case "open during a read" `Quick test_open_during_read;
       Alcotest.test_case "vectored write" `Quick test_vectored_write;
       Alcotest.test_case "a second open keeps the offset" `Quick
