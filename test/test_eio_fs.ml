@@ -625,6 +625,45 @@ let test_load_refuses_a_file () =
   | _ -> Alcotest.fail "loaded a regular file"
   | exception Invalid_argument _ -> ()
 
+(* [dir] with [on_stat path] run after each stat it answers. *)
+let on_stat on_stat (Eio.Resource.T (dir, ops), path) =
+  let module B = (val Eio.Resource.get ops Eio.Fs.Pi.Dir) in
+  let module S = struct
+    include B
+
+    let stat t ~follow path =
+      let stat = B.stat t ~follow path in
+      on_stat path;
+      stat
+  end in
+  ( Eio.Resource.T (dir, Eio.Resource.handler [ H (Eio.Fs.Pi.Dir, (module S)) ]),
+    path )
+
+(* [load] copies the regular file it statted. A file swapped for a symbolic
+   link between the stat and the open is not followed: the copy never holds
+   what the link points at. *)
+let test_load_reads_what_it_statted () =
+  with_fs @@ fun src ->
+  Eio.Path.mkdirs ~perm:0o755 (src / "/tree");
+  write src "/tree/f" "statted";
+  write src "/secret" "secret";
+  let swapped = ref false in
+  let swap path =
+    if (not !swapped) && Filename.basename path = "f" then begin
+      swapped := true;
+      Eio.Path.unlink (src / "/tree/f");
+      Eio.Path.symlink ~link_to:"/secret" (src / "/tree/f")
+    end
+  in
+  match Eio_fs.Fs.load (on_stat swap (src / "/tree")) with
+  | exception Eio.Io _ -> ()
+  | dst ->
+      Alcotest.(check bool)
+        "the copy does not hold the link's target" false
+        (match Eio.Path.load (dst / "/tree/f") with
+        | contents -> String.equal contents "secret"
+        | exception Eio.Io _ -> false)
+
 (* The current directory [run] is given exists, and is absolute. *)
 let test_run_makes_its_cwd () =
   Eio_mock.Backend.run @@ fun () ->
@@ -647,6 +686,8 @@ let suite =
         test_load_filter_refuses_the_root;
       Alcotest.test_case "load refuses a regular file" `Quick
         test_load_refuses_a_file;
+      Alcotest.test_case "load reads what it statted" `Quick
+        test_load_reads_what_it_statted;
       Alcotest.test_case "run makes its cwd" `Quick test_run_makes_its_cwd;
       Alcotest.test_case "run refuses a relative cwd" `Quick
         test_run_refuses_a_relative_cwd;
