@@ -37,7 +37,7 @@
   cstruct
   optint
   (console (>= 0.9.0))
-  cmdliner
+  (cmdliner (>= 1.1.0))
   eio_main
   (mdx :with-test)
   (alcotest :with-test)

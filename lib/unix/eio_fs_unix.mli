@@ -32,6 +32,10 @@ val statvfs : _ Eio.Path.t -> statvfs
     blocks available to an unprivileged process on the filesystem holding
     [path]. The call is made on a system thread.
 
+    {b Warning.} [path] is reached by its native name ({!Eio.Path.native_exn}),
+    not through the directory it is under, so [..] and symbolic links can lead
+    outside that directory.
+
     @raise Unix.Unix_error as POSIX [statvfs].
     @raise Invalid_argument if [path] has no native Unix representation. *)
 
@@ -47,7 +51,9 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
     volumes. Linux clones one file at a time ([FICLONE]) and has no call for a
     tree, so there it is always [false]: a tree cloned file by file costs a call
     per entry, which a caller that wants it walks itself. The call is made on a
-    system thread; a clone of a directory is one call whatever it holds.
+    system thread; a clone of a directory is one call whatever it holds. As for
+    {!statvfs}, [src] and [dst] are reached by their native names and can lead
+    outside their directories.
 
     @raise Unix.Unix_error
       as [clonefile]: [dst] exists, [src] does not, permission is denied.
@@ -502,7 +508,8 @@ val lock_section :
 val xattrs : _ Eio.Path.t -> (string * string) list
 (** [xattrs path] is every extended attribute of [path] as [(name, value)]
     pairs, in ascending byte order of name. A value is the attribute's bytes,
-    NUL bytes included.
+    NUL bytes included. As for {!statvfs}, [path] is reached by its native name
+    and can lead outside its directory.
 
     @raise Unix.Unix_error
       as the platform call: [ENOTSUP] where the filesystem keeps none, [ENOSYS]
@@ -511,7 +518,8 @@ val xattrs : _ Eio.Path.t -> (string * string) list
 
 val set_xattr : _ Eio.Path.t -> string -> string -> unit
 (** [set_xattr path name value] sets the extended attribute [name] of [path] to
-    [value], creating it or replacing it.
+    [value], creating it or replacing it. As for {!statvfs}, [path] is reached
+    by its native name and can lead outside its directory.
 
     @raise Unix.Unix_error
       as the platform call: [ENOTSUP] where the filesystem keeps none, [EPERM]
