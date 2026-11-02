@@ -381,12 +381,26 @@ module Fs = struct
     make_fs path;
     (fs, "/")
 
+  type node = Node of string * node list
+
+  (* Each child is drawn behind the guides of its ancestors: a branch, and
+     below it a rule while siblings follow, as tree(1) draws them. *)
+  let rec pp_children ppf guides = function
+    | [] -> ()
+    | [ child ] -> pp_child ppf guides "\u{2514}\u{2500}\u{2500} " "    " child
+    | child :: rest ->
+        pp_child ppf guides "\u{251C}\u{2500}\u{2500} " "\u{2502}   " child;
+        pp_children ppf guides rest
+
+  and pp_child ppf guides branch rule (Node (label, children)) =
+    Fmt.pf ppf "@,%s%s%s" guides branch label;
+    pp_children ppf (guides ^ rule) children
+
   let tree ~depth =
     let name (_, p) = last_component p in
     let rec node depth path =
       match Eio.Path.kind ~follow:false path with
-      | `Regular_file ->
-          Some (Console.Tree.v (Console.View.text (name path)) [])
+      | `Regular_file -> Some (Node (name path, []))
       | `Directory ->
           let children =
             if depth <= 1 then []
@@ -395,16 +409,18 @@ module Fs = struct
               |> List.filter_map (fun child ->
                   node (depth - 1) Eio.Path.(path / child))
           in
-          Some (Console.Tree.v (Console.View.text (name path)) children)
+          Some (Node (name path, children))
       | `Symbolic_link ->
-          let label = name path ^ " -> " ^ Eio.Path.read_link path in
-          Some (Console.Tree.v (Console.View.text label) [])
+          Some (Node (name path ^ " -> " ^ Eio.Path.read_link path, []))
       | _ -> None
     in
     fun ppf path ->
       if depth > 0 then
         Option.iter
-          (fun n -> Console.View.pp ppf (Console.Tree.view n))
+          (fun (Node (label, children)) ->
+            Fmt.pf ppf "@[<v>%s%a@]" label
+              (fun ppf -> pp_children ppf "")
+              children)
           (node depth path)
 end
 

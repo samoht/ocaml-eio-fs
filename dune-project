@@ -36,7 +36,6 @@
   fmt
   cstruct
   optint
-  (console (>= 0.9.0))
   (cmdliner (>= 1.1.0))
   eio_main
   (mdx :with-test)

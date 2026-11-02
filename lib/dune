@@ -10,5 +10,4 @@
   eio-fs.sync
   fmt
   cstruct
-  optint
-  console))
+  optint))
