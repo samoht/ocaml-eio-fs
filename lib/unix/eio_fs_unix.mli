@@ -257,18 +257,18 @@ val with_lock :
     lock suspends only the calling fiber. The lock is released when [fn] returns
     or raises.
 
-    [create] controls whether an absent rendezvous is created; the default,
-    [`If_missing 0o600], creates it owner-only, and [`Never] raises
-    {!Eio.Fs.Not_found} when it is absent. [contents], when present, replaces
-    the lock file's contents through the locked handle. [block] (defaults to
-    [`Yes]) says what a hold another caller already has does: [`Yes] waits,
-    [`No] raises {!Lock_unavailable}, [`Fibers] waits only for a fiber of this
-    process, and [`For seconds] waits up to a monotonic bound. Locks are
-    coordinated between fibers by device and inode, and between processes by the
-    POSIX record lock. It also excludes {!Lease} readers and writers. On Linux,
-    where BSD [flock] and POSIX record locks are independent, it takes an
-    exclusive [flock] too; on Darwin the record lock already conflicts with
-    leases.
+    [create] (defaults to [`If_missing 0o600], owner-only) says what an absent
+    rendezvous does: [`If_missing perm] creates it with mode [perm] less the
+    umask, and [`Never] raises {!Eio.Fs.Not_found}. [contents], when present,
+    replaces the lock file's contents through the locked handle. [block]
+    (defaults to [`Yes]) says what a hold another caller already has does:
+    [`Yes] waits, [`No] raises {!Lock_unavailable}, [`Fibers] waits only for a
+    fiber of this process, and [`For seconds] waits up to a monotonic bound.
+    Locks are coordinated between fibers by device and inode, and between
+    processes by the POSIX record lock. It also excludes {!Lease} readers and
+    writers. On Linux, where BSD [flock] and POSIX record locks are independent,
+    it takes an exclusive [flock] too; on Darwin the record lock already
+    conflicts with leases.
 
     With [`Yes] or [`For seconds], a POSIX record lock another process holds is
     waited for by the kernel's blocking request ([fcntl] [F_SETLKW]), which
@@ -442,11 +442,11 @@ module Lease : sig
       descriptor is closed when the callback returns unless another process
       inherited it.
 
-      [create] controls whether an absent rendezvous is created; the default,
-      [`If_missing 0o600], creates it owner-only, and [`Never] raises
-      {!Eio.Fs.Not_found} when absent. [contents], when present, replaces the
-      rendezvous contents while the lease is held. [block] (defaults to [`Yes])
-      selects the wait policy used by {!with_lock}.
+      [create] (defaults to [`If_missing 0o600], owner-only) says what an absent
+      rendezvous does: [`If_missing perm] creates it with mode [perm] less the
+      umask, and [`Never] raises {!Eio.Fs.Not_found}. [contents], when present,
+      replaces the rendezvous contents while the lease is held. [block]
+      (defaults to [`Yes]) selects the wait policy used by {!with_lock}.
 
       With [block] [`Readers], a lease only shared holders hold is waited for as
       with [`Yes], and one an exclusive holder holds is refused as with [`No]: a
