@@ -6,4 +6,5 @@
 
 (library
  (name eio_fs_path)
- (public_name eio-fs.path))
+ (public_name eio-fs.path)
+ (libraries hermetic))

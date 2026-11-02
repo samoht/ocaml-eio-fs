@@ -1,3 +1,5 @@
+open! Hermetic
+
 let is_abs p = String.length p > 0 && p.[0] = '/'
 let is_rel p = not (is_abs p)
 let segs p = String.split_on_char '/' p
