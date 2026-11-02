@@ -48,10 +48,12 @@ a unikernel's scratch filesystem.
 
 ## Embedding a file tree at compile time
 
-The `eio-fs-crunch` binary walks a directory tree and writes an OCaml module and
-its interface. The module contains every directory, file and symbolic link in
-the tree, as [ocaml-crunch](https://github.com/mirage/ocaml-crunch) does. A dune
-rule regenerates the module when the asset directory changes:
+The `eio-fs-crunch` binary walks a directory tree and writes an OCaml module
+holding every directory, file and symbolic link in it, as
+[ocaml-crunch](https://github.com/mirage/ocaml-crunch) does. With `-o
+assets.ml` it writes the module there and its interface to `assets.mli`;
+without, it prints the module alone. A dune rule regenerates the module when
+the asset directory changes, and a library stanza compiles it:
 
 ```
 (rule
@@ -60,6 +62,11 @@ rule regenerates the module when the asset directory changes:
   (source_tree static))
  (action
   (run %{bin:eio-fs-crunch} -o assets.ml static)))
+
+(library
+ (name assets)
+ (modules assets)
+ (libraries eio-fs eio))
 ```
 
 The generated `assets.ml` holds the tree as a value of type `Eio_fs.Crunch.t`.
