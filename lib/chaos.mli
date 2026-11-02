@@ -16,9 +16,10 @@
 
 type code = [ `Enoent | `Eacces | `Enospc | `Eio ]
 (** The type for the POSIX error codes an injected fault raises. An
-    {!Fault.t.Open_error} or {!Fault.t.Stat_error} raises {!Eio.Fs.Not_found}
-    for [`Enoent] and {!Eio.Fs.Permission_denied} for [`Eacces]; every other
-    injected error is an {!Eio.Io} whose message names the code. *)
+    {!Fault.t.Open_error}, or a {!Fault.t.Stat_error} on a stat of a path,
+    raises {!Eio.Fs.Not_found} for [`Enoent] and {!Eio.Fs.Permission_denied} for
+    [`Eacces]; every other injected error, a stat of an open file included, is
+    an {!Eio.Io} whose message names the code. *)
 
 (** The fault kinds the wrapper can inject. Byte counts on the short-read,
     short-write and torn-write faults are relative to the current operation's
@@ -305,8 +306,9 @@ module Crash : sig
 
   val post_crash : t -> base_dir
   (** [post_crash t] crashes [t] if it has not already crashed, and is the base
-      directory over the crashed image: a fresh, unperturbed handle that a test
-      re-mounts and re-reads through.
+      directory given to {!wrap}, which now holds the crashed image. It is that
+      handle itself, not a new one, and no wrapper is in front of it, so a test
+      re-reads the image through it.
 
       @raise Invalid_argument if [t] was never {!wrap}ped. *)
 
