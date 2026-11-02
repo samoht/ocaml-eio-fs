@@ -142,7 +142,7 @@ module Schedule : sig
       trigger. A fired rule is consumed; unmatched rules never fire. When
       several pending rules match one operation, the first in [rules] fires and
       the others stay pending. This pins an exact scenario: for example, a
-      single {!Write_covering} rule carrying a {!constructor-Torn_write} fault
+      single {!Write_covering} rule carrying a {!Fault.t.Torn_write} fault
       reproduces a torn superblock flush at a chosen offset. *)
 
   val observing : (Op.t -> unit) -> t -> t
@@ -194,10 +194,10 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
     [rmdir], [symlink] and [rename] enter a metadata journal in program order;
-    {!sync_metadata} commits it whole, and a directory barrier commits only the
-    entries of that directory. At a crash the policy decides how much of the
-    uncommitted suffix survives, always a prefix of program order, and a dropped
-    operation is rolled back whole. *)
+    {!Crash.sync_metadata} commits it whole, and a directory barrier commits
+    only the entries of that directory. At a crash the policy decides how much
+    of the uncommitted suffix survives, always a prefix of program order, and a
+    dropped operation is rolled back whole. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =
