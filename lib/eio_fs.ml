@@ -223,10 +223,15 @@ module Fs = struct
   type (_, _, _) Eio.Resource.pi +=
     | Memfs_dir : ('t, 't -> dir_fd, [> `Memfs_dir ]) Eio.Resource.pi
 
-  let as_memfs_dir (Eio.Resource.T (t, ops)) =
+  (* A rename target that wraps an in-memory directory, as a Chaos directory
+     does, is unwrapped here, inside the package, to the directory it wraps:
+     the entry moves within the one tree, and the wrapper itself still hands
+     its base to no caller. *)
+  let rec as_memfs_dir : 'a. 'a Eio.Resource.t -> dir_fd option =
+   fun (Eio.Resource.T (t, ops) as dir) ->
     match Eio.Resource.get_opt ops Memfs_dir with
-    | None -> None
     | Some fn -> Some (fn t)
+    | None -> Option.bind (Eio_fs_internal.base_dir dir) as_memfs_dir
 
   module rec Dir : sig
     include Eio.Fs.Pi.DIR

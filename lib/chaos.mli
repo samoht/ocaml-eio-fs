@@ -189,7 +189,11 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     reaches the schedule's own sync. A backend's own interfaces are not carried
     over: a wrapper over a host directory is no native working directory for a
     child process, and its files hand out no host descriptor, except to
-    [eio-fs.unix], which takes a lock on the descriptor beneath. *)
+    [eio-fs.unix], which takes a lock on the descriptor beneath. A rename from
+    an in-memory directory of {!Fs} into a wrapper over the same tree is the
+    in-memory rename, outside [schedule]; one from a host directory of another
+    backend into a wrapper is refused by that backend, which finds no directory
+    of its own there. *)
 
 (** A power-loss durability model over a base directory capability.
 
