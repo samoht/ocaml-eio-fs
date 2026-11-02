@@ -706,23 +706,21 @@ let read_dir_entries dir_fd path =
 let rmdir dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
-  let r = Filesystem.lookup ~follow:true dir_fd path in
+  (* A final symbolic link is not followed: ENOTDIR. *)
+  let r = Filesystem.lookup ~follow:false dir_fd path in
   match !r with
   | Resource.Dir d ->
       if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
       else begin
-        (* TODO: need to delete from FD table? *)
-        let dir, _ = dir_base path in
+        let dir, base = dir_base path in
         let parent = Filesystem.lookup ~follow:true dir_fd dir in
         let r = as_dir ~label:"rmdir" !parent in
         let entries =
-          List.filter
-            (fun (ino, _) -> not (Inode.equal d.stat.ino ino))
-            r.entries
+          List.filter (fun (_, name) -> not (String.equal name base)) r.entries
         in
         parent := Dir { r with entries }
       end
-  | _ -> Error.err "Not a directory"
+  | _ -> Error.err ("rmdir: not a directory: " ^ path)
 
 (* Whether the directory [r] is the directory [ino] or lies below it. *)
 let rec within tree r ino =
