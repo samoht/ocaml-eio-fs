@@ -487,9 +487,26 @@ let test_absolute_symlink () =
     (Eio.Path.load (fs / "/d/l"));
   Alcotest.(check string) "on the way" "e" (Eio.Path.load (fs / "/d/e/le/f"))
 
+(* open(2) with O_DIRECTORY fails with ENOTDIR on anything but a directory,
+   which [Eio.Path.open_dir] asks for; a symbolic link to a directory is
+   followed. *)
+let test_open_dir_not_a_directory () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "f";
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.symlink ~link_to:"d" (fs / "ld");
+  expect_eio_io "opening a file as a directory" (fun () ->
+      Eio.Switch.run @@ fun sw -> ignore (Eio.Path.open_dir ~sw (fs / "f")));
+  Eio.Switch.run @@ fun sw ->
+  let d = Eio.Path.open_dir ~sw (fs / "ld") in
+  Alcotest.(check (list string)) "through a link" [] (Eio.Path.read_dir d)
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "open_dir on a file" `Quick
+        test_open_dir_not_a_directory;
       Alcotest.test_case "absolute symbolic link" `Quick test_absolute_symlink;
       Alcotest.test_case "rmdir on a symbolic link" `Quick test_rmdir_symlink;
       Alcotest.test_case "unlink" `Quick test_unlink;
