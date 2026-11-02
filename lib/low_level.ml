@@ -836,6 +836,12 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
 
 let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 
+(* An offset before the start of a file: EINVAL, which eio_posix raises as a
+   bare [Eio.Io]. *)
+let check_offset op off =
+  if Optint.Int63.compare off Optint.Int63.zero < 0 then
+    Fmt.kstr Error.err "%s: invalid offset %a" op Optint.Int63.pp off
+
 (* TODO: update access times *)
 
 let blit_and_grow ~src ~dst ~off =
@@ -892,7 +898,9 @@ let readv t bufs =
           let len = Cstruct.length buf in
           let posi = Optint.Int63.to_int !pos in
           let actual_len = max 0 (min len (size - posi)) in
-          File.blit e.contents ~src_off:posi buf ~dst_off:0 ~len:actual_len;
+          (* At or past the end nothing is read: end of file. *)
+          if actual_len > 0 then
+            File.blit e.contents ~src_off:posi buf ~dst_off:0 ~len:actual_len;
           pos := Optint.Int63.add !pos (Optint.Int63.of_int actual_len);
           read := !read + actual_len)
         bufs;
@@ -904,6 +912,7 @@ let readv t bufs =
    the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
 let preadv t ~file_offset bufs =
   locked t.Fd.fs @@ fun () ->
+  check_offset "pread" file_offset;
   match !(resource_of t) with
   | Resource.File e ->
       let size = File.length e.contents in
@@ -926,6 +935,7 @@ let preadv t ~file_offset bufs =
 
 let pwritev t ~file_offset bufs =
   locked t.Fd.fs @@ fun () ->
+  check_offset "pwrite" file_offset;
   let r = resource_of t in
   match !r with
   | Resource.File e ->
@@ -951,12 +961,14 @@ let seek_fd t off cmd =
         | `End -> e.stat.size
       in
       let newpos = Optint.Int63.add base off in
+      check_offset "seek" newpos;
       t.pos <- newpos;
       newpos
   | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
 
 let truncate_fd t len =
   locked t.Fd.fs @@ fun () ->
+  check_offset "truncate" len;
   let r = resource_of t in
   match !r with
   | Resource.File e ->
