@@ -2842,6 +2842,67 @@ let test_path_calls_raise_eio_io () =
   | true -> Alcotest.fail "cloned a missing path"
   | exception Eio.Io _ -> ()
 
+(* A library handed only [sandbox], a directory opened beneath [dir], reaches
+   nothing outside it through these calls, as it reaches nothing through
+   [Eio.Path]: a [..] above the sandbox and a symbolic link leading out of it
+   are refused, and a final symbolic link is never followed. The sandbox
+   itself, named by the empty path, is still reachable. *)
+let test_path_calls_stay_in_their_directory () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.mkdir ~perm:0o755 (dir / "sandbox");
+  Eio.Path.mkdir ~perm:0o755 (dir / "outside");
+  let secret = dir / "outside" / "secret" in
+  Eio.Path.save ~create:(`Exclusive 0o644) secret "outside";
+  Eio.Path.symlink ~link_to:"../outside" (dir / "sandbox" / "up");
+  Eio.Path.symlink ~link_to:"../outside/secret" (dir / "sandbox" / "leaf");
+  Eio.Switch.run @@ fun sw ->
+  let sandbox = Eio.Path.open_dir ~sw (dir / "sandbox") in
+  Eio.Path.save ~create:(`Exclusive 0o644) (sandbox / "payload") "planted";
+  let refused what f =
+    match f () with
+    | _ -> Alcotest.failf "%s reached outside its directory" what
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ()
+  in
+  List.iter
+    (fun out ->
+      refused ("clone_tree from " ^ out) (fun () ->
+          Eio_fs_unix.clone_tree (sandbox / out) (sandbox / "stolen"));
+      refused ("statvfs of " ^ out) (fun () ->
+          Eio_fs_unix.statvfs (sandbox / out));
+      refused ("xattrs of " ^ out) (fun () ->
+          Eio_fs_unix.xattrs (sandbox / out));
+      refused ("set_xattr of " ^ out) (fun () ->
+          Eio_fs_unix.set_xattr (sandbox / out) "user.escaped" "1"))
+    [ "../outside/secret"; "up/secret" ];
+  List.iter
+    (fun out ->
+      refused ("clone_tree to " ^ out) (fun () ->
+          Eio_fs_unix.clone_tree (sandbox / "payload") (sandbox / out)))
+    [ "../outside/planted"; "up/planted" ];
+  Alcotest.(check bool)
+    "nothing cloned in" true
+    (Eio.Path.kind ~follow:false (sandbox / "stolen") = `Not_found);
+  Alcotest.(check bool)
+    "nothing planted outside" true
+    (Eio.Path.kind ~follow:false (dir / "outside" / "planted") = `Not_found);
+  (match Eio_fs_unix.set_xattr (sandbox / "leaf") "user.escaped" "1" with
+  | () | (exception Eio.Io _) -> ());
+  (match Eio_fs_unix.clone_tree (sandbox / "leaf") (sandbox / "copy") with
+  | _ -> ()
+  | exception Eio.Io _ -> ());
+  Alcotest.(check bool)
+    "a final link is cloned as a link, if at all" true
+    (Eio.Path.kind ~follow:false (sandbox / "copy") <> `Regular_file);
+  (match Eio_fs_unix.xattrs secret with
+  | attributes ->
+      Alcotest.(check (option string))
+        "a final link is not followed" None
+        (List.assoc_opt "user.escaped" attributes)
+  | exception Eio.Io _ -> ());
+  Alcotest.(check bool)
+    "the sandbox itself" true
+    (Int64.compare (Eio_fs_unix.statvfs sandbox).total_blocks 0L > 0)
+
 (* xattr(7): a value is a byte string, and the no-follow calls act on a link
    itself. The value holds a NUL byte, which a C-string round trip would cut. *)
 let user_value = "v\000alue"
@@ -3069,6 +3130,8 @@ let suite =
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
       Alcotest.test_case "calls on a path raise Eio.Io" `Quick
         test_path_calls_raise_eio_io;
+      Alcotest.test_case "path calls stay in their directory" `Quick
+        test_path_calls_stay_in_their_directory;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
         test_pread_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
