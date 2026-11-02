@@ -72,14 +72,18 @@ val statvfs : _ Eio.Path.t -> statvfs
     blocks available to an unprivileged process on the filesystem holding
     [path]. The call is made on a system thread.
 
-    {b Warning.} [path] is reached by its native name ({!Eio.Path.native_exn}),
-    not through the directory it is under, so [..] and symbolic links can lead
-    outside that directory.
+    [path] is reached through its directory, never by its native name: the
+    directory holding [path] is opened as {!Eio.Path.open_dir} opens it, so a
+    confined directory refuses a [..] above it, an absolute path and a symbolic
+    link leading out, and [path]'s last component is opened beneath it without
+    being followed ([fstatvfs] on it). A final symbolic link reports the
+    filesystem holding the link. The empty path names the directory itself.
 
     @raise Eio.Io
-      as POSIX [statvfs] fails, and with {!Eio.Fs.Not_native} if [path] has no
-      native name.
-    @raise Invalid_argument if [path]'s native name holds a NUL byte. *)
+      as POSIX [fstatvfs] fails, with {!Eio.Fs.Permission_denied} if [path]
+      leads outside its directory, and with {!Eio.Fs.Not_native} if the
+      directory has no host descriptor.
+    @raise Invalid_argument if [path] holds a NUL byte. *)
 
 (** {1:clones Copy-on-write clones} *)
 
@@ -94,15 +98,16 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
     tree, so there it is always [false]: a tree cloned file by file costs a call
     per entry, which a caller that wants it walks itself. The call is made on a
     system thread; a clone of a directory is one call whatever it holds. As for
-    {!val-statvfs}, [src] and [dst] are reached by their native names and can
-    lead outside their directories.
+    {!val-statvfs}, [src] and [dst] are each reached through their directory and
+    never lead outside it ([clonefileat]); a final symbolic link [src] is cloned
+    as a link ([CLONE_NOFOLLOW]).
 
     @raise Eio.Io
-      as [clonefile] fails: with {!Eio.Fs.Already_exists} if [dst] exists,
+      as [clonefileat] fails: with {!Eio.Fs.Already_exists} if [dst] exists,
       {!Eio.Fs.Not_found} if [src] does not, {!Eio.Fs.Permission_denied} if
-      permission is denied, and {!Eio.Fs.Not_native} if a path has no native
-      name.
-    @raise Invalid_argument if a native name holds a NUL byte. *)
+      permission is denied or a path leads outside its directory, and
+      {!Eio.Fs.Not_native} if a directory has no host descriptor.
+    @raise Invalid_argument if a path holds a NUL byte. *)
 
 (** {1:trees Removable trees} *)
 
@@ -551,36 +556,39 @@ val lock_section :
 
     The name-value pairs a filesystem keeps beside a file's data
     ({{:https://man7.org/linux/man-pages/man7/xattr.7.html}xattr(7)}), which
-    [Unix] does not bind. Both calls act on the entry [path] names, a symbolic
-    link included, and never follow it: [llistxattr], [lgetxattr] and
-    [lsetxattr] on Linux, [XATTR_NOFOLLOW] on Darwin. Each call is made on a
+    [Unix] does not bind. As for {!val-statvfs}, [path] is reached through its
+    directory and never leads outside it. Both calls act on the entry [path]
+    names, a symbolic link included, and never follow it: Darwin opens the entry
+    ([O_SYMLINK]) and calls [flistxattr], [fgetxattr] and [fsetxattr] on it, so
+    the entry must be readable; Linux calls [llistxattr], [lgetxattr] and
+    [lsetxattr] on the entry through its directory's [/proc/self/fd] link, and
+    fails with [ENOTSUP] where [/proc] is not mounted. Each call is made on a
     system thread. *)
 
 val xattrs : _ Eio.Path.t -> (string * string) list
 (** [xattrs path] is every extended attribute of [path] as [(name, value)]
     pairs, in ascending byte order of name, and [[]] for an entry that has none.
-    A value is the attribute's bytes, NUL bytes included. As for {!val-statvfs},
-    [path] is reached by its native name and can lead outside its directory.
+    A value is the attribute's bytes, NUL bytes included.
 
     @raise Eio.Io
       as the platform call fails ([ENOTSUP] where the filesystem keeps none,
-      [ENOSYS] on a platform with neither family), and with {!Eio.Fs.Not_native}
-      if [path] has no native name.
-    @raise Invalid_argument if [path]'s native name holds a NUL byte. *)
+      [ENOSYS] on a platform with neither family), with
+      {!Eio.Fs.Permission_denied} if [path] leads outside its directory, and
+      with {!Eio.Fs.Not_native} if the directory has no host descriptor.
+    @raise Invalid_argument if [path] holds a NUL byte. *)
 
 val set_xattr : _ Eio.Path.t -> string -> string -> unit
 (** [set_xattr path name value] sets the extended attribute [name] of [path] to
-    [value], creating it or replacing it. As for {!val-statvfs}, [path] is
-    reached by its native name and can lead outside its directory.
+    [value], creating it or replacing it.
 
     @raise Eio.Io
       as the platform call fails ([ENOTSUP] where the filesystem keeps none,
       [EPERM] for a namespace the process may not write, [security.*] and
       [trusted.*] without privilege on Linux, [ENOSYS] on a platform with
-      neither family), and with {!Eio.Fs.Not_native} if [path] has no native
-      name.
-    @raise Invalid_argument if [path]'s native name or [name] holds a NUL byte.
-*)
+      neither family), with {!Eio.Fs.Permission_denied} if [path] leads outside
+      its directory, and with {!Eio.Fs.Not_native} if the directory has no host
+      descriptor.
+    @raise Invalid_argument if [path] or [name] holds a NUL byte. *)
 
 (** {1:links Confined links} *)
 

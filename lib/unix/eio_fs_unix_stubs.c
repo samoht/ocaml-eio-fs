@@ -320,30 +320,52 @@ CAMLprim value caml_eio_fs_darwin_full_fsync(value fd_v)
 #endif
 }
 
-/* One POSIX statvfs call. Capacity policy and arithmetic live in OCaml. */
-CAMLprim value caml_eio_fs_statvfs(value path_v)
+/* The entry [name] beneath [dirfd] itself, a symbolic link included, opened
+   for a call that acts on a descriptor: O_PATH on Linux, which reads nothing
+   and needs no permission on the entry, and O_SYMLINK on Darwin, which opens a
+   final link rather than following it. A FIFO is not waited on (O_NONBLOCK)
+   and a terminal does not become the controlling one (O_NOCTTY). */
+static int eio_fs_open_entry(int dirfd, const char *name)
 {
-  CAMLparam1(path_v);
+  int fd;
+  do {
+#if defined(__linux__)
+    fd = openat(dirfd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+#elif defined(__APPLE__)
+    fd = openat(dirfd, name,
+                O_RDONLY | O_SYMLINK | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+#else
+    fd = openat(dirfd, name,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+#endif
+  } while (fd == -1 && errno == EINTR);
+  return fd;
+}
+
+/* One POSIX fstatvfs call on the entry [name] beneath [dirfd], never followed.
+   Capacity policy and arithmetic live in OCaml. */
+CAMLprim value caml_eio_fs_statvfsat(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
   CAMLlocal5(result, block_size, total_blocks, free_blocks, available_blocks);
-  mlsize_t path_len = caml_string_length(path_v);
-  const char *ocaml_path = String_val(path_v);
-  if (memchr(ocaml_path, '\0', path_len) != NULL)
-    caml_invalid_argument("Eio_fs_unix.statvfs: NUL byte in path");
-
-  char *path = malloc(path_len + 1);
-  if (path == NULL)
-    caml_raise_out_of_memory();
-  memcpy(path, ocaml_path, path_len);
-  path[path_len] = '\0';
-
+  caml_unix_check_path(name_v, "statvfs");
+  char *name = caml_stat_strdup(String_val(name_v));
+  int dirfd = Int_val(dirfd_v);
   struct statvfs buf;
+  int r = -1;
   caml_release_runtime_system();
-  int r = statvfs(path, &buf);
+  int fd = eio_fs_open_entry(dirfd, name);
+  if (fd != -1) {
+    r = fstatvfs(fd, &buf);
+    int e = errno;
+    close(fd);
+    errno = e;
+  }
   int saved_errno = errno;
   caml_acquire_runtime_system();
-  free(path);
+  caml_stat_free(name);
   if (r == -1)
-    caml_unix_error(saved_errno, "statvfs", path_v);
+    caml_unix_error(saved_errno, "statvfs", name_v);
 
   block_size = caml_copy_int64((int64_t)buf.f_frsize);
   total_blocks = caml_copy_int64((int64_t)buf.f_blocks);
@@ -631,16 +653,100 @@ CAMLprim value caml_eio_fs_rename_exclusive(value srcfd_v, value src_v,
 
 /* --- Extended attributes ---
 
-   POSIX has no extended-attribute call; Linux and Darwin each have one family
-   with different spellings. Linux names the no-follow form with an [l]
-   prefix (llistxattr(2), lgetxattr(2), lsetxattr(2)); Darwin passes
-   XATTR_NOFOLLOW to listxattr(2), getxattr(2) and setxattr(2), which also take
-   a resource-fork position, always 0 here. Every call acts on the named entry
-   itself, a symbolic link included, never on what it points to. */
+   POSIX has no extended-attribute call, and neither Linux nor Darwin has one
+   that takes a directory descriptor and a name. Each call here acts on the
+   entry [name] beneath [dirfd] itself, a symbolic link included, never on
+   what it points to. Darwin opens the entry once (O_SYMLINK) and calls
+   flistxattr(2), fgetxattr(2) and fsetxattr(2) on it. Linux cannot read the
+   attributes of a link through a descriptor, so it names the entry through
+   the parent's own /proc link and calls llistxattr(2), lgetxattr(2) and
+   lsetxattr(2): the kernel resolves that link to the directory [dirfd] holds,
+   whatever has been renamed since, and does not follow [name]. */
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/xattr.h>
 #endif
+
+typedef struct {
+  int fd;     /* Darwin: the entry itself. */
+  char *path; /* Linux: the entry through its parent's /proc link. */
+} eio_fs_entry;
+
+static int eio_fs_entry_open(int dirfd, const char *name, eio_fs_entry *e)
+{
+  e->fd = -1;
+  e->path = NULL;
+#if defined(__APPLE__)
+  e->fd = eio_fs_open_entry(dirfd, name);
+  return e->fd == -1 ? -1 : 0;
+#elif defined(__linux__)
+  if (access("/proc/self/fd", F_OK) == -1) {
+    errno = ENOTSUP;
+    return -1;
+  }
+  size_t len = strlen(name) + 32;
+  e->path = malloc(len);
+  if (e->path == NULL) {
+    errno = ENOMEM;
+    return -1;
+  }
+  snprintf(e->path, len, "/proc/self/fd/%d/%s", dirfd, name);
+  return 0;
+#else
+  (void)dirfd;
+  (void)name;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static void eio_fs_entry_close(eio_fs_entry *e)
+{
+  if (e->fd != -1)
+    close(e->fd);
+  free(e->path);
+}
+
+static ssize_t eio_fs_listxattr(eio_fs_entry *e, char *buf, size_t size)
+{
+#if defined(__APPLE__)
+  return flistxattr(e->fd, buf, size, 0);
+#elif defined(__linux__)
+  return llistxattr(e->path, buf, size);
+#else
+  (void)e; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static ssize_t eio_fs_getxattr(eio_fs_entry *e, const char *name, void *buf,
+                               size_t size)
+{
+#if defined(__APPLE__)
+  return fgetxattr(e->fd, name, buf, size, 0, 0);
+#elif defined(__linux__)
+  return lgetxattr(e->path, name, buf, size);
+#else
+  (void)e; (void)name; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static int eio_fs_setxattr(eio_fs_entry *e, const char *name, const void *buf,
+                           size_t size)
+{
+#if defined(__APPLE__)
+  return fsetxattr(e->fd, name, buf, size, 0, 0);
+#elif defined(__linux__)
+  return lsetxattr(e->path, name, buf, size, 0);
+#else
+  (void)e; (void)name; (void)buf; (void)size;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
 
 static void eio_fs_check_nul(value v, const char *what)
 {
@@ -648,186 +754,134 @@ static void eio_fs_check_nul(value v, const char *what)
     caml_invalid_argument(what);
 }
 
-static char *eio_fs_cstring(value v, const char *what)
+/* The size query and the read are two calls on one opened entry, and an
+   attribute can grow in between: ERANGE on the read asks again. The result is
+   the raw bytes the kernel returns, which the OCaml side cuts. */
+static value eio_fs_read_sized(value dirfd_v, value entry_v, value name_v,
+                               const char *what)
 {
-  mlsize_t len = caml_string_length(v);
-  const char *s = String_val(v);
-  eio_fs_check_nul(v, what);
-  char *c = malloc(len + 1);
-  if (c == NULL)
-    caml_raise_out_of_memory();
-  memcpy(c, s, len);
-  c[len] = '\0';
-  return c;
-}
-
-static ssize_t eio_fs_llistxattr(const char *path, char *buf, size_t size)
-{
-#if defined(__linux__)
-  return llistxattr(path, buf, size);
-#elif defined(__APPLE__)
-  return listxattr(path, buf, size, XATTR_NOFOLLOW);
-#else
-  (void)path; (void)buf; (void)size;
-  errno = ENOSYS;
-  return -1;
-#endif
-}
-
-static ssize_t eio_fs_lgetxattr(const char *path, const char *name, void *buf,
-                                size_t size)
-{
-#if defined(__linux__)
-  return lgetxattr(path, name, buf, size);
-#elif defined(__APPLE__)
-  return getxattr(path, name, buf, size, 0, XATTR_NOFOLLOW);
-#else
-  (void)path; (void)name; (void)buf; (void)size;
-  errno = ENOSYS;
-  return -1;
-#endif
-}
-
-static int eio_fs_lsetxattr(const char *path, const char *name,
-                            const void *buf, size_t size)
-{
-#if defined(__linux__)
-  return lsetxattr(path, name, buf, size, 0);
-#elif defined(__APPLE__)
-  return setxattr(path, name, buf, size, 0, XATTR_NOFOLLOW);
-#else
-  (void)path; (void)name; (void)buf; (void)size;
-  errno = ENOSYS;
-  return -1;
-#endif
-}
-
-/* The size query and the read are two calls, and an attribute can grow in
-   between: ERANGE on the read asks again. The result is the raw bytes the
-   kernel returns, which the OCaml side cuts. */
-static value eio_fs_read_sized(value path_v, value name_v, const char *what)
-{
-  CAMLparam2(path_v, name_v);
+  CAMLparam3(dirfd_v, entry_v, name_v);
   CAMLlocal1(result);
   /* Both are checked before either is copied, so a refusal leaks nothing. */
-  eio_fs_check_nul(path_v, "Eio_fs_unix: NUL byte in path");
+  eio_fs_check_nul(entry_v, "Eio_fs_unix: NUL byte in path");
   if (Is_block(name_v))
     eio_fs_check_nul(Field(name_v, 0), "Eio_fs_unix: NUL byte in name");
-  char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
-  char *name = NULL;
-  if (Is_block(name_v)) {
-    name = malloc(caml_string_length(Field(name_v, 0)) + 1);
-    if (name == NULL) {
-      free(path);
-      caml_raise_out_of_memory();
-    }
-    memcpy(name, String_val(Field(name_v, 0)),
-           caml_string_length(Field(name_v, 0)) + 1);
-  }
+  char *entry = caml_stat_strdup(String_val(entry_v));
+  char *name = Is_block(name_v) ? caml_stat_strdup(String_val(Field(name_v, 0)))
+                                : NULL;
+  int dirfd = Int_val(dirfd_v);
   char *buf = NULL;
-  ssize_t n;
+  ssize_t n = -1;
   int saved_errno;
-  for (;;) {
-    caml_release_runtime_system();
-    n = name ? eio_fs_lgetxattr(path, name, NULL, 0)
-             : eio_fs_llistxattr(path, NULL, 0);
+  eio_fs_entry e;
+  caml_release_runtime_system();
+  if (eio_fs_entry_open(dirfd, entry, &e) == -1) {
     saved_errno = errno;
-    if (n > 0) {
-      buf = malloc((size_t)n);
-      if (buf == NULL) {
-        caml_acquire_runtime_system();
-        free(path);
-        free(name);
-        caml_raise_out_of_memory();
-      }
-      ssize_t m = name ? eio_fs_lgetxattr(path, name, buf, (size_t)n)
-                       : eio_fs_llistxattr(path, buf, (size_t)n);
+  } else {
+    for (;;) {
+      n = name ? eio_fs_getxattr(&e, name, NULL, 0)
+               : eio_fs_listxattr(&e, NULL, 0);
       saved_errno = errno;
-      if (m == -1 && saved_errno == ERANGE) {
-        free(buf);
-        buf = NULL;
-        caml_acquire_runtime_system();
-        continue;
+      if (n > 0) {
+        buf = malloc((size_t)n);
+        if (buf == NULL) {
+          n = -1;
+          saved_errno = ENOMEM;
+          break;
+        }
+        ssize_t m = name ? eio_fs_getxattr(&e, name, buf, (size_t)n)
+                         : eio_fs_listxattr(&e, buf, (size_t)n);
+        saved_errno = errno;
+        if (m == -1 && saved_errno == ERANGE) {
+          free(buf);
+          buf = NULL;
+          continue;
+        }
+        n = m;
       }
-      n = m;
+      break;
     }
-    caml_acquire_runtime_system();
-    break;
+    eio_fs_entry_close(&e);
   }
-  free(path);
-  free(name);
+  caml_acquire_runtime_system();
+  caml_stat_free(entry);
+  caml_stat_free(name);
   if (n == -1) {
     free(buf);
-    caml_unix_error(saved_errno, (char *)what, path_v);
+    caml_unix_error(saved_errno, (char *)what, entry_v);
   }
   result = caml_alloc_initialized_string((mlsize_t)n, n > 0 ? buf : "");
   free(buf);
   CAMLreturn(result);
 }
 
-CAMLprim value caml_eio_fs_llistxattr(value path_v)
+CAMLprim value caml_eio_fs_listxattrat(value dirfd_v, value entry_v)
 {
-  return eio_fs_read_sized(path_v, Val_none, "llistxattr");
+  return eio_fs_read_sized(dirfd_v, entry_v, Val_none, "listxattr");
 }
 
-CAMLprim value caml_eio_fs_lgetxattr(value path_v, value name_v)
+CAMLprim value caml_eio_fs_getxattrat(value dirfd_v, value entry_v,
+                                      value name_v)
 {
-  CAMLparam2(path_v, name_v);
+  CAMLparam3(dirfd_v, entry_v, name_v);
   CAMLlocal1(some);
   some = caml_alloc_some(name_v);
-  CAMLreturn(eio_fs_read_sized(path_v, some, "lgetxattr"));
+  CAMLreturn(eio_fs_read_sized(dirfd_v, entry_v, some, "getxattr"));
 }
 
-CAMLprim value caml_eio_fs_lsetxattr(value path_v, value name_v, value data_v)
+CAMLprim value caml_eio_fs_setxattrat(value dirfd_v, value entry_v,
+                                      value name_v, value data_v)
 {
-  CAMLparam3(path_v, name_v, data_v);
-  eio_fs_check_nul(path_v, "Eio_fs_unix: NUL byte in path");
+  CAMLparam4(dirfd_v, entry_v, name_v, data_v);
+  eio_fs_check_nul(entry_v, "Eio_fs_unix: NUL byte in path");
   eio_fs_check_nul(name_v, "Eio_fs_unix: NUL byte in name");
-  char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
-  char *name = malloc(caml_string_length(name_v) + 1);
-  if (name == NULL) {
-    free(path);
-    caml_raise_out_of_memory();
-  }
-  memcpy(name, String_val(name_v), caml_string_length(name_v) + 1);
+  char *entry = caml_stat_strdup(String_val(entry_v));
+  char *name = caml_stat_strdup(String_val(name_v));
   size_t len = caml_string_length(data_v);
-  char *data = malloc(len > 0 ? len : 1);
-  if (data == NULL) {
-    free(path);
-    free(name);
-    caml_raise_out_of_memory();
-  }
+  char *data = caml_stat_alloc(len > 0 ? len : 1);
   memcpy(data, String_val(data_v), len);
+  int dirfd = Int_val(dirfd_v);
+  int r = -1;
+  eio_fs_entry e;
   caml_release_runtime_system();
-  int r = eio_fs_lsetxattr(path, name, data, len);
+  if (eio_fs_entry_open(dirfd, entry, &e) != -1) {
+    r = eio_fs_setxattr(&e, name, data, len);
+    int saved = errno;
+    eio_fs_entry_close(&e);
+    errno = saved;
+  }
   int saved_errno = errno;
   caml_acquire_runtime_system();
-  free(path);
-  free(name);
-  free(data);
+  caml_stat_free(entry);
+  caml_stat_free(name);
+  caml_stat_free(data);
   if (r == -1)
-    caml_unix_error(saved_errno, "lsetxattr", path_v);
+    caml_unix_error(saved_errno, "setxattr", entry_v);
   CAMLreturn(Val_unit);
 }
 
-/* One clonefile(2) of a file, or of a directory and everything under it, into
-   a destination that does not exist. A platform or a file system that cannot
-   clone, or two volumes, answer false and write nothing; any other failure is
-   an error. The clone is owned by the caller (CLONE_NOOWNERCOPY), as a copy
-   it made would be. */
-CAMLprim value caml_eio_fs_clone_tree(value src_v, value dst_v)
+/* One clonefileat(2) of the entry [src] beneath [srcfd], a file, a symbolic
+   link (CLONE_NOFOLLOW) or a directory and everything under it, to [dst]
+   beneath [dstfd], which must not exist. A platform or a file system that
+   cannot clone, or two volumes, answer false and write nothing; any other
+   failure is an error. The clone is owned by the caller (CLONE_NOOWNERCOPY),
+   as a copy it made would be. */
+CAMLprim value caml_eio_fs_clone_at(value srcfd_v, value src_v, value dstfd_v,
+                                    value dst_v)
 {
-  CAMLparam2(src_v, dst_v);
-  if (memchr(String_val(src_v), '\0', caml_string_length(src_v)) != NULL ||
-      memchr(String_val(dst_v), '\0', caml_string_length(dst_v)) != NULL)
-    caml_invalid_argument("Eio_fs_unix.clone_tree: NUL byte in path");
+  CAMLparam4(srcfd_v, src_v, dstfd_v, dst_v);
+  caml_unix_check_path(src_v, "clonefileat");
+  caml_unix_check_path(dst_v, "clonefileat");
   char *src = caml_stat_strdup(String_val(src_v));
   char *dst = caml_stat_strdup(String_val(dst_v));
+  int srcfd = Int_val(srcfd_v), dstfd = Int_val(dstfd_v);
   int r;
   caml_release_runtime_system();
 #if defined(__APPLE__)
-  r = clonefile(src, dst, CLONE_NOOWNERCOPY);
+  r = clonefileat(srcfd, src, dstfd, dst, CLONE_NOFOLLOW | CLONE_NOOWNERCOPY);
 #else
+  (void)srcfd;
+  (void)dstfd;
   errno = ENOTSUP;
   r = -1;
 #endif
@@ -839,7 +893,7 @@ CAMLprim value caml_eio_fs_clone_tree(value src_v, value dst_v)
     CAMLreturn(Val_true);
   if (saved_errno == ENOTSUP || saved_errno == EXDEV)
     CAMLreturn(Val_false);
-  caml_unix_error(saved_errno, "clonefile", src_v);
+  caml_unix_error(saved_errno, "clonefileat", src_v);
   CAMLreturn(Val_false);
 }
 

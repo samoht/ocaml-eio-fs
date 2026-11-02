@@ -87,21 +87,47 @@ type statvfs = {
   available_blocks : int64;
 }
 
-external statvfs_native : string -> statvfs = "caml_eio_fs_statvfs"
+(* [fn dir name] on the directory [path] is in, opened through the capability
+   [path] carries, and on [path]'s last component in it: ["."] when [path]
+   names that directory itself. Eio resolves the directory as it resolves any
+   path, so a confined capability refuses a [..] above it, an absolute path and
+   a symbolic link leading out, and [fn] never follows [name]. A native name
+   would reach whatever the string names from the process's own root. *)
+let with_entry ~label (path : _ Eio.Path.t) fn =
+  let path = (path :> Eio.Fs.dir_ty Eio.Path.t) in
+  if String.contains (snd path) '\000' then
+    Fmt.invalid_arg "Eio_fs_unix.%s: NUL byte in path" label;
+  let dir, name =
+    match Eio.Path.split path with
+    | Some (dir, name) when name <> "." && name <> ".." -> (dir, name)
+    | _ -> (path, ".")
+  in
+  Eio.Switch.run @@ fun sw ->
+  let opened = Eio.Path.open_dir ~sw dir in
+  match Eio_unix.Resource.fd_opt (Eio.Path.open_in ~sw opened) with
+  | None ->
+      raise (Eio.Fs.err (Eio.Fs.Not_native (Fmt.str "%a" Eio.Path.pp path)))
+  | Some fd -> Eio_unix.Fd.use_exn label fd @@ fun fd -> fn fd name
+
+external statvfs_at : Unix.file_descr -> string -> statvfs
+  = "caml_eio_fs_statvfsat"
 
 let statvfs path =
-  let native = Eio.Path.native_exn path in
+  with_entry ~label:"statvfs" path @@ fun dir name ->
   eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
-  statvfs_native native
+  statvfs_at dir name
 
-external clone_tree_native : string -> string -> bool = "caml_eio_fs_clone_tree"
+external clone_at :
+  Unix.file_descr -> string -> Unix.file_descr -> string -> bool
+  = "caml_eio_fs_clone_at"
 
 let clone_tree src dst =
-  let src = Eio.Path.native_exn src and dst = Eio.Path.native_exn dst in
+  with_entry ~label:"clone_tree" src @@ fun src_dir src_name ->
+  with_entry ~label:"clone_tree" dst @@ fun dst_dir dst_name ->
   eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-clone-tree" @@ fun () ->
-  clone_tree_native src dst
+  clone_at src_dir src_name dst_dir dst_name
 
 let rec grant_owner p =
   match Eio.Path.stat ~follow:false p with
@@ -1525,29 +1551,32 @@ let lock_section ?block ?create ?contents path =
 
 (* {1 Extended attributes} *)
 
-external llistxattr : string -> string = "caml_eio_fs_llistxattr"
-external lgetxattr : string -> string -> string = "caml_eio_fs_lgetxattr"
+external listxattr_at : Unix.file_descr -> string -> string
+  = "caml_eio_fs_listxattrat"
 
-external lsetxattr : string -> string -> string -> unit
-  = "caml_eio_fs_lsetxattr"
+external getxattr_at : Unix.file_descr -> string -> string -> string
+  = "caml_eio_fs_getxattrat"
+
+external setxattr_at : Unix.file_descr -> string -> string -> string -> unit
+  = "caml_eio_fs_setxattrat"
 
 (* The kernel lists names as a run of NUL-terminated strings. *)
 let names_of_list s =
   String.split_on_char '\000' s |> List.filter (fun n -> n <> "")
 
 let xattrs path =
-  let native = Eio.Path.native_exn path in
+  with_entry ~label:"xattrs" path @@ fun dir entry ->
   eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-xattrs" @@ fun () ->
-  names_of_list (llistxattr native)
+  names_of_list (listxattr_at dir entry)
   |> List.sort String.compare
-  |> List.map (fun name -> (name, lgetxattr native name))
+  |> List.map (fun name -> (name, getxattr_at dir entry name))
 
 let set_xattr path name v =
-  let native = Eio.Path.native_exn path in
+  with_entry ~label:"set_xattr" path @@ fun dir entry ->
   eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-set-xattr" @@ fun () ->
-  lsetxattr native name v
+  setxattr_at dir entry name v
 
 module Batch = struct
   external create_native : Unix.file_descr -> string -> int -> string -> unit
