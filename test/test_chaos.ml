@@ -1472,6 +1472,26 @@ let test_streaming_write_offsets () =
   Alcotest.(check (list int)) "write offsets" [ 2; 6 ] (List.rev !offsets);
   Alcotest.(check string) "the file" "abXYefgh" (Eio.Path.load (raw / "f"))
 
+(* A truncation is a change of its own kind, not a write: a survival
+   predicate keeps it and drops the write that follows it at the same
+   offset. *)
+let test_crash_truncation_kind () =
+  let ctl =
+    Crash.v ~policy:(Crash.Survive (fun u -> u.Crash.kind <> Crash.Data)) ()
+  in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.Flow.copy_string "abc" file;
+      Eio.File.sync file);
+  Crash.sync_metadata ctl;
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun file ->
+      Eio.File.truncate file (i63 1);
+      Eio.File.pwrite_all file ~file_offset:(i63 1) [ Cstruct.of_string "Z" ]);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the truncation kept, the write dropped" "a"
+    (Eio.Path.load (post / "f"))
+
 (* A barrier on one directory leaves a rename in another pending, so a file
    renamed after its name was made durable is still at its old name in the
    durable image, and that is where a crash puts its synced bytes. *)
@@ -1900,6 +1920,8 @@ let suite =
         test_crash_root_sync_commits_both_siblings;
       Alcotest.test_case "crash: dir sync does not reach a grandchild" `Quick
         test_crash_dir_sync_does_not_reach_a_grandchild;
+      Alcotest.test_case "crash: a truncation is its own kind" `Quick
+        test_crash_truncation_kind;
       Alcotest.test_case "crash: streaming write offsets" `Quick
         test_crash_streaming_write_offsets;
       Alcotest.test_case "streaming write offsets" `Quick
