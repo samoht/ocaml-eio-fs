@@ -516,6 +516,34 @@ let test_append_posix () =
   Eio_fs_sync.append_lines p [ "3" ];
   Alcotest.(check string) "repaired" "1\n2\n3\n" (Eio.Path.load p)
 
+(* The directory barrier that makes a created log's entry durable can fail
+   after the file is written. The next durable append barriers the directory
+   again, or the file it was told is durable is lost at a crash. *)
+let test_append_retries_a_failed_parent_barrier () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let dir_syncs = ref 0 in
+  let schedule =
+    Eio_fs.Chaos.Schedule.observing
+      (fun (op : Eio_fs.Chaos.Op.t) ->
+        if op.kind = `Sync && op.path <> "log.jsonl" then incr dir_syncs)
+      (Eio_fs.Chaos.Schedule.scripted
+         [
+           {
+             trigger = Op_on_path { kind = `Sync; path = "" };
+             fault = Sync_error `Eio;
+           };
+         ])
+  in
+  let p = Eio_fs.Chaos.wrap schedule env#fs / "log.jsonl" in
+  (match Eio_fs_sync.append_lines p [ "1" ] with
+  | () -> Alcotest.fail "the directory barrier did not fail"
+  | exception Eio.Io _ -> ());
+  dir_syncs := 0;
+  Eio_fs_sync.append_lines p [ "2" ];
+  Alcotest.(check bool) "the directory is barriered again" true (!dir_syncs > 0);
+  Alcotest.(check string) "both lines" "1\n2\n" (Eio.Path.load p)
+
 (* POSIX truncate leaves unwritten ranges zero. The independent operation
    trace pins the data extents, so filling those gaps with zero writes fails
    even if the published bytes still look right. *)
@@ -767,6 +795,8 @@ let suite =
       Alcotest.test_case "append refuses a line holding LF" `Quick
         test_append_refuses_lf;
       Alcotest.test_case "append on posix" `Quick test_append_posix;
+      Alcotest.test_case "append retries a failed parent barrier" `Quick
+        test_append_retries_a_failed_parent_barrier;
       Alcotest.test_case "posix needs no registration" `Quick
         test_posix_needs_no_registration;
       Alcotest.test_case "published mode ignores the umask" `Quick
