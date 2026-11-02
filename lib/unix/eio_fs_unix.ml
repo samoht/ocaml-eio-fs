@@ -447,7 +447,9 @@ module Link = struct
 
   (* The leaf is opened, weighed and read on system threads, one per call, so
      a cancel is seen between reads; it is closed before the result. *)
-  let read_regular ?(max_bytes = max_int) t =
+  let read_regular ~max_bytes t =
+    if max_bytes < 0 || max_bytes = max_int then
+      invalid_arg "Eio_fs_unix.Link.read_regular: invalid byte bound";
     let err_read fmt = Fmt.kstr (fun message -> Error message) fmt in
     let opened =
       match at t.parent (fun dir -> At.open_leaf dir t.name) with
@@ -474,11 +476,8 @@ module Link = struct
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
           err_read "%s is not a regular file" t.path
-        else if
-          size < 0L
-          || size >= Int64.of_int max_int
-          || size > Int64.of_int max_bytes
-        then err_read "%s is too large to read" t.path
+        else if size < 0L || size > Int64.of_int max_bytes then
+          err_read "%s is too large to read" t.path
         else
           match
             Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)

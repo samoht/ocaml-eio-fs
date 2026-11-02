@@ -46,6 +46,25 @@ The code that uses `fs` sees an ordinary `Eio.Path`. It cannot tell which
 backend is behind it, so the same code runs against a test's in-memory files or
 a unikernel's scratch filesystem.
 
+## Testing crash consistency
+
+A test wraps a directory in a crash controller, runs the code under test
+through the wrapper, and reads back the image a power cut at that point would
+leave. Here a file published with `Eio_fs_sync.save`, which syncs it and its
+directory, survives the cut, and one written with no sync is lost:
+
+```ocaml
+Eio_main.run @@ fun _env ->
+let module Crash = Eio_fs.Chaos.Crash in
+let ctl = Crash.v () in
+let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
+Eio_fs_sync.save Eio.Path.(fs / "state") "committed";
+Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(fs / "draft") "unsynced";
+let after = Crash.post_crash ctl in
+assert (Eio.Path.load Eio.Path.(after / "state") = "committed");
+assert (Eio.Path.kind ~follow:false Eio.Path.(after / "draft") = `Not_found)
+```
+
 ## Embedding a file tree at compile time
 
 The `eio-fs-crunch` binary walks a directory tree and writes an OCaml module

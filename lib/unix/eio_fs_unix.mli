@@ -1,13 +1,20 @@
-(** The POSIX durability barrier at full platform strength, advisory file
-    locking, filesystem capacity, and the sparse map.
+(** POSIX filesystem calls that Eio and [Unix] do not bind.
 
-    The portable machinery lives in {!Eio_fs_sync}; this facade is for programs
-    that link unix anyway and want the strongest barrier the platform offers: on
-    Darwin {!full_fsync} reaches the platter where the portable route's fsync
-    stops at the drive's cache. {!with_lock} takes an exclusive advisory lock
-    over a rendezvous file, and {!val-statvfs}, {!seek_data}, {!seek_hole} and
-    {!extents} answer the questions about capacity and sparseness that [Unix]
-    cannot. *)
+    [Eio_fs_unix] is for a program that links unix anyway, beside the portable
+    machinery of {!Eio_fs_sync}. It holds the {{!barriers}barriers} at full
+    platform strength (on Darwin {!full_fsync} reaches the platter where [fsync]
+    stops at the drive's cache), a filesystem's {{!capacity}capacity},
+    {{!clones}copy-on-write clones}, {{!files}files over a descriptor}, the
+    {{!sparse}sparse map}, {{!rename}exclusive rename}, POSIX
+    {{!record_locks}record locks}, {{!lock_files}lock files} and their leases,
+    {{!xattrs}extended attributes}, and {{!links}links} and {{!batches}batches}
+    confined beneath a directory.
+
+    A call that takes an [Eio.Path.t] or an [Eio.File.t] reports a failure as
+    [Eio.Io], as Eio's own backends do; one that takes a [Unix.file_descr]
+    raises [Unix.Unix_error], as [Unix] does. *)
+
+(** {1:barriers Barriers} *)
 
 val full_fsync : Unix.file_descr -> unit
 (** [full_fsync fd] pushes [fd]'s data through to stable storage. On Darwin it
@@ -15,6 +22,38 @@ val full_fsync : Unix.file_descr -> unit
     it (SMB, exFAT); elsewhere it is [fsync].
 
     @raise Unix.Unix_error as [fsync]. *)
+
+val sync_dir : _ Eio.Path.t -> unit
+(** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
+    issues after renaming a file into place. A backend that registers a
+    {!Eio_fs_sync.Dir_sync} answers through it; a plain POSIX directory is
+    opened and {!full_fsync}ed on the descriptor that open returns, which
+    resolves every component beneath [dir]'s capability, off the calling fiber's
+    thread. A directory whose handle carries no descriptor takes
+    {!Eio_fs_sync.sync_dir}, and raises as it does.
+
+    @raise Eio.Io
+      if [dir] cannot be opened for its barrier, as [fsync] fails, or as a
+      registered barrier raises. *)
+
+val sync_file : _ Eio.File.rw -> unit
+(** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
+    issues over the bytes it wrote. A backend that registers a
+    {!Eio_fs_sync.File_sync} answers through it, which is asked before any
+    descriptor [file] carries, so a model of power loss observes the barrier; a
+    plain POSIX file is {!full_fsync}ed on its descriptor, off the calling
+    fiber's thread. A file with neither takes {!Eio_fs_sync.sync_file}, and
+    raises as it does.
+
+    @raise Eio.Io as [fsync] fails, or as a registered barrier raises. *)
+
+val barrier : Eio_fs_sync.Barrier.t
+(** [barrier] is {!sync_file} and {!sync_dir} as the barriers a publication of
+    {!Eio_fs_sync} issues: pass it as [~barrier] for a publication that is
+    durable on Darwin through the drive's cache. A file open for reading only is
+    synced through its descriptor too. *)
+
+(** {1:capacity Capacity} *)
 
 type statvfs = {
   block_size : int64;  (** The fragment size in bytes ([f_frsize]). *)
@@ -42,7 +81,7 @@ val statvfs : _ Eio.Path.t -> statvfs
       native name.
     @raise Invalid_argument if [path]'s native name holds a NUL byte. *)
 
-(** {2 Copy-on-write clones} *)
+(** {1:clones Copy-on-write clones} *)
 
 val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
 (** [clone_tree src dst] clones the file [src], or the directory [src] with
@@ -65,7 +104,7 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
       name.
     @raise Invalid_argument if a native name holds a NUL byte. *)
 
-(** {2 Removable trees} *)
+(** {1:trees Removable trees} *)
 
 val grant_owner : _ Eio.Path.t -> unit
 (** [grant_owner p] grants its owner read, write and search on the directory [p]
@@ -76,7 +115,7 @@ val grant_owner : _ Eio.Path.t -> unit
     it is, for the removal to name; a [p] that is missing or not a directory is
     left alone. It costs a stat per entry and a listing per directory. *)
 
-(** {2 Positioned reads} *)
+(** {1:files Files over a descriptor} *)
 
 val pread :
   Unix.file_descr -> file_offset:int -> bytes -> pos:int -> len:int -> int
@@ -92,7 +131,25 @@ val pread :
       end of [buf].
     @raise Unix.Unix_error as [pread]. *)
 
-(** {2 The sparse map} *)
+val import_file :
+  sw:Eio.Switch.t ->
+  close_unix:bool ->
+  Unix.file_descr ->
+  [ `Unix_fd | Eio.File.rw_ty ] Eio.Resource.t
+(** [import_file ~sw ~close_unix fd] is
+    [Eio_unix.File.import_rw ~sw ~close_unix fd]: the file [fd], a descriptor on
+    a regular file, read and written by the running backend as the files it
+    opens itself are: positional reads and writes, [stat], [seek], [sync] and
+    [truncate]. The descriptor is closed with the file, or when [sw] finishes,
+    iff [close_unix]; {!Eio_unix.Fd.remove} on its {!Eio_unix.Resource.fd} takes
+    it back without closing it. The backend may make [fd] non-blocking
+    (eio_posix does), which changes nothing for a regular file. A caller that
+    keeps a descriptor open across handles, as SQLite's os_unix.c keeps one on
+    its inode while a lock stands, opens no other.
+
+    @raise Invalid_argument if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
+
+(** {1:sparse The sparse map} *)
 
 val seek_data : Unix.file_descr -> file_offset:int -> int option
 (** [seek_data fd ~file_offset] is the next offset at or after [file_offset]
@@ -140,53 +197,23 @@ val extents :
     @raise Unix.Unix_error
       as the platform call, and [ENOSYS] on a platform that has neither. *)
 
-val sync_dir : _ Eio.Path.t -> unit
-(** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
-    issues after renaming a file into place. A backend that registers a
-    {!Eio_fs_sync.Dir_sync} answers through it; a plain POSIX directory is
-    opened and {!full_fsync}ed on the descriptor that open returns, which
-    resolves every component beneath [dir]'s capability, off the calling fiber's
-    thread. A directory whose handle carries no descriptor takes
-    {!Eio_fs_sync.sync_dir}, and raises as it does.
+(** {1:rename Exclusive rename} *)
 
-    @raise Eio.Io
-      if [dir] cannot be opened for its barrier, as [fsync] fails, or as a
-      registered barrier raises. *)
+val exclusive_rename : Eio_fs_sync.Rename.t
+(** [exclusive_rename] is the POSIX backend for atomic no-replace publication.
+    Directory wrappers are consulted before resolving the source and target
+    parents through their capabilities. Linux uses
+    [renameat2(RENAME_NOREPLACE)], Darwin uses [renameatx_np(RENAME_EXCL)];
+    unsupported platforms or filesystems refuse. An existing target, including a
+    symbolic link, is never overwritten.
 
-val sync_file : _ Eio.File.rw -> unit
-(** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
-    issues over the bytes it wrote. A backend that registers a
-    {!Eio_fs_sync.File_sync} answers through it, which is asked before any
-    descriptor [file] carries, so a model of power loss observes the barrier; a
-    plain POSIX file is {!full_fsync}ed on its descriptor, off the calling
-    fiber's thread. A file with neither takes {!Eio_fs_sync.sync_file}, and
-    raises as it does.
+    Through {!Eio_fs_sync.Rename.exclusive}, it raises [Eio.Io] with
+    {!Eio.Fs.Already_exists} for an existing target, [Eio.Io] as the platform
+    call fails otherwise (an unsupported platform or filesystem included), and
+    [Invalid_argument] for a path that ends in no file name or whose directory
+    carries no Unix descriptor. *)
 
-    @raise Eio.Io as [fsync] fails, or as a registered barrier raises. *)
-
-val barrier : Eio_fs_sync.Barrier.t
-(** [barrier] is {!sync_file} and {!sync_dir} as the barriers a publication of
-    {!Eio_fs_sync} issues: pass it as [~barrier] for a publication that is
-    durable on Darwin through the drive's cache. A file open for reading only is
-    synced through its descriptor too. *)
-
-val import_file :
-  sw:Eio.Switch.t ->
-  close_unix:bool ->
-  Unix.file_descr ->
-  [ `Unix_fd | Eio.File.rw_ty ] Eio.Resource.t
-(** [import_file ~sw ~close_unix fd] is
-    [Eio_unix.File.import_rw ~sw ~close_unix fd]: the file [fd], a descriptor on
-    a regular file, read and written by the running backend as the files it
-    opens itself are: positional reads and writes, [stat], [seek], [sync] and
-    [truncate]. The descriptor is closed with the file, or when [sw] finishes,
-    iff [close_unix]; {!Eio_unix.Fd.remove} on its {!Eio_unix.Resource.fd} takes
-    it back without closing it. The backend may make [fd] non-blocking
-    (eio_posix does), which changes nothing for a regular file. A caller that
-    keeps a descriptor open across handles, as SQLite's os_unix.c keeps one on
-    its inode while a lock stands, opens no other.
-
-    @raise Invalid_argument if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
+(** {1:record_locks Record locks} *)
 
 val lock_range :
   Unix.file_descr ->
@@ -223,19 +250,23 @@ val range_holder :
     kernel names no process, and [`Free] where none is held. This process's own
     locks never count. *)
 
-val exclusive_rename : Eio_fs_sync.Rename.t
-(** [exclusive_rename] is the POSIX backend for atomic no-replace publication.
-    Directory wrappers are consulted before resolving the source and target
-    parents through their capabilities. Linux uses
-    [renameat2(RENAME_NOREPLACE)], Darwin uses [renameatx_np(RENAME_EXCL)];
-    unsupported platforms or filesystems refuse. An existing target, including a
-    symbolic link, is never overwritten.
+val await_record_lock :
+  ?mode:[ `Shared | `Exclusive ] -> Unix.file_descr -> unit
+(** [await_record_lock ~mode fd] takes the POSIX record lock over [fd], from its
+    offset to the end of the file as [lockf] does, by the kernel's blocking
+    request ([fcntl] [F_SETLKW]), and returns once the kernel grants it. [mode]
+    is [`Exclusive] (a write lock, the default) or [`Shared] (a read lock). The
+    request waits on a thread of its own and the calling fiber waits for its
+    answer, so the domain goes on running other fibers; a cancel withdraws the
+    request, and a lock granted in that instant is let go.
 
-    Through {!Eio_fs_sync.Rename.exclusive}, it raises [Eio.Io] with
-    {!Eio.Fs.Already_exists} for an existing target, [Eio.Io] as the platform
-    call fails otherwise (an unsupported platform or filesystem included), and
-    [Invalid_argument] for a path that ends in no file name or whose directory
-    carries no Unix descriptor. *)
+    It is the wait under {!with_lock}, for a caller that keeps its own
+    descriptors: the record lock belongs to the process, and closing any
+    descriptor on the file drops it.
+
+    @raise Unix.Unix_error as [fcntl] does. *)
+
+(** {1:lock_files Lock files} *)
 
 type refusal = {
   path : string;  (** The native path of the lock file. *)
@@ -378,22 +409,6 @@ module Held : sig
       descriptor and lets the lock go, returning once it is free. Releasing a
       released lock, or one whose switch has ended, does nothing. *)
 end
-
-val await_record_lock :
-  ?mode:[ `Shared | `Exclusive ] -> Unix.file_descr -> unit
-(** [await_record_lock ~mode fd] takes the POSIX record lock over [fd], from its
-    offset to the end of the file as [lockf] does, by the kernel's blocking
-    request ([fcntl] [F_SETLKW]), and returns once the kernel grants it. [mode]
-    is [`Exclusive] (a write lock, the default) or [`Shared] (a read lock). The
-    request waits on a thread of its own and the calling fiber waits for its
-    answer, so the domain goes on running other fibers; a cancel withdraws the
-    request, and a lock granted in that instant is let go.
-
-    It is the wait under {!with_lock}, for a caller that keeps its own
-    descriptors: the record lock belongs to the process, and closing any
-    descriptor on the file drops it.
-
-    @raise Unix.Unix_error as [fcntl] does. *)
 
 (** Leases: BSD [flock] locks, which belong to an open file description rather
     than to the process that took them. *)
@@ -567,6 +582,8 @@ val set_xattr : _ Eio.Path.t -> string -> string -> unit
     @raise Invalid_argument if [path]'s native name or [name] holds a NUL byte.
 *)
 
+(** {1:links Confined links} *)
+
 type Eio.Exn.Backend.t +=
   | Unsafe_parent of string
         (** Why {!Link.with_parent} or {!Batch.with_parent} refused a path: it
@@ -620,23 +637,28 @@ module Link : sig
       byte and a failed call are [Error msg], and nothing is replaced; [msg]
       names the original path and the action needed to retry. *)
 
-  val read_regular : ?max_bytes:int -> t -> (string option, string) result
+  val read_regular : max_bytes:int -> t -> (string option, string) result
   (** [read_regular ~max_bytes parent] opens the final entry beneath the held
       parent with [O_NOFOLLOW | O_NONBLOCK | O_NOCTTY] and is [Ok (Some s)], [s]
       the bytes read from that descriptor, or [Ok None] if the entry is absent.
       It is [Error msg] for a symbolic link or another non-regular entry (a FIFO
       is refused without waiting for a writer, and a terminal never becomes the
-      controlling one), a file of more than [max_bytes] bytes (defaults to
-      [max_int]) or one that grows beyond its size at open, and a failed open.
-      The descriptor is closed before the result. The enclosing
-      {!val-with_parent} refuses symbolic links at every parent component.
+      controlling one), a file of more than [max_bytes] bytes or one that grows
+      beyond its size at open, and a failed open. The descriptor is closed
+      before the result. The enclosing {!val-with_parent} refuses symbolic links
+      at every parent component.
 
       {b Warning.} A hard link is the file it names, wherever its other names
       are: a regular file linked beneath the parent from outside the root is
       read. Only a process that can write both directories makes such a link.
 
-      @raise Eio.Io if the opened entry cannot be stated or read. *)
+      @raise Eio.Io if the opened entry cannot be stated or read.
+      @raise Invalid_argument
+        if [max_bytes] is negative or [max_int], as {!Eio_fs.Nofollow.run}
+        refuses it. *)
 end
+
+(** {1:batches Batched directory operations} *)
 
 (** Confined directory operations, many to one system-thread hop.
 

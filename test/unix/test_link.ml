@@ -202,8 +202,8 @@ let test_admission () =
   Alcotest.(check (list string))
     "no admission side effects" [] (Eio.Path.read_dir root)
 
-let read ?max_bytes root path =
-  Link.with_parent (root / path) (Link.read_regular ?max_bytes)
+let read ?(max_bytes = 1024) root path =
+  Link.with_parent (root / path) (Link.read_regular ~max_bytes)
 
 let read_refused ~kind root path =
   match read root path with
@@ -258,6 +258,17 @@ let test_read_too_large () =
         "at the bound" (Some "12345")
         (get (read ~max_bytes:5 root "library"))
 
+(* The bound is Nofollow's: a negative one or max_int is refused. *)
+let test_read_bound () =
+  with_dir @@ fun root ->
+  Eio.Path.save ~create:(`Exclusive 0o600) (root / "library") "bytes";
+  List.iter
+    (fun max_bytes ->
+      match read ~max_bytes root "library" with
+      | _ -> Alcotest.failf "accepted a bound of %d" max_bytes
+      | exception Invalid_argument _ -> ())
+    [ -1; max_int ]
+
 let suite =
   ( "link",
     List.map
@@ -282,4 +293,5 @@ let suite =
         ("read refuses a directory leaf", test_read_directory_leaf);
         ("read refuses a FIFO leaf without blocking", test_read_fifo_leaf);
         ("read refuses a file over the bound", test_read_too_large);
+        ("read refuses an invalid bound", test_read_bound);
       ] )

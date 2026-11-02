@@ -4,4 +4,4 @@
 
 (mdx
  (files README.md)
- (libraries eio-fs eio eio_main assets))
+ (libraries eio-fs eio-fs.sync eio eio_main assets))

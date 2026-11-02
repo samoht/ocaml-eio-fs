@@ -20,7 +20,7 @@ module Nofollow : sig
 
   val read_file :
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
+    validate:(Eio.File.Stat.t -> (unit, string) result) ->
     _ Eio.Path.t ->
     (Cstruct.t, error) result
   (** [read_file ~max_bytes ~validate path] opens [path] as
@@ -44,7 +44,7 @@ module Nofollow : sig
 
   val run :
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
+    validate:(Eio.File.Stat.t -> (unit, string) result) ->
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
     (Cstruct.t, error) result
@@ -114,10 +114,21 @@ module Path : sig
   (** [pp_tree ~depth] formats a path and what is under it [depth] levels deep,
       as tree(1) lists it: each entry by its last component, a symbolic link as
       [name -> target], not followed. [depth = 1] is the path alone, and
-      [depth <= 0] prints nothing. *)
+      [depth <= 0] prints nothing. A missing path prints nothing, and an entry
+      that is neither a regular file, a directory nor a symbolic link (a FIFO, a
+      socket, a device) is left out with what is under it.
+
+      @raise Eio.Io
+        if a directory cannot be listed or a link read; what was formatted
+        before stays formatted. *)
 end
 
-(** An in-memory filesystem for {!Eio}. *)
+(** An in-memory filesystem for {!Eio}.
+
+    An entry's stat carries its kind, mode, size and inode, and the owner
+    {!Eio.Path.chown} gives it. It keeps no times, no block count and no link
+    count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
+    {!Path.usage} counts no allocated bytes, and [nlink] is [0]. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
@@ -171,7 +182,8 @@ module Crunch : sig
       that is neither a regular file, a directory nor a symbolic link is not
       recorded; it is traced with [Eio.traceln].
 
-      @raise Invalid_argument if [dir] is not a directory. *)
+      @raise Invalid_argument if [dir] is not a directory.
+      @raise Eio.Io if [dir] or an entry under it cannot be read. *)
 
   val find : string -> t -> string option
   (** [find path entries] is [Some contents] for the first {!File} at [path] in
