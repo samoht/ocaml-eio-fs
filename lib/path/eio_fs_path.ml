@@ -86,16 +86,19 @@ let components path =
   |> List.filter (fun segment ->
       not (String.equal segment "" || String.equal segment "."))
 
+(* Normalised, a relative path keeps its [..] at its head only, so what is
+   left of [path] past [root] climbs out of [root] iff it holds one. An
+   absolute path has none left: a [..] above the root is the root. *)
 let is_rooted ~root path =
   if is_abs root <> is_abs path then false
   else
-    let rec is_prefix prefix items =
+    let rec below prefix items =
       match (prefix, items) with
-      | [], _ -> true
-      | x :: xs, y :: ys when String.equal x y -> is_prefix xs ys
+      | [], rest -> not (List.exists (String.equal "..") rest)
+      | x :: xs, y :: ys when String.equal x y -> below xs ys
       | _ -> false
     in
-    is_prefix (components root) (components path)
+    below (components root) (components path)
 
 type refusal = Not_a_path | Relative | Root | Not_canonical
 

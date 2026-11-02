@@ -61,11 +61,15 @@ val components : string -> string list
 
 val is_rooted : root:string -> string -> bool
 (** [is_rooted ~root path] is [true] iff [root] and [path] are both absolute or
-    both relative and the {!components} of [root] are a prefix of those of
-    [path]: [path] names [root] or something under it, whatever the spelling of
-    either. An absolute [root] and a relative [path] are never rooted in one
-    another: they are named from different places and nothing here knows where.
-*)
+    both relative, the {!components} of [root] are a prefix of those of [path],
+    and the components of [path] past that prefix hold no [".."]: [path] names
+    [root] or something under it, whatever the spelling of either. A relative
+    [path] that still climbs out of a relative [root] once normalised is not
+    under it, so [is_rooted ~root:"." "../x"] is [false]. An absolute [root] and
+    a relative [path] are never rooted in one another: they are named from
+    different places and nothing here knows where. The answer is lexical, so it
+    holds of the objects named only where no component on the way is a symbolic
+    link. *)
 
 (** The type for the reasons {!canonical} refuses a path. *)
 type refusal =
