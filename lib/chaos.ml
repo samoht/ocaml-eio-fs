@@ -637,6 +637,12 @@ module Dir_impl = struct
     let (Base_dir ((module B), bv)) = t.boxed in
     B.native bv path
 
+  let sync_dir t path =
+    (match Schedule.next t.sched (Op.sync path) with
+    | Some (Fault.Sync_error c) -> raise_io c path
+    | _ -> ());
+    Eio_fs_sync.sync_dir (t.base, path)
+
   let pp ppf t =
     let (Base_dir ((module B), bv)) = t.boxed in
     Fmt.pf ppf "chaos(%a)" B.pp bv
@@ -661,12 +667,7 @@ let dir_extra_bindings state =
     Eio.Resource.H
       (Eio_fs_sync.Modeless, fun _ -> Eio_fs_sync.is_modeless state.base);
     Eio.Resource.H
-      ( Eio_fs_sync.Dir_sync,
-        fun _ ~path ->
-          (match Schedule.next state.sched (Op.sync path) with
-          | Some (Fault.Sync_error c) -> raise_io c path
-          | _ -> ());
-          Eio_fs_sync.sync_dir (state.base, path) );
+      (Eio_fs_sync.Dir_sync, fun _ ~path -> Dir_impl.sync_dir state path);
   ]
 
 (* Keep the base value and every backend binding. A directory's native
@@ -698,6 +699,11 @@ let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =
 
     let read_link _ path = Dir_impl.read_link state path
     let symlink ~link_to _ path = Dir_impl.symlink ~link_to state path
+
+    (* [Eio.Path.sync_dir] reaches this where [Pi.DIR] has it (Eio's main
+       branch), scheduled as the [Dir_sync] barrier is. TODO: drop the
+       attribute when Eio 1.7, whose [Pi.DIR] has it, is released. *)
+    let sync_dir _ path = Dir_impl.sync_dir state path [@@warning "-32"]
     let chmod _ ~follow ~perm path = Dir_impl.chmod state ~follow ~perm path
 
     let chown ~follow ?uid ?gid _ path =
