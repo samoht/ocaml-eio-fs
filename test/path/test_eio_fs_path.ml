@@ -72,9 +72,33 @@ let test_the_accepted_components_are_the_components () =
             (P.components path) parts)
     [ "/a"; "/var/lib/space/logs"; "/a/..b/c." ]
 
+(* [parent] is lexical: the directory holding a path, without resolving it.
+   The empty path is the current directory, as Eio reads it, and [..] is held
+   by [../..]. *)
+let test_parent () =
+  List.iter
+    (fun (path, expected) ->
+      Alcotest.(check string)
+        (Fmt.str "parent %S" path) expected (P.parent path))
+    [
+      ("/", "/");
+      ("/a", "/");
+      ("/a/b", "/a/");
+      ("/a/b/", "/a/");
+      ("a", "./");
+      ("a/b", "a/");
+      ("", "../");
+      (".", "../");
+      ("a/.", "./");
+      ("..", "../../");
+      ("a/..", "a/../../");
+      ("/..", "/");
+    ]
+
 let suite =
   ( "eio_fs_path",
     [
+      Alcotest.test_case "parent is lexical" `Quick test_parent;
       Alcotest.test_case "a canonical path is its own spelling" `Quick
         test_a_canonical_path_is_its_own_spelling;
       Alcotest.test_case "every other spelling is refused" `Quick
