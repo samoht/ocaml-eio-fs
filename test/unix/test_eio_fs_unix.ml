@@ -107,6 +107,16 @@ let test_sync_dir_refuses_a_name_a_link_took () =
         "the refusal names the directory it was asked to barrier" true
         (mentions ~needle:"store" (Printexc.to_string e))
 
+(* A link inside the directory is refused too, as its open is [~follow:false]:
+   the barrier would otherwise land on the directory the link names. *)
+let test_sync_dir_refuses_a_relative_link () =
+  with_real_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o700 (root / "moved");
+  Eio.Path.symlink ~link_to:"moved" (root / "store");
+  match Eio_fs_unix.sync_dir (root / "store") with
+  | () -> Alcotest.fail "the barrier followed a link"
+  | exception Eio.Io _ -> ()
+
 (* The barrier runs on a fiber that shares its domain with every other fiber of
    the program: a server publishes while it serves. So the open and the fsync
    belong on a system thread, not on the fiber's own thread -- an inline pair
@@ -601,7 +611,9 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
   refuses "a negative offset" (fun () ->
       Eio_fs_unix.extents fd ~offset:(-1L) ~length:4096L ~max:16);
   refuses "a negative length" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:(-1L) ~max:16)
+      Eio_fs_unix.extents fd ~offset:0L ~length:(-1L) ~max:16);
+  refuses "a range past the largest offset" (fun () ->
+      Eio_fs_unix.extents fd ~offset:Int64.max_int ~length:1L ~max:16)
 
 (* The whole reason these three live in this library rather than beside a
    caller: they run on a system thread with the runtime system released, so a
@@ -2984,6 +2996,8 @@ let suite =
         test_sync_dir_barriers_the_held_directory;
       Alcotest.test_case "barrier refuses a name a link took" `Quick
         test_sync_dir_refuses_a_name_a_link_took;
+      Alcotest.test_case "barrier refuses a relative link" `Quick
+        test_sync_dir_refuses_a_relative_link;
       Alcotest.test_case "an imported descriptor is a file" `Quick
         test_import_file;
       Alcotest.test_case "file barrier asks the registration first" `Quick

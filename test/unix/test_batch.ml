@@ -214,6 +214,31 @@ let test_one_hop () =
     "every file written" n
     (Array.length (Sys.readdir (Filename.concat base "inside/d")))
 
+(* A time whose nanoseconds round its sum up to the next second: Eio keeps it
+   in its own second, and so must a batch's stat of the same entry. *)
+let test_lstat_times_match_eio () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let base = Filename.temp_dir "eio-fs-batch" "" in
+  Fun.protect ~finally:(fun () ->
+      Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / base))
+  @@ fun () ->
+  let file = Filename.concat base "f" in
+  Out_channel.with_open_bin file ignore;
+  let touched =
+    Unix.system
+      (Filename.quote_command "touch"
+         [ "-d"; "2023-11-14T22:13:20.999999999"; file ])
+  in
+  Alcotest.(check bool) "touch set the time" true (touched = Unix.WEXITED 0);
+  let eio = Eio.Path.stat ~follow:false Eio.Path.(fs / file) in
+  Eio.Switch.run @@ fun sw ->
+  match Batch.run (Batch.v ~sw Eio.Path.(fs / base)) [ Batch.Lstat "f" ] with
+  | [ Ok (Batch.Stat stat) ] ->
+      Alcotest.(check (float 0.)) "mtime" eio.mtime stat.mtime;
+      Alcotest.(check (float 0.)) "atime" eio.atime stat.atime
+  | _ -> Alcotest.fail "lstat failed"
+
 let suite =
   ( "batch",
     [
@@ -223,4 +248,6 @@ let suite =
       Alcotest.test_case "per-op errors" `Quick test_per_op_errors;
       Alcotest.test_case "link" `Quick test_link;
       Alcotest.test_case "one hop per batch" `Quick test_one_hop;
+      Alcotest.test_case "lstat times match Eio's" `Quick
+        test_lstat_times_match_eio;
     ] )
