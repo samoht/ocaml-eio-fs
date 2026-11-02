@@ -41,9 +41,12 @@ val basename : string -> string
     and [""] for a path that has none: a root, ["."] or [".."]. *)
 
 val parent : string -> string
-(** [parent path] is the directory holding [path], in directory syntax: ["/"]
-    for a path directly under the root, ["./"] for a relative path of one
-    component, and the root itself for the root. *)
+(** [parent path] is the directory holding [path], in directory syntax and
+    without resolving it: ["/"] for a path directly under the root, ["./"] for a
+    relative path of one component, and the root itself for the root. The empty
+    path is the current directory, as Eio reads it, so its parent is ["../"]; a
+    final ["."] is the directory before it, and the parent of a final [".."] is
+    one more [".."] up, except at the root. *)
 
 val components : string -> string list
 (** [components path] are the segments {!normalize} leaves, its empty and ["."]
