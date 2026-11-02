@@ -41,7 +41,7 @@ module Fault : sig
     | Torn_write of int
         (** Commit [n] bytes to the base, then raise: bytes reach the store but
             the operation reports failure. *)
-    | Write_error of code  (** Commit nothing, raise a write error (ENOSPC). *)
+    | Write_error of code  (** Commit nothing and raise the error [code]. *)
     | Sync_error of code  (** Fail a flush/sync. *)
     | Open_error of code  (** Fail an open/open_dir. *)
     | Stat_error of code  (** Fail a stat. *)
@@ -269,11 +269,10 @@ module Crash : sig
       @raise Invalid_argument if [t] was never {!wrap}ped. *)
 
   val sync_metadata : t -> unit
-  (** [sync_metadata t] commits the metadata journal: every pending directory
-      operation becomes durable, as fsync(2) on the enclosing directories would
-      make it. The model's stand-in for the directory-fsync barrier Eio cannot
-      express; a store whose recovery depends on directory-entry durability
-      calls this wherever production code fsyncs a directory. *)
+  (** [sync_metadata t] commits the whole metadata journal: every pending
+      directory operation becomes durable, as fsync(2) on every directory
+      concerned would make it. A directory barrier ({!Eio_fs_sync.sync_dir} on a
+      wrapped directory) commits only the entries of that directory. *)
 
   val unsynced : t -> unsynced list
   (** [unsynced t] lists the changes not yet made durable, in program order. *)

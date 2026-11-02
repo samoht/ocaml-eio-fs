@@ -10,7 +10,7 @@
 
     {!Process_local} declares whether any opener of a backend's files can exist
     outside this process, and {!Lock} is the exclusion a caller supplies. This
-    library depends on nothing but eio. *)
+    library does not use [Unix]: the POSIX barrier is in [eio-fs.unix]. *)
 
 type (_, _, _) Eio.Resource.pi +=
   | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
