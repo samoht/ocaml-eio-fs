@@ -273,9 +273,27 @@ let test_append_writes_at_end () =
   Alcotest.(check string)
     "every append landed at the end" "Xbcdefghijkl" (Eio.Path.load path)
 
+(* writev(2) writes its buffers in order as one contiguous run, at the end of
+   the file as well as inside it, and answers the bytes written. *)
+let test_vectored_write () =
+  with_env @@ fun env ->
+  let path = env#fs / "v" in
+  let bufs = List.map Cstruct.of_string [ "hello"; " "; "world" ] in
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) path (fun f ->
+      let n = Eio.Flow.single_write f bufs in
+      Alcotest.(check int) "bytes written" 11 n);
+  Alcotest.(check string) "every buffer" "hello world" (Eio.Path.load path);
+  Eio.Path.with_open_out ~create:`Never path (fun f ->
+      let n =
+        Eio.Flow.single_write f (List.map Cstruct.of_string [ "HE"; "LL" ])
+      in
+      Alcotest.(check int) "bytes overwritten" 4 n);
+  Alcotest.(check string) "inside the file" "HELLo world" (Eio.Path.load path)
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "vectored write" `Quick test_vectored_write;
       Alcotest.test_case "a second open keeps the offset" `Quick
         test_second_open_keeps_offset;
       Alcotest.test_case "append writes at the end" `Quick
