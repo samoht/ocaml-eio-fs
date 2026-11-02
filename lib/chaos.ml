@@ -905,11 +905,16 @@ module Crash = struct
      set's deltas in program order reproduces those operations alone, which a
      whole-tree snapshot cannot do once the set is not a journal prefix. *)
 
+  (* [tree] and [locations] are the image a crash rebuilds when this entry is
+     the last to survive: the tree, and where each tracked file sits in it.
+     [recorded] is where the files sat when the entry was recorded, which a
+     replay of [delta] reads the moved files' new places from. *)
   type metadata_entry = {
     meta : unsynced;
     tree : tree;
     delta : delta;
     locations : location list;
+    recorded : location list;
   }
 
   (** How the post-crash image reconstructs from the un-synced writes. *)
@@ -1154,10 +1159,50 @@ module Crash = struct
             in
             Dir { d with entries })
 
-  let apply_delta tree delta =
+  let rec is_prefix prefix segs =
+    match (prefix, segs) with
+    | [], _ -> true
+    | p :: prefix, s :: segs when String.equal p s -> is_prefix prefix segs
+    | _ -> false
+
+  (* Replay entry [e]'s delta onto an image: the tree, and the location of
+     each tracked file in it. A half of the delta lands only where the image
+     holds its parent directory, as [tree_replace] does; where it lands, the
+     files it covers are those [e] recorded there, and no file sits anywhere
+     else. A file's durable name is so its name in the image, which a rename
+     still pending leaves where it was. *)
+  let replay ~root (tree, locs) e =
     List.fold_left
-      (fun tree (segs, node) -> tree_replace tree segs node)
-      tree delta
+      (fun (tree, locs) (segs, node) ->
+        let lands =
+          match List.rev segs with
+          | [] -> false
+          | _ :: up -> (
+              match tree_find tree (List.rev up) with
+              | Some (Dir _) -> true
+              | Some (File _ | Link _) | None -> false)
+        in
+        if not lands then (tree, locs)
+        else
+          let covered (_, _, rel) =
+            match tree_path ~root rel with
+            | Some s -> is_prefix segs s
+            | None -> false
+          in
+          let moved =
+            match node with
+            | None -> []
+            | Some _ -> List.filter covered e.recorded
+          in
+          let locs =
+            List.filter
+              (fun ((fs, _, _) as l) ->
+                (not (covered l))
+                && not (List.exists (fun (fs', _, _) -> fs' == fs) moved))
+              locs
+          in
+          (tree_replace tree segs node, moved @ locs))
+      (tree, locs) e.delta
 
   (* The paths one directory operation touched: its own, and for a rename the
      destination as well, since a rename frees one name and fills another. *)
@@ -1181,8 +1226,9 @@ module Crash = struct
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let tree = snapshot_at owner root_path in
     let delta = delta_of ~root:(path_segments root_path) ~tree ~path ~kind in
+    let locations = locations ctl in
     ctl.metadata <-
-      { meta; tree; delta; locations = locations ctl } :: ctl.metadata
+      { meta; tree; delta; locations; recorded = locations } :: ctl.metadata
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
@@ -1229,29 +1275,17 @@ module Crash = struct
             | [] -> ()
             | _ :: _ ->
                 let durable =
-                  List.fold_left
-                    (fun tree e -> apply_delta tree e.delta)
-                    durable committed
+                  List.fold_left (replay ~root)
+                    (durable, ctl.durable_locations)
+                    committed
                 in
-                ctl.durable_tree <- Some durable;
-                ctl.durable_locations <- locations ctl;
-                (* A rebased entry's image holds every durable file, so it
-                   names each one to rewrite, a file made after the entry was
-                   recorded included. *)
-                let with_durable own =
-                  own
-                  @ List.filter
-                      (fun (fs, _, _) ->
-                        not (List.exists (fun (fs', _, _) -> fs' == fs) own))
-                      ctl.durable_locations
-                in
+                ctl.durable_tree <- Some (fst durable);
+                ctl.durable_locations <- snd durable;
                 let _, rebased =
                   List.fold_left
-                    (fun (tree, acc) e ->
-                      let tree = apply_delta tree e.delta in
-                      ( tree,
-                        { e with tree; locations = with_durable e.locations }
-                        :: acc ))
+                    (fun (image, acc) e ->
+                      let ((tree, locations) as image) = replay ~root image e in
+                      (image, { e with tree; locations } :: acc))
                     (durable, []) pending
                 in
                 ctl.metadata <- rebased))
@@ -1280,7 +1314,11 @@ module Crash = struct
           List.map
             (fun e ->
               if holds e.tree then
-                { e with locations = location :: e.locations }
+                {
+                  e with
+                  locations = location :: e.locations;
+                  recorded = location :: e.recorded;
+                }
               else e)
             ctl.metadata
 

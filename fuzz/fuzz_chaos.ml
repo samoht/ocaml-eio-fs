@@ -179,10 +179,18 @@ module Model = struct
   (* Shapes keyed by path; file contents keyed by a rename-stable id. *)
   type shape = File of int | Dir | Link of string
 
+  (* One directory operation: the path it names, whose parent's barrier
+     commits it, and each path it touched with what the live tree held at and
+     below that path just after it, [None] for a name it freed. *)
+  type entry = {
+    path : string;
+    delta : (string * (string * shape) list option) list;
+  }
+
   type t = {
     mutable live : shape SM.t;
     mutable durable : shape SM.t;
-    mutable journal : (shape SM.t -> shape SM.t) list; (* newest first *)
+    mutable journal : entry list; (* newest first *)
     mutable live_data : string IM.t;
     mutable durable_data : string IM.t;
     mutable next_id : int;
@@ -198,17 +206,56 @@ module Model = struct
       next_id = 0;
     }
 
-  let log m edit = m.journal <- edit :: m.journal
-
-  (* The metadata barrier: pending directory operations land in the durable
-     world, oldest first. *)
-  let commit m =
-    m.durable <- List.fold_right (fun edit d -> edit d) m.journal m.durable;
-    m.journal <- []
-
   let under prefix p =
     let n = String.length prefix in
     String.length p > n && String.equal (String.sub p 0 n) prefix && p.[n] = '/'
+
+  let at_or_under prefix p = String.equal prefix p || under prefix p
+
+  let parent p =
+    match String.rindex_opt p '/' with None -> "" | Some i -> String.sub p 0 i
+
+  let log ?(paths = []) m path =
+    let touched p =
+      let below = SM.filter (fun k _ -> at_or_under p k) m.live in
+      (p, if SM.mem p below then Some (SM.bindings below) else None)
+    in
+    m.journal <- { path; delta = List.map touched (path :: paths) } :: m.journal
+
+  (* The metadata barrier: the durable world becomes the live one. *)
+  let commit m =
+    m.durable <- m.live;
+    m.journal <- []
+
+  (* A half of a delta lands only where the durable world holds its parent
+     directory, and then replaces everything at and below its path. *)
+  let land_half durable (p, node) =
+    let up = parent p in
+    if not (String.equal up "" || SM.find_opt up durable = Some Dir) then
+      durable
+    else
+      let durable = SM.filter (fun k _ -> not (at_or_under p k)) durable in
+      match node with
+      | None -> durable
+      | Some below ->
+          List.fold_left (fun d (k, v) -> SM.add k v d) durable below
+
+  (* The barrier on directory [dir]: the pending operations on its entries
+     land, oldest first, provided [dir] itself is durable; the others stay
+     pending. *)
+  let commit_dir m dir =
+    if String.equal dir "" || SM.find_opt dir m.durable = Some Dir then begin
+      let mine, others =
+        List.partition
+          (fun e -> String.equal (parent e.path) dir)
+          (List.rev m.journal)
+      in
+      m.durable <-
+        List.fold_left
+          (fun d e -> List.fold_left land_half d e.delta)
+          m.durable mine;
+      m.journal <- List.rev others
+    end
 
   (* Move the subtree at [src] over [dst], removing whatever the move
      replaces -- rename semantics. *)
@@ -237,7 +284,7 @@ module Model = struct
     m.live <- SM.add path (File id) m.live;
     m.live_data <- IM.add id "" m.live_data;
     m.durable_data <- IM.add id "" m.durable_data;
-    log m (SM.add path (File id))
+    log m path
 
   let write m path s = m.live_data <- IM.add (file_id m path) s m.live_data
 
@@ -250,23 +297,23 @@ module Model = struct
 
   let unlink m path =
     m.live <- SM.remove path m.live;
-    log m (SM.remove path)
+    log m path
 
   let mkdir m path =
     m.live <- SM.add path Dir m.live;
-    log m (SM.add path Dir)
+    log m path
 
   let rmdir m path =
     m.live <- SM.remove path m.live;
-    log m (SM.remove path)
+    log m path
 
   let symlink m path target =
     m.live <- SM.add path (Link target) m.live;
-    log m (SM.add path (Link target))
+    log m path
 
   let rename m ~src ~dst =
     m.live <- move ~src ~dst m.live;
-    log m (move ~src ~dst)
+    log ~paths:[ dst ] m src
 
   (* The exact post-crash tree under [Drop_unsynced]: committed shapes over
      per-file durable contents. *)
@@ -365,7 +412,7 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
     let path = join parent names.(nk mod 4) in
     if SM.mem path m.Model.live then None else Some path
   in
-  match b0 mod 9 with
+  match b0 mod 10 with
   | 0 -> (
       (* create a file with unsynced content *)
       match fresh_path b1 b2 with
@@ -433,10 +480,17 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
                 Eio.Path.rename (fs / src) (fs / dst);
                 Model.rename m ~src ~dst
               end))
-  | _ ->
-      (* the directory-fsync barrier *)
+  | 8 ->
+      (* the barrier on every directory *)
       Crash.sync_metadata ctl;
       Model.commit m
+  | _ -> (
+      (* the barrier on one directory: its own entries only *)
+      match pick (dirs ()) b1 with
+      | None -> ()
+      | Some dir ->
+          Eio_fs_sync.sync_dir (if dir = "" then fs else fs / dir);
+          Model.commit_dir m dir)
 
 (* Run [tape] against a fresh crash-wrapped tree; return the model and the
    recovered tree. *)
