@@ -425,6 +425,9 @@ module Filesystem = struct
             path
         in
         r
+    (* A confined capability refuses an absolute path, as eio_posix does. *)
+    | (Dir.Cwd _ | Dir.Dir_fd _) when Eio_fs_path.is_abs path ->
+        Error.permission_denied path
     | Dir.Cwd _ ->
         (* Confined to the current directory. *)
         let _, cwddir =
