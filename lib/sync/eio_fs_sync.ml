@@ -19,7 +19,7 @@ let fsync_handle (Eio.Resource.T (v, ops)) =
   match Eio.Resource.get_opt ops Eio.File.Pi.Write with
   | Some (module W) -> W.sync v
   | None ->
-      failwith
+      invalid_arg
         "Eio_fs_sync.sync_dir: this backend's directory handle cannot sync; \
          register a Dir_sync barrier on the directory resource"
 

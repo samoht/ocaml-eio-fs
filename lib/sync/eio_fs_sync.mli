@@ -30,9 +30,12 @@ val sync_dir : _ Eio.Path.t -> unit
     programs that link unix.
 
     A backend that registers no barrier and whose directory handle has no sync
-    operation is a wiring error, which [sync_dir] reports by raising [Failure]
-    rather than skip the barrier.
+    operation is a wiring error, which [sync_dir] reports rather than skip the
+    barrier.
 
+    @raise Invalid_argument
+      if [dir]'s backend registers no {!Dir_sync} and its directory handle
+      cannot sync.
     @raise Eio.Io
       if the directory cannot be opened, or as the barrier or the sync raises.
 *)
