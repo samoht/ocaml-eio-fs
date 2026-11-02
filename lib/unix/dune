@@ -10,7 +10,11 @@
   (language c)
   (names eio_fs_unix_stubs)
   (flags
-   (:standard -std=gnu11 -Wall -Wextra -Werror)))
+   (:standard
+    -std=gnu11
+    -Wall
+    -Wextra
+    (:include c_werror.sexp))))
  (libraries
   eio
   eio.unix
@@ -40,6 +44,27 @@
  (target repro_link_flags.sexp)
  (enabled_if
   (<> %{system} macosx))
+ (action
+  (with-stdout-to
+   %{target}
+   (echo "()"))))
+
+; Warnings are errors in development only: a compiler that warns about
+; something new must not fail an installation.
+
+(rule
+ (target c_werror.sexp)
+ (enabled_if
+  (= %{profile} dev))
+ (action
+  (with-stdout-to
+   %{target}
+   (echo "(-Werror)"))))
+
+(rule
+ (target c_werror.sexp)
+ (enabled_if
+  (<> %{profile} dev))
  (action
   (with-stdout-to
    %{target}
