@@ -520,9 +520,26 @@ let test_seek_bounds () =
   | n -> Alcotest.failf "read %d bytes past the end" n
   | exception End_of_file -> ()
 
+(* A confined capability, the current directory or an opened directory,
+   refuses an absolute path as eio_posix does, rather than resolving it below
+   itself. *)
+let test_confined_absolute_path () =
+  with_env ~cwd:"/d" @@ fun env ->
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "/d");
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/d/f") "inner";
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/f") "outer";
+  expect_io_error "permission denied" (fun () ->
+      ignore (Eio.Path.load (env#cwd / "/f") : string));
+  Eio.Switch.run @@ fun sw ->
+  let d = Eio.Path.open_dir ~sw (env#fs / "/d") in
+  expect_io_error "permission denied" (fun () ->
+      ignore (Eio.Path.load Eio.Path.(d / "/f") : string))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "confined absolute path" `Quick
+        test_confined_absolute_path;
       Alcotest.test_case "seek bounds" `Quick test_seek_bounds;
       Alcotest.test_case "open_dir on a file" `Quick
         test_open_dir_not_a_directory;
