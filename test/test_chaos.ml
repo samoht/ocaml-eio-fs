@@ -1429,6 +1429,49 @@ let test_crash_dir_sync_does_not_reach_a_grandchild () =
     "the file one level further down is not" true
     (absent (post / "a" / "sub" / "g"))
 
+(* A streaming write lands at the descriptor's offset, which a seek moves,
+   and through an append descriptor at the end of the file. The journal logs
+   each write where it landed, so a crash that keeps them replays them
+   there. *)
+let streaming_writes fs =
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun file ->
+      ignore (Eio.File.seek file (i63 2) `Set : Optint.Int63.t);
+      Eio.Flow.copy_string "XY" file);
+  Eio.Path.with_open_out ~append:true ~create:`Never (fs / "f") (fun file ->
+      Eio.Flow.copy_string "gh" file)
+
+let test_crash_streaming_write_offsets () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.Flow.copy_string "abcdef" file;
+      Eio.File.sync file);
+  Crash.sync_metadata ctl;
+  streaming_writes fs;
+  Alcotest.(check (list (pair int int)))
+    "logged where they landed"
+    [ (2, 2); (6, 2) ]
+    (List.map (fun u -> (u.Crash.offset, u.Crash.length)) (Crash.unsynced ctl));
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "replayed where they landed" "abXYefgh"
+    (Eio.Path.load (post / "f"))
+
+(* The schedule is told the same offsets. *)
+let test_streaming_write_offsets () =
+  let offsets = ref [] in
+  let schedule =
+    Schedule.observing
+      (fun op ->
+        if op.Op.kind = `Write then offsets := op.file_offset :: !offsets)
+      Schedule.empty
+  in
+  with_chaos schedule @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "abcdef";
+  streaming_writes chaos;
+  Alcotest.(check (list int)) "write offsets" [ 2; 6 ] (List.rev !offsets);
+  Alcotest.(check string) "the file" "abXYefgh" (Eio.Path.load (raw / "f"))
+
 (* A barrier on one directory leaves a rename in another pending, so a file
    renamed after its name was made durable is still at its old name in the
    durable image, and that is where a crash puts its synced bytes. *)
@@ -1857,6 +1900,10 @@ let suite =
         test_crash_root_sync_commits_both_siblings;
       Alcotest.test_case "crash: dir sync does not reach a grandchild" `Quick
         test_crash_dir_sync_does_not_reach_a_grandchild;
+      Alcotest.test_case "crash: streaming write offsets" `Quick
+        test_crash_streaming_write_offsets;
+      Alcotest.test_case "streaming write offsets" `Quick
+        test_streaming_write_offsets;
       Alcotest.test_case "crash: dir sync keeps a pending rename" `Quick
         test_crash_dir_sync_keeps_a_pending_rename;
       Alcotest.test_case "crash: dir sync keeps a pending replacement" `Quick
