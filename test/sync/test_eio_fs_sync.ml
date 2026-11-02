@@ -535,8 +535,10 @@ let test_sparse_cost size =
           writes := (op.file_offset, op.length) :: !writes)
       Eio_fs.Chaos.Schedule.empty
   in
-  let observed = Eio_fs.Chaos.wrap schedule dir in
-  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst observed)) @@ fun () ->
+  (* The wrapper closes what it wraps: an opened directory, which the switch
+     closes, not the root of [fs]. *)
+  Eio.Switch.run @@ fun sw ->
+  let observed = Eio_fs.Chaos.wrap schedule (Eio.Path.open_dir ~sw dir) in
   Eio_fs_sync.publish_sparse
     ~config:(config (Int64.of_int size))
     ~rename:Eio_fs_unix.exclusive_rename ~mode:`Exclusive
@@ -573,7 +575,6 @@ let test_sparse_bounds_before_io () =
       Eio_fs.Chaos.Schedule.empty
   in
   let fs = Eio_fs.Chaos.wrap schedule env#fs in
-  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
   let byte = Cstruct.of_string "x" in
   List.iter
     (fun (name, ceiling, size, spans, limit) ->
@@ -643,7 +644,6 @@ let test_sparse_write_failure () =
       ]
   in
   let fs = Eio_fs.Chaos.wrap schedule env#fs in
-  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
   (match
      Eio_fs_sync.publish_sparse ~config:(config 16L) ~tmp:(fs / "draft")
        ~size_bytes:16L (fs / "image")
@@ -695,7 +695,6 @@ let test_sparse_cancellation () =
       Eio_fs.Chaos.Schedule.empty
   in
   let fs = Eio_fs.Chaos.wrap schedule env#fs in
-  Fun.protect ~finally:(fun () -> Eio.Flow.close (fst fs)) @@ fun () ->
   Eio.Fiber.first
     (fun () ->
       Eio_fs_sync.publish_sparse ~config:(config 16L) ~tmp:(fs / "draft")
