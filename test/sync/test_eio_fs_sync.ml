@@ -82,6 +82,48 @@ let test_unissuable_barrier_raises () =
         "error context names Dir_sync" true
         (contains ~affix:"Dir_sync" (Printexc.to_string e))
 
+(* [unsyncable dir] is [dir] with no Dir_sync barrier and with handles that
+   cannot sync: [dir]'s own operations, its files opened read-only. *)
+let unsyncable ((Eio.Resource.T (v, ops), path) : _ Eio.Path.t) =
+  let unsyncable (type a) (v : a) (ops : (a, _) Eio.Resource.handler) =
+    let module D = (val Eio.Resource.get ops Eio.Fs.Pi.Dir) in
+    let module Read_only = struct
+      include D
+
+      let open_in t ~sw ~follow path =
+        let (Eio.Resource.T (f, file)) = D.open_in t ~sw ~follow path in
+        let module R = (val Eio.Resource.get file Eio.File.Pi.Read) in
+        Eio.Resource.T (f, Eio.File.Pi.ro (module R))
+    end in
+    let barrier : type i g. (a, i, g) Eio.Resource.pi -> bool = function
+      | Eio_fs_sync.Dir_sync -> true
+      | _ -> false
+    in
+    let kept =
+      List.filter
+        (fun (Eio.Resource.H (pi, _)) -> not (barrier pi))
+        (Eio.Resource.bindings ops)
+    in
+    let handler : (a, Eio.Fs.dir_ty) Eio.Resource.handler =
+      Eio.Resource.handler
+        (Eio.Resource.H (Eio.Fs.Pi.Dir, (module Read_only)) :: kept)
+    in
+    (Eio.Resource.T (v, handler), path)
+  in
+  unsyncable v ops
+
+(* A backend that registers no barrier and whose directory handle cannot sync
+   is wired wrongly, an error in the program rather than in the filesystem. *)
+let test_unsyncable_backend_is_invalid () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  match Eio_fs_sync.sync_dir (unsyncable env#fs) with
+  | () -> Alcotest.fail "sync_dir skipped the barrier"
+  | exception Invalid_argument reason ->
+      Alcotest.(check bool)
+        "names Dir_sync" true
+        (contains ~affix:"Dir_sync" reason)
+
 (* A failed write cleans its temporary up and the failure propagates. *)
 let test_failed_save_cleans_temporary () =
   Eio_mock.Backend.run @@ fun () ->
@@ -732,6 +774,8 @@ let suite =
         test_publish_honours_perm_under_umask;
       Alcotest.test_case "unissuable barrier raises" `Quick
         test_unissuable_barrier_raises;
+      Alcotest.test_case "unsyncable backend is invalid" `Quick
+        test_unsyncable_backend_is_invalid;
       Alcotest.test_case "failed save cleans temporary" `Quick
         test_failed_save_cleans_temporary;
       Alcotest.test_case "publish with a remote temporary" `Quick
