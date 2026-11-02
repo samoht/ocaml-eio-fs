@@ -1288,6 +1288,8 @@ module Crash = struct
 
   let do_crash ctl =
     if not ctl.crashed then begin
+      if Option.is_none ctl.base then
+        invalid_arg "Chaos.Crash: controller was never wrapped";
       ctl.crashed <- true;
       let ordered =
         List.rev ctl.log

@@ -737,6 +737,21 @@ let with_crash ctl fn =
 
 let absent p = Eio.Path.kind ~follow:false p = `Not_found
 
+(* A controller that was never wrapped has no image to rebuild, so a crash
+   is refused, and the refusal leaves it uncrashed. *)
+let test_crash_unwrapped_refused () =
+  let ctl = Crash.v () in
+  let refused f =
+    match f () with _ -> false | exception Invalid_argument _ -> true
+  in
+  Alcotest.(check bool)
+    "crash refused" true
+    (refused (fun () -> Crash.crash ctl));
+  Alcotest.(check bool) "not crashed" false (Crash.is_crashed ctl);
+  Alcotest.(check bool)
+    "post_crash refused" true
+    (refused (fun () -> ignore (Crash.post_crash ctl)))
+
 (* A write with no intervening sync is lost after a crash -- and so is the
    file itself: its creation is an uncommitted directory operation, so no
    empty ghost file lingers. *)
@@ -1689,6 +1704,8 @@ let suite =
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
       Alcotest.test_case "chaos perturbs" `Quick test_chaos_perturbs;
+      Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
+        test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
         test_crash_unsynced_lost;
       Alcotest.test_case "crash: synced write survives" `Quick
