@@ -10,7 +10,7 @@
 (implicit_transitive_deps false)
 
 (license ISC)
-(authors "Thomas Leonard" "Patrick Ferris")
+(authors "Thomas Gazagnaire <thomas@gazagnaire.org>" "Thomas Leonard" "Patrick Ferris")
 (maintainers "Thomas Gazagnaire <thomas@gazagnaire.org>")
 
 (source (github samoht/ocaml-eio-fs))
