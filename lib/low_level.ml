@@ -606,8 +606,14 @@ let chown ~follow ?uid ?gid dir_fd path =
 let unlink dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let path = check_path path in
+  (match lookup_entry dir_fd path with
+  | None -> Error.not_found path
+  (* EISDIR, as Linux answers; macOS answers EPERM. *)
+  | Some { contents = Resource.Dir _ } ->
+      Error.err ("unlink: is a directory: " ^ path)
+  | Some _ -> ());
   let dir, base = dir_base path in
-  let r = Filesystem.lookup ~follow:false dir_fd dir in
+  let r = Filesystem.lookup ~follow:true dir_fd dir in
   let d = as_dir ~label:"unlink" !r in
   let entries =
     List.filter (fun (_, name) -> not (String.equal base name)) d.entries

@@ -505,7 +505,7 @@ let wrap_dir_hook :
 let rec remove_at (Base_dir ((module B), bv) as owner) path =
   match B.stat bv ~follow:false path with
   | exception Eio.Io _ -> ()
-  | { kind = `Directory; _ } -> (
+  | { kind = `Directory; _ } ->
       let rec clear () =
         match B.read_dir bv path with
         | [] -> ()
@@ -518,12 +518,7 @@ let rec remove_at (Base_dir ((module B), bv) as owner) path =
             clear ()
       in
       clear ();
-      if not (String.equal path "") then
-        (* A deliberately adversarial in-memory tree may retain hidden
-           bookkeeping entries after a chain of directory renames. The
-           namespace entry is still safe to discard; real filesystems take the
-           normal [rmdir] path. *)
-        try B.rmdir bv path with Eio.Io _ -> B.unlink bv path)
+      if not (String.equal path "") then B.rmdir bv path
   | _ -> B.unlink bv path
 
 (* A swap fires AFTER the scheduled operation: the name is unlinked and made a
