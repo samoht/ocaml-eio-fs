@@ -496,12 +496,7 @@ let test_crash_determinism seed nblocks block sync_after access placement reopen
 
 let publish_string path data =
   let config =
-    Eio_fs_sync.
-      {
-        durable = true;
-        perm = 0o644;
-        max_bytes = Int64.of_int (String.length data);
-      }
+    Eio_fs_sync.config ~max_bytes:(Int64.of_int (String.length data)) ()
   in
   Eio_fs_sync.publish ~config path (Eio.Flow.copy_string data)
 

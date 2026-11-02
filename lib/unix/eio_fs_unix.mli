@@ -164,6 +164,12 @@ val sync_file : _ Eio.File.rw -> unit
 
     @raise Eio.Io as [fsync] fails, or as a registered barrier raises. *)
 
+val barrier : Eio_fs_sync.Barrier.t
+(** [barrier] is {!sync_file} and {!sync_dir} as the barriers a publication of
+    {!Eio_fs_sync} issues: pass it as [~barrier] for a publication that is
+    durable on Darwin through the drive's cache. A file open for reading only is
+    synced through its descriptor too. *)
+
 val import_file :
   sw:Eio.Switch.t ->
   close_unix:bool ->

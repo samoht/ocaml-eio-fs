@@ -10,7 +10,7 @@ let contains ~affix s =
   let rec at i = i + n <= m && (String.sub s i n = affix || at (i + 1)) in
   at 0
 
-let config max_bytes = Eio_fs_sync.{ durable = true; perm = 0o644; max_bytes }
+let config max_bytes = Eio_fs_sync.config ~max_bytes ()
 
 (* The in-memory backend registers its barrier (a no-op: volatile storage has
    nothing to sync), so the portable entry points work unchanged over it. *)
@@ -64,7 +64,7 @@ let test_publish_honours_perm_under_umask () =
       Eio.Path.rmtree ~missing_ok:true (fs / dir))
   @@ fun () ->
   Eio_fs_sync.publish
-    ~config:Eio_fs_sync.{ durable = true; perm = 0o644; max_bytes = 1L }
+    ~config:(Eio_fs_sync.config ~perm:0o644 ~max_bytes:1L ())
     (fs / dir / "cfg")
     (fun f -> Eio.Flow.copy_string "x" f);
   let stat = Eio.Path.stat ~follow:false (fs / dir / "cfg") in
@@ -272,9 +272,8 @@ let test_publish_durability_flag () =
   Eio_fs_sync.publish ~config:(config 1L) ~tmp:(fs / "safe-tmp") (fs / "safe")
     (fun f -> Eio.Flow.copy_string "s" f);
   Eio_fs_sync.publish
-    ~config:Eio_fs_sync.{ durable = false; perm = 0o644; max_bytes = 1L }
-    ~tmp:(fs / "fast-tmp") (fs / "fast")
-    (fun f -> Eio.Flow.copy_string "f" f);
+    ~config:(Eio_fs_sync.config ~durable:false ~max_bytes:1L ())
+    ~tmp:(fs / "fast-tmp") (fs / "fast") (fun f -> Eio.Flow.copy_string "f" f);
   let post = Crash.post_crash ctl in
   Alcotest.(check string)
     "durable publish survives" "s"
@@ -451,6 +450,50 @@ let test_save () =
   Alcotest.(check string) "replaced" "{}" (Eio.Path.load p);
   Eio_fs_sync.save p "";
   Alcotest.(check string) "empty" "" (Eio.Path.load p)
+
+(* Every durable entry point issues the barriers it is given, and none of
+   them when it is not durable. *)
+let test_barrier_is_used () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let files = ref 0 and dirs = ref 0 in
+  let module Counting = Eio_fs_sync.Barrier.Make (struct
+    type t = unit
+
+    let sync_file () file =
+      incr files;
+      Eio_fs_sync.Barrier.(sync_file portable) file
+
+    let sync_dir () dir =
+      incr dirs;
+      Eio_fs_sync.Barrier.(sync_dir portable) dir
+  end) in
+  let barrier = Counting.v () in
+  let issued name ~files:f ~dirs:d fn =
+    files := 0;
+    dirs := 0;
+    fn ();
+    Alcotest.(check (pair int int)) name (f, d) (!files, !dirs)
+  in
+  let fs = env#fs in
+  issued "publish" ~files:1 ~dirs:1 (fun () ->
+      Eio_fs_sync.publish
+        ~config:(Eio_fs_sync.config ~barrier ~max_bytes:1L ())
+        (fs / "p") (Eio.Flow.copy_string "x"));
+  issued "save" ~files:1 ~dirs:1 (fun () ->
+      Eio_fs_sync.save ~barrier (fs / "s") "x");
+  issued "save, not durable" ~files:0 ~dirs:0 (fun () ->
+      Eio_fs_sync.save ~durable:false ~barrier (fs / "s") "y");
+  issued "append_lines" ~files:1 ~dirs:1 (fun () ->
+      Eio_fs_sync.append_lines ~barrier (fs / "l") [ "x" ]);
+  issued "publish_generation" ~files:1 ~dirs:3 (fun () ->
+      Eio_fs_sync.publish_generation ~barrier (fs / "g") (fun dir ->
+          Eio.Path.save ~create:(`Exclusive 0o644) (dir / "f") "x"));
+  issued "publish_link" ~files:0 ~dirs:2 (fun () ->
+      ignore
+        (Eio_fs_sync.publish_link ~barrier ~lock:Eio_fs_sync.Lock.none
+           ~expected:None ~link_to:"target" (fs / "k")
+          : (unit, _) result))
 
 (* -- Appending lines -- *)
 
@@ -787,6 +830,8 @@ let suite =
         test_exclusive_publication_survives_crash;
       Alcotest.test_case "registered backend" `Quick test_registered_backend;
       Alcotest.test_case "save a string" `Quick test_save;
+      Alcotest.test_case "the barrier given is the one issued" `Quick
+        test_barrier_is_used;
       Alcotest.test_case "append lines" `Quick test_append_creates;
       Alcotest.test_case "append ends a torn line" `Quick
         test_append_repairs_a_torn_line;

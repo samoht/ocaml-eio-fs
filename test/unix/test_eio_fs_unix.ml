@@ -2759,7 +2759,7 @@ let test_exclusive_publication_reaches_crash_model () =
   with_real_dir @@ fun dir ->
   let ctl = Crash.v () in
   let fs = Crash.wrap ctl dir in
-  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 7L } in
+  let config = Eio_fs_sync.config ~perm:0o600 ~max_bytes:7L () in
   Eio_fs_sync.publish ~config ~mode:`Exclusive
     ~rename:Eio_fs_unix.exclusive_rename (fs / "state")
     (Eio.Flow.copy_string "payload");
@@ -2768,9 +2768,25 @@ let test_exclusive_publication_reaches_crash_model () =
     "published bytes survive" "payload"
     (Eio.Path.load (Crash.post_crash ctl / "state"))
 
+(* The platform barrier carries a publication on a real directory, a durable
+   generation's read-only handles included. *)
+let test_publication_with_the_platform_barrier () =
+  with_real_dir @@ fun dir ->
+  let barrier = Eio_fs_unix.barrier in
+  Eio_fs_sync.publish
+    ~config:(Eio_fs_sync.config ~barrier ~max_bytes:7L ())
+    (dir / "state")
+    (Eio.Flow.copy_string "payload");
+  Eio_fs_sync.publish_generation ~barrier (dir / "tree") (fun d ->
+      Eio.Path.save ~create:(`Exclusive 0o444) (d / "f") "frozen");
+  Alcotest.(check string) "the file" "payload" (Eio.Path.load (dir / "state"));
+  Alcotest.(check string)
+    "the generation" "frozen"
+    (Eio.Path.load (dir / "tree/f"))
+
 let test_concurrent_exclusive_publications_have_one_winner () =
   with_real_dir @@ fun dir ->
-  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 3L } in
+  let config = Eio_fs_sync.config ~perm:0o600 ~max_bytes:3L () in
   let save text () =
     match
       Eio_fs_sync.publish ~config ~mode:`Exclusive
@@ -3012,6 +3028,8 @@ let suite =
         test_exclusive_rename_refuses_embedded_nul;
       Alcotest.test_case "exclusive publication reaches crash model" `Quick
         test_exclusive_publication_reaches_crash_model;
+      Alcotest.test_case "publication with the platform barrier" `Quick
+        test_publication_with_the_platform_barrier;
       Alcotest.test_case "concurrent exclusive publications have one winner"
         `Quick test_concurrent_exclusive_publications_have_one_winner;
       Alcotest.test_case "exclusive rename keeps its open parent" `Quick

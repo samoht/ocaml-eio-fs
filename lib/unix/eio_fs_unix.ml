@@ -165,17 +165,38 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
    carries over is a second way past the wrapper, so a barrier taken on it is
    one the wrapper never saw. A file with neither a registration nor a
    descriptor takes the portable barrier, its own sync. *)
-let sync_file file =
+let sync_file_or ~portable file =
   match Eio_fs_sync.file_barrier file with
   | Some barrier -> barrier ()
   | None -> (
       match Eio_unix.Resource.fd_opt file with
-      | None -> Eio_fs_sync.sync_file file
+      | None -> portable file
       | Some fd ->
           Eio_unix.Fd.use_exn "eio-fs-sync-file" fd @@ fun fd ->
           eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
           full_fsync fd)
+
+let sync_file file = sync_file_or ~portable:Eio_fs_sync.sync_file file
+
+(* The pair a publication issues at full platform strength. A file opened for
+   reading only, as a published generation's are, carries its descriptor all
+   the same; one with neither a registration nor a descriptor takes the
+   portable barrier. *)
+module Full_barrier = struct
+  type t = unit
+
+  let sync_file () file =
+    sync_file_or
+      ~portable:(Eio_fs_sync.Barrier.sync_file Eio_fs_sync.Barrier.portable)
+      file
+
+  let sync_dir () dir = sync_dir dir
+end
+
+let barrier =
+  let module B = Eio_fs_sync.Barrier.Make (Full_barrier) in
+  B.v ()
 
 let rec unwrapped_dir dir =
   match Eio_fs.Chaos.Private.base_dir dir with

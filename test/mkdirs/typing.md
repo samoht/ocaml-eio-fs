@@ -10,6 +10,7 @@ creation is supported.
 
 ```ocaml
 let (_ :
-    ?exists_ok:bool -> perm:Eio.File.Unix_perm.t ->
+    ?exists_ok:bool -> ?barrier:Eio_fs_sync.Barrier.t ->
+    perm:Eio.File.Unix_perm.t ->
     Eio.Fs.dir_ty Eio.Path.t -> unit) = Eio_fs_sync.mkdirs
 ```
