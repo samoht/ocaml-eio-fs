@@ -5,9 +5,12 @@
     [Eio_fs_sync.Process_local], the fiber exclusion is the whole of it. *)
 
 type t
-(** A critical-section runner. *)
+(** The type for critical-section runners. *)
 
 exception Unavailable of string
+(** Raised by {!use} when a section cannot be entered, with what refused it. A
+    runner raises it in place of its lock's own exceptions, so a component that
+    cannot name the lock still names the refusal. *)
 
 val use : t -> (unit -> 'a) -> 'a
 (** [use t f] runs [f] inside [t]'s section and is what [f] returns. One [t]
@@ -27,7 +30,7 @@ val none : t
 (** The caller's lock, as the section it runs. *)
 module type S = sig
   type t
-  (** The lock handle. *)
+  (** The type for lock handles. *)
 
   val use : t -> (unit -> 'a) -> 'a
   (** [use t f] runs [f] under [t], holding [t] for the whole call. A component
