@@ -100,19 +100,10 @@ module File = struct
      into an owned [Buffer] by the first write, so embedding a file costs no
      copy until someone mutates it. *)
   type contents = Literal of string | Buffer of Cstruct.t
+  type t = { stat : Eio.File.Stat.t; name : string; contents : contents }
 
-  type t = {
-    stat : Eio.File.Stat.t;
-    name : string;
-    contents : contents;
-    pos : Optint.Int63.t;
-  }
-
-  let v ~stat name =
-    { stat; name; contents = Buffer Cstruct.empty; pos = Optint.Int63.zero }
-
-  let literal ~stat name contents =
-    { stat; name; contents = Literal contents; pos = Optint.Int63.zero }
+  let v ~stat name = { stat; name; contents = Buffer Cstruct.empty }
+  let literal ~stat name contents = { stat; name; contents = Literal contents }
 
   let length = function
     | Literal s -> String.length s
@@ -178,19 +169,11 @@ let as_dir ~label = function
       Fmt.kstr Error.not_found "as_dir(%s): not a directory: %a" label
         Resource.pp r
 
-let reset_file ~truncate ~append r =
+let truncate_file r =
   match !r with
   | Resource.File f ->
-      let contents =
-        if truncate then File.Buffer Cstruct.empty else f.contents
-      in
-      let pos =
-        if append then File.length contents |> Optint.Int63.of_int
-        else Optint.Int63.zero
-      in
-      let size = File.length contents |> Optint.Int63.of_int in
-      let stat = { f.stat with size } in
-      r := File { f with contents; stat; pos }
+      let stat = { f.stat with size = Optint.Int63.zero } in
+      r := File { f with contents = File.Buffer Cstruct.empty; stat }
   | _ -> ()
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
@@ -216,10 +199,20 @@ type fs = {
 
 type t = fs
 
+(* A descriptor is one open file description: the offset and the O_APPEND
+   flag are its own, never shared with another open of the same file. *)
 module Fd = struct
-  type t = { fs : fs; num : Num.t; mutable closed : bool }
+  type t = {
+    fs : fs;
+    num : Num.t;
+    append : bool;
+    mutable pos : Optint.Int63.t;
+    mutable closed : bool;
+  }
 
-  let v fs num = { fs; num; closed = false }
+  let v ?(append = false) fs num =
+    { fs; num; append; pos = Optint.Int63.zero; closed = false }
+
   let closed t = t.closed
 
   (* A closed handle answers on its own state, never by its number, which the
@@ -509,11 +502,11 @@ let openat ~mode ~sw dir_fd path flags =
   | false ->
       update_fd_table_with_result fs @@ fun fds ->
       let num = next_fd_of_fds fds in
-      let fd = Fd.v fs num in
+      let fd = Fd.v ~append fs num in
       let r = Filesystem.lookup ~follow dir_fd path in
       refuse_link r;
       check_access path flags r;
-      reset_file ~truncate ~append r;
+      if truncate then truncate_file r;
       Eio.Switch.on_release sw (fun () -> close fd);
       (fd, Fd_table.add num r fds)
   | true -> (
@@ -526,7 +519,7 @@ let openat ~mode ~sw dir_fd path flags =
       in
       update_fd_table_with_result fs @@ fun fds ->
       let num = next_fd_of_fds fds in
-      let fd = Fd.v fs num in
+      let fd = Fd.v ~append fs num in
       let r =
         try Option.some @@ Filesystem.lookup ~follow dir_fd path
         with Eio.Exn.Io (Eio.Fs.(E (Not_found _)), _) -> None
@@ -536,7 +529,7 @@ let openat ~mode ~sw dir_fd path flags =
           refuse_link r;
           check_access path flags r;
           let fds = Fd_table.add num r fds in
-          reset_file ~truncate ~append r;
+          if truncate then truncate_file r;
           Eio.Switch.on_release sw (fun () -> close fd);
           (fd, fds)
       | None ->
@@ -768,8 +761,9 @@ let writev ({ Fd.fs; _ } as t) bufs =
     match !r with
     | File e ->
         let size = e.stat.size in
+        if t.append then t.pos <- size;
         (* If the position is equal to the size then we just append. *)
-        if Optint.Int63.equal size e.pos then
+        if Optint.Int63.equal size t.pos then
           (* We do it one buf at a time so we can simulate some concurrency... *)
           List.iter
             (fun buf ->
@@ -778,7 +772,8 @@ let writev ({ Fd.fs; _ } as t) bufs =
               in
               let new_size = Optint.Int63.of_int @@ File.length contents in
               let stat = { e.stat with size = new_size } in
-              r := File { e with stat; contents; pos = new_size };
+              r := File { e with stat; contents };
+              t.pos <- new_size;
               Eio.Fiber.yield ())
             bufs
         else
@@ -787,14 +782,13 @@ let writev ({ Fd.fs; _ } as t) bufs =
           let contents =
             File.Buffer
               (blit_and_grow ~src ~dst:(File.buffer e.contents)
-                 ~off:(Optint.Int63.to_int e.pos))
+                 ~off:(Optint.Int63.to_int t.pos))
           in
           let new_size = Optint.Int63.of_int @@ File.length contents in
           let stat = { e.stat with size = new_size } in
-          let new_pos =
-            Optint.Int63.add e.pos (Optint.Int63.of_int (Cstruct.length src))
-          in
-          r := File { e with stat; contents; pos = new_pos }
+          r := File { e with stat; contents };
+          t.pos <-
+            Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src))
     | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
   in
   (Cstruct.length (Cstruct.concat bufs), fds)
@@ -807,7 +801,7 @@ let readv ({ Fd.fs; _ } as t) bufs =
     update_entry fd fds @@ fun r ->
     match !r with
     | File e ->
-        let pos = ref e.pos in
+        let pos = ref t.pos in
         let size = Optint.Int63.to_int e.stat.size in
         List.iter
           (fun buf ->
@@ -819,7 +813,7 @@ let readv ({ Fd.fs; _ } as t) bufs =
             read := !read + actual_len;
             Eio.Fiber.yield ())
           bufs;
-        r := File { e with pos = !pos }
+        t.pos <- !pos
     | r -> Fmt.kstr Error.err "readv: not a file: %a" Resource.pp r
   in
   (!read, fds)
@@ -884,11 +878,11 @@ let seek_fd ({ Fd.fs; _ } as t) off cmd =
         let base =
           match cmd with
           | `Set -> Optint.Int63.zero
-          | `Cur -> e.pos
+          | `Cur -> t.pos
           | `End -> e.stat.size
         in
         let newpos = Optint.Int63.add base off in
-        r := Resource.File { e with pos = newpos };
+        t.pos <- newpos;
         result := newpos
     | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
   in
@@ -914,8 +908,7 @@ let truncate_fd ({ Fd.fs; _ } as t) len =
             end
           in
           let stat = { e.stat with size = Optint.Int63.of_int target } in
-          let pos = if Optint.Int63.compare e.pos len > 0 then len else e.pos in
-          r := Resource.File { e with contents; stat; pos }
+          r := Resource.File { e with contents; stat }
       | r -> Fmt.kstr Error.err "truncate: not a file: %a" Resource.pp r);
   fds
 
