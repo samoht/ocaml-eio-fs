@@ -435,7 +435,7 @@ let test_rename_refusals () =
 let test_rename_moves_parent_link () =
   with_env ~cwd:"/q" @@ fun env ->
   Eio.Path.mkdirs ~perm:0o755 (env#fs / "/p/m");
-  Eio.Path.mkdir ~perm:0o755 (env#fs / "/q");
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (env#fs / "/q");
   Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/p/m/f") "x";
   Eio.Path.rename (env#fs / "/p/m") (env#fs / "/q/m");
   Alcotest.(check string)
@@ -525,7 +525,7 @@ let test_seek_bounds () =
    itself. *)
 let test_confined_absolute_path () =
   with_env ~cwd:"/d" @@ fun env ->
-  Eio.Path.mkdir ~perm:0o755 (env#fs / "/d");
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (env#fs / "/d");
   Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/d/f") "inner";
   Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "/f") "outer";
   expect_io_error "permission denied" (fun () ->
