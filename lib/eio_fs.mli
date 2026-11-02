@@ -128,7 +128,14 @@ end
     An entry's stat carries its kind, mode, size and inode, and the owner
     {!Eio.Path.chown} gives it. It keeps no times, no block count and no link
     count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
-    {!Path.usage} counts no allocated bytes, and [nlink] is [0]. *)
+    {!Path.usage} counts no allocated bytes, and [nlink] is [0].
+
+    Where POSIX systems differ, it answers as Linux does: {!Eio.Path.unlink} of
+    a directory raises the error EISDIR names, not [Permission_denied]. Its
+    paths have no native spelling ({!Eio.Path.native} is [None]), and an
+    absolute symbolic link resolves from the filesystem's root, so through the
+    root that {!v} returns it is followed where eio_posix would refuse it. One
+    filesystem may be used from several domains at once. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
