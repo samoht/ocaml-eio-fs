@@ -8,6 +8,7 @@ let expect_io_error expected fn =
       | "not found", Eio.Fs.Not_found _ -> ()
       | "already exists", Eio.Fs.Already_exists _ -> ()
       | "permission denied", Eio.Fs.Permission_denied _ -> ()
+      | "too many symbolic links", Eio.Fs.Symlink -> ()
       | _ -> Alcotest.failf "expected %s, got another filesystem error" expected
       )
 
@@ -328,9 +329,31 @@ let test_shared_across_domains () =
     "every entry" (2 * n)
     (List.length (Eio.Path.read_dir env#fs))
 
+(* path_resolution(7): resolution follows at most 40 symbolic links, as
+   eio_posix does, and then fails with ELOOP, which Eio raises as
+   [Eio.Fs.Symlink]. *)
+let link_chain fs n =
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "target") "end";
+  for i = 1 to n do
+    let link_to = if i = 1 then "target" else Fmt.str "l%d" (i - 1) in
+    Eio.Path.symlink ~link_to (fs / Fmt.str "l%d" i)
+  done;
+  fs / Fmt.str "l%d" n
+
+let test_symlink_chain_limit () =
+  with_env @@ fun env ->
+  let last = link_chain env#fs 41 in
+  Alcotest.(check string)
+    "forty links resolve" "end"
+    (Eio.Path.load (env#fs / "l40"));
+  expect_io_error "too many symbolic links" (fun () ->
+      ignore (Eio.Path.load last : string))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "symbolic link chain limit" `Quick
+        test_symlink_chain_limit;
       Alcotest.test_case "shared across domains" `Quick
         test_shared_across_domains;
       Alcotest.test_case "open during a read" `Quick test_open_during_read;
