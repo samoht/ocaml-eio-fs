@@ -459,9 +459,21 @@ let test_unlink () =
   Eio.Path.unlink (fs / "ld/f");
   Alcotest.(check (list string)) "through a linked parent" [] (names (fs / "d"))
 
+(* rmdir(2) does not follow a final symbolic link: on a link to a directory
+   it fails with ENOTDIR and removes neither. *)
+let test_rmdir_symlink () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.symlink ~link_to:"d" (fs / "ld");
+  expect_eio_io "rmdir on a symbolic link" (fun () ->
+      Eio.Path.rmdir (fs / "ld"));
+  Alcotest.(check (list string)) "both stay" [ "d"; "ld" ] (names fs)
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "rmdir on a symbolic link" `Quick test_rmdir_symlink;
       Alcotest.test_case "unlink" `Quick test_unlink;
       Alcotest.test_case "rename refusals" `Quick test_rename_refusals;
       Alcotest.test_case "rename moves the parent link" `Quick
