@@ -17,9 +17,9 @@ end
 
 type Eio.Exn.Backend.t += Eio_fs of string
 
-(* Eio makes use of the empty string for paths so we can start
-   with "no path". Fpath does not allow that. *)
-let check_path p = if String.equal p "" then "." else Eio_fs_path.normalize p
+(* Why a confined capability refused a path, named as eio_posix names it: by
+   what the caller asked for, never by where the capability sits. *)
+type Eio.Exn.Backend.t += Outside_sandbox of string | Absolute_path
 
 let () =
   let pp_eio_fs ppf = function
@@ -28,6 +28,12 @@ let () =
         true
     | Eio_fs s ->
         Fmt.pf ppf "eio-fs:%s" s;
+        true
+    | Outside_sandbox path ->
+        Fmt.pf ppf "Outside_sandbox (%S)" path;
+        true
+    | Absolute_path ->
+        Fmt.pf ppf "Absolute_path";
         true
     | _ -> false
   in
@@ -45,6 +51,11 @@ module Error = struct
   let permission_denied path =
     let exn = Eio.Exn.create Eio.Fs.(E (Permission_denied (Eio_fs path))) in
     raise exn
+
+  let outside_sandbox path =
+    raise (Eio.Fs.err (Permission_denied (Outside_sandbox path)))
+
+  let absolute_path () = raise (Eio.Fs.err (Permission_denied Absolute_path))
 
   (* ELOOP, which Eio raises as [Symlink]. *)
   let symlink_loop () = raise (Eio.Fs.err Eio.Fs.Symlink)
@@ -81,11 +92,11 @@ module Inode = struct
 end
 
 module Dir_node = struct
-  type 'a t = { name : string; stat : Eio.File.Stat.t; entries : 'a list }
+  (* A node holds no name of its own: its names are the entries of the
+     directories that hold it. *)
+  type 'a t = { stat : Eio.File.Stat.t; entries : 'a list }
 
-  let v ~parent name stat =
-    { name; stat; entries = [ (stat.ino, "."); (parent, "..") ] }
-
+  let v ~parent stat = { stat; entries = [ (stat.ino, "."); (parent, "..") ] }
   let is_empty dir = List.length dir.entries = 2
 
   let parent dir =
@@ -93,9 +104,9 @@ module Dir_node = struct
 end
 
 module Symlink = struct
-  type t = { name : string; stat : Eio.File.Stat.t; link_to : string }
+  type t = { stat : Eio.File.Stat.t; link_to : string }
 
-  let v ~link_to name stat = { name; stat; link_to }
+  let v ~link_to stat = { stat; link_to }
 end
 
 module File = struct
@@ -103,10 +114,10 @@ module File = struct
      into an owned [Buffer] by the first write, so embedding a file costs no
      copy until someone mutates it. *)
   type contents = Literal of string | Buffer of Cstruct.t
-  type t = { stat : Eio.File.Stat.t; name : string; contents : contents }
+  type t = { stat : Eio.File.Stat.t; contents : contents }
 
-  let v ~stat name = { stat; name; contents = Buffer Cstruct.empty }
-  let literal ~stat name contents = { stat; name; contents = Literal contents }
+  let v ~stat = { stat; contents = Buffer Cstruct.empty }
+  let literal ~stat contents = { stat; contents = Literal contents }
 
   let length = function
     | Literal s -> String.length s
@@ -118,8 +129,6 @@ module File = struct
     match t with
     | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
     | Buffer b -> Cstruct.blit b src_off dst dst_off len
-
-  let to_string = function Literal s -> s | Buffer b -> Cstruct.to_string b
 end
 
 module Fd_table = Map.Make (Num)
@@ -132,22 +141,6 @@ module Resource = struct
     | File of File.t
     | Dir of (Inode.t * string) Dir_node.t
     | Symlink of Symlink.t
-
-  let pp ppf = function
-    | File f ->
-        Fmt.pf ppf "file:%s:[%a]" f.name
-          Fmt.(truncated ~max:12)
-          (File.to_string f.contents)
-    | Dir dir ->
-        Fmt.pf ppf "dir:%s:%a" dir.name
-          Fmt.(
-            brackets
-            @@ list ~sep:comma
-                 (Fmt.parens @@ pair ~sep:comma int64 (quote string)))
-          dir.entries
-    | Symlink s -> Fmt.pf ppf "sym:%s -> %s" s.name s.link_to
-
-  let name = function File f -> f.name | Dir d -> d.name | Symlink s -> s.name
 
   let stat = function
     | File f -> f.stat
@@ -166,17 +159,15 @@ type resource = Resource.t
 (* A component that had to be a directory and is not: POSIX answers ENOTDIR,
    which every real Eio backend surfaces as an [Eio.Io]. Eio.Fs has no ENOTDIR
    constructor, so report the path does not resolve. *)
-let as_dir ~label = function
+let as_dir ~path = function
   | Resource.Dir dir -> dir
-  | r ->
-      Fmt.kstr Error.not_found "as_dir(%s): not a directory: %a" label
-        Resource.pp r
+  | _ -> Error.not_found path
 
 let truncate_file r =
   match !r with
   | Resource.File f ->
       let stat = { f.stat with size = Optint.Int63.zero } in
-      r := File { f with contents = File.Buffer Cstruct.empty; stat }
+      r := File { contents = File.Buffer Cstruct.empty; stat }
   | _ -> ()
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
@@ -279,7 +270,6 @@ module Filesystem = struct
     let root =
       Resource.Dir
         {
-          name = "/";
           stat =
             {
               default_stat with
@@ -293,26 +283,23 @@ module Filesystem = struct
     Entries.empty |> Entries.add 0L (ref root)
 
   let add_file fs ino r = fs.tree <- Entries.add ino r fs.tree
+  let root (tree : t) = Entries.find 0L tree
 
-  let absolute_path (tree : t) (dir : _ Dir_node.t) =
-    if dir.stat.ino = 0L then "/"
-    else
-      let rec loop (dir : _ Dir_node.t) acc =
-        if Int64.equal dir.stat.ino 0L then "/" ^ acc
-        else
-          let parent = Entries.find (Dir_node.parent dir |> fst) tree in
-          loop (as_dir ~label:"absolute" !parent) (dir.name ^ "/" ^ acc)
-      in
-      loop dir ""
+  let parent_dir (tree : t) r =
+    Entries.find (fst (Dir_node.parent (as_dir ~path:".." !r))) tree
 
-  let is_confined ~root p =
-    if Eio_fs_path.is_abs p then Eio_fs_path.is_rooted ~root p
-    else
-      let full_path = Eio_fs_path.append root p in
-      Eio_fs_path.is_rooted ~root full_path
-
-  let check_confinement ~root p =
-    if is_confined ~root p then () else Error.permission_denied p
+  (* Whether the directory [r] is the directory [ino] or lies below it, by the
+     parent links of the tree itself. *)
+  let rec within (tree : t) r ino =
+    match !r with
+    | Resource.Dir d -> (
+        Inode.equal d.stat.ino ino
+        || (not (Inode.equal d.stat.ino 0L))
+           &&
+           match Entries.find_opt (fst (Dir_node.parent d)) tree with
+           | Some parent -> within tree parent ino
+           | None -> false)
+    | _ -> false
 
   (* path_resolution(7): a resolution follows at most [max_follows] symbolic
      links, as Linux and eio_posix do, and then fails with ELOOP. *)
@@ -322,137 +309,149 @@ module Filesystem = struct
     if !follows <= 0 then Error.symlink_loop ();
     decr follows
 
-  (* The directory a symbolic link's target resolves from: the root for an
-     absolute target, the directory holding the link otherwise. *)
-  let link_base fs ~parent link_to =
-    if Eio_fs_path.is_abs link_to then Entries.find 0L fs else parent
+  (* A resolution in progress, one component at a time as path_resolution(7)
+     describes it. [dirs] holds the directories entered, innermost first. A
+     confined walk keeps all of them back to its [base] and climbs a [..] by
+     dropping one, so it never leaves the base: a [..] at the base, or an
+     absolute path or link target, is refused, as eio_posix refuses them. A
+     walk with full access keeps only the directory it is in and climbs to
+     its parent, the root being its own. *)
+  type walk = {
+    tree : t;
+    base : Inode.t option;
+    follows : int ref;
+    dirs : resource ref list;
+  }
 
-  let rec find_entry_relative_to_dir ~follows ~check ~follow fs dir
-      (path : string) =
-    let confinement_dir = as_dir ~label:"confinement-dir" !dir in
-    let confinement_path = absolute_path fs confinement_dir in
-    let check_confinement parent resource_name =
-      let parent_path =
-        absolute_path fs (as_dir ~label:"confinement" !parent)
-      in
-      let path_of_next_item =
-        if resource_name = "/" then resource_name
-        else begin
-          Eio_fs_path.append parent_path resource_name
-        end
-      in
-      check_confinement ~root:confinement_path
-        (Eio_fs_path.to_dir_path path_of_next_item)
-    in
-    let rec loop ~parent r = function
-      | [] -> (
-          match !r with
-          | Resource.Symlink s when follow ->
-              follow_link follows;
-              if check then check_confinement dir s.link_to;
-              find_entry_relative_to_dir ~follows ~check ~follow fs
-                (link_base fs ~parent s.link_to)
-                s.link_to
-          | _ ->
-              let parent_path =
-                absolute_path fs (as_dir ~label:"find-loop" !parent)
-              in
-              let resource_name = Resource.name !r in
-              if resource_name = "/" then (resource_name, r)
-              else begin
-                (Eio_fs_path.append parent_path resource_name, r)
-              end)
-      | "" :: segs -> loop ~parent r segs
-      | seg :: segs -> (
-          if check then check_confinement dir seg;
-          let entries, resolved_dir =
-            entries_exn ~follows
-              ~check:(if check then Some (check_confinement dir) else None)
-              ~follow ~parent fs r
-          in
-          match
-            List.find_opt (fun (_, name) -> String.equal seg name) entries
-          with
-          | None -> Error.not_found (String.concat "/" segs)
-          | Some (ino, _) -> (
-              match Entries.find_opt ino fs with
-              | None -> Error.not_found (String.concat "/" segs)
-              | Some n ->
-                  if check then check_confinement dir (Resource.name !n);
-                  loop ~parent:resolved_dir n segs))
-    in
-    let parent =
-      match !dir with
-      | Dir d ->
-          let ino, _ = Dir_node.parent d in
-          Entries.find ino fs
-      | _ -> assert false
-    in
-    loop ~parent dir (Eio_fs_path.segs path)
+  let here w = match w.dirs with r :: _ -> r | [] -> assert false
 
-  and entries_exn ~follows ~check ~follow ~parent fs :
-      resource ref -> (Inode.t * string) list * resource ref =
-   fun r ->
+  let push w r =
+    match w.base with
+    | Some _ -> { w with dirs = r :: w.dirs }
+    | None -> { w with dirs = [ r ] }
+
+  (* [up w rest] is [w] one directory up, [rest] the components after the
+     [..], which a refusal names as eio_posix names them. *)
+  let up w rest =
+    match (w.base, w.dirs) with
+    | Some _, [ _ ] -> Error.outside_sandbox (String.concat "/" (".." :: rest))
+    | Some _, _ :: dirs -> { w with dirs }
+    | Some _, [] -> assert false
+    | None, _ -> { w with dirs = [ parent_dir w.tree (here w) ] }
+
+  let names path =
+    List.filter (fun name -> not (String.equal name "")) (Eio_fs_path.segs path)
+
+  (* Where [path] starts: the root for an absolute path, which a confined walk
+     refuses, and the directory [w] is in otherwise. *)
+  let enter w path =
+    if not (Eio_fs_path.is_abs path) then w
+    else
+      match w.base with
+      | Some _ -> Error.absolute_path ()
+      | None -> { w with dirs = [ root w.tree ] }
+
+  (* The entry [name] names in the directory [w] is in, [.] and [..] included,
+     or [None]. *)
+  let child w name =
+    match name with
+    | "." -> Some (here w)
+    | ".." -> Some (here (up w []))
+    | name -> (
+        let d = as_dir ~path:name !(here w) in
+        match List.find_opt (fun (_, n) -> String.equal n name) d.entries with
+        | None -> None
+        | Some (ino, _) -> Entries.find_opt ino w.tree)
+
+  (* A link to the empty path names nothing: ENOENT. *)
+  let link_target name (s : Symlink.t) =
+    if String.equal s.link_to "" then Error.not_found name;
+    s.link_to
+
+  (* [walk ~after w names] enters each directory of [names] in turn,
+     following every link on the way; [after] are the components left once
+     [names] are, which a refusal names. *)
+  let rec walk ?(after = []) w = function
+    | [] -> w
+    | "." :: rest -> walk ~after w rest
+    | ".." :: rest -> walk ~after (up w (rest @ after)) rest
+    | name :: rest -> walk ~after (into w name) rest
+
+  and into w name =
+    match child w name with
+    | None -> Error.not_found name
+    | Some r -> (
+        match !r with
+        | Resource.Dir _ -> push w r
+        | Symlink s ->
+            follow_link w.follows;
+            let target = link_target name s in
+            walk (enter w target) (names target)
+        (* ENOTDIR, which Eio.Fs has no constructor for. *)
+        | File _ -> Error.not_found name)
+
+  (* [locate w path] is the walk into the directory holding [path]'s last
+     component, that component (["."] when [path] has none) and whether
+     [path] ends in a separator. A confined walk checks by the tree's own
+     parent links that the directory it reached is below its base. *)
+  let locate w path =
+    let w = enter w path in
+    let w, name =
+      match List.rev (names path) with
+      | [] -> (w, ".")
+      | last :: rest -> (walk ~after:[ last ] w (List.rev rest), last)
+    in
+    (match w.base with
+    | Some base when not (within w.tree (here w) base) ->
+        Error.outside_sandbox path
+    | _ -> ());
+    let len = String.length path in
+    (w, name, len > 0 && path.[len - 1] = '/')
+
+  (* [final ~follow w name ~slash] is the resource [name] names in [w], a link
+     followed when [follow] or [slash] says so. A name in directory syntax
+     must be a directory. *)
+  let rec final ~follow w name ~slash =
+    let r =
+      match child w name with Some r -> r | None -> Error.not_found name
+    in
     match !r with
-    | Resource.Dir dir -> (dir.entries, r)
-    | Symlink sym ->
-        follow_link follows;
-        Option.iter (fun f -> f sym.link_to) check;
-        let _, r =
-          find_entry_relative_to_dir ~follows ~check:(Option.is_some check)
-            ~follow fs
-            (link_base fs ~parent sym.link_to)
-            sym.link_to
-        in
-        entries_exn ~follows ~check ~follow ~parent fs r
-    (* Walking through a non-directory: POSIX ENOTDIR, surfaced as an [Eio.Io]
-         rather than a bare [Failure]. *)
-    | r -> Fmt.kstr Error.not_found "not a directory: %a" Resource.pp r
+    | Resource.Symlink s when follow || slash ->
+        follow_link w.follows;
+        let w, name, slash' = locate w (link_target name s) in
+        final ~follow:true w name ~slash:(slash || slash')
+    | Resource.Dir _ -> r
+    | _ when slash -> Error.not_found name
+    | _ -> r
+
+  (* Where [path] given to [dir_fd] starts. Full access resolves a relative
+     path against the current directory, which an absolute path need not
+     reach; the current directory and an open directory confine the walk to
+     themselves. *)
+  let start dir_fd path =
+    let fs = Dir.fs dir_fd in
+    let tree = fs.tree in
+    let at_root =
+      { tree; base = None; follows = ref max_follows; dirs = [ root tree ] }
+    in
+    let cwd () =
+      { (walk at_root (names fs.cwd)) with follows = ref max_follows }
+    in
+    match dir_fd with
+    | Dir.Fs _ when Eio_fs_path.is_abs path -> at_root
+    | Dir.Fs _ -> cwd ()
+    | Dir.Cwd _ ->
+        let w = cwd () in
+        { w with base = Some (Resource.stat !(here w)).ino }
+    | Dir.Dir_fd fd ->
+        let r = resource_of fd in
+        { at_root with base = Some (Resource.stat !r).ino; dirs = [ r ] }
+
+  let locate_from dir_fd path = locate (start dir_fd path) path
 
   let lookup ~follow dir_fd path =
-    let { tree; cwd; _ } = Dir.fs dir_fd in
-    let root = Entries.find 0L tree in
-    let follows = ref max_follows in
-    match dir_fd with
-    | Dir.Fs _ ->
-        (* Full access: a relative path resolves against the current
-           directory. *)
-        let path =
-          if Eio_fs_path.is_abs path then path else Eio_fs_path.append cwd path
-        in
-        let _, r =
-          find_entry_relative_to_dir ~follows ~check:false ~follow tree root
-            path
-        in
-        r
-    (* A confined capability refuses an absolute path, as eio_posix does. *)
-    | (Dir.Cwd _ | Dir.Dir_fd _) when Eio_fs_path.is_abs path ->
-        Error.permission_denied path
-    | Dir.Cwd _ ->
-        (* Confined to the current directory. *)
-        let _, cwddir =
-          find_entry_relative_to_dir ~follows ~check:false ~follow tree root cwd
-        in
-        let resource_path, r =
-          find_entry_relative_to_dir ~follows ~check:true ~follow tree cwddir
-            path
-        in
-        if is_confined ~root:cwd resource_path then r
-        else Error.permission_denied resource_path
-    | Dir.Dir_fd fd ->
-        (* Confined to the descriptor's directory. A directory fd closed with
-           its switch is EBADF, as for a real O_DIRECTORY fd, never a silent
-           success. *)
-        let dir = resource_of fd in
-        let resource_path, r =
-          find_entry_relative_to_dir ~follows ~check:true ~follow tree dir path
-        in
-        if
-          is_confined
-            ~root:(absolute_path tree (as_dir ~label:"lookup" !dir))
-            resource_path
-        then r
-        else Error.permission_denied resource_path
+    let w, name, slash = locate_from dir_fd path in
+    final ~follow w name ~slash
 end
 
 let v ?(cwd = "/") () =
@@ -487,50 +486,30 @@ let check_access path flags r =
       Error.permission_denied path
   | _ -> ()
 
-let dir_base path = (Eio_fs_path.parent path, Eio_fs_path.basename path)
-
-(* The entry [path] names, its last component not followed, or [None] when
-   that component is missing. *)
-let lookup_entry dir_fd path =
-  match Filesystem.lookup ~follow:false dir_fd path with
-  | r -> Some r
-  | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> None
-
-(* The path the symbolic link [path] to [link_to] resolves to. *)
-let link_target path link_to =
-  check_path (Eio_fs_path.append (Eio_fs_path.parent path) link_to)
+(* [.] and [..] name a directory already there, never an entry to make,
+   remove or move. *)
+let is_dot name = String.equal name "." || String.equal name ".."
 
 (* Create the entry [path] with [add parent name] unless its name is taken,
    by a dangling symbolic link included: EEXIST, as mkdir(2) and symlink(2)
    answer. *)
 let create_entry dir_fd path add =
-  match lookup_entry dir_fd path with
+  let w, name, _ = Filesystem.locate_from dir_fd path in
+  match Filesystem.child w name with
   | Some _ -> Error.already_exists path
-  | None ->
-      let dir, base = dir_base path in
-      add (Filesystem.lookup ~follow:true dir_fd dir) base
+  | None -> add (Filesystem.here w) name
 
-(* Create [path] in its parent directory, register the new file in the
+(* Create [name] in the directory [w] is in, register the new file in the
    filesystem, and return its resource. *)
-let new_file ~mode dir_fd path =
+let new_file ~mode fs (w : Filesystem.walk) name ~slash =
   (* A path in directory syntax names a directory, which O_CREAT never makes:
      macOS answers ENOENT, Linux EISDIR. *)
-  if String.equal (Eio_fs_path.to_dir_path path) path then Error.not_found path;
-  let dir, fname = dir_base path in
-  let rdir = Filesystem.lookup ~follow:true dir_fd dir in
-  let dir =
-    match !rdir with
-    | Resource.Dir d -> d
-    (* open(2) with O_CREAT answers ENOTDIR when a component of the path prefix
-       is not a directory. Eio.Fs has no ENOTDIR constructor, so report what a
-       walk through such a component already reports here: the path does not
-       resolve. *)
-    | _ -> Error.not_found path
-  in
-  let fs = Dir.fs dir_fd in
+  if slash then Error.not_found name;
+  let rdir = Filesystem.here w in
+  let dir = as_dir ~path:name !rdir in
   let stat = new_stat fs ~perm:(mode land 0o7777) () in
-  let f = File.v ~stat fname in
-  let dir = { dir with entries = (f.stat.ino, f.name) :: dir.entries } in
+  let f = File.v ~stat in
+  let dir = { dir with entries = (f.stat.ino, name) :: dir.entries } in
   rdir := Resource.Dir dir;
   let file = ref (Resource.File f) in
   Filesystem.add_file fs f.stat.ino file;
@@ -539,7 +518,6 @@ let new_file ~mode dir_fd path =
 (* The descriptor is registered with [sw] once the lock is released: a
    finished switch runs [close] at once, which takes the lock. *)
 let open_locked ~mode dir_fd path flags =
-  let path = check_path path in
   let is_create = Open_flags.(mem o_creat flags) in
   let is_excl = Open_flags.(mem o_excl flags) in
   let append = Open_flags.(mem o_append flags) in
@@ -569,24 +547,28 @@ let open_locked ~mode dir_fd path flags =
         (* O_CREAT looks at the last component without following it. A
            symbolic link there, dangling or not, makes O_EXCL fail with EEXIST
            and O_NOFOLLOW with ELOOP; otherwise the open follows it and, when
-           its target is missing, creates that target. *)
-        let follows = ref Filesystem.max_follows in
-        let rec create path =
-          match lookup_entry dir_fd path with
-          | None -> new_file ~mode dir_fd path
+           its target is missing, creates that target, resolved from the
+           directory holding the link. *)
+        let rec create (w : Filesystem.walk) name ~slash =
+          match Filesystem.child w name with
+          | None -> new_file ~mode fs w name ~slash
           | Some _ when is_excl -> Error.already_exists path
           | Some r -> (
               match !r with
               | Resource.Symlink _ when nofollow -> Error.symlink_loop ()
               | Resource.Symlink s -> (
-                  match Filesystem.lookup ~follow:true dir_fd path with
+                  match Filesystem.final ~follow:true w name ~slash with
                   | r -> opened r
                   | exception Eio.Io (Eio.Fs.E (Not_found _), _) ->
-                      Filesystem.follow_link follows;
-                      create (link_target path s.link_to))
+                      Filesystem.follow_link w.follows;
+                      let w, name, slash =
+                        Filesystem.locate w (Filesystem.link_target name s)
+                      in
+                      create w name ~slash)
               | _ -> opened r)
         in
-        create path
+        let w, name, slash = Filesystem.locate_from dir_fd path in
+        create w name ~slash
   in
   let num = next_fd_of_fds fs.fds in
   fs.fds <- Fd_table.add num r fs.fds;
@@ -601,50 +583,48 @@ let openat ~mode ~sw dir_fd path flags =
 
 let statat ~follow dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
-  let f = Filesystem.lookup ~follow dir_fd path in
-  Resource.stat !f
+  Resource.stat !(Filesystem.lookup ~follow dir_fd path)
 
 let chmod ~follow dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
   let r = Filesystem.lookup ~follow dir_fd path in
   r := Resource.set_stat !r { (Resource.stat !r) with perm }
 
 let chown ~follow ?uid ?gid dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
   let r = Filesystem.lookup ~follow dir_fd path in
   let s = Resource.stat !r in
   let uid = Option.value ~default:s.uid uid in
   let gid = Option.value ~default:s.gid gid in
   r := Resource.set_stat !r { s with uid; gid }
 
-let unlink dir_fd path =
-  locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
-  (match lookup_entry dir_fd path with
-  | None -> Error.not_found path
-  (* EISDIR, as Linux answers; macOS answers EPERM. *)
-  | Some { contents = Resource.Dir _ } ->
-      Error.err ("unlink: is a directory: " ^ path)
-  | Some _ -> ());
-  let dir, base = dir_base path in
-  let r = Filesystem.lookup ~follow:true dir_fd dir in
-  let d = as_dir ~label:"unlink" !r in
+(* The directory [w] is in, without its entry [name]. *)
+let remove_entry (w : Filesystem.walk) name =
+  let r = Filesystem.here w in
+  let d = as_dir ~path:name !r in
   let entries =
-    List.filter (fun (_, name) -> not (String.equal base name)) d.entries
+    List.filter (fun (_, n) -> not (String.equal name n)) d.entries
   in
   r := Resource.Dir { d with entries }
 
+let unlink dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
+  let w, name, _ = Filesystem.locate_from dir_fd path in
+  (* EISDIR, as Linux answers; macOS answers EPERM. *)
+  let is_a_directory () = Error.err ("unlink: is a directory: " ^ path) in
+  if is_dot name then is_a_directory ();
+  match Filesystem.child w name with
+  | None -> Error.not_found path
+  | Some { contents = Resource.Dir _ } -> is_a_directory ()
+  | Some _ -> remove_entry w name
+
 let mkdirat dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
   let fs = Dir.fs dir_fd in
   let mkdir r name =
     let new_stat = new_stat fs ~kind:`Directory ~perm () in
-    let d = as_dir ~label:"mkdirat" !r in
-    let dir = Dir_node.v ~parent:d.stat.ino name new_stat in
+    let d = as_dir ~path !r in
+    let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Dir dir));
     let entries = (ino, name) :: d.entries in
@@ -654,7 +634,6 @@ let mkdirat dir_fd ~perm path =
 
 let embed dir_fd ~perm path ~contents =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
   let fs = Dir.fs dir_fd in
   let add r name =
     let stat =
@@ -663,8 +642,8 @@ let embed dir_fd ~perm path ~contents =
         size = Optint.Int63.of_int (String.length contents);
       }
     in
-    let d = as_dir ~label:"embed" !r in
-    let f = File.literal ~stat name contents in
+    let d = as_dir ~path !r in
+    let f = File.literal ~stat contents in
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
     r := Dir { d with entries = (stat.ino, name) :: d.entries }
   in
@@ -672,12 +651,11 @@ let embed dir_fd ~perm path ~contents =
 
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
   let fs = Dir.fs dir_fd in
   let symlink r name =
     let new_stat = new_stat fs ~kind:`Symbolic_link ~perm:0o644 () in
-    let d = as_dir ~label:"symlink" !r in
-    let dir = Symlink.v ~link_to name new_stat in
+    let d = as_dir ~path !r in
+    let dir = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Symlink dir));
     let entries = (ino, name) :: d.entries in
@@ -687,17 +665,13 @@ let symlinkat ~link_to dir_fd path =
 
 let read_link dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
-  let r = Filesystem.lookup ~follow:false dir_fd path in
-  match !r with
+  match !(Filesystem.lookup ~follow:false dir_fd path) with
   | Symlink s -> s.link_to
-  | r -> Fmt.kstr Error.err "not a symlink: %a" Resource.pp r
+  | _ -> Error.err ("not a symbolic link: " ^ path)
 
 let read_dir dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
-  let r = Filesystem.lookup ~follow:true dir_fd path in
-  match !r with
+  match !(Filesystem.lookup ~follow:true dir_fd path) with
   | Resource.Dir dir ->
       List.map snd dir.entries
       |> List.filter (function "." | ".." -> false | _ -> true)
@@ -705,9 +679,7 @@ let read_dir dir_fd path =
 
 let read_dir_entries dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
-  let r = Filesystem.lookup ~follow:true dir_fd path in
-  match !r with
+  match !(Filesystem.lookup ~follow:true dir_fd path) with
   | Resource.Dir dir ->
       dir.entries
       |> List.filter (fun (_, name) -> name <> "." && name <> "..")
@@ -722,34 +694,18 @@ let read_dir_entries dir_fd path =
 
 let rmdir dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let path = check_path path in
+  let w, name, _ = Filesystem.locate_from dir_fd path in
+  (* rmdir(2) refuses a last [.] with EINVAL and a last [..] with ENOTEMPTY. *)
+  if String.equal name "." then Error.err ("rmdir: invalid argument: " ^ path);
+  if String.equal name ".." then
+    Error.err ("rmdir: directory not empty: " ^ path);
   (* A final symbolic link is not followed: ENOTDIR. *)
-  let r = Filesystem.lookup ~follow:false dir_fd path in
-  match !r with
-  | Resource.Dir d ->
+  match Filesystem.child w name with
+  | None -> Error.not_found path
+  | Some { contents = Resource.Dir d } ->
       if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
-      else begin
-        let dir, base = dir_base path in
-        let parent = Filesystem.lookup ~follow:true dir_fd dir in
-        let r = as_dir ~label:"rmdir" !parent in
-        let entries =
-          List.filter (fun (_, name) -> not (String.equal name base)) r.entries
-        in
-        parent := Dir { r with entries }
-      end
-  | _ -> Error.err ("rmdir: not a directory: " ^ path)
-
-(* Whether the directory [r] is the directory [ino] or lies below it. *)
-let rec within tree r ino =
-  match !r with
-  | Resource.Dir d -> (
-      Inode.equal d.stat.ino ino
-      || (not (Inode.equal d.stat.ino 0L))
-         &&
-         match Entries.find_opt (fst (Dir_node.parent d)) tree with
-         | Some parent -> within tree parent ino
-         | None -> false)
-  | _ -> false
+      else remove_entry w name
+  | Some _ -> Error.err ("rmdir: not a directory: " ^ path)
 
 (* rename(2) refuses to move a directory below itself (EINVAL), a directory
    over a non-empty directory (ENOTEMPTY) or over a non-directory (ENOTDIR),
@@ -758,7 +714,7 @@ let rec within tree r ino =
 let check_rename tree ~src ~new_parent ~dst new_path =
   let ino = (Resource.stat !src).ino in
   match (!src, Option.map ( ! ) dst) with
-  | Resource.Dir _, _ when within tree new_parent ino ->
+  | Resource.Dir _, _ when Filesystem.within tree new_parent ino ->
       Error.err ("rename: invalid argument, into its own subtree: " ^ new_path)
   | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
       Error.err ("rename: directory not empty: " ^ new_path)
@@ -770,25 +726,30 @@ let check_rename tree ~src ~new_parent ~dst new_path =
 
 let rename ?(replace = true) dir_fd old_path new_dir new_path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let old_path = check_path old_path in
-  let new_path = check_path new_path in
   (* rename(2) does not move an entry between two file systems: EXDEV, which
      Eio.Fs has no constructor for. *)
   if Dir.fs dir_fd != Dir.fs new_dir then
     Error.err ("rename: invalid cross-device link: " ^ new_path);
   let tree = (Dir.fs dir_fd).tree in
+  let old_w, old_name, _ = Filesystem.locate_from dir_fd old_path in
+  let new_w, new_name, _ = Filesystem.locate_from new_dir new_path in
+  (* rename(2) answers EINVAL or EBUSY for a last [.] or [..]. *)
+  if is_dot old_name || is_dot new_name then
+    Error.err ("rename: invalid argument: " ^ new_path);
   (* Rename the directory entry itself. In particular, a symlink's target need
      not exist and must not be followed while moving the link. *)
-  let old_res = Filesystem.lookup ~follow:false dir_fd old_path in
+  let old_res =
+    match Filesystem.child old_w old_name with
+    | Some r -> r
+    | None -> Error.not_found old_path
+  in
   let ino = Resource.(stat !old_res).ino in
-  let old_parent_path, old_name = dir_base old_path in
-  let new_parent_path, new_name = dir_base new_path in
-  let old_parent = Filesystem.lookup ~follow:true dir_fd old_parent_path in
-  let new_parent = Filesystem.lookup ~follow:true new_dir new_parent_path in
+  let old_parent = Filesystem.here old_w in
+  let new_parent = Filesystem.here new_w in
   let existing =
     List.find_opt
       (fun (_, name) -> String.equal name new_name)
-      (as_dir ~label:"rename-dst" !new_parent).entries
+      (as_dir ~path:new_path !new_parent).entries
   in
   match existing with
   (* Two names of one entry: rename(2) does nothing. *)
@@ -807,35 +768,32 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
          [new_name] pointing at [ino]. Same-parent edits go to one entries
          list, so the move is atomic. *)
       if old_parent == new_parent then begin
-        let d = as_dir ~label:"rename" !new_parent in
+        let d = as_dir ~path:new_path !new_parent in
         let entries =
           (ino, new_name) :: without new_name (without old_name d.entries)
         in
         new_parent := Resource.Dir { d with entries }
       end
       else begin
-        let dst = as_dir ~label:"rename-dst" !new_parent in
+        let dst = as_dir ~path:new_path !new_parent in
         let entries = (ino, new_name) :: without new_name dst.entries in
         new_parent := Resource.Dir { dst with entries };
-        let src = as_dir ~label:"rename-src" !old_parent in
+        let src = as_dir ~path:old_path !old_parent in
         old_parent :=
           Resource.Dir { src with entries = without old_name src.entries }
       end;
-      (* The entry answers to its new name, and a directory's [..] names its
-         new parent. *)
-      old_res :=
-        match !old_res with
-        | Resource.Dir d ->
-            let parent = (Resource.stat !new_parent).ino in
-            let entries =
-              List.map
-                (fun ((_, name) as e) ->
-                  if String.equal name ".." then (parent, "..") else e)
-                d.entries
-            in
-            Resource.Dir { d with name = new_name; entries }
-        | File f -> File { f with name = new_name }
-        | Symlink l -> Symlink { l with name = new_name })
+      (* A directory's [..] names its new parent. *)
+      match !old_res with
+      | Resource.Dir d ->
+          let parent = (Resource.stat !new_parent).ino in
+          let entries =
+            List.map
+              (fun ((_, name) as e) ->
+                if String.equal name ".." then (parent, "..") else e)
+              d.entries
+          in
+          old_res := Resource.Dir { d with entries }
+      | File _ | Symlink _ -> ())
 
 let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 
@@ -864,6 +822,12 @@ let blit_and_grow ~src ~dst ~off =
     new_dst
   end
 
+(* EISDIR, naming the operation and never the contents. *)
+let not_a_file op r =
+  Error.err
+    (op ^ ": not a file: "
+    ^ match r with Resource.Dir _ -> "a directory" | _ -> "not a regular file")
+
 (* A descriptor open on a non-regular file still answers the file interface --
    [Eio.Path.open_in] on a directory is legal and the portable directory
    barrier depends on it -- so the operations below refuse one with EISDIR, as
@@ -884,10 +848,10 @@ let writev t bufs =
       in
       let new_size = Optint.Int63.of_int @@ File.length contents in
       let stat = { e.stat with size = new_size } in
-      r := File { e with stat; contents };
+      r := File { stat; contents };
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
       Cstruct.length src
-  | r -> Fmt.kstr Error.err "writev: not a file: %a" Resource.pp r
+  | r -> not_a_file "writev" r
 
 let readv t bufs =
   locked t.Fd.fs @@ fun () ->
@@ -909,7 +873,7 @@ let readv t bufs =
         bufs;
       t.pos <- !pos;
       !read
-  | r -> Fmt.kstr Error.err "readv: not a file: %a" Resource.pp r
+  | r -> not_a_file "readv" r
 
 (* Positioned reads and writes address an explicit [file_offset] and never move
    the cursor, unlike [readv]/[writev]. This mirrors [Eio.File.pread]/[pwrite]. *)
@@ -934,7 +898,7 @@ let preadv t ~file_offset bufs =
           bufs;
         if !read = 0 then raise End_of_file else !read
       end
-  | r -> Fmt.kstr Error.err "pread: not a file: %a" Resource.pp r
+  | r -> not_a_file "pread" r
 
 let pwritev t ~file_offset bufs =
   locked t.Fd.fs @@ fun () ->
@@ -949,9 +913,9 @@ let pwritev t ~file_offset bufs =
       in
       let new_size = Optint.Int63.of_int (File.length contents) in
       let stat = { e.stat with size = new_size } in
-      r := Resource.File { e with contents; stat };
+      r := Resource.File { contents; stat };
       Cstruct.length src
-  | r -> Fmt.kstr Error.err "pwrite: not a file: %a" Resource.pp r
+  | r -> not_a_file "pwrite" r
 
 let seek_fd t off cmd =
   locked t.Fd.fs @@ fun () ->
@@ -967,7 +931,7 @@ let seek_fd t off cmd =
       check_offset "seek" newpos;
       t.pos <- newpos;
       newpos
-  | r -> Fmt.kstr Error.err "seek: not a file: %a" Resource.pp r
+  | r -> not_a_file "seek" r
 
 let truncate_fd t len =
   locked t.Fd.fs @@ fun () ->
@@ -986,8 +950,8 @@ let truncate_fd t len =
         end
       in
       let stat = { e.stat with size = Optint.Int63.of_int target } in
-      r := Resource.File { e with contents; stat }
-  | r -> Fmt.kstr Error.err "truncate: not a file: %a" Resource.pp r
+      r := Resource.File { contents; stat }
+  | r -> not_a_file "truncate" r
 
 module Flow = struct
   module Impl = struct

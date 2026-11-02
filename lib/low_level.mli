@@ -64,7 +64,10 @@ end
 (** Directory descriptors. *)
 module Dir : sig
   (** The type for the directory a relative path resolves against: a file
-      system's root, its current directory, or an open descriptor. *)
+      system's root, its current directory, or an open descriptor. The root has
+      full access. The other two confine a resolution below themselves: an
+      absolute path or link target, and a [..] above them, are refused with
+      [Eio.Fs.Permission_denied]. *)
   type fd = Fs of t | Cwd of t | Dir_fd of Fd.t
 end
 

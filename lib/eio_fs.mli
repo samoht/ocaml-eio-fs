@@ -135,7 +135,15 @@ end
     paths have no native spelling ({!Eio.Path.native} is [None]), and an
     absolute symbolic link resolves from the filesystem's root, so through the
     root that {!v} returns it is followed where eio_posix would refuse it. One
-    filesystem may be used from several domains at once. *)
+    filesystem may be used from several domains at once.
+
+    A path resolves one component at a time, as path_resolution(7) describes: a
+    [".."] climbs from the directory the walk has reached, a link's target
+    included, never from a lexical rewrite of the path. A directory opened from
+    the filesystem is confined as eio_posix confines one: an absolute path, an
+    absolute link target and a [".."] above that directory are refused with
+    [Eio.Fs.Permission_denied], whose message names the path asked for and not
+    where the directory sits. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
