@@ -1849,3 +1849,8 @@ module Crash = struct
         Fmt.pf ppf "symlink %s -> %s #%d" u.path target u.seq
     | Rename { dest } -> Fmt.pf ppf "rename %s -> %s #%d" u.path dest u.seq
 end
+
+module Private = struct
+  let next = Schedule.next
+  let base_dir = base_dir
+end

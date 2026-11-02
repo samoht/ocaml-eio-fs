@@ -95,7 +95,6 @@ module Schedule : sig
             offset, since the fault's byte count is operation-relative. *)
 
   type rule = { trigger : trigger; fault : Fault.t }
-  type config = { probability : float; kinds : Fault.kind list }
   type t
 
   val empty : t
@@ -127,11 +126,6 @@ module Schedule : sig
       (default: all) applicable to that operation. The same [seed] and operation
       sequence always yield the same fault sequence. *)
 
-  val next : t -> Op.t -> Fault.t option
-  (** [next t op] advances the schedule by one operation and is the fault to
-      inject, if any. {!wrap} calls it; it is exported to test a schedule in
-      isolation. *)
-
   val pp : t Fmt.t
   (** [pp] formats a schedule for logs (a seed or the count of pending rules).
   *)
@@ -150,11 +144,6 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     base's descriptor where there is one. The file registers
     {!Eio_fs_sync.File_sync} so a barrier through {!Eio_fs_sync.sync_file}
     reaches the schedule's own sync. *)
-
-val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
-(** [base_dir dir] is the directory wrapped by {!wrap}, when [dir] is such a
-    wrapper. Backend extensions use it only after the wrapper has observed the
-    path operation that precedes their own operation. *)
 
 (** A power-loss durability model over a base directory capability.
 
@@ -279,4 +268,17 @@ module Crash : sig
 
   val pp_unsynced : unsynced Fmt.t
   (** [pp_unsynced] formats an un-synced change for logs and test failures. *)
+end
+
+(**/**)
+
+(* For this package's tests and eio-fs.unix only. *)
+module Private : sig
+  val next : Schedule.t -> Op.t -> Fault.t option
+  (* [next t op] advances [t] by one operation and is the fault to inject. *)
+
+  val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
+  (* [base_dir dir] is the directory {!wrap} wraps, when [dir] is a wrapper; a
+     backend extension reads it only after the wrapper has observed the path
+     operation preceding its own. *)
 end

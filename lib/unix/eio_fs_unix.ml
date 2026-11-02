@@ -200,7 +200,7 @@ let stat_of_fd fd =
     }
 
 let rec unwrapped_dir dir =
-  match Eio_fs.Chaos.base_dir dir with
+  match Eio_fs.Chaos.Private.base_dir dir with
   | Some base -> unwrapped_dir base
   | None -> dir
 
@@ -1829,4 +1829,8 @@ module Batch = struct
           (fun () ->
             List.rev
               (List.fold_left (fun acc op -> attempt run op :: acc) [] ops))
+end
+
+module Private = struct
+  let batch_hops = Batch.hops
 end

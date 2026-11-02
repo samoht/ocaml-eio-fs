@@ -318,7 +318,7 @@ let test_directory_short_read_inapplicable () =
   in
   Alcotest.(check bool)
     "no byte fault selected for directory" true
-    (Schedule.next sched op = None);
+    (Chaos.Private.next sched op = None);
   with_chaos sched @@ fun ~raw ~chaos ->
   Eio.Path.mkdir ~perm:0o755 (raw / "tree");
   Alcotest.(check (list string))
@@ -593,7 +593,7 @@ let test_scripted_fires_once () =
   let check name expected =
     Alcotest.(check bool)
       name true
-      (match (Schedule.next sched op, expected) with
+      (match (Chaos.Private.next sched op, expected) with
       | None, None -> true
       | Some a, Some b -> Fault.equal a b
       | _ -> false)
@@ -618,7 +618,7 @@ let test_nth_op_on_path () =
   let op kind path = { Op.kind; path; file_offset = 0; length = 0 } in
   let faults =
     List.map
-      (fun o -> Option.is_some (Schedule.next sched o))
+      (fun o -> Option.is_some (Chaos.Private.next sched o))
       [
         op `Open "f";
         op `Open "g";
@@ -655,7 +655,7 @@ let ops_fixture =
 
 let run_schedule seed =
   let s = Schedule.seeded ~seed ~probability:0.7 () in
-  List.map (Schedule.next s) ops_fixture
+  List.map (Chaos.Private.next s) ops_fixture
 
 let test_seed_determinism () =
   let a = run_schedule 1234 and b = run_schedule 1234 in

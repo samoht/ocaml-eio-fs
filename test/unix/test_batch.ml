@@ -203,9 +203,9 @@ let test_one_hop () =
             contents = string_of_int i;
           })
   in
-  let before = Batch.hops () in
+  let before = Eio_fs_unix.Private.batch_hops () in
   let results = Batch.run batch ops in
-  let after = Batch.hops () in
+  let after = Eio_fs_unix.Private.batch_hops () in
   Alcotest.(check int) "N + 1 operations, one hop" 1 (after - before);
   Alcotest.(check int)
     "every op succeeded" (n + 1)
