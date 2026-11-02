@@ -218,6 +218,29 @@ let test_sync_error () =
   Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "data" ];
   expect_io "fsync failure" (fun () -> Eio.File.sync file)
 
+(* fsync(2) flushes a file through any descriptor on it, so a file opened
+   read-only answers the barrier too -- a durable publish syncs a read-only
+   file that way -- and the schedule fails it as it fails a read-write one. *)
+let test_read_only_file_sync () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Nth_op_on_path { n = 2; kind = `Sync; path = "f" };
+          fault = Sync_error `Eio;
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o444) (raw / "f") "data";
+  Eio.Switch.run @@ fun sw ->
+  let file = Eio.Path.open_in ~sw (chaos / "f") in
+  match Eio_fs_sync.file_barrier file with
+  | None -> Alcotest.fail "a read-only file registers no barrier"
+  | Some barrier ->
+      barrier ();
+      expect_io "the scheduled sync failure" barrier
+
 let test_open_error () =
   let sched =
     Schedule.scripted
@@ -1804,6 +1827,7 @@ let suite =
       Alcotest.test_case "torn write" `Quick test_torn_write;
       Alcotest.test_case "write error" `Quick test_write_error;
       Alcotest.test_case "sync error" `Quick test_sync_error;
+      Alcotest.test_case "read-only file sync" `Quick test_read_only_file_sync;
       Alcotest.test_case "open error" `Quick test_open_error;
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "real child cwd" `Quick test_real_child_cwd;
