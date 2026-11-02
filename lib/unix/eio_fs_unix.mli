@@ -561,6 +561,12 @@ val set_xattr : _ Eio.Path.t -> string -> string -> unit
     @raise Invalid_argument if [path]'s native name or [name] holds a NUL byte.
 *)
 
+type Eio.Exn.Backend.t +=
+  | Unsafe_parent of string
+        (** Why {!Link.with_parent} or {!Batch.with_parent} refused a path: it
+            names nothing beneath its directory, or a parent on the way is not
+            one it may descend. *)
+
 (** Symbolic links published beneath a parent directory held open, each
     component opened with [O_NOFOLLOW], so no link on the way can redirect the
     publication. *)
@@ -575,27 +581,30 @@ module Link : sig
     | Present  (** A link holding exactly the target was already there. *)
 
   val with_parent :
-    ?mkdir:int ->
-    root:_ Eio.Path.t ->
-    path:string ->
-    (t -> ('a, string) result) ->
-    ('a, string) result
-  (** [with_parent ~mkdir ~root ~path fn] opens each parent component of [path]
-      beneath [root] with [O_DIRECTORY | O_NOFOLLOW], then is [fn] applied to
-      the held parent and final basename. [path] must be non-empty, canonical
-      and relative, with no empty, dot, dot-dot or NUL components. A missing
-      parent is created with mode [mkdir], subject to the process umask, when
-      [mkdir] is given, and refused when it is not (the default). Created
-      parents survive a later refusal. A refused [path] or a parent that cannot
-      be opened is [Error msg], [msg] naming [path] and the action needed to
-      retry, and [fn] is not called.
+    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    _ Eio.Path.t ->
+    (t -> 'a) ->
+    'a
+  (** [with_parent ~create path fn] opens each parent component of [path]
+      beneath its directory with [O_DIRECTORY | O_NOFOLLOW], then is [fn]
+      applied to the held parent and final basename. [path]'s name must be
+      non-empty, canonical and relative, with no empty, dot, dot-dot or NUL
+      components. [create] (defaults to [`Never]) says what a missing parent
+      does: [`If_missing perm] creates it with mode [perm] less the umask, and
+      [`Never] refuses it. Created parents survive a later refusal.
 
       The handle is closed when [fn] returns and must not escape its scope. A
       renamed parent remains the held directory; this does not promise that its
-      original textual path still names it. [root] is the caller's chosen
-      capability, resolved once before descending.
+      original textual path still names it. Where [fn]'s result or exception
+      comes from [fn], it passes through unchanged.
 
-      @raise Invalid_argument if [root] carries no Unix descriptor. *)
+      @raise Eio.Io
+        with {!Eio.Fs.Permission_denied} carrying {!Unsafe_parent} if [path]'s
+        name is refused, and as [openat] or [mkdirat] fails on a parent
+        otherwise ({!Eio.Fs.Not_found} for a missing one, {!Eio.Fs.Symlink} for
+        a symbolic link); [fn] is then not called.
+      @raise Invalid_argument if [path]'s directory carries no Unix descriptor.
+  *)
 
   val publish : t -> target:string -> (publication, string) result
   (** [publish parent ~target] atomically creates an absent symbolic link
@@ -650,9 +659,9 @@ module Batch : sig
       used after [fn] returns.
 
       @raise Eio.Io
-        with {!Eio.Fs.Permission_denied} for invalid path components, a
-        non-directory parent or an identity mismatch; with {!Eio.Fs.Not_found}
-        for a missing parent. *)
+        with {!Eio.Fs.Permission_denied} carrying {!Unsafe_parent} for invalid
+        path components, a non-directory parent or an identity mismatch; with
+        {!Eio.Fs.Not_found} for a missing parent. *)
 
   type t
   (** The type for a directory that batches run beneath. *)

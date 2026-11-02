@@ -305,6 +305,20 @@ module At = struct
     }
 end
 
+(* Why a [with_parent] refused a path: it names nothing beneath its
+   directory, or a parent on the way is not a directory it may descend. *)
+type Eio.Exn.Backend.t += Unsafe_parent of string
+
+let () =
+  Eio.Exn.Backend.register_pp (fun f -> function
+    | Unsafe_parent reason ->
+        Fmt.string f reason;
+        true
+    | _ -> false)
+
+let unsafe_parent reason =
+  raise (Eio.Fs.err (Eio.Fs.Permission_denied (Unsafe_parent reason)))
+
 module Link = struct
   type t = { parent : Eio_unix.Fd.t; name : string; path : string }
   type publication = Created | Present
@@ -329,56 +343,53 @@ module Link = struct
     Eio_unix.Fd.use_exn "Eio_fs_unix.Link" dir @@ fun dir ->
     Eio_unix.run_in_systhread ~label:"eio-fs-link" (fun () -> fn dir)
 
-  let with_parent ?mkdir ~root ~path fn =
-    let original = Eio_fs.Path.name Eio.Path.(root / path) in
-    match components path with
-    | Error reason -> err_refused original reason
-    | Ok components -> (
-        Eio.Switch.run @@ fun sw ->
-        let open_parent () =
-          let directory = Eio.Path.open_dir ~sw root in
-          let file = Eio.Path.open_in ~sw directory in
-          let descriptor =
-            match Eio_unix.Resource.fd_opt file with
-            | Some fd -> fd
-            | None ->
-                invalid_arg
-                  "Eio_fs_unix.Link.with_parent: native directory required"
-          in
-          let rec descend fd = function
-            | [] -> assert false
-            | [ name ] -> { parent = fd; name; path = original }
-            | name :: rest ->
-                let open_component () =
-                  at fd (fun dir -> At.open_dir dir name)
-                in
-                let next =
-                  match open_component () with
-                  | opened -> opened
-                  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> (
-                      match mkdir with
-                      | None ->
-                          raise (Unix.Unix_error (Unix.ENOENT, "openat", name))
-                      | Some mode ->
-                          (try at fd (fun dir -> At.mkdir dir name mode)
-                           with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-                          open_component ())
-                in
-                descend (Eio_unix.Fd.of_unix ~sw ~close_unix:true next) rest
-          in
-          descend descriptor components
+  (* A missing parent is made as [create] says, and one another caller made
+     meanwhile is opened all the same. *)
+  let rec open_parent ~create fd name =
+    match at fd (fun dir -> At.open_dir dir name) with
+    | opened -> opened
+    | exception (Unix.Unix_error (Unix.ENOENT, _, _) as e) -> (
+        match create with
+        | `Never -> raise e
+        | `If_missing perm ->
+            (try at fd (fun dir -> At.mkdir dir name perm)
+             with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+            open_parent ~create:`Never fd name)
+
+  let with_parent ?(create = `Never) (input : _ Eio.Path.t) fn =
+    let dir, path = (input :> Eio.Fs.dir_ty Eio.Path.t) in
+    let original = Eio_fs.Path.name input in
+    let components =
+      match components path with
+      | Ok components -> components
+      | Error reason ->
+          Fmt.kstr unsafe_parent "%s: %s; name a path beneath the directory"
+            original reason
+    in
+    Eio.Switch.run @@ fun sw ->
+    let rec descend fd = function
+      | [] -> assert false
+      | [ name ] -> { parent = fd; name; path = original }
+      | name :: rest ->
+          let next = open_parent ~create fd name in
+          descend (Eio_unix.Fd.of_unix ~sw ~close_unix:true next) rest
+    in
+    let parent =
+      try
+        let directory = Eio.Path.open_dir ~sw (dir, ".") in
+        let descriptor =
+          match Eio_unix.Resource.fd_opt (Eio.Path.open_in ~sw directory) with
+          | Some fd -> fd
+          | None ->
+              invalid_arg
+                "Eio_fs_unix.Link.with_parent: native directory required"
         in
-        let opened =
-          match open_parent () with
-          | handle -> Ok handle
-          | exception Unix.Unix_error (code, operation, argument) ->
-              err_refused original
-                (Fmt.str "%s %s: %s" operation argument
-                   (Unix.error_message code))
-          | exception (Eio.Io _ as ex) ->
-              err_refused original (Printexc.to_string ex)
-        in
-        match opened with Error _ as error -> error | Ok handle -> fn handle)
+        eio_unix_errors (fun () -> descend descriptor components)
+      with Eio.Io _ as ex ->
+        let bt = Printexc.get_raw_backtrace () in
+        Eio.Exn.reraise_with_context ex bt "opening the parents of %s" original
+    in
+    fn parent
 
   let publish t ~target =
     let existing () =
@@ -1665,20 +1676,9 @@ module Batch = struct
     | exception Unix.Unix_error (code, call, arg) ->
         Error (`Unix (code, call, arg))
 
-  type Eio.Exn.Backend.t += Unsafe_parent of string
-
-  let () =
-    Eio.Exn.Backend.register_pp (fun f -> function
-      | Unsafe_parent reason ->
-          Fmt.string f reason;
-          true
-      | _ -> false)
-
   let with_parent (input : _ Eio.Path.t) fn =
     let root, path = (input :> Eio.Fs.dir_ty Eio.Path.t) in
-    let denied reason =
-      raise (Eio.Fs.err (Eio.Fs.Permission_denied (Unsafe_parent reason)))
-    in
+    let denied reason = unsafe_parent reason in
     let parents, leaf =
       match split path with
       | parts -> parts
