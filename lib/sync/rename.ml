@@ -1,3 +1,5 @@
+open! Hermetic
+
 type path = Eio.Fs.dir_ty Eio.Path.t
 type t = path -> path -> unit
 

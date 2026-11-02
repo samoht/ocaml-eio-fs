@@ -15,4 +15,4 @@
 (mdx
  (package eio-fs)
  (files sparse-typing.md)
- (libraries hermetic.eio eio-fs.sync eio cstruct))
+ (libraries eio-fs.sync eio cstruct))

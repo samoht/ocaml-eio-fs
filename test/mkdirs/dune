@@ -6,4 +6,4 @@
 
 (mdx
  (files typing.md)
- (libraries hermetic.eio eio-fs.sync eio eio.core))
+ (libraries eio-fs.sync eio eio.core))

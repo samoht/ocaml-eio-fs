@@ -4,6 +4,8 @@
    [unit], a listing in the ids it collected -- so the representation quantifies
    the section's result inside the field rather than at the type. The explicit
    [ 'a. ] is what stops the first use fixing the type for the rest. *)
+open! Hermetic
+
 type t = { run : 'a. (unit -> 'a) -> 'a }
 
 (* The section's own vocabulary for a refusal. [use] answers at the section's

@@ -4,6 +4,4 @@
 (library
  (name eio_fs_sync)
  (public_name eio-fs.sync)
- (libraries hermetic.eio cstruct eio fmt optint)
- (flags
-  (:standard -open Hermetic_eio)))
+ (libraries hermetic cstruct eio fmt optint))

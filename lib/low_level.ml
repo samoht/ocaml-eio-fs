@@ -1,4 +1,6 @@
 (* The fake file-descriptor table and filesystem. *)
+open! Hermetic
+
 module Open_flags = struct
   let o_rdonly = 0x0
   let o_rdwr = 0x2

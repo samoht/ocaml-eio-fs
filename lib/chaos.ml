@@ -4,6 +4,7 @@
    schedule that is
    either seeded (for fuzzing) or scripted (for pinning an exact scenario). *)
 
+open! Hermetic
 open Eio.Std
 
 type code = [ `Enoent | `Eacces | `Enospc | `Eio ]

@@ -11,6 +11,6 @@
 (library
  (name assets)
  (modules assets)
- (libraries hermetic.eio eio-fs eio)
+ (libraries hermetic eio-fs eio)
  (flags
-  (:standard -open Hermetic_eio)))
+  (:standard -open Hermetic)))

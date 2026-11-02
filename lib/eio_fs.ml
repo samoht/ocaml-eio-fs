@@ -14,6 +14,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
+open! Hermetic
 open Eio.Std
 
 module Nofollow = struct
@@ -189,6 +190,8 @@ module Fs = struct
   module rec Dir : sig
     include Eio.Fs.Pi.DIR
 
+    (* TODO: drop when Eio 1.7, whose [Pi.DIR] has it, is released. *)
+    val sync_dir : t -> Eio.Fs.path -> unit
     val v : label:string -> path:string -> dir_fd -> t
     val fd : t -> dir_fd
     val close : t -> unit
@@ -383,7 +386,7 @@ module Fs = struct
     let rec node depth path =
       match Eio.Path.kind ~follow:false path with
       | `Regular_file ->
-          Some (Console.Tree.Node (Console.Span.text (name path), []))
+          Some (Console.Tree.v (Console.View.text (name path)) [])
       | `Directory ->
           let children =
             if depth <= 1 then []
@@ -392,16 +395,16 @@ module Fs = struct
               |> List.filter_map (fun child ->
                   node (depth - 1) Eio.Path.(path / child))
           in
-          Some (Console.Tree.Node (Console.Span.text (name path), children))
+          Some (Console.Tree.v (Console.View.text (name path)) children)
       | `Symbolic_link ->
           let label = name path ^ " -> " ^ Eio.Path.read_link path in
-          Some (Console.Tree.Node (Console.Span.text label, []))
+          Some (Console.Tree.v (Console.View.text label) [])
       | _ -> None
     in
     fun ppf path ->
       if depth > 0 then
         Option.iter
-          (fun n -> Console.Tree.pp ppf (Console.Tree.of_tree n))
+          (fun n -> Console.View.pp ppf (Console.Tree.view n))
           (node depth path)
 end
 
