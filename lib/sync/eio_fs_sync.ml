@@ -343,12 +343,20 @@ let append_lines ?(durable = true) ?(perm = 0o644) path lines =
   end
 
 (* A file opened read-only still names the inode fsync(2) flushes. A registered
-   barrier answers first; the POSIX backends expose their sync on every handle,
-   which is the route [fsync_handle] probes. *)
-let sync_readable file =
-  match file_barrier file with
-  | Some barrier -> barrier ()
-  | None -> fsync_handle file
+   barrier answers first; the POSIX backends expose their sync on every handle.
+   A read-only handle with neither, as a fault wrapper opens one, is opened
+   again for writing, without creating or truncating, and that handle synced:
+   any descriptor on the file flushes the same inode. *)
+let sync_regular path =
+  Eio.Switch.run @@ fun sw ->
+  let (Eio.Resource.T (v, ops) as file) =
+    Eio.Path.open_in ~sw ~follow:false path
+  in
+  match (file_barrier file, Eio.Resource.get_opt ops Eio.File.Pi.Write) with
+  | Some barrier, _ -> barrier ()
+  | None, Some (module W) -> W.sync v
+  | None, None ->
+      sync_file (Eio.Path.open_out ~sw ~follow:false ~create:`Never path)
 
 (* Top down: a directory's barrier commits the entries naming its children, and
    commits nothing while the directory's own entry is not durable, so [dir]'s
@@ -362,8 +370,7 @@ let rec sync_tree dir =
         match Eio.Path.kind ~follow:false child with
         | `Directory -> Some child
         | `Regular_file ->
-            Eio.Switch.run (fun sw ->
-                sync_readable (Eio.Path.open_in ~sw child));
+            sync_regular child;
             None
         | _ -> None)
       (Eio.Path.read_dir dir)
