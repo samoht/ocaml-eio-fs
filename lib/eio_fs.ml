@@ -272,12 +272,12 @@ module Fs = struct
 
     let rename t old_path (new_dir : [> Eio.Fs.dir_ty ] Eio.Std.r) new_path =
       match as_memfs_dir new_dir with
-      | None -> invalid_arg "Target is not an eio_mem directory"
+      | None -> invalid_arg "Eio_fs: the target is not an in-memory directory"
       | Some new_dir -> Low_level.rename (fd t) old_path new_dir new_path
 
     let rename_exclusive t _backend ~source ~target:(new_dir, new_path) =
       match as_memfs_dir new_dir with
-      | None -> invalid_arg "Target is not an eio_mem directory"
+      | None -> invalid_arg "Eio_fs: the target is not an in-memory directory"
       | Some new_dir ->
           Low_level.rename ~replace:false (fd t) source new_dir new_path
 

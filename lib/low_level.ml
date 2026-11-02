@@ -22,16 +22,16 @@ type Eio.Exn.Backend.t += Eio_fs of string
 let check_path p = if String.equal p "" then "." else Eio_fs_path.normalize p
 
 let () =
-  let pp_eio_mem ppf = function
+  let pp_eio_fs ppf = function
     | Eio_fs "" ->
-        Fmt.pf ppf "eio-mem";
+        Fmt.pf ppf "eio-fs";
         true
     | Eio_fs s ->
-        Fmt.pf ppf "eio-mem:%s" s;
+        Fmt.pf ppf "eio-fs:%s" s;
         true
     | _ -> false
   in
-  Eio.Exn.Backend.register_pp pp_eio_mem
+  Eio.Exn.Backend.register_pp pp_eio_fs
 
 module Error = struct
   let not_found path =

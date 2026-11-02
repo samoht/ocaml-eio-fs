@@ -1,3 +1,6 @@
+(* A POSIX-only modification of fpath's lexical path handling.
+   Copyright (c) 2015 The fpath programmers, ISC; see LICENSE.md. *)
+
 open! Hermetic
 
 let is_abs p = String.length p > 0 && p.[0] = '/'

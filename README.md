@@ -100,6 +100,7 @@ assert (
 
 This code started as Patrick Ferris's
 [eio_mem](https://tangled.org/patrick.sirref.org/eio_mem), which was derived
-from the Eio filesystem interfaces. The path handling comes from
+from the Eio filesystem interfaces. The lexical path handling in
+`eio-fs.path` is a POSIX-only modification of
 [fpath](https://github.com/dbuenzli/fpath). All three are under the ISC
 licence; see [LICENSE.md](LICENSE.md).
