@@ -449,7 +449,26 @@ module Ro_impl = struct
   let close t = close_resource t.ro
 end
 
-let ro_handler = Eio.File.Pi.ro (module Ro_impl)
+(* fsync(2) flushes the file whichever descriptor names it, so a file opened
+   read-only answers [Eio_fs_sync.File_sync] too, scheduled as the read-write
+   sync is: through the base's own barrier, or the sync its handle exposes. *)
+let sync_base (Eio.Resource.T (v, ops) as base) =
+  match Eio_fs_sync.file_barrier base with
+  | Some barrier -> barrier ()
+  | None -> (
+      match Eio.Resource.get_opt ops Eio.File.Pi.Write with
+      | Some (module W) -> W.sync v
+      | None -> invalid_arg "Chaos: the base file opened read-only cannot sync")
+
+let sync_ro t =
+  match Schedule.next t.sched (Op.sync t.path) with
+  | Some (Fault.Sync_error c) -> raise_io c t.path
+  | _ -> sync_base t.ro
+
+let ro_handler =
+  Eio.Resource.handler
+    (Eio.Resource.bindings (Eio.File.Pi.ro (module Ro_impl))
+    @ [ Eio.Resource.H (Eio_fs_sync.File_sync, sync_ro) ])
 
 let wrap_ro sched ~path base : Eio.File.ro_ty r =
   Eio.Resource.T

@@ -182,9 +182,9 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     The wrapper answers for the base it was given: it reports the base's
     {!Eio_fs_sync.Process_local}, and a file opened read-write carries the
-    base's descriptor where there is one. The file registers
-    {!Eio_fs_sync.File_sync} so a barrier through {!Eio_fs_sync.sync_file}
-    reaches the schedule's own sync. *)
+    base's descriptor where there is one. Every opened file, a read-only one
+    included, registers {!Eio_fs_sync.File_sync} so a barrier through it reaches
+    the schedule's own sync. *)
 
 (** A power-loss durability model over a base directory capability.
 
