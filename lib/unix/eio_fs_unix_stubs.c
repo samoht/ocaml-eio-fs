@@ -392,9 +392,8 @@ static value eio_fs_seek(value fd_v, value offset_v, int whence,
                          const char *name)
 {
   CAMLparam2(fd_v, offset_v);
-  CAMLlocal1(found_v);
   int fd = Int_val(fd_v);
-  off_t offset = (off_t)Int64_val(offset_v);
+  off_t offset = (off_t)Long_val(offset_v);
 
   caml_release_runtime_system();
   off_t found = lseek(fd, offset, whence);
@@ -409,8 +408,9 @@ static value eio_fs_seek(value fd_v, value offset_v, int whence,
       CAMLreturn(Val_none);
     caml_unix_error(saved_errno, name, Nothing);
   }
-  found_v = caml_copy_int64((int64_t)found);
-  CAMLreturn(caml_alloc_some(found_v));
+  if ((int64_t)found > (int64_t)Max_long)
+    caml_unix_error(EOVERFLOW, name, Nothing);
+  CAMLreturn(caml_alloc_some(Val_long(found)));
 }
 
 CAMLprim value caml_eio_fs_seek_data(value fd_v, value offset_v)
@@ -547,8 +547,8 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
   CAMLparam4(fd_v, offset_v, length_v, max_v);
   CAMLlocal3(list, cell, extent);
   int fd = Int_val(fd_v);
-  int64_t offset = Int64_val(offset_v);
-  int64_t length = Int64_val(length_v);
+  int64_t offset = (int64_t)Long_val(offset_v);
+  int64_t length = (int64_t)Long_val(length_v);
   long max = Long_val(max_v);
   int err = 0;
   const char *what = "extents";
@@ -557,7 +557,7 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
     caml_invalid_argument("Eio_fs_unix.extents: max out of range");
   if (offset < 0 || length < 0)
     caml_invalid_argument("Eio_fs_unix.extents: negative offset or length");
-  if (length > INT64_MAX - offset)
+  if (length > (int64_t)Max_long - offset)
     caml_invalid_argument("Eio_fs_unix.extents: range past the largest offset");
 
   struct eio_fs_extent *out =
@@ -574,13 +574,20 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
     caml_unix_error(err, what, Nothing);
   }
 
+  /* A device offset past the largest int has no answer to give. */
+  for (long i = 0; i < n; i++)
+    if (out[i].physical > (int64_t)Max_long) {
+      free(out);
+      caml_unix_error(EOVERFLOW, (char *)what, Nothing);
+    }
+
   /* Built back to front so the list comes out in increasing logical order. */
   list = Val_emptylist;
   for (long i = n - 1; i >= 0; i--) {
-    extent = caml_alloc_tuple(3);
-    Store_field(extent, 0, caml_copy_int64(out[i].logical));
-    Store_field(extent, 1, caml_copy_int64(out[i].physical));
-    Store_field(extent, 2, caml_copy_int64(out[i].length));
+    extent = caml_alloc_small(3, 0);
+    Field(extent, 0) = Val_long(out[i].logical);
+    Field(extent, 1) = Val_long(out[i].physical);
+    Field(extent, 2) = Val_long(out[i].length);
     cell = caml_alloc_small(2, Tag_cons);
     Field(cell, 0) = extent;
     Field(cell, 1) = list;

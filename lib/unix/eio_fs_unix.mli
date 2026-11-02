@@ -94,26 +94,28 @@ val pread :
 
 (** {2 The sparse map} *)
 
-val seek_data : Unix.file_descr -> int64 -> int64 option
-(** [seek_data fd offset] is the next offset at or after [offset] that starts
-    allocated data, and [None] when there is none: a hole runs to the end of the
-    file, or [offset] is at or past it. This is [lseek(SEEK_DATA)], which
-    [Unix.lseek] has no whence for. The offset is absolute and the call moves
-    [fd]'s position as [lseek] does. The call is made on a system thread.
+val seek_data : Unix.file_descr -> file_offset:int -> int option
+(** [seek_data fd ~file_offset] is the next offset at or after [file_offset]
+    that starts allocated data, and [None] when there is none: a hole runs to
+    the end of the file, or [file_offset] is at or past it. This is
+    [lseek(SEEK_DATA)], which [Unix.lseek] has no whence for. The offset is
+    absolute and the call moves [fd]'s position as [lseek] does. The call is
+    made on a system thread.
 
     @raise Unix.Unix_error as [lseek]. *)
 
-val seek_hole : Unix.file_descr -> int64 -> int64 option
-(** [seek_hole fd offset] is like {!seek_data} for the next offset at or after
-    [offset] that starts a hole. The end of the file counts as one, so this is
-    [None] only when [offset] is at or past the end. This is [lseek(SEEK_HOLE)].
+val seek_hole : Unix.file_descr -> file_offset:int -> int option
+(** [seek_hole fd ~file_offset] is like {!seek_data} for the next offset at or
+    after [file_offset] that starts a hole. The end of the file counts as one,
+    so this is [None] only when [file_offset] is at or past the end. This is
+    [lseek(SEEK_HOLE)].
 
     @raise Unix.Unix_error as [lseek]. *)
 
 type extent = {
-  logical : int64;  (** The extent's offset in the file. *)
-  physical : int64;  (** The extent's offset on the device. *)
-  length : int64;  (** The extent's length in bytes. *)
+  logical : int;  (** The extent's offset in the file. *)
+  physical : int;  (** The extent's offset on the device. *)
+  length : int;  (** The extent's length in bytes. *)
 }
 (** The type for the physical pieces a file's bytes are stored in: [length]
     bytes of the file starting at [logical] live at [physical] on the device.
@@ -121,11 +123,11 @@ type extent = {
     physical one. *)
 
 val extents :
-  Unix.file_descr -> offset:int64 -> length:int64 -> max:int -> extent list
-(** [extents fd ~offset ~length ~max] is the physical extents backing
-    [[offset], [offset + length])], in increasing logical order, at most [max]
-    of them. This is [F_LOG2PHYS_EXT] on Darwin and [FS_IOC_FIEMAP] on Linux,
-    neither of which [Unix] binds.
+  Unix.file_descr -> file_offset:int -> length:int -> max:int -> extent list
+(** [extents fd ~file_offset ~length ~max] is the physical extents backing the
+    [length] bytes of [fd]'s file from byte [file_offset], in increasing logical
+    order, at most [max] of them. This is [F_LOG2PHYS_EXT] on Darwin and
+    [FS_IOC_FIEMAP] on Linux, neither of which [Unix] binds.
 
     The answer stops at the first hole, the end of the range, [max], or bytes
     the filesystem accepted but has not placed. A walk steps past the last
@@ -133,7 +135,8 @@ val extents :
     the batch, so one system-thread hop covers many extents.
 
     @raise Invalid_argument
-      if [max] is not between 1 and 65536, or [offset] or [length] is negative.
+      if [max] is not between 1 and 65536, [file_offset] or [length] is
+      negative, or [file_offset + length] is past [max_int].
     @raise Unix.Unix_error
       as the platform call, and [ENOSYS] on a platform that has neither. *)
 
@@ -180,28 +183,39 @@ val import_file :
     @raise Invalid_argument if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
 
 val lock_range :
-  Unix.file_descr -> [ `Read | `Write | `Unlock ] -> at:int -> len:int -> unit
-(** [lock_range fd kind ~at ~len] sets a POSIX record lock of [kind] on the
-    [len] bytes of [fd]'s file from byte [at], without waiting (fcntl
-    [F_SETLK]), placed from the start of the file. [fd]'s file offset does not
-    move, where {!Unix.lockf} places its range at the offset and so has to be
-    preceded by a seek. A lock this process holds there already is replaced.
+  Unix.file_descr ->
+  [ `Read | `Write | `Unlock ] ->
+  file_offset:int ->
+  length:int ->
+  unit
+(** [lock_range fd kind ~file_offset ~length] sets a POSIX record lock of [kind]
+    on the [length] bytes of [fd]'s file from byte [file_offset], without
+    waiting (fcntl [F_SETLK]), placed from the start of the file. [fd]'s file
+    offset does not move, where {!Unix.lockf} places its range at the offset and
+    so has to be preceded by a seek. A lock this process holds there already is
+    replaced.
 
     @raise Unix.Unix_error
       with [EAGAIN] or [EACCES] where another process holds a lock that
       conflicts. *)
 
-val range_locked : Unix.file_descr -> at:int -> len:int -> bool
-(** [range_locked fd ~at ~len] is [true] iff another process holds a record lock
-    that would refuse a write lock on the [len] bytes of [fd]'s file from byte
-    [at] (fcntl [F_GETLK]). This process's own locks never count. *)
-
-val range_holder : Unix.file_descr -> at:int -> len:int -> int option option
-(** [range_holder fd ~at ~len] is [Some (Some pid)] where process [pid] holds a
-    record lock that would refuse a write lock on the [len] bytes of [fd]'s file
-    from byte [at] (fcntl [F_GETLK]), [Some None] where one is held and the
-    kernel names no process, and [None] where none is. This process's own locks
+val range_locked : Unix.file_descr -> file_offset:int -> length:int -> bool
+(** [range_locked fd ~file_offset ~length] is [true] iff another process holds a
+    record lock that would refuse a write lock on the [length] bytes of [fd]'s
+    file from byte [file_offset] (fcntl [F_GETLK]). This process's own locks
     never count. *)
+
+val range_holder :
+  Unix.file_descr ->
+  file_offset:int ->
+  length:int ->
+  [ `Free | `Held of int option ]
+(** [range_holder fd ~file_offset ~length] is the record lock another process
+    holds that would refuse a write lock on the [length] bytes of [fd]'s file
+    from byte [file_offset] (fcntl [F_GETLK]), in the shape {!probe} answers:
+    [`Held (Some pid)] where process [pid] holds it, [`Held None] where the
+    kernel names no process, and [`Free] where none is held. This process's own
+    locks never count. *)
 
 val exclusive_rename : Eio_fs_sync.Rename.t
 (** [exclusive_rename] is the POSIX backend for atomic no-replace publication.

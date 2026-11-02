@@ -31,17 +31,18 @@ external range_locked_native : Unix.file_descr -> int -> int -> bool
 external range_holder_native : Unix.file_descr -> int -> int -> int
   = "caml_eio_fs_range_holder"
 
-let lock_range fd kind ~at ~len =
+let lock_range fd kind ~file_offset ~length =
   let kind = match kind with `Read -> 0 | `Write -> 1 | `Unlock -> 2 in
-  lock_range_native fd kind at len
+  lock_range_native fd kind file_offset length
 
-let range_locked fd ~at ~len = range_locked_native fd at len
+let range_locked fd ~file_offset ~length =
+  range_locked_native fd file_offset length
 
-let range_holder fd ~at ~len =
-  match range_holder_native fd at len with
-  | -1 -> None
-  | 0 -> Some None
-  | pid -> Some (Some pid)
+let range_holder fd ~file_offset ~length =
+  match range_holder_native fd file_offset length with
+  | -1 -> `Free
+  | 0 -> `Held None
+  | pid -> `Held (Some pid)
 
 external pread_head : Unix.file_descr -> int -> string
   = "caml_eio_fs_pread_head"
@@ -113,33 +114,32 @@ let rec grant_owner p =
       | exception Eio.Io _ -> ())
   | _ | (exception Eio.Io _) -> ()
 
-type extent = { logical : int64; physical : int64; length : int64 }
+type extent = { logical : int; physical : int; length : int }
 
-external seek_data_native : Unix.file_descr -> int64 -> int64 option
+external seek_data_native : Unix.file_descr -> int -> int option
   = "caml_eio_fs_seek_data"
 
-external seek_hole_native : Unix.file_descr -> int64 -> int64 option
+external seek_hole_native : Unix.file_descr -> int -> int option
   = "caml_eio_fs_seek_hole"
 
-external extents_native :
-  Unix.file_descr -> int64 -> int64 -> int -> extent list
+external extents_native : Unix.file_descr -> int -> int -> int -> extent list
   = "caml_eio_fs_extents"
 
 (* Each runs on a system thread whose stub releases the runtime system around
    the syscall. The hop has a price, which is why the extent map takes a batch:
    one hop per batch covers many extents where one hop each would spend the
    time in scheduling alone. *)
-let seek_data fd offset =
+let seek_data fd ~file_offset =
   Eio_unix.run_in_systhread ~label:"eio-fs-seek-data" @@ fun () ->
-  seek_data_native fd offset
+  seek_data_native fd file_offset
 
-let seek_hole fd offset =
+let seek_hole fd ~file_offset =
   Eio_unix.run_in_systhread ~label:"eio-fs-seek-hole" @@ fun () ->
-  seek_hole_native fd offset
+  seek_hole_native fd file_offset
 
-let extents fd ~offset ~length ~max =
+let extents fd ~file_offset ~length ~max =
   Eio_unix.run_in_systhread ~label:"eio-fs-extents" @@ fun () ->
-  extents_native fd offset length max
+  extents_native fd file_offset length max
 
 (* A registered barrier keeps its own semantics; a plain POSIX directory is
    opened through the capability the path carries, without following a final

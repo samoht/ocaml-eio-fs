@@ -502,7 +502,7 @@ let with_sparse_file fn =
   write_at 0;
   write_at hole_span;
   Unix.fsync fd;
-  let size = Int64.of_int (hole_span + Bytes.length block) in
+  let size = hole_span + Bytes.length block in
   fn env fd ~size
 
 let some name = function
@@ -514,58 +514,58 @@ let some name = function
    the size here, and every case that walks the hole would then be walking
    nothing. *)
 let hole_start fd ~size =
-  let start = some "seek_hole 0" (Eio_fs_unix.seek_hole fd 0L) in
+  let start = some "seek_hole 0" (Eio_fs_unix.seek_hole fd ~file_offset:0) in
   Alcotest.(check bool)
     "the filesystem left a hole between the two writes" true
-    (Int64.compare start 0L > 0 && Int64.compare start size < 0);
+    (start > 0 && start < size);
   start
 
 let test_seek_data_and_hole_walk_the_file () =
   with_sparse_file @@ fun _env fd ~size ->
-  let first_data = some "seek_data 0" (Eio_fs_unix.seek_data fd 0L) in
-  Alcotest.(check int64) "data starts at the first byte" 0L first_data;
+  let first_data =
+    some "seek_data 0" (Eio_fs_unix.seek_data fd ~file_offset:0)
+  in
+  Alcotest.(check int) "data starts at the first byte" 0 first_data;
   let first_hole = hole_start fd ~size in
   Alcotest.(check bool)
     "the hole starts at or before the second write" true
-    (Int64.compare first_hole (Int64.of_int hole_span) <= 0);
+    (first_hole <= hole_span);
   let second_data =
-    some "seek_data in the hole" (Eio_fs_unix.seek_data fd first_hole)
+    some "seek_data in the hole"
+      (Eio_fs_unix.seek_data fd ~file_offset:first_hole)
   in
   Alcotest.(check bool)
     "the next data starts at or before the second write" true
-    (Int64.compare second_data first_hole > 0
-    && Int64.compare second_data (Int64.of_int hole_span) <= 0);
+    (second_data > first_hole && second_data <= hole_span);
   (* Past the last byte there is no next answer, and that is an answer rather
      than an error. *)
   Alcotest.(check bool)
     "no data past the end" true
-    (Option.is_none (Eio_fs_unix.seek_data fd size));
+    (Option.is_none (Eio_fs_unix.seek_data fd ~file_offset:size));
   Alcotest.(check bool)
     "no hole past the end" true
-    (Option.is_none (Eio_fs_unix.seek_hole fd size))
+    (Option.is_none (Eio_fs_unix.seek_hole fd ~file_offset:size))
 
 let test_extents_report_the_physical_map () =
   with_sparse_file @@ fun _env fd ~size:_ ->
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:16 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:16 in
   Alcotest.(check bool) "the first block is backed" true (es <> []);
   let e = List.hd es in
-  Alcotest.(check int64) "the first extent starts where asked" 0L e.logical;
-  Alcotest.(check bool)
-    "the extent has length" true
-    (Int64.compare e.length 0L > 0);
+  Alcotest.(check int) "the first extent starts where asked" 0 e.logical;
+  Alcotest.(check bool) "the extent has length" true (e.length > 0);
   Alcotest.(check bool)
     "the extent does not run past the range asked about" true
-    (Int64.compare (Int64.add e.logical e.length) 4096L <= 0);
+    (e.logical + e.length <= 4096);
   (* The answers are in increasing logical order and do not overlap. *)
   ignore
     (List.fold_left
        (fun previous (e : Eio_fs_unix.extent) ->
          Alcotest.(check bool)
            "extents come back in increasing logical order" true
-           (Int64.compare e.logical previous >= 0);
-         Int64.add e.logical e.length)
-       0L es
-      : int64)
+           (e.logical >= previous);
+         e.logical + e.length)
+       0 es
+      : int)
 
 let test_extents_stop_at_a_hole () =
   with_sparse_file @@ fun _env fd ~size ->
@@ -575,26 +575,25 @@ let test_extents_stop_at_a_hole () =
      with the hole's own length, so a binding that reads the length alone
      counts holes as physical pieces. *)
   let start = hole_start fd ~size in
-  let es = Eio_fs_unix.extents fd ~offset:start ~length:4096L ~max:16 in
+  let es = Eio_fs_unix.extents fd ~file_offset:start ~length:4096 ~max:16 in
   Alcotest.(check int) "no extents inside a hole" 0 (List.length es);
   (* And a walk that starts before the hole stops AT it rather than crossing
      it: every extent it reports lies wholly in the data before the hole. *)
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:64 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:64 in
   Alcotest.(check bool)
     "the walk reported the data before the hole" true (es <> []);
   List.iter
     (fun (e : Eio_fs_unix.extent) ->
       Alcotest.(check bool)
         "no extent crosses or follows the hole" true
-        (Int64.compare (Int64.add e.logical e.length) start <= 0);
+        (e.logical + e.length <= start);
       Alcotest.(check bool)
-        "every extent has a device address" true
-        (Int64.compare e.physical 0L >= 0))
+        "every extent has a device address" true (e.physical >= 0))
     es
 
 let test_extents_honour_max () =
   with_sparse_file @@ fun _env fd ~size ->
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:1 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:1 in
   Alcotest.(check bool)
     "at most one extent when one was asked for" true
     (List.length es <= 1)
@@ -607,15 +606,15 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
     | exception Invalid_argument _ -> ()
   in
   refuses "max 0" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:0);
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:0);
   refuses "max above the buffer ceiling" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:65537);
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:65537);
   refuses "a negative offset" (fun () ->
-      Eio_fs_unix.extents fd ~offset:(-1L) ~length:4096L ~max:16);
+      Eio_fs_unix.extents fd ~file_offset:(-1) ~length:4096 ~max:16);
   refuses "a negative length" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:(-1L) ~max:16);
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:(-1) ~max:16);
   refuses "a range past the largest offset" (fun () ->
-      Eio_fs_unix.extents fd ~offset:Int64.max_int ~length:1L ~max:16)
+      Eio_fs_unix.extents fd ~file_offset:max_int ~length:1 ~max:16)
 
 (* The whole reason these three live in this library rather than beside a
    caller: they run on a system thread with the runtime system released, so a
@@ -639,9 +638,9 @@ let test_sparse_map_does_not_block_eio () =
       Eio.Fiber.yield ();
       ran := true);
   for _ = 1 to 2000 do
-    ignore (Eio_fs_unix.seek_data fd 0L : int64 option);
+    ignore (Eio_fs_unix.seek_data fd ~file_offset:0 : int option);
     ignore
-      (Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:8
+      (Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:8
         : Eio_fs_unix.extent list)
   done;
   Alcotest.(check bool)
@@ -928,13 +927,16 @@ let test_lock_range () =
   let fd = Unix.openfile (Eio.Path.native_exn lock) [ Unix.O_RDWR ] 0 in
   Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
   ignore (Unix.lseek fd 7 Unix.SEEK_SET : int);
-  Eio_fs_unix.lock_range fd `Write ~at:10 ~len:5;
+  Eio_fs_unix.lock_range fd `Write ~file_offset:10 ~length:5;
   Alcotest.(check int)
     "the lock leaves the offset" 7
     (Unix.lseek fd 0 Unix.SEEK_CUR);
   Alcotest.(check bool)
     "this process's own lock is not another's" false
-    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
+    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
+  Alcotest.(check bool)
+    "nor does it name a holder" true
+    (Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 = `Free);
   let manager = Eio.Stdenv.process_mgr env in
   let self = Sys.executable_name in
   let try_lock () =
@@ -945,15 +947,21 @@ let test_lock_range () =
   in
   Alcotest.check status "another process meets the lock" (`Exited 3)
     (try_lock ());
-  Eio_fs_unix.lock_range fd `Unlock ~at:10 ~len:5;
+  Eio_fs_unix.lock_range fd `Unlock ~file_offset:10 ~length:5;
   Alcotest.check status "and is granted the file once it is let go" (`Exited 0)
     (try_lock ());
   Eio.Switch.run @@ fun sw ->
   with_held_lock ~sw ~env ~clock ~lock @@ fun () ->
   Alcotest.(check bool)
     "another process's lock is seen" true
-    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
-  match Eio_fs_unix.lock_range fd `Read ~at:10 ~len:5 with
+    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
+  (match Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 with
+  | `Held (Some pid) ->
+      Alcotest.(check bool)
+        "the holder is another process" true
+        (pid <> Unix.getpid ())
+  | `Held None | `Free -> Alcotest.fail "the holding process is not named");
+  match Eio_fs_unix.lock_range fd `Read ~file_offset:10 ~length:5 with
   | () -> Alcotest.fail "a read lock was granted under another's write lock"
   | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ()
 
