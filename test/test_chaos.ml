@@ -46,6 +46,32 @@ let test_short_read () =
     "first 3 bytes correct" "hel"
     (Cstruct.to_string (Cstruct.sub buf 0 got))
 
+(* A short read of an empty buffer has nothing to shorten: the read answers
+   what the base answers, and the fault's arithmetic raises nothing. *)
+let test_short_read_empty () =
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Read; path = "f" };
+          fault = Short_read 3;
+        };
+      ]
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "f") "hello";
+  let answer dir =
+    Eio.Path.with_open_in (dir / "f") @@ fun file ->
+    match Eio.Flow.single_read file Cstruct.empty with
+    | n -> Fmt.str "%d" n
+    | exception ex -> Printexc.to_string ex
+  in
+  let expected = answer raw in
+  Alcotest.(check string) "as the base answers" expected (answer chaos);
+  Alcotest.(check string)
+    "fault consumed once" "scripted(0 rules)"
+    (Fmt.str "%a" Schedule.pp sched)
+
 let test_read_error positional () =
   let observed = ref [] in
   let schedule =
@@ -1660,6 +1686,8 @@ let suite =
   ( "chaos",
     [
       Alcotest.test_case "short read" `Quick test_short_read;
+      Alcotest.test_case "short read of an empty buffer" `Quick
+        test_short_read_empty;
       Alcotest.test_case "streaming read error" `Quick (test_read_error false);
       Alcotest.test_case "seeded streaming read error" `Quick
         (test_seeded_read_error false);
