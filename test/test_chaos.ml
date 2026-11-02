@@ -1429,6 +1429,49 @@ let test_crash_dir_sync_does_not_reach_a_grandchild () =
     "the file one level further down is not" true
     (absent (post / "a" / "sub" / "g"))
 
+(* A barrier on one directory leaves a rename in another pending, so a file
+   renamed after its name was made durable is still at its old name in the
+   durable image, and that is where a crash puts its synced bytes. *)
+let test_crash_dir_sync_keeps_a_pending_rename () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "x");
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun file ->
+      Eio.File.pwrite_all file ~file_offset:(i63 0)
+        [ Cstruct.of_string "synced" ];
+      Eio.File.sync file;
+      Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string "LOST" ]);
+  Crash.sync_metadata ctl;
+  Eio.Path.rename (fs / "f") (fs / "g");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "x" / "h") "h";
+  Eio_fs_sync.sync_dir (fs / "x");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the synced bytes, at the durable name" "synced"
+    (Eio.Path.load (post / "f"));
+  Alcotest.(check bool) "the pending name is gone" true (absent (post / "g"))
+
+(* The same with a rename that replaces a file: until a barrier on their
+   directory, both files keep their own name and their own synced bytes. *)
+let test_crash_dir_sync_keeps_a_pending_replacement () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "x");
+  let synced name content =
+    Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / name) (fun file ->
+        Eio.Flow.copy_string content file;
+        Eio.File.sync file)
+  in
+  synced "a" "A";
+  synced "b" "B";
+  Crash.sync_metadata ctl;
+  Eio.Path.rename (fs / "b") (fs / "a");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "x" / "h") "h";
+  Eio_fs_sync.sync_dir (fs / "x");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "a" "A" (Eio.Path.load (post / "a"));
+  Alcotest.(check string) "b" "B" (Eio.Path.load (post / "b"))
+
 (* A write-only (0o200) file is still rewritten at crash time: the rewrite
    opens O_RDWR, which needs the read bit too, so the model grants owner
    read and write for the duration and restores the exact mode after. *)
@@ -1814,6 +1857,10 @@ let suite =
         test_crash_root_sync_commits_both_siblings;
       Alcotest.test_case "crash: dir sync does not reach a grandchild" `Quick
         test_crash_dir_sync_does_not_reach_a_grandchild;
+      Alcotest.test_case "crash: dir sync keeps a pending rename" `Quick
+        test_crash_dir_sync_keeps_a_pending_rename;
+      Alcotest.test_case "crash: dir sync keeps a pending replacement" `Quick
+        test_crash_dir_sync_keeps_a_pending_replacement;
       Alcotest.test_case "crash: rename revert (real fs)" `Quick
         test_crash_rename_revert_real;
       Alcotest.test_case "crash: a bare descriptor's write is not journalled"
