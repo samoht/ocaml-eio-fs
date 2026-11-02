@@ -95,9 +95,28 @@ let test_parent () =
       ("/..", "/");
     ]
 
+(* [to_dir_path] adds a separator and changes nothing else. The empty path is
+   the current directory, as Eio reads it, not the root. *)
+let test_to_dir_path () =
+  List.iter
+    (fun (path, expected) ->
+      Alcotest.(check string)
+        (Fmt.str "to_dir_path %S" path)
+        expected (P.to_dir_path path))
+    [
+      ("", "./");
+      ("/", "/");
+      (".", "./");
+      ("a", "a/");
+      ("a/", "a/");
+      ("/a/b", "/a/b/");
+    ]
+
 let suite =
   ( "eio_fs_path",
     [
+      Alcotest.test_case "to_dir_path keeps the directory" `Quick
+        test_to_dir_path;
       Alcotest.test_case "parent is lexical" `Quick test_parent;
       Alcotest.test_case "a canonical path is its own spelling" `Quick
         test_a_canonical_path_is_its_own_spelling;
