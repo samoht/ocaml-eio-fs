@@ -2796,6 +2796,25 @@ let test_exclusive_rename_keeps_open_parent () =
     "replacement directory untouched" []
     (Eio.Path.read_dir (dir / "elsewhere"))
 
+(* A call that takes an [Eio.Path.t] reports a failure as [Eio.Io], as Eio's
+   own backends do, never as the [Unix.Unix_error] of the call beneath. *)
+let test_path_calls_raise_eio_io () =
+  with_real_dir @@ fun dir ->
+  let missing = dir / "missing" in
+  let not_found name f =
+    match f () with
+    | () -> Alcotest.failf "%s of a missing path succeeded" name
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+  in
+  not_found "statvfs" (fun () -> ignore (Eio_fs_unix.statvfs missing));
+  not_found "xattrs" (fun () -> ignore (Eio_fs_unix.xattrs missing));
+  not_found "set_xattr" (fun () -> Eio_fs_unix.set_xattr missing "user.a" "v");
+  Eio.Path.mkdir ~perm:0o755 (dir / "dst");
+  match Eio_fs_unix.clone_tree missing (dir / "dst") with
+  | false -> ()
+  | true -> Alcotest.fail "cloned a missing path"
+  | exception Eio.Io _ -> ()
+
 (* xattr(7): a value is a byte string, and the no-follow calls act on a link
    itself. The value holds a NUL byte, which a C-string round trip would cut. *)
 let user_value = "v\000alue"
@@ -3016,6 +3035,8 @@ let suite =
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
+      Alcotest.test_case "calls on a path raise Eio.Io" `Quick
+        test_path_calls_raise_eio_io;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
         test_pread_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
