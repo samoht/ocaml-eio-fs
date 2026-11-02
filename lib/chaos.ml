@@ -366,23 +366,36 @@ let do_pread sched path (base : Eio.File.ro_ty r) ~file_offset bufs =
   in
   Eio.File.pread base ~file_offset bufs
 
-let do_single_write sched path ~pos (base : Eio.File.rw_ty r) bufs =
+(* Where a streaming write lands: at the cursor, or for a file opened to
+   append at its end, wherever the cursor was. *)
+let write_offset ~append ~pos base =
+  if append then Optint.Int63.to_int (Eio.File.stat base).Eio.File.Stat.size
+  else !pos
+
+(* A seek moves the cursor the wrapper reports offsets from. *)
+let do_seek ~pos base off cmd =
+  let at = Eio.File.seek base off cmd in
+  pos := Optint.Int63.to_int at;
+  at
+
+let do_single_write sched path ~append ~pos (base : Eio.File.rw_ty r) bufs =
   let len = Cstruct.lenv bufs in
-  let op = Op.write path ~offset:!pos ~len in
+  let off = write_offset ~append ~pos base in
+  let op = Op.write path ~offset:off ~len in
   match Schedule.next sched op with
   | Some (Fault.Short_write n) ->
       let got = Eio.Flow.single_write base (take_v (clamp 1 len n) bufs) in
-      pos := !pos + got;
+      pos := off + got;
       got
   | Some (Fault.Torn_write n) ->
       let n = clamp 0 len n in
       if n > 0 then Eio.Flow.write base (take_v n bufs);
-      pos := !pos + n;
+      pos := off + n;
       Fmt.kstr (raise_io `Enospc) "%s torn@%d" path !pos
   | Some (Fault.Write_error c) -> raise_io c path
   | _ ->
       let got = Eio.Flow.single_write base bufs in
-      pos := !pos + got;
+      pos := off + got;
       got
 
 let do_pwrite sched path (base : Eio.File.rw_ty r) ~file_offset bufs =
@@ -415,6 +428,7 @@ let do_stat sched path (base : Eio.File.ro_ty r) =
 type file = {
   sched : Schedule.t;
   path : string;
+  append : bool;
   pos : int ref;
   ro : Eio.File.ro_ty r;
   rw : Eio.File.rw_ty r option;
@@ -431,14 +445,16 @@ module Ro_impl = struct
   let single_read t buf = do_single_read t.sched t.path ~pos:t.pos t.ro buf
   let pread t ~file_offset bufs = do_pread t.sched t.path t.ro ~file_offset bufs
   let stat t = do_stat t.sched t.path t.ro
-  let seek t off cmd = Eio.File.seek t.ro off cmd
+  let seek t off cmd = do_seek ~pos:t.pos t.ro off cmd
   let close t = close_resource t.ro
 end
 
 let ro_handler = Eio.File.Pi.ro (module Ro_impl)
 
 let wrap_ro sched ~path base : Eio.File.ro_ty r =
-  Eio.Resource.T ({ sched; path; pos = ref 0; ro = base; rw = None }, ro_handler)
+  Eio.Resource.T
+    ( { sched; path; append = false; pos = ref 0; ro = base; rw = None },
+      ro_handler )
 
 module Rw_impl = struct
   type t = file
@@ -447,11 +463,11 @@ module Rw_impl = struct
   let single_read t buf = do_single_read t.sched t.path ~pos:t.pos t.ro buf
   let pread t ~file_offset bufs = do_pread t.sched t.path t.ro ~file_offset bufs
   let stat t = do_stat t.sched t.path t.ro
-  let seek t off cmd = Eio.File.seek t.ro off cmd
+  let seek t off cmd = do_seek ~pos:t.pos t.ro off cmd
   let close t = close_resource t.ro
 
   let single_write t bufs =
-    do_single_write t.sched t.path ~pos:t.pos (writable t) bufs
+    do_single_write t.sched t.path ~append:t.append ~pos:t.pos (writable t) bufs
 
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
 
@@ -462,11 +478,12 @@ module Rw_impl = struct
   let truncate t len = Eio.File.truncate (writable t) len
 end
 
-let wrap_rw sched ~path base : Eio.File.rw_ty r =
+let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =
   let state =
     {
       sched;
       path;
+      append;
       pos = ref 0;
       ro = (base :> Eio.File.ro_ty r);
       rw = Some base;
@@ -551,7 +568,7 @@ module Dir_impl = struct
     let (Base_dir ((module B), bv)) = t.boxed in
     let file = B.open_out bv ~sw ~follow ~append ~create path in
     swap_after t.boxed fault path;
-    wrap_rw t.sched ~path file
+    wrap_rw t.sched ~path ~append file
 
   let open_subtree t ~sw path =
     let fault = Schedule.next t.sched (Op.open_ path) in
@@ -1424,6 +1441,7 @@ module Crash = struct
     cfs : fstate option;
     cro : Eio.File.ro_ty r;
     crw : Eio.File.rw_ty r option;
+    cappend : bool;
     cpos : int ref;
   }
 
@@ -1447,7 +1465,7 @@ module Crash = struct
       Eio.File.pread cf.cro ~file_offset bufs
 
     let stat cf = Eio.File.stat cf.cro
-    let seek cf off cmd = Eio.File.seek cf.cro off cmd
+    let seek cf off cmd = do_seek ~pos:cf.cpos cf.cro off cmd
     let close cf = close_resource cf.cro
   end
 
@@ -1465,7 +1483,9 @@ module Crash = struct
         bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
 
   let wrap_cfile_ro ?fs ctl base : Eio.File.ro_ty r =
-    let cf = { ctl; cfs = None; cro = base; crw = None; cpos = ref 0 } in
+    let cf =
+      { ctl; cfs = None; cro = base; crw = None; cappend = false; cpos = ref 0 }
+    in
     Eio.Resource.T
       ( cf,
         Eio.Resource.handler
@@ -1489,14 +1509,14 @@ module Crash = struct
       Eio.File.pread cf.cro ~file_offset bufs
 
     let stat cf = Eio.File.stat cf.cro
-    let seek cf off cmd = Eio.File.seek cf.cro off cmd
+    let seek cf off cmd = do_seek ~pos:cf.cpos cf.cro off cmd
     let close cf = close_resource cf.cro
 
     let single_write cf bufs =
       guard cf;
       let fs = fstate_of cf in
+      let off = write_offset ~append:cf.cappend ~pos:cf.cpos cf.cro in
       let got = Eio.Flow.single_write (writable cf) bufs in
-      let off = !(cf.cpos) in
       clog_write cf.ctl fs ~offset:off (capture bufs got);
       cf.cpos := off + got;
       bump cf.ctl fs ~kind:`Write ~offset:off ~len:got;
@@ -1534,13 +1554,14 @@ module Crash = struct
       bump cf.ctl fs ~kind:`Write ~offset:0 ~len:0
   end
 
-  let wrap_cfile_rw ctl fs base : Eio.File.rw_ty r =
+  let wrap_cfile_rw ctl fs ~append base : Eio.File.rw_ty r =
     let state =
       {
         ctl;
         cfs = Some fs;
         cro = (base :> Eio.File.ro_ty r);
         crw = Some base;
+        cappend = append;
         cpos = ref 0;
       }
     in
@@ -1670,7 +1691,7 @@ module Crash = struct
         record_metadata d.dctl ~path:rel ~kind:Create;
         bump_metadata d.dctl ~path:rel ~kind:Create
       end;
-      wrap_cfile_rw d.dctl fs base
+      wrap_cfile_rw d.dctl fs ~append base
 
     let open_subtree d ~sw path =
       live d;

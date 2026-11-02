@@ -287,6 +287,7 @@ module Model = struct
     log m path
 
   let write m path s = m.live_data <- IM.add (file_id m path) s m.live_data
+  let contents m path = IM.find (file_id m path) m.live_data
 
   (* A file sync makes that file's contents durable and nothing else: the
      directory entries naming it are the metadata journal's business, committed
@@ -315,15 +316,20 @@ module Model = struct
     m.live <- move ~src ~dst m.live;
     log ~paths:[ dst ] m src
 
-  (* The exact post-crash tree under [Drop_unsynced]: committed shapes over
-     per-file durable contents. *)
-  let expected m =
+  let image shapes data =
     SM.map
       (function
-        | File id -> `File (IM.find id m.durable_data)
+        | File id -> `File (IM.find id data)
         | Dir -> `Dir
         | Link target -> `Link target)
-      m.durable
+      shapes
+
+  (* The exact post-crash tree under [Drop_unsynced]: committed shapes over
+     per-file durable contents. *)
+  let expected m = image m.durable m.durable_data
+
+  (* The exact post-crash tree when every change survives: the live one. *)
+  let live m = image m.live m.live_data
 end
 
 (* Read the real recovered tree into the model's representation. *)
@@ -386,7 +392,7 @@ let add_file fs (m : Model.t) path content =
    an existing name) are skipped, so every tape is valid. Candidate lists come
    from the model's sorted map, so the same tape always drives the same
    operations. *)
-let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
+let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
   let module SM = Model.SM in
   let names = [| "a"; "b"; "c"; "d" |] in
   let join parent name = if parent = "" then name else parent ^ "/" ^ name in
@@ -412,7 +418,7 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
     let path = join parent names.(nk mod 4) in
     if SM.mem path m.Model.live then None else Some path
   in
-  match b0 mod 10 with
+  match b0 mod 12 with
   | 0 -> (
       (* create a file with unsynced content *)
       match fresh_path b1 b2 with
@@ -480,6 +486,34 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
                 Eio.Path.rename (fs / src) (fs / dst);
                 Model.rename m ~src ~dst
               end))
+  | 9 -> (
+      (* append to a file, unsynced: the write lands at the end *)
+      match pick (files ()) b1 with
+      | None -> ()
+      | Some path ->
+          let more = Fmt.str "a%d" b2 in
+          Eio.Path.with_open_out ~append:true ~create:`Never (fs / path)
+            (fun file ->
+              ignore (Eio.File.seek file (i63 0) `Set : Optint.Int63.t);
+              Eio.Flow.copy_string more file);
+          Model.write m path (Model.contents m path ^ more))
+  | 10 -> (
+      (* seek into a file and write there, unsynced *)
+      match pick (files ()) b1 with
+      | None -> ()
+      | Some path ->
+          let old = Model.contents m path in
+          let at = b2 mod (String.length old + 1) in
+          let data = Fmt.str "s%d" b3 in
+          Eio.Path.with_open_out ~create:`Never (fs / path) (fun file ->
+              ignore (Eio.File.seek file (i63 at) `Set : Optint.Int63.t);
+              Eio.Flow.copy_string data file);
+          let tail_at = at + String.length data in
+          let tail =
+            if tail_at >= String.length old then ""
+            else String.sub old tail_at (String.length old - tail_at)
+          in
+          Model.write m path (String.sub old 0 at ^ data ^ tail))
   | 8 ->
       (* the barrier on every directory *)
       Crash.sync_metadata ctl;
@@ -487,14 +521,14 @@ let apply_op fs ctl (m : Model.t) b0 b1 b2 b3 =
   | _ -> (
       (* the barrier on one directory: its own entries only *)
       match pick (dirs ()) b1 with
-      | None -> ()
-      | Some dir ->
+      | Some dir when dir_barriers ->
           Eio_fs_sync.sync_dir (if dir = "" then fs else fs / dir);
-          Model.commit_dir m dir)
+          Model.commit_dir m dir
+      | Some _ | None -> ())
 
 (* Run [tape] against a fresh crash-wrapped tree; return the model and the
    recovered tree. *)
-let run_tape ~policy tape =
+let run_tape ?(dir_barriers = true) ~policy tape =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
   let ctl = Crash.v ~policy () in
@@ -504,7 +538,7 @@ let run_tape ~policy tape =
   let steps = min 32 (Int.div len 4) in
   for i = 0 to steps - 1 do
     let b j = Char.code tape.[(i * 4) + j] in
-    apply_op fs ctl m (b 0) (b 1) (b 2) (b 3)
+    apply_op ~dir_barriers fs ctl m (b 0) (b 1) (b 2) (b 3)
   done;
   let post = Crash.post_crash ctl in
   (m, snapshot post)
@@ -514,6 +548,17 @@ let run_tape ~policy tape =
 let test_crash_reference_model tape =
   let m, actual = run_tape ~policy:Drop_unsynced tape in
   check_eq ~pp:pp_tree ~eq:(Model.SM.equal ( = )) actual (Model.expected m)
+
+(* {b Every change kept.} When the policy keeps every pending change, each
+   write replayed where it landed and each directory operation in program
+   order, the recovered tree is the live one. The tapes have no barrier on a
+   single directory: one commits a rename whole through its source's
+   directory, after which the surviving image need not be the live one. *)
+let test_crash_keep_all_model tape =
+  let m, actual =
+    run_tape ~dir_barriers:false ~policy:(Crash.Survive (fun _ -> true)) tape
+  in
+  check_eq ~pp:pp_tree ~eq:(Model.SM.equal ( = )) actual (Model.live m)
 
 (* {b Reorder determinism.} The same tape and seed recover the same tree, over
    workloads that include directory operations. *)
@@ -649,6 +694,7 @@ let suite =
         ]
         test_crash_determinism;
       test_case "crash reference model" [ bytes ] test_crash_reference_model;
+      test_case "crash keep-all model" [ bytes ] test_crash_keep_all_model;
       test_case "crash reorder model determinism" [ bytes; int ]
         test_crash_reorder_model_determinism;
       test_case "publish survives a crash whole or not at all" [ bytes; bytes ]
