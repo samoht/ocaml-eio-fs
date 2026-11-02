@@ -584,6 +584,24 @@ let test_directory_close_after_switch_release () =
   expect_closed "read_dir after switch release" (fun () ->
       Eio.Path.read_dir child)
 
+(* [load] copies a tree from any filesystem, an in-memory one included, to
+   the same path in a new one; a directory its filter refuses is not copied,
+   and nothing under it is read. *)
+let test_load_filter () =
+  with_fs @@ fun src ->
+  Eio.Path.mkdirs ~perm:0o755 (src / "tree/keep");
+  Eio.Path.mkdirs ~perm:0o755 (src / "tree/skip");
+  write src "tree/keep/a" "kept";
+  write src "tree/skip/b" "skipped";
+  let filter (_, path) = Filename.basename path <> "skip" in
+  let dst = Eio_fs.Fs.load ~filter (src / "tree") in
+  Alcotest.(check string)
+    "a kept file is copied" "kept"
+    (Eio.Path.load (dst / "tree/keep/a"));
+  Alcotest.(check bool)
+    "a refused directory is not copied" true
+    (Eio.Path.kind ~follow:false (dst / "tree/skip") = `Not_found)
+
 let suite =
   ( "eio_fs",
     [
@@ -594,6 +612,8 @@ let suite =
       Alcotest.test_case "directory close after switch release" `Quick
         test_directory_close_after_switch_release;
       Alcotest.test_case "write/read" `Quick test_write_read;
+      Alcotest.test_case "load copies what its filter accepts" `Quick
+        test_load_filter;
       Alcotest.test_case "v roots share no file" `Quick
         test_v_roots_share_no_file;
       Alcotest.test_case "v is empty" `Quick test_v_is_empty;
