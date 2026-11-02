@@ -392,9 +392,8 @@ static value eio_fs_seek(value fd_v, value offset_v, int whence,
                          const char *name)
 {
   CAMLparam2(fd_v, offset_v);
-  CAMLlocal1(found_v);
   int fd = Int_val(fd_v);
-  off_t offset = (off_t)Int64_val(offset_v);
+  off_t offset = (off_t)Long_val(offset_v);
 
   caml_release_runtime_system();
   off_t found = lseek(fd, offset, whence);
@@ -409,8 +408,9 @@ static value eio_fs_seek(value fd_v, value offset_v, int whence,
       CAMLreturn(Val_none);
     caml_unix_error(saved_errno, name, Nothing);
   }
-  found_v = caml_copy_int64((int64_t)found);
-  CAMLreturn(caml_alloc_some(found_v));
+  if ((int64_t)found > (int64_t)Max_long)
+    caml_unix_error(EOVERFLOW, name, Nothing);
+  CAMLreturn(caml_alloc_some(Val_long(found)));
 }
 
 CAMLprim value caml_eio_fs_seek_data(value fd_v, value offset_v)
@@ -547,8 +547,8 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
   CAMLparam4(fd_v, offset_v, length_v, max_v);
   CAMLlocal3(list, cell, extent);
   int fd = Int_val(fd_v);
-  int64_t offset = Int64_val(offset_v);
-  int64_t length = Int64_val(length_v);
+  int64_t offset = (int64_t)Long_val(offset_v);
+  int64_t length = (int64_t)Long_val(length_v);
   long max = Long_val(max_v);
   int err = 0;
   const char *what = "extents";
@@ -557,6 +557,8 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
     caml_invalid_argument("Eio_fs_unix.extents: max out of range");
   if (offset < 0 || length < 0)
     caml_invalid_argument("Eio_fs_unix.extents: negative offset or length");
+  if (length > (int64_t)Max_long - offset)
+    caml_invalid_argument("Eio_fs_unix.extents: range past the largest offset");
 
   struct eio_fs_extent *out =
       malloc((size_t)max * sizeof(struct eio_fs_extent));
@@ -572,13 +574,20 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
     caml_unix_error(err, what, Nothing);
   }
 
+  /* A device offset past the largest int has no answer to give. */
+  for (long i = 0; i < n; i++)
+    if (out[i].physical > (int64_t)Max_long) {
+      free(out);
+      caml_unix_error(EOVERFLOW, (char *)what, Nothing);
+    }
+
   /* Built back to front so the list comes out in increasing logical order. */
   list = Val_emptylist;
   for (long i = n - 1; i >= 0; i--) {
-    extent = caml_alloc_tuple(3);
-    Store_field(extent, 0, caml_copy_int64(out[i].logical));
-    Store_field(extent, 1, caml_copy_int64(out[i].physical));
-    Store_field(extent, 2, caml_copy_int64(out[i].length));
+    extent = caml_alloc_small(3, 0);
+    Field(extent, 0) = Val_long(out[i].logical);
+    Field(extent, 1) = Val_long(out[i].physical);
+    Field(extent, 2) = Val_long(out[i].length);
     cell = caml_alloc_small(2, Tag_cons);
     Field(cell, 0) = extent;
     Field(cell, 1) = list;
@@ -633,12 +642,17 @@ CAMLprim value caml_eio_fs_rename_exclusive(value srcfd_v, value src_v,
 #include <sys/xattr.h>
 #endif
 
+static void eio_fs_check_nul(value v, const char *what)
+{
+  if (memchr(String_val(v), '\0', caml_string_length(v)) != NULL)
+    caml_invalid_argument(what);
+}
+
 static char *eio_fs_cstring(value v, const char *what)
 {
   mlsize_t len = caml_string_length(v);
   const char *s = String_val(v);
-  if (memchr(s, '\0', len) != NULL)
-    caml_invalid_argument(what);
+  eio_fs_check_nul(v, what);
   char *c = malloc(len + 1);
   if (c == NULL)
     caml_raise_out_of_memory();
@@ -695,10 +709,21 @@ static value eio_fs_read_sized(value path_v, value name_v, const char *what)
 {
   CAMLparam2(path_v, name_v);
   CAMLlocal1(result);
+  /* Both are checked before either is copied, so a refusal leaks nothing. */
+  eio_fs_check_nul(path_v, "Eio_fs_unix: NUL byte in path");
+  if (Is_block(name_v))
+    eio_fs_check_nul(Field(name_v, 0), "Eio_fs_unix: NUL byte in name");
   char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
   char *name = NULL;
-  if (Is_block(name_v))
-    name = eio_fs_cstring(Field(name_v, 0), "Eio_fs_unix: NUL byte in name");
+  if (Is_block(name_v)) {
+    name = malloc(caml_string_length(Field(name_v, 0)) + 1);
+    if (name == NULL) {
+      free(path);
+      caml_raise_out_of_memory();
+    }
+    memcpy(name, String_val(Field(name_v, 0)),
+           caml_string_length(Field(name_v, 0)) + 1);
+  }
   char *buf = NULL;
   ssize_t n;
   int saved_errno;
@@ -756,8 +781,15 @@ CAMLprim value caml_eio_fs_lgetxattr(value path_v, value name_v)
 CAMLprim value caml_eio_fs_lsetxattr(value path_v, value name_v, value data_v)
 {
   CAMLparam3(path_v, name_v, data_v);
+  eio_fs_check_nul(path_v, "Eio_fs_unix: NUL byte in path");
+  eio_fs_check_nul(name_v, "Eio_fs_unix: NUL byte in name");
   char *path = eio_fs_cstring(path_v, "Eio_fs_unix: NUL byte in path");
-  char *name = eio_fs_cstring(name_v, "Eio_fs_unix: NUL byte in name");
+  char *name = malloc(caml_string_length(name_v) + 1);
+  if (name == NULL) {
+    free(path);
+    caml_raise_out_of_memory();
+  }
+  memcpy(name, String_val(name_v), caml_string_length(name_v) + 1);
   size_t len = caml_string_length(data_v);
   char *data = malloc(len > 0 ? len : 1);
   if (data == NULL) {
@@ -907,7 +939,9 @@ CAMLprim value caml_eio_fs_batch_mkdir(value dirfd_v, value name_v,
   char *name = caml_stat_strdup(String_val(name_v));
   int r;
   caml_release_runtime_system();
-  r = mkdirat(Int_val(dirfd_v), name, (mode_t)Int_val(perm_v));
+  do {
+    r = mkdirat(Int_val(dirfd_v), name, (mode_t)Int_val(perm_v));
+  } while (r == -1 && errno == EINTR);
   int saved_errno = errno;
   caml_acquire_runtime_system();
   caml_stat_free(name);
@@ -926,7 +960,9 @@ CAMLprim value caml_eio_fs_batch_symlink(value target_v, value dirfd_v,
   char *name = caml_stat_strdup(String_val(name_v));
   int r;
   caml_release_runtime_system();
-  r = symlinkat(target, Int_val(dirfd_v), name);
+  do {
+    r = symlinkat(target, Int_val(dirfd_v), name);
+  } while (r == -1 && errno == EINTR);
   int saved_errno = errno;
   caml_acquire_runtime_system();
   caml_stat_free(target);
@@ -1032,32 +1068,6 @@ static value eio_fs_stat_value(const struct stat *st, double at, double mt,
 #define EIO_FS_CTIME(st) ((st).st_ctim)
 #endif
 
-CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
-{
-  CAMLparam2(dirfd_v, name_v);
-  caml_unix_check_path(name_v, "fstatat");
-  char *name = caml_stat_strdup(String_val(name_v));
-  struct stat st;
-  int r;
-  caml_release_runtime_system();
-  r = fstatat(Int_val(dirfd_v), name, &st, AT_SYMLINK_NOFOLLOW);
-  int saved_errno = errno;
-  caml_acquire_runtime_system();
-  caml_stat_free(name);
-  if (r == -1)
-    caml_unix_error(saved_errno, "fstatat", name_v);
-  double at = EIO_FS_ATIME(st).tv_sec + EIO_FS_ATIME(st).tv_nsec / 1e9;
-  double mt = EIO_FS_MTIME(st).tv_sec + EIO_FS_MTIME(st).tv_nsec / 1e9;
-  double ct = EIO_FS_CTIME(st).tv_sec + EIO_FS_CTIME(st).tv_nsec / 1e9;
-  CAMLreturn(eio_fs_stat_value(&st, at, mt, ct));
-}
-
-/* --- Calls beneath a held directory, for Link ---
-
-   Each is the one system call it names on a descriptor the caller keeps
-   open, so they work under any Eio backend: the caller makes them from a
-   system thread and the runtime is released around the call. */
-
 /* [t] in seconds, its whole part kept at [t]'s own second where the sum
    rounds up to the next one, as Eio's own stat does. */
 static double eio_fs_timestamp(struct timespec t)
@@ -1067,13 +1077,42 @@ static double eio_fs_timestamp(struct timespec t)
   return floor(f) == s ? f : nextafter(f, -INFINITY);
 }
 
+CAMLprim value caml_eio_fs_batch_lstat(value dirfd_v, value name_v)
+{
+  CAMLparam2(dirfd_v, name_v);
+  caml_unix_check_path(name_v, "fstatat");
+  char *name = caml_stat_strdup(String_val(name_v));
+  struct stat st;
+  int r;
+  caml_release_runtime_system();
+  do {
+    r = fstatat(Int_val(dirfd_v), name, &st, AT_SYMLINK_NOFOLLOW);
+  } while (r == -1 && errno == EINTR);
+  int saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(name);
+  if (r == -1)
+    caml_unix_error(saved_errno, "fstatat", name_v);
+  CAMLreturn(eio_fs_stat_value(&st, eio_fs_timestamp(EIO_FS_ATIME(st)),
+                               eio_fs_timestamp(EIO_FS_MTIME(st)),
+                               eio_fs_timestamp(EIO_FS_CTIME(st))));
+}
+
+/* --- Calls beneath a held directory, for Link ---
+
+   Each is the one system call it names on a descriptor the caller keeps
+   open, so they work under any Eio backend: the caller makes them from a
+   system thread and the runtime is released around the call. */
+
 CAMLprim value caml_eio_fs_fstat(value fd_v)
 {
   CAMLparam1(fd_v);
   struct stat st;
   int r;
   caml_release_runtime_system();
-  r = fstat(Int_val(fd_v), &st);
+  do {
+    r = fstat(Int_val(fd_v), &st);
+  } while (r == -1 && errno == EINTR);
   int saved_errno = errno;
   caml_acquire_runtime_system();
   if (r == -1)
@@ -1084,8 +1123,9 @@ CAMLprim value caml_eio_fs_fstat(value fd_v)
 }
 
 /* The entry [name] beneath [dirfd] opened read-only, never through a
-   symbolic link (O_NOFOLLOW) and without waiting for a FIFO's writer
-   (O_NONBLOCK). */
+   symbolic link (O_NOFOLLOW), without waiting for a FIFO's writer
+   (O_NONBLOCK) and without a terminal becoming the controlling one
+   (O_NOCTTY). */
 CAMLprim value caml_eio_fs_open_leaf(value dirfd_v, value name_v)
 {
   CAMLparam2(dirfd_v, name_v);
@@ -1095,7 +1135,7 @@ CAMLprim value caml_eio_fs_open_leaf(value dirfd_v, value name_v)
   caml_release_runtime_system();
   do {
     fd = openat(Int_val(dirfd_v), name,
-                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
   } while (fd == -1 && errno == EINTR);
   int saved_errno = errno;
   caml_acquire_runtime_system();
@@ -1122,7 +1162,10 @@ CAMLprim value caml_eio_fs_readlinkat(value dirfd_v, value name_v)
       caml_raise_out_of_memory();
     }
     caml_release_runtime_system();
-    ssize_t n = readlinkat(dirfd, name, buf, size);
+    ssize_t n;
+    do {
+      n = readlinkat(dirfd, name, buf, size);
+    } while (n == -1 && errno == EINTR);
     int saved_errno = errno;
     caml_acquire_runtime_system();
     if (n == -1) {

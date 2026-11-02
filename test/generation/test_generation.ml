@@ -315,6 +315,14 @@ let test_posix_readonly_failed_populate () =
     "old content remains complete" "previous complete rootfs"
     (Eio.Path.load (root / "out/readonly/file"))
 
+(* A fault wrapper opens files for reading without a barrier of their own: a
+   durable publication through it syncs each file all the same. *)
+let test_durable_through_a_fault_wrapper () =
+  with_empty @@ fun fs ->
+  let wrapped = Eio_fs.Chaos.wrap Eio_fs.Chaos.Schedule.empty fs in
+  publish ~durable:true wrapped new_tree;
+  Alcotest.check tree "published" (Some new_tree) (read_back (fs / "out"))
+
 let suite =
   ( "generation",
     [
@@ -337,4 +345,6 @@ let suite =
         test_posix_readonly_reclaimed;
       Alcotest.test_case "POSIX failed read-only population leaves no stage"
         `Quick test_posix_readonly_failed_populate;
+      Alcotest.test_case "durable through a fault wrapper" `Quick
+        test_durable_through_a_fault_wrapper;
     ] )

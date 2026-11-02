@@ -102,10 +102,22 @@ let test_sync_dir_refuses_a_name_a_link_took () =
   | () ->
       Alcotest.fail
         "the barrier reported a directory the caller never named durable"
-  | exception (Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) as e) ->
+  | exception
+      (Eio.Io (Eio.Fs.E (Eio.Fs.Symlink | Eio.Fs.Permission_denied _), _) as e)
+    ->
       Alcotest.(check bool)
         "the refusal names the directory it was asked to barrier" true
         (mentions ~needle:"store" (Printexc.to_string e))
+
+(* A link inside the directory is refused too, as its open is [~follow:false]:
+   the barrier would otherwise land on the directory the link names. *)
+let test_sync_dir_refuses_a_relative_link () =
+  with_real_dir @@ fun root ->
+  Eio.Path.mkdir ~perm:0o700 (root / "moved");
+  Eio.Path.symlink ~link_to:"moved" (root / "store");
+  match Eio_fs_unix.sync_dir (root / "store") with
+  | () -> Alcotest.fail "the barrier followed a link"
+  | exception Eio.Io _ -> ()
 
 (* The barrier runs on a fiber that shares its domain with every other fiber of
    the program: a server publishes while it serves. So the open and the fsync
@@ -406,7 +418,7 @@ let test_clone_tree () =
         "a destination that exists" true
         (match Eio_fs_unix.clone_tree src dst with
         | _ -> false
-        | exception Unix.Unix_error (Unix.EEXIST, _, _) -> true)
+        | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) -> true)
 
 let test_statvfs_reports_raw_block_capacity () =
   with_real_dir @@ fun dir ->
@@ -490,7 +502,7 @@ let with_sparse_file fn =
   write_at 0;
   write_at hole_span;
   Unix.fsync fd;
-  let size = Int64.of_int (hole_span + Bytes.length block) in
+  let size = hole_span + Bytes.length block in
   fn env fd ~size
 
 let some name = function
@@ -502,58 +514,58 @@ let some name = function
    the size here, and every case that walks the hole would then be walking
    nothing. *)
 let hole_start fd ~size =
-  let start = some "seek_hole 0" (Eio_fs_unix.seek_hole fd 0L) in
+  let start = some "seek_hole 0" (Eio_fs_unix.seek_hole fd ~file_offset:0) in
   Alcotest.(check bool)
     "the filesystem left a hole between the two writes" true
-    (Int64.compare start 0L > 0 && Int64.compare start size < 0);
+    (start > 0 && start < size);
   start
 
 let test_seek_data_and_hole_walk_the_file () =
   with_sparse_file @@ fun _env fd ~size ->
-  let first_data = some "seek_data 0" (Eio_fs_unix.seek_data fd 0L) in
-  Alcotest.(check int64) "data starts at the first byte" 0L first_data;
+  let first_data =
+    some "seek_data 0" (Eio_fs_unix.seek_data fd ~file_offset:0)
+  in
+  Alcotest.(check int) "data starts at the first byte" 0 first_data;
   let first_hole = hole_start fd ~size in
   Alcotest.(check bool)
     "the hole starts at or before the second write" true
-    (Int64.compare first_hole (Int64.of_int hole_span) <= 0);
+    (first_hole <= hole_span);
   let second_data =
-    some "seek_data in the hole" (Eio_fs_unix.seek_data fd first_hole)
+    some "seek_data in the hole"
+      (Eio_fs_unix.seek_data fd ~file_offset:first_hole)
   in
   Alcotest.(check bool)
     "the next data starts at or before the second write" true
-    (Int64.compare second_data first_hole > 0
-    && Int64.compare second_data (Int64.of_int hole_span) <= 0);
+    (second_data > first_hole && second_data <= hole_span);
   (* Past the last byte there is no next answer, and that is an answer rather
      than an error. *)
   Alcotest.(check bool)
     "no data past the end" true
-    (Option.is_none (Eio_fs_unix.seek_data fd size));
+    (Option.is_none (Eio_fs_unix.seek_data fd ~file_offset:size));
   Alcotest.(check bool)
     "no hole past the end" true
-    (Option.is_none (Eio_fs_unix.seek_hole fd size))
+    (Option.is_none (Eio_fs_unix.seek_hole fd ~file_offset:size))
 
 let test_extents_report_the_physical_map () =
   with_sparse_file @@ fun _env fd ~size:_ ->
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:16 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:16 in
   Alcotest.(check bool) "the first block is backed" true (es <> []);
   let e = List.hd es in
-  Alcotest.(check int64) "the first extent starts where asked" 0L e.logical;
-  Alcotest.(check bool)
-    "the extent has length" true
-    (Int64.compare e.length 0L > 0);
+  Alcotest.(check int) "the first extent starts where asked" 0 e.logical;
+  Alcotest.(check bool) "the extent has length" true (e.length > 0);
   Alcotest.(check bool)
     "the extent does not run past the range asked about" true
-    (Int64.compare (Int64.add e.logical e.length) 4096L <= 0);
+    (e.logical + e.length <= 4096);
   (* The answers are in increasing logical order and do not overlap. *)
   ignore
     (List.fold_left
        (fun previous (e : Eio_fs_unix.extent) ->
          Alcotest.(check bool)
            "extents come back in increasing logical order" true
-           (Int64.compare e.logical previous >= 0);
-         Int64.add e.logical e.length)
-       0L es
-      : int64)
+           (e.logical >= previous);
+         e.logical + e.length)
+       0 es
+      : int)
 
 let test_extents_stop_at_a_hole () =
   with_sparse_file @@ fun _env fd ~size ->
@@ -563,26 +575,25 @@ let test_extents_stop_at_a_hole () =
      with the hole's own length, so a binding that reads the length alone
      counts holes as physical pieces. *)
   let start = hole_start fd ~size in
-  let es = Eio_fs_unix.extents fd ~offset:start ~length:4096L ~max:16 in
+  let es = Eio_fs_unix.extents fd ~file_offset:start ~length:4096 ~max:16 in
   Alcotest.(check int) "no extents inside a hole" 0 (List.length es);
   (* And a walk that starts before the hole stops AT it rather than crossing
      it: every extent it reports lies wholly in the data before the hole. *)
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:64 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:64 in
   Alcotest.(check bool)
     "the walk reported the data before the hole" true (es <> []);
   List.iter
     (fun (e : Eio_fs_unix.extent) ->
       Alcotest.(check bool)
         "no extent crosses or follows the hole" true
-        (Int64.compare (Int64.add e.logical e.length) start <= 0);
+        (e.logical + e.length <= start);
       Alcotest.(check bool)
-        "every extent has a device address" true
-        (Int64.compare e.physical 0L >= 0))
+        "every extent has a device address" true (e.physical >= 0))
     es
 
 let test_extents_honour_max () =
   with_sparse_file @@ fun _env fd ~size ->
-  let es = Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:1 in
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:1 in
   Alcotest.(check bool)
     "at most one extent when one was asked for" true
     (List.length es <= 1)
@@ -595,13 +606,15 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
     | exception Invalid_argument _ -> ()
   in
   refuses "max 0" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:0);
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:0);
   refuses "max above the buffer ceiling" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:4096L ~max:65537);
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:65537);
   refuses "a negative offset" (fun () ->
-      Eio_fs_unix.extents fd ~offset:(-1L) ~length:4096L ~max:16);
+      Eio_fs_unix.extents fd ~file_offset:(-1) ~length:4096 ~max:16);
   refuses "a negative length" (fun () ->
-      Eio_fs_unix.extents fd ~offset:0L ~length:(-1L) ~max:16)
+      Eio_fs_unix.extents fd ~file_offset:0 ~length:(-1) ~max:16);
+  refuses "a range past the largest offset" (fun () ->
+      Eio_fs_unix.extents fd ~file_offset:max_int ~length:1 ~max:16)
 
 (* The whole reason these three live in this library rather than beside a
    caller: they run on a system thread with the runtime system released, so a
@@ -625,9 +638,9 @@ let test_sparse_map_does_not_block_eio () =
       Eio.Fiber.yield ();
       ran := true);
   for _ = 1 to 2000 do
-    ignore (Eio_fs_unix.seek_data fd 0L : int64 option);
+    ignore (Eio_fs_unix.seek_data fd ~file_offset:0 : int option);
     ignore
-      (Eio_fs_unix.extents fd ~offset:0L ~length:size ~max:8
+      (Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:8
         : Eio_fs_unix.extent list)
   done;
   Alcotest.(check bool)
@@ -914,13 +927,16 @@ let test_lock_range () =
   let fd = Unix.openfile (Eio.Path.native_exn lock) [ Unix.O_RDWR ] 0 in
   Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
   ignore (Unix.lseek fd 7 Unix.SEEK_SET : int);
-  Eio_fs_unix.lock_range fd `Write ~at:10 ~len:5;
+  Eio_fs_unix.lock_range fd `Write ~file_offset:10 ~length:5;
   Alcotest.(check int)
     "the lock leaves the offset" 7
     (Unix.lseek fd 0 Unix.SEEK_CUR);
   Alcotest.(check bool)
     "this process's own lock is not another's" false
-    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
+    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
+  Alcotest.(check bool)
+    "nor does it name a holder" true
+    (Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 = `Free);
   let manager = Eio.Stdenv.process_mgr env in
   let self = Sys.executable_name in
   let try_lock () =
@@ -931,15 +947,21 @@ let test_lock_range () =
   in
   Alcotest.check status "another process meets the lock" (`Exited 3)
     (try_lock ());
-  Eio_fs_unix.lock_range fd `Unlock ~at:10 ~len:5;
+  Eio_fs_unix.lock_range fd `Unlock ~file_offset:10 ~length:5;
   Alcotest.check status "and is granted the file once it is let go" (`Exited 0)
     (try_lock ());
   Eio.Switch.run @@ fun sw ->
   with_held_lock ~sw ~env ~clock ~lock @@ fun () ->
   Alcotest.(check bool)
     "another process's lock is seen" true
-    (Eio_fs_unix.range_locked fd ~at:10 ~len:5);
-  match Eio_fs_unix.lock_range fd `Read ~at:10 ~len:5 with
+    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
+  (match Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 with
+  | `Held (Some pid) ->
+      Alcotest.(check bool)
+        "the holder is another process" true
+        (pid <> Unix.getpid ())
+  | `Held None | `Free -> Alcotest.fail "the holding process is not named");
+  match Eio_fs_unix.lock_range fd `Read ~file_offset:10 ~length:5 with
   | () -> Alcotest.fail "a read lock was granted under another's write lock"
   | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES), _, _) -> ()
 
@@ -1520,14 +1542,15 @@ let test_probe_of_a_lock_file_replaced () =
   Alcotest.(check bool)
     "the file was replaced between the open and the stat" true !replaced
 
-(* A hold is a lock for the rest of a switch: taken when [hold] returns, still
-   held while the switch runs, and let go when it finishes. *)
+(* A held lock not released lasts the rest of its switch: taken when [take]
+   returns, still held while the switch runs, and let go when it finishes. *)
 let test_hold_lasts_as_long_as_its_switch () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lock" in
   let record = "held for the switch\n" in
   Eio.Switch.run (fun sw ->
-      Eio_fs_unix.hold ~sw ~contents:record lock;
+      ignore
+        (Eio_fs_unix.Held.take ~sw ~contents:record lock : Eio_fs_unix.Held.t);
       match Eio_fs_unix.with_lock ~block:`No lock (fun () -> ()) with
       | () -> Alcotest.fail "a lock held for the switch was granted"
       | exception Eio_fs_unix.Lock_unavailable refused ->
@@ -1549,8 +1572,9 @@ let test_hold_refusal_names_the_holding_process () =
   Eio.Switch.run @@ fun sw ->
   let child, release = holding_process ~sw ~env ~clock ~kind:"record" ~lock in
   ( Eio.Switch.run @@ fun hold_sw ->
-    match Eio_fs_unix.hold ~sw:hold_sw ~block:`No lock with
-    | () -> Alcotest.fail "a hold was granted over another process's lock"
+    match Eio_fs_unix.Held.take ~sw:hold_sw ~block:`No lock with
+    | (_ : Eio_fs_unix.Held.t) ->
+        Alcotest.fail "a hold was granted over another process's lock"
     | exception Eio_fs_unix.Lock_unavailable refused ->
         Alcotest.(check (option int))
           "the holder the refusal carries"
@@ -2735,7 +2759,7 @@ let test_exclusive_publication_reaches_crash_model () =
   with_real_dir @@ fun dir ->
   let ctl = Crash.v () in
   let fs = Crash.wrap ctl dir in
-  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 7L } in
+  let config = Eio_fs_sync.config ~perm:0o600 ~max_bytes:7L () in
   Eio_fs_sync.publish ~config ~mode:`Exclusive
     ~rename:Eio_fs_unix.exclusive_rename (fs / "state")
     (Eio.Flow.copy_string "payload");
@@ -2744,9 +2768,25 @@ let test_exclusive_publication_reaches_crash_model () =
     "published bytes survive" "payload"
     (Eio.Path.load (Crash.post_crash ctl / "state"))
 
+(* The platform barrier carries a publication on a real directory, a durable
+   generation's read-only handles included. *)
+let test_publication_with_the_platform_barrier () =
+  with_real_dir @@ fun dir ->
+  let barrier = Eio_fs_unix.barrier in
+  Eio_fs_sync.publish
+    ~config:(Eio_fs_sync.config ~barrier ~max_bytes:7L ())
+    (dir / "state")
+    (Eio.Flow.copy_string "payload");
+  Eio_fs_sync.publish_generation ~barrier (dir / "tree") (fun d ->
+      Eio.Path.save ~create:(`Exclusive 0o444) (d / "f") "frozen");
+  Alcotest.(check string) "the file" "payload" (Eio.Path.load (dir / "state"));
+  Alcotest.(check string)
+    "the generation" "frozen"
+    (Eio.Path.load (dir / "tree/f"))
+
 let test_concurrent_exclusive_publications_have_one_winner () =
   with_real_dir @@ fun dir ->
-  let config = Eio_fs_sync.{ durable = true; perm = 0o600; max_bytes = 3L } in
+  let config = Eio_fs_sync.config ~perm:0o600 ~max_bytes:3L () in
   let save text () =
     match
       Eio_fs_sync.publish ~config ~mode:`Exclusive
@@ -2782,13 +2822,35 @@ let test_exclusive_rename_keeps_open_parent () =
     "replacement directory untouched" []
     (Eio.Path.read_dir (dir / "elsewhere"))
 
+(* A call that takes an [Eio.Path.t] reports a failure as [Eio.Io], as Eio's
+   own backends do, never as the [Unix.Unix_error] of the call beneath. *)
+let test_path_calls_raise_eio_io () =
+  with_real_dir @@ fun dir ->
+  let missing = dir / "missing" in
+  let not_found name f =
+    match f () with
+    | () -> Alcotest.failf "%s of a missing path succeeded" name
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+  in
+  not_found "statvfs" (fun () -> ignore (Eio_fs_unix.statvfs missing));
+  not_found "xattrs" (fun () -> ignore (Eio_fs_unix.xattrs missing));
+  not_found "set_xattr" (fun () -> Eio_fs_unix.set_xattr missing "user.a" "v");
+  Eio.Path.mkdir ~perm:0o755 (dir / "dst");
+  match Eio_fs_unix.clone_tree missing (dir / "dst") with
+  | false -> ()
+  | true -> Alcotest.fail "cloned a missing path"
+  | exception Eio.Io _ -> ()
+
 (* xattr(7): a value is a byte string, and the no-follow calls act on a link
    itself. The value holds a NUL byte, which a C-string round trip would cut. *)
 let user_value = "v\000alue"
 
 let supported f =
   try f ()
-  with Unix.Unix_error ((Unix.EOPNOTSUPP | Unix.ENOSYS), _, _) ->
+  with
+  | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EOPNOTSUPP, _, _)), _)
+  | Eio.Io (Eio.Exn.Not_available _, _)
+  ->
     Alcotest.skip ()
 
 let test_xattr_round_trip () =
@@ -2966,6 +3028,8 @@ let suite =
         test_exclusive_rename_refuses_embedded_nul;
       Alcotest.test_case "exclusive publication reaches crash model" `Quick
         test_exclusive_publication_reaches_crash_model;
+      Alcotest.test_case "publication with the platform barrier" `Quick
+        test_publication_with_the_platform_barrier;
       Alcotest.test_case "concurrent exclusive publications have one winner"
         `Quick test_concurrent_exclusive_publications_have_one_winner;
       Alcotest.test_case "exclusive rename keeps its open parent" `Quick
@@ -2984,6 +3048,8 @@ let suite =
         test_sync_dir_barriers_the_held_directory;
       Alcotest.test_case "barrier refuses a name a link took" `Quick
         test_sync_dir_refuses_a_name_a_link_took;
+      Alcotest.test_case "barrier refuses a relative link" `Quick
+        test_sync_dir_refuses_a_relative_link;
       Alcotest.test_case "an imported descriptor is a file" `Quick
         test_import_file;
       Alcotest.test_case "file barrier asks the registration first" `Quick
@@ -3000,6 +3066,8 @@ let suite =
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
+      Alcotest.test_case "calls on a path raise Eio.Io" `Quick
+        test_path_calls_raise_eio_io;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
         test_pread_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick

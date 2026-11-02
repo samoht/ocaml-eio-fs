@@ -343,7 +343,7 @@ module Crunch = struct
           Symlink { path = "/l"; target = "a" };
         ]
     in
-    let find = Eio_fs.Crunch.find entries in
+    let find path = Eio_fs.Crunch.find path entries in
     Alcotest.(check (option string)) "/a" (Some "top") (find "/a");
     Alcotest.(check (option string)) "/sub/a" (Some "nested") (find "/sub/a");
     Alcotest.(check (option string)) "directory" None (find "/sub");
@@ -602,9 +602,54 @@ let test_load_filter () =
     "a refused directory is not copied" true
     (Eio.Path.kind ~follow:false (dst / "tree/skip") = `Not_found)
 
+(* The filter is asked about the root before anything is made: a refused root
+   is an empty filesystem. *)
+let test_load_filter_refuses_the_root () =
+  with_fs @@ fun src ->
+  Eio.Path.mkdirs ~perm:0o755 (src / "tree/keep");
+  let asked = ref [] in
+  let filter (_, path) =
+    asked := path :: !asked;
+    false
+  in
+  let dst = Eio_fs.Fs.load ~filter (src / "tree") in
+  Alcotest.(check (list string)) "only the root asked" [ "tree" ] !asked;
+  Alcotest.(check (list string)) "nothing copied" [] (Eio.Path.read_dir dst)
+
+(* [load] copies a directory tree; anything else is refused, as [Crunch.scan]
+   refuses it. *)
+let test_load_refuses_a_file () =
+  with_fs @@ fun src ->
+  write src "file" "bytes";
+  match Eio_fs.Fs.load (src / "file") with
+  | _ -> Alcotest.fail "loaded a regular file"
+  | exception Invalid_argument _ -> ()
+
+(* The current directory [run] is given exists, and is absolute. *)
+let test_run_makes_its_cwd () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run ~cwd:"/work/dir" @@ fun env ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#cwd / "f") "here";
+  Alcotest.(check string)
+    "under the cwd" "here"
+    (Eio.Path.load (env#fs / "/work/dir/f"))
+
+let test_run_refuses_a_relative_cwd () =
+  Eio_mock.Backend.run @@ fun () ->
+  match Eio_fs.run ~cwd:"work" (fun _ -> ()) with
+  | () -> Alcotest.fail "accepted a relative cwd"
+  | exception Invalid_argument _ -> ()
+
 let suite =
   ( "eio_fs",
     [
+      Alcotest.test_case "load asks its filter about the root first" `Quick
+        test_load_filter_refuses_the_root;
+      Alcotest.test_case "load refuses a regular file" `Quick
+        test_load_refuses_a_file;
+      Alcotest.test_case "run makes its cwd" `Quick test_run_makes_its_cwd;
+      Alcotest.test_case "run refuses a relative cwd" `Quick
+        test_run_refuses_a_relative_cwd;
       Alcotest.test_case "root close invalidates aliases" `Quick
         test_root_close_invalidates_aliases;
       Alcotest.test_case "directory close then switch release" `Quick

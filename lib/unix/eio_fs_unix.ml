@@ -1,5 +1,13 @@
 external is_darwin : unit -> bool = "caml_eio_fs_is_darwin"
 
+(* A call that takes an [Eio.Path.t] or an [Eio.File.t] reports its failure as
+   Eio's own backends do: the [Unix.Unix_error] beneath becomes [Eio.Io]. *)
+let eio_unix_errors fn =
+  match fn () with
+  | value -> value
+  | exception Unix.Unix_error (code, operation, argument) ->
+      raise (Eio_unix.Err.v code operation argument)
+
 type flock_mode = Exclusive | Shared
 
 external flock_native : Unix.file_descr -> flock_mode -> bool -> unit
@@ -23,17 +31,18 @@ external range_locked_native : Unix.file_descr -> int -> int -> bool
 external range_holder_native : Unix.file_descr -> int -> int -> int
   = "caml_eio_fs_range_holder"
 
-let lock_range fd kind ~at ~len =
+let lock_range fd kind ~file_offset ~length =
   let kind = match kind with `Read -> 0 | `Write -> 1 | `Unlock -> 2 in
-  lock_range_native fd kind at len
+  lock_range_native fd kind file_offset length
 
-let range_locked fd ~at ~len = range_locked_native fd at len
+let range_locked fd ~file_offset ~length =
+  range_locked_native fd file_offset length
 
-let range_holder fd ~at ~len =
-  match range_holder_native fd at len with
-  | -1 -> None
-  | 0 -> Some None
-  | pid -> Some (Some pid)
+let range_holder fd ~file_offset ~length =
+  match range_holder_native fd file_offset length with
+  | -1 -> `Free
+  | 0 -> `Held None
+  | pid -> `Held (Some pid)
 
 external pread_head : Unix.file_descr -> int -> string
   = "caml_eio_fs_pread_head"
@@ -82,6 +91,7 @@ external statvfs_native : string -> statvfs = "caml_eio_fs_statvfs"
 
 let statvfs path =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
   statvfs_native native
 
@@ -89,6 +99,7 @@ external clone_tree_native : string -> string -> bool = "caml_eio_fs_clone_tree"
 
 let clone_tree src dst =
   let src = Eio.Path.native_exn src and dst = Eio.Path.native_exn dst in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-clone-tree" @@ fun () ->
   clone_tree_native src dst
 
@@ -103,49 +114,50 @@ let rec grant_owner p =
       | exception Eio.Io _ -> ())
   | _ | (exception Eio.Io _) -> ()
 
-type extent = { logical : int64; physical : int64; length : int64 }
+type extent = { logical : int; physical : int; length : int }
 
-external seek_data_native : Unix.file_descr -> int64 -> int64 option
+external seek_data_native : Unix.file_descr -> int -> int option
   = "caml_eio_fs_seek_data"
 
-external seek_hole_native : Unix.file_descr -> int64 -> int64 option
+external seek_hole_native : Unix.file_descr -> int -> int option
   = "caml_eio_fs_seek_hole"
 
-external extents_native :
-  Unix.file_descr -> int64 -> int64 -> int -> extent list
+external extents_native : Unix.file_descr -> int -> int -> int -> extent list
   = "caml_eio_fs_extents"
 
 (* Each runs on a system thread whose stub releases the runtime system around
    the syscall. The hop has a price, which is why the extent map takes a batch:
    one hop per batch covers many extents where one hop each would spend the
    time in scheduling alone. *)
-let seek_data fd offset =
+let seek_data fd ~file_offset =
   Eio_unix.run_in_systhread ~label:"eio-fs-seek-data" @@ fun () ->
-  seek_data_native fd offset
+  seek_data_native fd file_offset
 
-let seek_hole fd offset =
+let seek_hole fd ~file_offset =
   Eio_unix.run_in_systhread ~label:"eio-fs-seek-hole" @@ fun () ->
-  seek_hole_native fd offset
+  seek_hole_native fd file_offset
 
-let extents fd ~offset ~length ~max =
+let extents fd ~file_offset ~length ~max =
   Eio_unix.run_in_systhread ~label:"eio-fs-extents" @@ fun () ->
-  extents_native fd offset length max
+  extents_native fd file_offset length max
 
 (* A registered barrier keeps its own semantics; a plain POSIX directory is
-   opened through the capability the path carries -- so a name a link has taken
-   is refused rather than fsynced instead of the caller's directory -- and
-   pushed through to stable storage off the calling fiber's thread. A handle
-   with no descriptor takes the portable barrier. *)
+   opened through the capability the path carries, without following a final
+   link -- so a name a link has taken is refused rather than fsynced instead of
+   the caller's directory -- and pushed through to stable storage off the
+   calling fiber's thread. A handle with no descriptor takes the portable
+   barrier. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match Eio_fs_sync.dir_barrier res with
   | Some barrier -> barrier ~path
   | None -> (
       Eio.Switch.run @@ fun sw ->
-      let handle = Eio.Path.open_in ~sw p in
+      let handle = Eio.Path.open_in ~sw ~follow:false p in
       match Eio_unix.Resource.fd_opt handle with
       | None -> Eio_fs_sync.sync_dir p
       | Some fd ->
           Eio_unix.Fd.use_exn "eio-fs-sync-dir" fd @@ fun fd ->
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
           full_fsync fd)
 
@@ -153,27 +165,43 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
    carries over is a second way past the wrapper, so a barrier taken on it is
    one the wrapper never saw. A file with neither a registration nor a
    descriptor takes the portable barrier, its own sync. *)
-let sync_file file =
+let sync_file_or ~portable file =
   match Eio_fs_sync.file_barrier file with
   | Some barrier -> barrier ()
   | None -> (
       match Eio_unix.Resource.fd_opt file with
-      | None -> Eio_fs_sync.sync_file file
+      | None -> portable file
       | Some fd ->
           Eio_unix.Fd.use_exn "eio-fs-sync-file" fd @@ fun fd ->
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
           full_fsync fd)
+
+let sync_file file = sync_file_or ~portable:Eio_fs_sync.sync_file file
+
+(* The pair a publication issues at full platform strength. A file opened for
+   reading only, as a published generation's are, carries its descriptor all
+   the same; one with neither a registration nor a descriptor takes the
+   portable barrier. *)
+module Full_barrier = struct
+  type t = unit
+
+  let sync_file () file =
+    sync_file_or
+      ~portable:(Eio_fs_sync.Barrier.sync_file Eio_fs_sync.Barrier.portable)
+      file
+
+  let sync_dir () dir = sync_dir dir
+end
+
+let barrier =
+  let module B = Eio_fs_sync.Barrier.Make (Full_barrier) in
+  B.v ()
 
 let rec unwrapped_dir dir =
   match Eio_fs.Chaos.Private.base_dir dir with
   | Some base -> unwrapped_dir base
   | None -> dir
-
-let eio_unix_errors fn =
-  match fn () with
-  | value -> value
-  | exception Unix.Unix_error (code, operation, argument) ->
-      raise (Eio_unix.Err.v code operation argument)
 
 external rename_exclusive_at :
   Unix.file_descr -> string -> Unix.file_descr -> string -> unit
@@ -298,6 +326,20 @@ module At = struct
     }
 end
 
+(* Why a [with_parent] refused a path: it names nothing beneath its
+   directory, or a parent on the way is not a directory it may descend. *)
+type Eio.Exn.Backend.t += Unsafe_parent of string
+
+let () =
+  Eio.Exn.Backend.register_pp (fun f -> function
+    | Unsafe_parent reason ->
+        Fmt.string f reason;
+        true
+    | _ -> false)
+
+let unsafe_parent reason =
+  raise (Eio.Fs.err (Eio.Fs.Permission_denied (Unsafe_parent reason)))
+
 module Link = struct
   type t = { parent : Eio_unix.Fd.t; name : string; path : string }
   type publication = Created | Present
@@ -322,56 +364,53 @@ module Link = struct
     Eio_unix.Fd.use_exn "Eio_fs_unix.Link" dir @@ fun dir ->
     Eio_unix.run_in_systhread ~label:"eio-fs-link" (fun () -> fn dir)
 
-  let with_parent ?mkdir ~root ~path fn =
-    let original = Eio_fs.Path.name Eio.Path.(root / path) in
-    match components path with
-    | Error reason -> err_refused original reason
-    | Ok components -> (
-        Eio.Switch.run @@ fun sw ->
-        let open_parent () =
-          let directory = Eio.Path.open_dir ~sw root in
-          let file = Eio.Path.open_in ~sw directory in
-          let descriptor =
-            match Eio_unix.Resource.fd_opt file with
-            | Some fd -> fd
-            | None ->
-                invalid_arg
-                  "Eio_fs_unix.Link.with_parent: native directory required"
-          in
-          let rec descend fd = function
-            | [] -> assert false
-            | [ name ] -> { parent = fd; name; path = original }
-            | name :: rest ->
-                let open_component () =
-                  at fd (fun dir -> At.open_dir dir name)
-                in
-                let next =
-                  match open_component () with
-                  | opened -> opened
-                  | exception Unix.Unix_error (Unix.ENOENT, _, _) -> (
-                      match mkdir with
-                      | None ->
-                          raise (Unix.Unix_error (Unix.ENOENT, "openat", name))
-                      | Some mode ->
-                          (try at fd (fun dir -> At.mkdir dir name mode)
-                           with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
-                          open_component ())
-                in
-                descend (Eio_unix.Fd.of_unix ~sw ~close_unix:true next) rest
-          in
-          descend descriptor components
+  (* A missing parent is made as [create] says, and one another caller made
+     meanwhile is opened all the same. *)
+  let rec open_parent ~create fd name =
+    match at fd (fun dir -> At.open_dir dir name) with
+    | opened -> opened
+    | exception (Unix.Unix_error (Unix.ENOENT, _, _) as e) -> (
+        match create with
+        | `Never -> raise e
+        | `If_missing perm ->
+            (try at fd (fun dir -> At.mkdir dir name perm)
+             with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+            open_parent ~create:`Never fd name)
+
+  let with_parent ?(create = `Never) (input : _ Eio.Path.t) fn =
+    let dir, path = (input :> Eio.Fs.dir_ty Eio.Path.t) in
+    let original = Eio_fs.Path.name input in
+    let components =
+      match components path with
+      | Ok components -> components
+      | Error reason ->
+          Fmt.kstr unsafe_parent "%s: %s; name a path beneath the directory"
+            original reason
+    in
+    Eio.Switch.run @@ fun sw ->
+    let rec descend fd = function
+      | [] -> assert false
+      | [ name ] -> { parent = fd; name; path = original }
+      | name :: rest ->
+          let next = open_parent ~create fd name in
+          descend (Eio_unix.Fd.of_unix ~sw ~close_unix:true next) rest
+    in
+    let parent =
+      try
+        let directory = Eio.Path.open_dir ~sw (dir, ".") in
+        let descriptor =
+          match Eio_unix.Resource.fd_opt (Eio.Path.open_in ~sw directory) with
+          | Some fd -> fd
+          | None ->
+              invalid_arg
+                "Eio_fs_unix.Link.with_parent: native directory required"
         in
-        let opened =
-          match open_parent () with
-          | handle -> Ok handle
-          | exception Unix.Unix_error (code, operation, argument) ->
-              err_refused original
-                (Fmt.str "%s %s: %s" operation argument
-                   (Unix.error_message code))
-          | exception (Eio.Io _ as ex) ->
-              err_refused original (Printexc.to_string ex)
-        in
-        match opened with Error _ as error -> error | Ok handle -> fn handle)
+        eio_unix_errors (fun () -> descend descriptor components)
+      with Eio.Io _ as ex ->
+        let bt = Printexc.get_raw_backtrace () in
+        Eio.Exn.reraise_with_context ex bt "opening the parents of %s" original
+    in
+    fn parent
 
   let publish t ~target =
     let existing () =
@@ -408,7 +447,9 @@ module Link = struct
 
   (* The leaf is opened, weighed and read on system threads, one per call, so
      a cancel is seen between reads; it is closed before the result. *)
-  let read_regular ?(max_bytes = max_int) t =
+  let read_regular ~max_bytes t =
+    if max_bytes < 0 || max_bytes = max_int then
+      invalid_arg "Eio_fs_unix.Link.read_regular: invalid byte bound";
     let err_read fmt = Fmt.kstr (fun message -> Error message) fmt in
     let opened =
       match at t.parent (fun dir -> At.open_leaf dir t.name) with
@@ -428,17 +469,15 @@ module Link = struct
             try Unix.close fd with Unix.Unix_error _ -> ())
         @@ fun () ->
         let in_systhread fn =
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-link-read" fn
         in
         let stat = At.to_stat (in_systhread (fun () -> At.fstat fd)) in
         let size = Optint.Int63.to_int64 stat.size in
         if stat.kind <> `Regular_file then
           err_read "%s is not a regular file" t.path
-        else if
-          size < 0L
-          || size >= Int64.of_int max_int
-          || size > Int64.of_int max_bytes
-        then err_read "%s is too large to read" t.path
+        else if size < 0L || size > Int64.of_int max_bytes then
+          err_read "%s is too large to read" t.path
         else
           match
             Eio_fs.Nofollow.run ~max_bytes:(Int64.to_int size)
@@ -954,6 +993,7 @@ let block_patience ~sw = function
    back what was already taken. *)
 let let_go steps =
   Eio.Cancel.protect @@ fun () ->
+  eio_unix_errors @@ fun () ->
   let taken = !steps in
   steps := [];
   List.iter (fun give_back -> give_back ()) taken
@@ -1160,6 +1200,7 @@ let rec acquire ~sw ?lease
     (file, (Eio.File.stat file : Eio.File.Stat.t))
   in
   match
+    eio_unix_errors @@ fun () ->
     Eio.Switch.run @@ fun budget_sw ->
     let fibers, processes = block_patience ~sw:budget_sw block in
     let key, opened_first = key_of_name ~taken ~name path open_rendezvous in
@@ -1264,13 +1305,9 @@ module Held = struct
     match t.file with
     | None -> invalid_arg "Eio_fs_unix.Held.restate: the lock has been released"
     | Some file ->
-        take_back t file;
+        eio_unix_errors (fun () -> take_back t file);
         update_lock_contents file contents
 end
-
-let hold ~sw ?block ?create ?contents ?on_wait path =
-  let (_ : Held.t) = Held.take ~sw ?block ?create ?contents ?on_wait path in
-  ()
 
 (* The kernel is asked first: it names another process holding the record
    lock, and a fiber of this process waiting for that process holds the mutex
@@ -1376,7 +1413,8 @@ module Lease = struct
 
   let unlock t =
     Eio.Cancel.protect @@ fun () ->
-    Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native;
+    eio_unix_errors (fun () ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native);
     t.release_reader ()
 
   let release t = t.let_go ()
@@ -1468,9 +1506,6 @@ let enter_lock ?block ?create ?contents path f =
   | exception (Eio.Io _ as e) when not !began ->
       fail_unavailable "%s cannot be locked: %s" (lock_name path)
         (Printexc.to_string e)
-  | exception Unix.Unix_error (e, _, _) when not !began ->
-      fail_unavailable "%s cannot be locked: %s" (lock_name path)
-        (Unix.error_message e)
   | exception Invalid_argument m when not !began -> fail_unavailable "%s" m
 
 let lock_section ?block ?create ?contents path =
@@ -1491,6 +1526,7 @@ let names_of_list s =
 
 let xattrs path =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-xattrs" @@ fun () ->
   names_of_list (llistxattr native)
   |> List.sort String.compare
@@ -1498,6 +1534,7 @@ let xattrs path =
 
 let set_xattr path name v =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-set-xattr" @@ fun () ->
   lsetxattr native name v
 
@@ -1659,20 +1696,9 @@ module Batch = struct
     | exception Unix.Unix_error (code, call, arg) ->
         Error (`Unix (code, call, arg))
 
-  type Eio.Exn.Backend.t += Unsafe_parent of string
-
-  let () =
-    Eio.Exn.Backend.register_pp (fun f -> function
-      | Unsafe_parent reason ->
-          Fmt.string f reason;
-          true
-      | _ -> false)
-
   let with_parent (input : _ Eio.Path.t) fn =
     let root, path = (input :> Eio.Fs.dir_ty Eio.Path.t) in
-    let denied reason =
-      raise (Eio.Fs.err (Eio.Fs.Permission_denied (Unsafe_parent reason)))
-    in
+    let denied reason = unsafe_parent reason in
     let parents, leaf =
       match split path with
       | parts -> parts

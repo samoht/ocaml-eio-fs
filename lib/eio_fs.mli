@@ -20,7 +20,7 @@ module Nofollow : sig
 
   val read_file :
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
+    validate:(Eio.File.Stat.t -> (unit, string) result) ->
     _ Eio.Path.t ->
     (Cstruct.t, error) result
   (** [read_file ~max_bytes ~validate path] opens [path] as
@@ -44,7 +44,7 @@ module Nofollow : sig
 
   val run :
     max_bytes:int ->
-    validate:(Eio.File.Stat.t -> (unit, string) Result.t) ->
+    validate:(Eio.File.Stat.t -> (unit, string) result) ->
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
     (Cstruct.t, error) result
@@ -114,10 +114,21 @@ module Path : sig
   (** [pp_tree ~depth] formats a path and what is under it [depth] levels deep,
       as tree(1) lists it: each entry by its last component, a symbolic link as
       [name -> target], not followed. [depth = 1] is the path alone, and
-      [depth <= 0] prints nothing. *)
+      [depth <= 0] prints nothing. A missing path prints nothing, and an entry
+      that is neither a regular file, a directory nor a symbolic link (a FIFO, a
+      socket, a device) is left out with what is under it.
+
+      @raise Eio.Io
+        if a directory cannot be listed or a link read; what was formatted
+        before stays formatted. *)
 end
 
-(** An in-memory filesystem for {!Eio}. *)
+(** An in-memory filesystem for {!Eio}.
+
+    An entry's stat carries its kind, mode, size and inode, and the owner
+    {!Eio.Path.chown} gives it. It keeps no times, no block count and no link
+    count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
+    {!Path.usage} counts no allocated bytes, and [nlink] is [0]. *)
 module Fs : sig
   val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
@@ -130,14 +141,18 @@ module Fs : sig
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [load ~filter path] is the root of a new in-memory filesystem holding a
       copy of the directory tree at [path], at the same path from its root:
-      [load (dir / "a/b")] holds [/a/b]. [filter] (defaults to [fun _ -> true])
-      is called on [path] and every path below it before it is copied: a path
-      for which it is [false] is not copied, nor anything under it. [path] can
-      be on any filesystem, an in-memory one included.
+      [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a symbolic
+      link; the entries below it are copied as they are, a link kept a link.
+      [filter] (defaults to [fun _ -> true]) is called on [path], then on every
+      path below it, before anything of it is copied: a path for which it is
+      [false] is not copied, nor anything under it, so a refused [path] is an
+      empty filesystem. [path] can be on any filesystem, an in-memory one
+      included.
 
       An entry that is neither a regular file, a directory nor a symbolic link
       is not copied; it is traced with [Eio.traceln].
 
+      @raise Invalid_argument if [path] is not a directory.
       @raise Eio.Io if [path] or an entry under it cannot be read. *)
 end
 
@@ -167,10 +182,11 @@ module Crunch : sig
       that is neither a regular file, a directory nor a symbolic link is not
       recorded; it is traced with [Eio.traceln].
 
-      @raise Invalid_argument if [dir] is not a directory. *)
+      @raise Invalid_argument if [dir] is not a directory.
+      @raise Eio.Io if [dir] or an entry under it cannot be read. *)
 
-  val find : t -> string -> string option
-  (** [find entries path] is [Some contents] for the first {!File} at [path] in
+  val find : string -> t -> string option
+  (** [find path entries] is [Some contents] for the first {!File} at [path] in
       [entries], and [None] if there is none. [path] is absolute within the
       image, as {!scan} records it, and compared as a string; a symbolic link is
       not followed. A program that embeds fixtures reads them with it and needs
@@ -208,7 +224,10 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 val run : ?cwd:string -> (stdenv -> 'a) -> 'a
 (** [run ~cwd fn] is [fn env], with [env] holding the root and the current
     directory of a new in-memory filesystem; the current directory is the
-    absolute path [cwd] (defaults to ["/"]).
+    absolute path [cwd] (defaults to ["/"]), made with its missing ancestors,
+    mode [0o755], before [fn] runs.
 
     {b Note.} This does not install an effect handler; wrap the call in
-    something like [Eio_mock.Backend.run]. *)
+    something like [Eio_mock.Backend.run].
+
+    @raise Invalid_argument if [cwd] is not an absolute path. *)
