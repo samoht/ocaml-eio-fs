@@ -37,8 +37,9 @@ val statvfs : _ Eio.Path.t -> statvfs
     not through the directory it is under, so [..] and symbolic links can lead
     outside that directory.
 
-    @raise Unix.Unix_error as POSIX [statvfs].
-    @raise Eio.Io with {!Eio.Fs.Not_native} if [path] has no native name.
+    @raise Eio.Io
+      as POSIX [statvfs] fails, and with {!Eio.Fs.Not_native} if [path] has no
+      native name.
     @raise Invalid_argument if [path]'s native name holds a NUL byte. *)
 
 (** {2 Copy-on-write clones} *)
@@ -57,9 +58,11 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
     {!val-statvfs}, [src] and [dst] are reached by their native names and can
     lead outside their directories.
 
-    @raise Unix.Unix_error
-      as [clonefile]: [dst] exists, [src] does not, permission is denied.
-    @raise Eio.Io with {!Eio.Fs.Not_native} if a path has no native name.
+    @raise Eio.Io
+      as [clonefile] fails: with {!Eio.Fs.Already_exists} if [dst] exists,
+      {!Eio.Fs.Not_found} if [src] does not, {!Eio.Fs.Permission_denied} if
+      permission is denied, and {!Eio.Fs.Not_native} if a path has no native
+      name.
     @raise Invalid_argument if a native name holds a NUL byte. *)
 
 (** {2 Removable trees} *)
@@ -144,9 +147,8 @@ val sync_dir : _ Eio.Path.t -> unit
     {!Eio_fs_sync.sync_dir}, and raises as it does.
 
     @raise Eio.Io
-      if [dir] cannot be opened for its barrier, or as a registered barrier
-      raises.
-    @raise Unix.Unix_error as [fsync]. *)
+      if [dir] cannot be opened for its barrier, as [fsync] fails, or as a
+      registered barrier raises. *)
 
 val sync_file : _ Eio.File.rw -> unit
 (** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
@@ -157,7 +159,7 @@ val sync_file : _ Eio.File.rw -> unit
     fiber's thread. A file with neither takes {!Eio_fs_sync.sync_file}, and
     raises as it does.
 
-    @raise Unix.Unix_error as [fsync]. *)
+    @raise Eio.Io as [fsync] fails, or as a registered barrier raises. *)
 
 val import_file :
   sw:Eio.Switch.t ->
@@ -295,10 +297,10 @@ val with_lock :
     @raise Eio.Io
       with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
       is not the lock's own regular file.
+    @raise Eio.Io as [lockf] or [flock] fails otherwise.
     @raise Invalid_argument
       if the opened rendezvous carries no Unix descriptor and its backend is not
-      {!Eio_fs_sync.Process_local}.
-    @raise Unix.Unix_error as [lockf]. *)
+      {!Eio_fs_sync.Process_local}. *)
 
 val hold :
   sw:Eio.Switch.t ->
@@ -485,8 +487,9 @@ module Lease : sig
       @raise Eio.Io
         with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when the
         path is not its own regular file.
+      @raise Eio.Io as [flock] fails otherwise.
       @raise Invalid_argument when the filesystem provides no Unix descriptor.
-      @raise Unix.Unix_error as [flock]. *)
+  *)
 
   val with_shared :
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
@@ -539,10 +542,10 @@ val xattrs : _ Eio.Path.t -> (string * string) list
     A value is the attribute's bytes, NUL bytes included. As for {!val-statvfs},
     [path] is reached by its native name and can lead outside its directory.
 
-    @raise Unix.Unix_error
-      as the platform call: [ENOTSUP] where the filesystem keeps none, [ENOSYS]
-      on a platform with neither family.
-    @raise Eio.Io with {!Eio.Fs.Not_native} if [path] has no native name.
+    @raise Eio.Io
+      as the platform call fails ([ENOTSUP] where the filesystem keeps none,
+      [ENOSYS] on a platform with neither family), and with {!Eio.Fs.Not_native}
+      if [path] has no native name.
     @raise Invalid_argument if [path]'s native name holds a NUL byte. *)
 
 val set_xattr : _ Eio.Path.t -> string -> string -> unit
@@ -550,11 +553,12 @@ val set_xattr : _ Eio.Path.t -> string -> string -> unit
     [value], creating it or replacing it. As for {!val-statvfs}, [path] is
     reached by its native name and can lead outside its directory.
 
-    @raise Unix.Unix_error
-      as the platform call: [ENOTSUP] where the filesystem keeps none, [EPERM]
-      for a namespace the process may not write ([security.*] and [trusted.*]
-      without privilege on Linux), [ENOSYS] on a platform with neither family.
-    @raise Eio.Io with {!Eio.Fs.Not_native} if [path] has no native name.
+    @raise Eio.Io
+      as the platform call fails ([ENOTSUP] where the filesystem keeps none,
+      [EPERM] for a namespace the process may not write, [security.*] and
+      [trusted.*] without privilege on Linux, [ENOSYS] on a platform with
+      neither family), and with {!Eio.Fs.Not_native} if [path] has no native
+      name.
     @raise Invalid_argument if [path]'s native name or [name] holds a NUL byte.
 *)
 
@@ -617,7 +621,7 @@ module Link : sig
       are: a regular file linked beneath the parent from outside the root is
       read. Only a process that can write both directories makes such a link.
 
-      @raise Unix.Unix_error if the opened entry cannot be stated or read. *)
+      @raise Eio.Io if the opened entry cannot be stated or read. *)
 end
 
 (** Confined directory operations, many to one system-thread hop.

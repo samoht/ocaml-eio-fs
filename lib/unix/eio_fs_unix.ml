@@ -1,5 +1,13 @@
 external is_darwin : unit -> bool = "caml_eio_fs_is_darwin"
 
+(* A call that takes an [Eio.Path.t] or an [Eio.File.t] reports its failure as
+   Eio's own backends do: the [Unix.Unix_error] beneath becomes [Eio.Io]. *)
+let eio_unix_errors fn =
+  match fn () with
+  | value -> value
+  | exception Unix.Unix_error (code, operation, argument) ->
+      raise (Eio_unix.Err.v code operation argument)
+
 type flock_mode = Exclusive | Shared
 
 external flock_native : Unix.file_descr -> flock_mode -> bool -> unit
@@ -82,6 +90,7 @@ external statvfs_native : string -> statvfs = "caml_eio_fs_statvfs"
 
 let statvfs path =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-statvfs" @@ fun () ->
   statvfs_native native
 
@@ -89,6 +98,7 @@ external clone_tree_native : string -> string -> bool = "caml_eio_fs_clone_tree"
 
 let clone_tree src dst =
   let src = Eio.Path.native_exn src and dst = Eio.Path.native_exn dst in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-clone-tree" @@ fun () ->
   clone_tree_native src dst
 
@@ -147,6 +157,7 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
       | None -> Eio_fs_sync.sync_dir p
       | Some fd ->
           Eio_unix.Fd.use_exn "eio-fs-sync-dir" fd @@ fun fd ->
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-dir" @@ fun () ->
           full_fsync fd)
 
@@ -162,6 +173,7 @@ let sync_file file =
       | None -> Eio_fs_sync.sync_file file
       | Some fd ->
           Eio_unix.Fd.use_exn "eio-fs-sync-file" fd @@ fun fd ->
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-sync-file" @@ fun () ->
           full_fsync fd)
 
@@ -169,12 +181,6 @@ let rec unwrapped_dir dir =
   match Eio_fs.Chaos.Private.base_dir dir with
   | Some base -> unwrapped_dir base
   | None -> dir
-
-let eio_unix_errors fn =
-  match fn () with
-  | value -> value
-  | exception Unix.Unix_error (code, operation, argument) ->
-      raise (Eio_unix.Err.v code operation argument)
 
 external rename_exclusive_at :
   Unix.file_descr -> string -> Unix.file_descr -> string -> unit
@@ -429,6 +435,7 @@ module Link = struct
             try Unix.close fd with Unix.Unix_error _ -> ())
         @@ fun () ->
         let in_systhread fn =
+          eio_unix_errors @@ fun () ->
           Eio_unix.run_in_systhread ~label:"eio-fs-link-read" fn
         in
         let stat = At.to_stat (in_systhread (fun () -> At.fstat fd)) in
@@ -955,6 +962,7 @@ let block_patience ~sw = function
    back what was already taken. *)
 let let_go steps =
   Eio.Cancel.protect @@ fun () ->
+  eio_unix_errors @@ fun () ->
   let taken = !steps in
   steps := [];
   List.iter (fun give_back -> give_back ()) taken
@@ -1161,6 +1169,7 @@ let rec acquire ~sw ?lease
     (file, (Eio.File.stat file : Eio.File.Stat.t))
   in
   match
+    eio_unix_errors @@ fun () ->
     Eio.Switch.run @@ fun budget_sw ->
     let fibers, processes = block_patience ~sw:budget_sw block in
     let key, opened_first = key_of_name ~taken ~name path open_rendezvous in
@@ -1265,7 +1274,7 @@ module Held = struct
     match t.file with
     | None -> invalid_arg "Eio_fs_unix.Held.restate: the lock has been released"
     | Some file ->
-        take_back t file;
+        eio_unix_errors (fun () -> take_back t file);
         update_lock_contents file contents
 end
 
@@ -1377,7 +1386,8 @@ module Lease = struct
 
   let unlock t =
     Eio.Cancel.protect @@ fun () ->
-    Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native;
+    eio_unix_errors (fun () ->
+        Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.unlock" t.fd flock_unlock_native);
     t.release_reader ()
 
   let release t = t.let_go ()
@@ -1469,9 +1479,6 @@ let enter_lock ?block ?create ?contents path f =
   | exception (Eio.Io _ as e) when not !began ->
       fail_unavailable "%s cannot be locked: %s" (lock_name path)
         (Printexc.to_string e)
-  | exception Unix.Unix_error (e, _, _) when not !began ->
-      fail_unavailable "%s cannot be locked: %s" (lock_name path)
-        (Unix.error_message e)
   | exception Invalid_argument m when not !began -> fail_unavailable "%s" m
 
 let lock_section ?block ?create ?contents path =
@@ -1492,6 +1499,7 @@ let names_of_list s =
 
 let xattrs path =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-xattrs" @@ fun () ->
   names_of_list (llistxattr native)
   |> List.sort String.compare
@@ -1499,6 +1507,7 @@ let xattrs path =
 
 let set_xattr path name v =
   let native = Eio.Path.native_exn path in
+  eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-set-xattr" @@ fun () ->
   lsetxattr native name v
 

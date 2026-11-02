@@ -418,7 +418,7 @@ let test_clone_tree () =
         "a destination that exists" true
         (match Eio_fs_unix.clone_tree src dst with
         | _ -> false
-        | exception Unix.Unix_error (Unix.EEXIST, _, _) -> true)
+        | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) -> true)
 
 let test_statvfs_reports_raw_block_capacity () =
   with_real_dir @@ fun dir ->
@@ -2821,7 +2821,10 @@ let user_value = "v\000alue"
 
 let supported f =
   try f ()
-  with Unix.Unix_error ((Unix.EOPNOTSUPP | Unix.ENOSYS), _, _) ->
+  with
+  | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.EOPNOTSUPP, _, _)), _)
+  | Eio.Io (Eio.Exn.Not_available _, _)
+  ->
     Alcotest.skip ()
 
 let test_xattr_round_trip () =
