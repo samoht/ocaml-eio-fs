@@ -442,9 +442,27 @@ let test_rename_moves_parent_link () =
     "reached from the new parent" "x"
     (Eio.Path.load (env#cwd / "m/f"))
 
+(* unlink(2) of a missing name is ENOENT, and of a directory EISDIR on Linux
+   (EPERM on macOS): the directory stays. A symbolic link to a directory on
+   the way is followed, as for any parent. *)
+let test_unlink () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "d/f") "f";
+  Eio.Path.symlink ~link_to:"d" (fs / "ld");
+  expect_io_error "not found" (fun () -> Eio.Path.unlink (fs / "missing"));
+  expect_eio_io "unlinking a directory" (fun () -> Eio.Path.unlink (fs / "d"));
+  Alcotest.(check bool)
+    "the directory stays" true
+    (Eio.Path.kind ~follow:false (fs / "d") = `Directory);
+  Eio.Path.unlink (fs / "ld/f");
+  Alcotest.(check (list string)) "through a linked parent" [] (names (fs / "d"))
+
 let suite =
   ( "low_level",
     [
+      Alcotest.test_case "unlink" `Quick test_unlink;
       Alcotest.test_case "rename refusals" `Quick test_rename_refusals;
       Alcotest.test_case "rename moves the parent link" `Quick
         test_rename_moves_parent_link;
