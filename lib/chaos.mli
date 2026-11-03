@@ -47,7 +47,8 @@ module Fault : sig
         (** Deliver at most [max 1 n] bytes of the requested read, forcing the
             caller to loop. A read of an empty buffer is left whole. *)
     | Read_error of code
-        (** Deliver nothing and raise [code], on a read or a directory read. *)
+        (** Deliver nothing and raise {!type-code}, on a read or a directory
+            read. *)
     | Short_write of int
         (** Accept at most [max 1 n] bytes of the offered write, forcing the
             caller to loop. *)
@@ -55,10 +56,11 @@ module Fault : sig
         (** Commit the first [n] bytes of the write (none if [n <= 0], all of
             them if [n] exceeds its length) to the base, then raise [`Enospc]:
             bytes reach the store but the operation reports failure. *)
-    | Write_error of code  (** Commit nothing and raise [code]. *)
-    | Sync_error of code  (** Fail a sync with [code]. *)
-    | Open_error of code  (** Fail an open or a directory open with [code]. *)
-    | Stat_error of code  (** Fail a stat with [code]. *)
+    | Write_error of code  (** Commit nothing and raise {!type-code}. *)
+    | Sync_error of code  (** Fail a sync with {!type-code}. *)
+    | Open_error of code
+        (** Fail an open or a directory open with {!type-code}. *)
+    | Stat_error of code  (** Fail a stat with {!type-code}. *)
     | Swap_symlink of string
         (** Perform an open or a stat, then replace its path with a symbolic
             link to the given target: the check-to-use window a TOCTOU exploits.
@@ -344,5 +346,5 @@ end
    not reach by running an operation through a wrapper. *)
 module Private : sig
   val next : Schedule.t -> Op.t -> Fault.t option
-  (* [next t op] advances [t] by one operation and is the fault to inject. *)
+  (** [next t op] advances [t] by one operation and is the fault to inject. *)
 end

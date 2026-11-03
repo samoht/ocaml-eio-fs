@@ -762,6 +762,6 @@ end
 (* For this package's tests only. *)
 module Private : sig
   val batch_hops : unit -> int
-  (* [batch_hops ()] is how many system-thread hops {!Batch} has made since
-     the program started. *)
+  (** [batch_hops ()] is how many system-thread hops {!Batch} has made since the
+      program started. *)
 end
