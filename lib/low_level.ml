@@ -493,7 +493,7 @@ let is_dot name = String.equal name "." || String.equal name ".."
 (* Create the entry [path] with [add parent name] unless its name is taken,
    by a dangling symbolic link included: EEXIST, as mkdir(2) and symlink(2)
    answer. *)
-let create_entry dir_fd path add =
+let new_entry dir_fd path add =
   let w, name, _ = Filesystem.locate_from dir_fd path in
   match Filesystem.child w name with
   | Some _ -> Error.already_exists path
@@ -630,7 +630,7 @@ let mkdirat dir_fd ~perm path =
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
-  create_entry dir_fd path mkdir
+  new_entry dir_fd path mkdir
 
 let embed dir_fd ~perm path ~contents =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -647,7 +647,7 @@ let embed dir_fd ~perm path ~contents =
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
     r := Dir { d with entries = (stat.ino, name) :: d.entries }
   in
-  create_entry dir_fd path add
+  new_entry dir_fd path add
 
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -661,7 +661,7 @@ let symlinkat ~link_to dir_fd path =
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
-  create_entry dir_fd path symlink
+  new_entry dir_fd path symlink
 
 let read_link dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
