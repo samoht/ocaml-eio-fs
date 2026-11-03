@@ -106,7 +106,7 @@ let with_entry ~label (path : _ Eio.Path.t) fn =
   let opened = Eio.Path.open_dir ~sw dir in
   match Eio_unix.Resource.fd_opt (Eio.Path.open_in ~sw opened) with
   | None ->
-      raise (Eio.Fs.err (Eio.Fs.Not_native (Fmt.str "%a" Eio.Path.pp path)))
+      raise (Eio.Fs.err (Eio.Fs.Not_native (Fmt.to_to_string Eio.Path.pp path)))
   | Some fd -> Eio_unix.Fd.use_exn label fd @@ fun fd -> fn fd name
 
 external statvfs_at : Unix.file_descr -> string -> statvfs
