@@ -105,6 +105,9 @@ jobs:
 
   # merlint is not on opam yet and its dependencies come from a private
   # overlay, so this job reports without blocking until merlint is released.
+  # The overlay's packages build against its own hermetic and eio-fs, not the
+  # ones pinned here, so merlint gets a switch of its own and reads the .cmt
+  # files built in this one.
   merlint:
     name: Lint (merlint)
     runs-on: ubuntu-latest
@@ -117,8 +120,12 @@ jobs:
         with:
           ocaml-compiler: '5.4'
 
-      - run: opam repo add samoht https://tangled.org/gazagnaire.org/opam-overlay.git
       - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-test
-      - run: opam install merlint
-      - run: opam exec -- merlint --build
+      - run: opam exec -- dune build @check
+      - run: >-
+          opam switch create merlint --no-switch
+          "ocaml-base-compiler.$(opam exec -- ocamlc -version)"
+          --repos samoht=git+https://tangled.org/gazagnaire.org/opam-overlay.git,default
+      - run: opam install --switch merlint merlint
+      - run: opam exec -- "$(opam var --switch merlint bin)/merlint"
