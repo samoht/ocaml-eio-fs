@@ -64,7 +64,7 @@ let test_short_read_empty () =
     Eio.Path.with_open_in (dir / "f") @@ fun file ->
     match Eio.Flow.single_read file Cstruct.empty with
     | n -> Fmt.str "%d" n
-    | exception ex -> Printexc.to_string ex
+    | exception ((End_of_file | Eio.Io _) as ex) -> Printexc.to_string ex
   in
   let expected = answer raw in
   Alcotest.(check string) "as the base answers" expected (answer chaos);
@@ -1893,7 +1893,9 @@ let test_crash_after_write_trigger () =
    binding at a time from what the wrapper hands back and asks the rest for
    what the dropped one answered. *)
 
-(* [r] with its [k]th binding dropped, for each [k]. *)
+(* [r] with its [k]th binding dropped, for each [k]. An operation the stripped
+   handler refuses raises [Eio.Io], the fault the schedule injects, or
+   [Failure], what Eio raises for an operation its handler lacks. *)
 let each_without (Eio.Resource.T (v, ops)) fn =
   let bindings = Eio.Resource.bindings ops in
   List.iteri
@@ -1916,12 +1918,12 @@ let test_wrapped_dir_hides_its_base () =
       | data ->
           Alcotest.failf "without binding %d, a read past the schedule: %S" k
             data
-      | exception _ -> ());
+      | exception (Eio.Io _ | Failure _) -> ());
       match
         Eio.Path.save ~create:(`Or_truncate 0o644) ((stripped, path) / "f") "x"
       with
       | () -> Alcotest.failf "without binding %d, a write past the schedule" k
-      | exception _ -> ());
+      | exception (Eio.Io _ | Failure _) -> ());
   Alcotest.(check string)
     "the base is untouched" "base"
     (Eio.Path.load (raw / "f"))
@@ -1934,7 +1936,7 @@ let test_wrapped_file_hides_its_base () =
       let stripped = (stripped :> Eio.File.rw_ty Eio.Resource.t) in
       match Eio.Flow.copy_string "x" stripped with
       | () -> Alcotest.failf "without binding %d, a write past the schedule" k
-      | exception _ -> ());
+      | exception (Eio.Io _ | Failure _) -> ());
   Alcotest.(check string)
     "the base is untouched" "base"
     (Eio.Path.load (raw / "f"))
@@ -1958,7 +1960,7 @@ let test_crash_file_hides_its_base () =
       | () ->
           if journalled () = before then
             Alcotest.failf "without binding %d, a write the journal missed" k
-      | exception _ -> ())
+      | exception (Eio.Io _ | Failure _) -> ())
 
 (* A rename from a directory of the base backend into a Chaos directory
    lands in the tree both share, as a rename between two directories of one
