@@ -225,10 +225,7 @@ let bounded_sink ~max_bytes sink =
    is created exclusively and retried. So the salt takes its entropy from the
    system, which the prelude refuses because it makes results unrepeatable;
    here it decides a name and nothing else. *)
-let tmp_salt =
-  Unsafe.Random.State.bits
-    (Unsafe.Random.State.make_self_init ())
-
+let tmp_salt = Unsafe.Random.State.bits (Unsafe.Random.State.make_self_init ())
 let tmp_sequence = Atomic.make 0
 
 let fresh_name stem =
