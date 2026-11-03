@@ -387,67 +387,99 @@ let add_file fs (m : Model.t) path content =
   Model.new_file m path;
   Model.write m path content
 
+(* The names a tape step creates or moves to. *)
+let names = [| "a"; "b"; "c"; "d" |]
+
+let join parent name =
+  if String.equal parent "" then name else parent ^ "/" ^ name
+
+(* The live paths whose shape satisfies [pred], in key order. *)
+let keys (m : Model.t) pred =
+  Model.SM.fold
+    (fun k v acc -> if pred k v then k :: acc else acc)
+    m.Model.live []
+  |> List.rev
+
+(* The live directories, the root [""] first. *)
+let dirs m = "" :: keys m (fun _ v -> v = Model.Dir)
+
+let files m =
+  keys m (fun _ v -> match v with Model.File _ -> true | _ -> false)
+
+(* The live entries an unlink removes: files and symbolic links. *)
+let entries m =
+  keys m (fun _ v ->
+      match v with Model.File _ | Model.Link _ -> true | _ -> false)
+
+let pick lst k =
+  match lst with [] -> None | _ -> Some (List.nth lst (k mod List.length lst))
+
+(* A path not yet live: a name picked by [nk] in a directory picked by [pk]. *)
+let fresh_path (m : Model.t) pk nk =
+  Option.bind (pick (dirs m) pk) @@ fun parent ->
+  let path = join parent names.(nk mod 4) in
+  if Model.SM.mem path m.Model.live then None else Some path
+
+(* Rewrite the file [path] whole with unsynced [content]. *)
+let rewrite fs m path content =
+  Eio.Path.save ~create:(`Or_truncate 0o644) (fs / path) content;
+  Model.write m path content
+
+(* Append [more] to the file [path], unsynced: the write lands at the end. *)
+let append fs m path more =
+  Eio.Path.with_open_out ~append:true ~create:`Never (fs / path) (fun file ->
+      ignore (Eio.File.seek file (i63 0) `Set : Optint.Int63.t);
+      Eio.Flow.copy_string more file);
+  Model.write m path (Model.contents m path ^ more)
+
+(* Seek into the file [path] at an offset picked by [k] and write [data] there,
+   unsynced. *)
+let write_at fs m path k data =
+  let old = Model.contents m path in
+  let at = k mod (String.length old + 1) in
+  Eio.Path.with_open_out ~create:`Never (fs / path) (fun file ->
+      ignore (Eio.File.seek file (i63 at) `Set : Optint.Int63.t);
+      Eio.Flow.copy_string data file);
+  let tail_at = at + String.length data in
+  let tail =
+    if tail_at >= String.length old then ""
+    else String.sub old tail_at (String.length old - tail_at)
+  in
+  Model.write m path (String.sub old 0 at ^ data ^ tail)
+
 (* One tape step: four bytes pick an operation and its arguments. Picks that
    do not apply to the current tree (unlink with nothing to unlink, mkdir over
    an existing name) are skipped, so every tape is valid. Candidate lists come
    from the model's sorted map, so the same tape always drives the same
    operations. *)
 let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
-  let module SM = Model.SM in
-  let names = [| "a"; "b"; "c"; "d" |] in
-  let join parent name = if parent = "" then name else parent ^ "/" ^ name in
-  let keys pred =
-    SM.fold (fun k v acc -> if pred k v then k :: acc else acc) m.Model.live []
-    |> List.rev
-  in
-  let dirs () = "" :: keys (fun _ v -> v = Model.Dir) in
-  let files () =
-    keys (fun _ v -> match v with Model.File _ -> true | _ -> false)
-  in
-  let entries () =
-    keys (fun _ v ->
-        match v with Model.File _ | Model.Link _ -> true | _ -> false)
-  in
-  let pick lst k =
-    match lst with
-    | [] -> None
-    | _ -> Some (List.nth lst (k mod List.length lst))
-  in
-  let fresh_path pk nk =
-    Option.bind (pick (dirs ()) pk) @@ fun parent ->
-    let path = join parent names.(nk mod 4) in
-    if SM.mem path m.Model.live then None else Some path
-  in
   match b0 mod 12 with
   | 0 -> (
       (* create a file with unsynced content *)
-      match fresh_path b1 b2 with
+      match fresh_path m b1 b2 with
       | None -> ()
       | Some path -> add_file fs m path (Fmt.str "c%d" b3))
   | 1 -> (
       (* rewrite an existing file, unsynced *)
-      match pick (files ()) b1 with
+      match pick (files m) b1 with
       | None -> ()
-      | Some path ->
-          let content = Fmt.str "w%d" b2 in
-          Eio.Path.save ~create:(`Or_truncate 0o644) (fs / path) content;
-          Model.write m path content)
+      | Some path -> rewrite fs m path (Fmt.str "w%d" b2))
   | 2 -> (
       (* sync a file: its data becomes durable and the journal commits *)
-      match pick (files ()) b1 with
+      match pick (files m) b1 with
       | None -> ()
       | Some path ->
           Eio.Path.with_open_out ~create:`Never (fs / path) (fun file ->
               Eio.File.sync file);
           Model.sync m path)
   | 3 -> (
-      match pick (entries ()) b1 with
+      match pick (entries m) b1 with
       | None -> ()
       | Some path ->
           Eio.Path.unlink (fs / path);
           Model.unlink m path)
   | 4 -> (
-      match fresh_path b1 b2 with
+      match fresh_path m b1 b2 with
       | None -> ()
       | Some path ->
           Eio.Path.mkdir ~perm:0o755 (fs / path);
@@ -455,9 +487,9 @@ let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
   | 5 -> (
       (* remove an empty directory *)
       let empty_dirs =
-        keys (fun k v ->
+        keys m (fun k v ->
             v = Model.Dir
-            && not (SM.exists (fun q _ -> Model.under k q) m.Model.live))
+            && not (Model.SM.exists (fun q _ -> Model.under k q) m.Model.live))
       in
       match pick empty_dirs b1 with
       | None -> ()
@@ -465,7 +497,7 @@ let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
           Eio.Path.rmdir (fs / path);
           Model.rmdir m path)
   | 6 -> (
-      match fresh_path b1 b2 with
+      match fresh_path m b1 b2 with
       | None -> ()
       | Some path ->
           let target = names.(b3 mod 4) in
@@ -474,11 +506,11 @@ let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
   | 7 -> (
       (* rename an entry; a file or symlink may clobber a file or symlink,
          a directory only lands on a fresh name *)
-      let sources = keys (fun _ _ -> true) in
+      let sources = keys m (fun _ _ -> true) in
       match pick sources b1 with
       | None -> ()
       | Some src -> (
-          match pick (dirs ()) b2 with
+          match pick (dirs m) b2 with
           | None -> ()
           | Some parent ->
               let dst = join parent names.(b3 mod 4) in
@@ -487,42 +519,24 @@ let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
                 Model.rename m ~src ~dst
               end))
   | 9 -> (
-      (* append to a file, unsynced: the write lands at the end *)
-      match pick (files ()) b1 with
+      (* append to a file, unsynced *)
+      match pick (files m) b1 with
       | None -> ()
-      | Some path ->
-          let more = Fmt.str "a%d" b2 in
-          Eio.Path.with_open_out ~append:true ~create:`Never (fs / path)
-            (fun file ->
-              ignore (Eio.File.seek file (i63 0) `Set : Optint.Int63.t);
-              Eio.Flow.copy_string more file);
-          Model.write m path (Model.contents m path ^ more))
+      | Some path -> append fs m path (Fmt.str "a%d" b2))
   | 10 -> (
       (* seek into a file and write there, unsynced *)
-      match pick (files ()) b1 with
+      match pick (files m) b1 with
       | None -> ()
-      | Some path ->
-          let old = Model.contents m path in
-          let at = b2 mod (String.length old + 1) in
-          let data = Fmt.str "s%d" b3 in
-          Eio.Path.with_open_out ~create:`Never (fs / path) (fun file ->
-              ignore (Eio.File.seek file (i63 at) `Set : Optint.Int63.t);
-              Eio.Flow.copy_string data file);
-          let tail_at = at + String.length data in
-          let tail =
-            if tail_at >= String.length old then ""
-            else String.sub old tail_at (String.length old - tail_at)
-          in
-          Model.write m path (String.sub old 0 at ^ data ^ tail))
+      | Some path -> write_at fs m path b2 (Fmt.str "s%d" b3))
   | 8 ->
       (* the barrier on every directory *)
       Crash.sync_metadata ctl;
       Model.commit m
   | _ -> (
       (* the barrier on one directory: its own entries only *)
-      match pick (dirs ()) b1 with
+      match pick (dirs m) b1 with
       | Some dir when dir_barriers ->
-          Eio_fs_sync.sync_dir (if dir = "" then fs else fs / dir);
+          Eio_fs_sync.sync_dir (if String.equal dir "" then fs else fs / dir);
           Model.commit_dir m dir
       | Some _ | None -> ())
 
