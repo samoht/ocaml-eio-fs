@@ -59,7 +59,7 @@ let cmd =
   Cmd.v info
     Term.(
       const (fun dir output ->
-          match run dir output with 0 -> () | n -> exit n)
+          match run dir output with 0 -> () | n -> Stdlib.exit n)
       $ dir $ output)
 
 let () = exit (Cmd.eval cmd)

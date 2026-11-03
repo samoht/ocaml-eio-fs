@@ -45,6 +45,6 @@
   (cmdliner (>= 1.1.0))
   eio_main
   (mdx :with-test)
-  (alcotest :with-test)
+  (alcotest (and :with-test (>= 1.7.0)))
   (alcobar :with-test)
   (mtime :with-test)))
