@@ -129,8 +129,10 @@ jobs:
         run: |
           echo "ocaml=$(opam exec -- ocamlc -version)" >> "$GITHUB_OUTPUT"
           echo "overlay=$(git ls-remote https://tangled.org/gazagnaire.org/opam-overlay.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      # Saved as soon as it is built: actions/cache would save it only when
+      # the job passes, so a run with findings would never fill it.
       - id: merlint-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/merlint
           key: merlint-${{ runner.os }}-${{ steps.merlint-key.outputs.ocaml }}-${{ steps.merlint-key.outputs.overlay }}
@@ -142,4 +144,9 @@ jobs:
           opam install --switch merlint merlint
           mkdir -p ~/merlint
           cp "$(opam var --switch merlint bin)/merlint" ~/merlint/
+      - if: steps.merlint-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/merlint
+          key: ${{ steps.merlint-cache.outputs.cache-primary-key }}
       - run: opam exec -- ~/merlint/merlint
