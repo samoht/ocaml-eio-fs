@@ -123,9 +123,23 @@ jobs:
       - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-test
       - run: opam exec -- dune build @check
-      - run: >-
-          opam switch create merlint --no-switch
-          "ocaml-base-compiler.$(opam exec -- ocamlc -version)"
-          --repos samoht=git+https://tangled.org/gazagnaire.org/opam-overlay.git,default
-      - run: opam install --switch merlint merlint
-      - run: opam exec -- "$(opam var --switch merlint bin)/merlint"
+      # The binary is cached by the overlay's commit and the compiler's
+      # version, which fixes the format of the .cmt files it reads.
+      - id: merlint-key
+        run: |
+          echo "ocaml=$(opam exec -- ocamlc -version)" >> "$GITHUB_OUTPUT"
+          echo "overlay=$(git ls-remote https://tangled.org/gazagnaire.org/opam-overlay.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+      - id: merlint-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/merlint
+          key: merlint-${{ runner.os }}-${{ steps.merlint-key.outputs.ocaml }}-${{ steps.merlint-key.outputs.overlay }}
+      - if: steps.merlint-cache.outputs.cache-hit != 'true'
+        run: |
+          opam switch create merlint --no-switch \
+            "ocaml-base-compiler.${{ steps.merlint-key.outputs.ocaml }}" \
+            --repos samoht=git+https://tangled.org/gazagnaire.org/opam-overlay.git,default
+          opam install --switch merlint merlint
+          mkdir -p ~/merlint
+          cp "$(opam var --switch merlint bin)/merlint" ~/merlint/
+      - run: opam exec -- ~/merlint/merlint
