@@ -724,6 +724,45 @@ let check_rename tree ~src ~new_parent ~dst new_path =
       Error.err ("rename: is a directory: " ^ new_path)
   | _ -> ()
 
+(* [entries] without the entry [name]. *)
+let without name entries =
+  List.filter (fun (_, n) -> not (String.equal n name)) entries
+
+(* A rename MOVES: the source loses [old_name] and the target gains [new_name]
+   pointing at [ino]. Same-parent edits go to one entries list, so the move is
+   atomic. *)
+let move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name new_path
+    =
+  if old_parent == new_parent then begin
+    let d = as_dir ~path:new_path !new_parent in
+    let entries =
+      (ino, new_name) :: without new_name (without old_name d.entries)
+    in
+    new_parent := Resource.Dir { d with entries }
+  end
+  else begin
+    let dst = as_dir ~path:new_path !new_parent in
+    let entries = (ino, new_name) :: without new_name dst.entries in
+    new_parent := Resource.Dir { dst with entries };
+    let src = as_dir ~path:old_path !old_parent in
+    old_parent :=
+      Resource.Dir { src with entries = without old_name src.entries }
+  end
+
+(* A directory's [..] names its new parent. *)
+let reparent res ~new_parent =
+  match !res with
+  | Resource.Dir d ->
+      let parent = (Resource.stat !new_parent).ino in
+      let entries =
+        List.map
+          (fun ((_, name) as e) ->
+            if String.equal name ".." then (parent, "..") else e)
+          d.entries
+      in
+      res := Resource.Dir { d with entries }
+  | File _ | Symlink _ -> ()
+
 let rename ?(replace = true) dir_fd old_path new_dir new_path =
   locked (Dir.fs dir_fd) @@ fun () ->
   (* rename(2) does not move an entry between two file systems: EXDEV, which
@@ -754,46 +793,16 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   match existing with
   (* Two names of one entry: rename(2) does nothing. *)
   | Some (dst_ino, _) when Inode.equal dst_ino ino -> ()
-  | _ -> (
+  | _ ->
       if (not replace) && Option.is_some existing then
         Error.already_exists new_path;
       let dst =
         Option.bind existing (fun (dst_ino, _) -> Entries.find_opt dst_ino tree)
       in
       check_rename tree ~src:old_res ~new_parent ~dst new_path;
-      let without name entries =
-        List.filter (fun (_, n) -> not (String.equal n name)) entries
-      in
-      (* A rename MOVES: the source loses [old_name] and the target gains
-         [new_name] pointing at [ino]. Same-parent edits go to one entries
-         list, so the move is atomic. *)
-      if old_parent == new_parent then begin
-        let d = as_dir ~path:new_path !new_parent in
-        let entries =
-          (ino, new_name) :: without new_name (without old_name d.entries)
-        in
-        new_parent := Resource.Dir { d with entries }
-      end
-      else begin
-        let dst = as_dir ~path:new_path !new_parent in
-        let entries = (ino, new_name) :: without new_name dst.entries in
-        new_parent := Resource.Dir { dst with entries };
-        let src = as_dir ~path:old_path !old_parent in
-        old_parent :=
-          Resource.Dir { src with entries = without old_name src.entries }
-      end;
-      (* A directory's [..] names its new parent. *)
-      match !old_res with
-      | Resource.Dir d ->
-          let parent = (Resource.stat !new_parent).ino in
-          let entries =
-            List.map
-              (fun ((_, name) as e) ->
-                if String.equal name ".." then (parent, "..") else e)
-              d.entries
-          in
-          old_res := Resource.Dir { d with entries }
-      | File _ | Symlink _ -> ())
+      move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
+        new_path;
+      reparent old_res ~new_parent
 
 let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 
