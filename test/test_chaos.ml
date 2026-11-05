@@ -407,6 +407,20 @@ let test_directory_short_read_inapplicable () =
     "directory read is not a byte read" []
     (directory_names false (chaos / "tree"))
 
+(* An operation longer than [2^30] bytes is split like any other. *)
+let test_seeded_short_read_long_op () =
+  let sched =
+    Schedule.seeded ~probability:1. ~kinds:[ `Short_read ] ~seed:29 ()
+  in
+  let length = (1 lsl 30) + 1 in
+  let op : Op.t = { kind = `Read; path = "f"; file_offset = 0; length } in
+  match Chaos.Private.next sched op with
+  | Some (Short_read n) ->
+      Alcotest.(check bool)
+        "split inside the operation" true
+        (n >= 1 && n < length)
+  | _ -> Alcotest.fail "no short read for a long operation"
+
 (* A [Swap_symlink] fault reproduces a TOCTOU: the scripted [`Stat] on "victim"
    still returns the original regular file, then the path becomes a symlink to
    the secret, so a follow-up open on the same path -- as a builder that stats
@@ -2012,6 +2026,8 @@ let suite =
         (test_seeded_directory_error true);
       Alcotest.test_case "directory short-read inapplicable" `Quick
         test_directory_short_read_inapplicable;
+      Alcotest.test_case "seeded short read of a long operation" `Quick
+        test_seeded_short_read_long_op;
       Alcotest.test_case "read-only descriptor stat error" `Quick
         (test_descriptor_stat_error false);
       Alcotest.test_case "read-write descriptor stat error" `Quick
