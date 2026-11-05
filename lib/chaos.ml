@@ -244,7 +244,7 @@ module Schedule = struct
   (* A count in [1, len-1] so the operation is split rather than passed through
      whole (or [1] when the operation is too small to split). *)
   let split_count rng len =
-    if len <= 1 then 1 else 1 + Random.State.int rng (len - 1)
+    if len <= 1 then 1 else 1 + Random.State.full_int rng (len - 1)
 
   let some_code rng = if Random.State.bool rng then `Enoent else `Eacces
 
