@@ -1827,6 +1827,61 @@ let test_crash_rename_revert_real () =
         "real fs: final path absent" true
         (absent (post / "final")))
 
+(* {2 A file is the file, whatever name opened it} *)
+
+let write_new ?(sync = false) p data =
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) p (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string data ];
+      if sync then Eio.File.sync f)
+
+let overwrite p data =
+  Eio.Path.with_open_out ~create:`Never p (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string data ])
+
+(* An unsynced write through a symbolic link is a write to its target. *)
+let test_crash_write_through_a_symlink () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let raw = env#fs in
+  write_new (raw / "real") "old";
+  Eio.Path.symlink ~link_to:"real" (raw / "link");
+  let fs = Crash.wrap ctl raw in
+  overwrite (fs / "link") "NEW";
+  Eio.Path.mkdir ~perm:0o755 (fs / "x");
+  Crash.sync_metadata ctl;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the target's write is lost" "old"
+    (Eio.Path.load (post / "real"))
+
+(* fsync(2) flushes the file whatever name opened it. *)
+let test_crash_sync_through_another_spelling () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "f") "";
+  Eio_fs_sync.sync_dir fs;
+  overwrite (fs / "f") "data";
+  Eio.Switch.run (fun sw ->
+      let h = Eio.Path.open_in ~sw (fs / "./f") in
+      Eio_fs_sync.Barrier.(sync_file portable) h);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "durable" "data" (Eio.Path.load (post / "f"))
+
+(* Opening a file under another spelling makes none of its bytes durable. *)
+let test_crash_open_through_another_spelling () =
+  List.iter
+    (fun alias ->
+      let ctl = Crash.v ~policy:Drop_unsynced () in
+      with_crash ctl @@ fun ~raw:_ ~fs ->
+      write_new ~sync:true (fs / "f") "";
+      Eio_fs_sync.sync_dir fs;
+      overwrite (fs / "f") "secret";
+      Eio.Path.with_open_out ~create:`Never (fs / alias) (fun _ -> ());
+      let post = Crash.post_crash ctl in
+      Alcotest.(check string) alias "" (Eio.Path.load (post / "f")))
+    [ "./f"; ".//f"; "././f" ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2134,6 +2189,12 @@ let suite =
         test_crash_seed_reproduces_save;
       Alcotest.test_case "crash: the default policy is one state" `Quick
         test_crash_default_is_one_state;
+      Alcotest.test_case "crash: a write through a symbolic link" `Quick
+        test_crash_write_through_a_symlink;
+      Alcotest.test_case "crash: a sync through another spelling" `Quick
+        test_crash_sync_through_another_spelling;
+      Alcotest.test_case "crash: an open through another spelling" `Quick
+        test_crash_open_through_another_spelling;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

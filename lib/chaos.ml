@@ -944,6 +944,8 @@ module Crash = struct
      replay of [delta] reads the moved files' new places from. *)
   type metadata_entry = {
     meta : unsynced;
+    dirs : string list;
+        (* The resolved directories whose barrier commits the entry. *)
     tree : tree;
     delta : delta;
     locations : location list;
@@ -1147,6 +1149,56 @@ module Crash = struct
     | [] -> ""
     | _ :: up -> String.concat "/" (List.rev up)
 
+  (* [resolve ~root owner path] is [path] with every symbolic link below
+     [root] replaced by its target, the last one too unless [follow_last] is
+     [false], and its [.], [..] and empty components gone, as
+     path_resolution(7) walks it: one spelling per file. A component that does
+     not resolve is kept, and so is a path outside [root]. *)
+  let resolve_at ?(follow_last = true) ~root (Base_dir ((module B), bv)) path =
+    let render abs rev =
+      let p = String.concat "/" (List.rev rev) in
+      if abs then "/" ^ p else p
+    in
+    let link_at p =
+      match B.stat bv ~follow:false p with
+      | { kind = `Symbolic_link; _ } -> (
+          try Some (B.read_link bv p) with Eio.Io _ -> None)
+      | _ -> None
+      | exception Eio.Io _ -> None
+    in
+    let rec go hops abs rev = function
+      | [] -> render abs rev
+      | ("" | ".") :: rest -> go hops abs rev rest
+      | ".." :: rest -> (
+          match rev with
+          | name :: up when not (String.equal name "..") -> go hops abs up rest
+          | _ when abs -> go hops abs rev rest
+          | _ -> go hops abs (".." :: rev) rest)
+      | name :: rest -> (
+          let p = render abs (name :: rev) in
+          let target =
+            if hops <= 0 || (rest = [] && not follow_last) then None
+            else link_at p
+          in
+          match target with
+          | None -> go hops abs (name :: rev) rest
+          | Some target ->
+              let segs = String.split_on_char '/' target in
+              if Eio_fs_path.is_abs target then
+                go (hops - 1) true [] (segs @ rest)
+              else go (hops - 1) abs rev (segs @ rest))
+    in
+    let root = path_segments root in
+    let rec strip root segs =
+      match (root, segs) with
+      | [], segs -> Some segs
+      | r :: root, s :: segs when String.equal r s -> strip root segs
+      | _ -> None
+    in
+    match strip root (path_segments path) with
+    | None -> path
+    | Some rest -> go 40 (Eio_fs_path.is_abs path) (List.rev root) rest
+
   (* The journal names an entry as the base directory resource sees it: the path
      {!wrap} was handed, with the entry below it. The durable image is a
      snapshot rooted at that same path, so indexing the image means dropping the
@@ -1248,12 +1300,10 @@ module Crash = struct
           (tree_replace tree segs node, moved @ locs))
       (tree, locs) e.delta
 
-  (* The paths one directory operation touched: its own, and for a rename the
-     destination as well, since a rename frees one name and fills another. *)
-  let delta_of ~root ~tree ~path ~kind =
-    let paths =
-      match kind with Rename { dest } -> [ path; dest ] | _ -> [ path ]
-    in
+  (* The paths one directory operation touched, resolved: its own, and for a
+     rename the destination as well, since a rename frees one name and fills
+     another. *)
+  let delta_of ~root ~tree paths =
     List.filter_map
       (fun p ->
         match tree_path ~root p with
@@ -1264,15 +1314,19 @@ module Crash = struct
   let metadata_unsynced ~path ~kind ~seq =
     { path; kind; offset = 0; length = 0; seq }
 
-  let record_metadata ctl ~path ~kind =
+  (* [path] and [kind] as the caller spelled them, [resolved] the paths the
+     operation touched, resolved: its own first. *)
+  let record_metadata ctl ~path ~kind ~resolved =
     ctl.seq <- ctl.seq + 1;
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let tree = snapshot_at owner root_path in
-    let delta = delta_of ~root:(path_segments root_path) ~tree ~path ~kind in
+    let delta = delta_of ~root:(path_segments root_path) ~tree resolved in
+    let dirs = match resolved with p :: _ -> [ parent_key p ] | [] -> [] in
     let locations = locations ctl in
     ctl.metadata <-
-      { meta; tree; delta; locations; recorded = locations } :: ctl.metadata
+      { meta; dirs; tree; delta; locations; recorded = locations }
+      :: ctl.metadata
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
@@ -1312,7 +1366,7 @@ module Crash = struct
         | Some (Dir _) -> (
             let committed, pending =
               List.partition
-                (fun e -> String.equal (parent_key e.meta.path) dir)
+                (fun e -> List.exists (String.equal dir) e.dirs)
                 (List.rev ctl.metadata)
             in
             match committed with
@@ -1636,8 +1690,12 @@ module Crash = struct
      the wrap root. *)
   let at prefix path = Eio_fs_path.append prefix path
 
+  (* One key per file, whatever spelling [path] is. *)
   let file_key (Base_dir ((module B), bv)) path =
-    match B.native bv path with Some native -> native | None -> path
+    match B.native bv path with
+    | Some native -> native
+    | None -> path_key path
+    | exception Eio.Io _ -> path_key path
 
   let path_is_at_or_under ~parent path =
     String.equal parent path
@@ -1691,22 +1749,27 @@ module Crash = struct
      as a read or a write does. *)
   let live d = if d.dctl.crashed then raise_power_lost ()
 
+  (* A path from [d]'s root, resolved below the wrapped root. *)
+  let resolve ?follow_last d path =
+    match d.dctl.base with
+    | None -> path
+    | Some (_, root) -> resolve_at ?follow_last ~root d.dplace.proot path
+
   module Cdir_impl = struct
     type t = cdir
 
     let open_in d ~sw ~follow path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let fs =
-        Hashtbl.find_opt d.dctl.files
-          (file_key d.dplace.proot (at d.dplace.prefix path))
-      in
+      let rel = resolve d (at d.dplace.prefix path) in
+      let fs = Hashtbl.find_opt d.dctl.files (file_key d.dplace.proot rel) in
       wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw ~follow path)
 
     let open_out d ~sw ~follow ~append ~create path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let rel = at d.dplace.prefix path in
+      let spelt = at d.dplace.prefix path in
+      let rel = resolve d spelt in
       let key = file_key d.dplace.proot rel in
       let existed =
         match B.stat bv ~follow:false path with
@@ -1732,8 +1795,8 @@ module Crash = struct
       if is_trunc create && Cstruct.length prev > 0 then
         clog_change d.dctl fs (Resize 0);
       if not existed then begin
-        record_metadata d.dctl ~path:rel ~kind:Create;
-        bump_metadata d.dctl ~path:rel ~kind:Create
+        record_metadata d.dctl ~path:spelt ~kind:Create ~resolved:[ rel ];
+        bump_metadata d.dctl ~path:spelt ~kind:Create
       end;
       wrap_cfile_rw d.dctl fs ~append base
 
@@ -1742,7 +1805,7 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let sub = B.open_subtree bv ~sw path in
       !crash_dir_hook d.dctl ~root:d.dplace.proot
-        ~prefix:(at d.dplace.prefix path)
+        ~prefix:(resolve d (at d.dplace.prefix path))
         ~base:(sub :> Eio.Fs.dir_ty r)
 
     let stat d ~follow path =
@@ -1755,7 +1818,8 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.mkdir bv ~perm path;
       let rel = at d.dplace.prefix path in
-      record_metadata d.dctl ~path:rel ~kind:Mkdir;
+      let resolved = [ resolve ~follow_last:false d rel ] in
+      record_metadata d.dctl ~path:rel ~kind:Mkdir ~resolved;
       bump_metadata d.dctl ~path:rel ~kind:Mkdir
 
     let read_dir d path =
@@ -1771,18 +1835,20 @@ module Crash = struct
     let unlink d path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.unlink bv path;
       let rel = at d.dplace.prefix path in
-      Hashtbl.remove d.dctl.files (file_key d.dplace.proot rel);
-      record_metadata d.dctl ~path:rel ~kind:Unlink;
+      let resolved = resolve ~follow_last:false d rel in
+      B.unlink bv path;
+      Hashtbl.remove d.dctl.files (file_key d.dplace.proot resolved);
+      record_metadata d.dctl ~path:rel ~kind:Unlink ~resolved:[ resolved ];
       bump_metadata d.dctl ~path:rel ~kind:Unlink
 
     let rmdir d path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.rmdir bv path;
       let rel = at d.dplace.prefix path in
-      record_metadata d.dctl ~path:rel ~kind:Rmdir;
+      let resolved = [ resolve ~follow_last:false d rel ] in
+      B.rmdir bv path;
+      record_metadata d.dctl ~path:rel ~kind:Rmdir ~resolved;
       bump_metadata d.dctl ~path:rel ~kind:Rmdir
 
     let rename_with exclusive d old_path new_dir new_path =
@@ -1797,13 +1863,16 @@ module Crash = struct
         | None -> (new_dir :> Eio.Fs.dir_ty r)
       in
       let (Base_dir ((module B), bv)) = d.dboxed in
-      let old_rel = at d.dplace.prefix old_path in
+      let spelt = at d.dplace.prefix old_path in
+      let old_rel = resolve ~follow_last:false d spelt in
       (* A crash-wrapped target rehomes the file root-relative, so its rewrite
          does not depend on the target subtree staying open. *)
-      let owner, rel =
+      let owner, dest, rel =
         match target_cdir with
-        | Some cd -> (cd.dplace.proot, at cd.dplace.prefix new_path)
-        | None -> (box_dir target, new_path)
+        | Some cd ->
+            let dest = at cd.dplace.prefix new_path in
+            (cd.dplace.proot, dest, resolve ~follow_last:false cd dest)
+        | None -> (box_dir target, new_path, new_path)
       in
       (match exclusive with
       | None -> B.rename bv old_path target new_path
@@ -1815,9 +1884,9 @@ module Crash = struct
          reachable file and must not be replayed after a crash. *)
       move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
         ~new_rel:rel;
-      let kind = Rename { dest = rel } in
-      record_metadata d.dctl ~path:old_rel ~kind;
-      bump_metadata d.dctl ~path:old_rel ~kind
+      let kind = Rename { dest } in
+      record_metadata d.dctl ~path:spelt ~kind ~resolved:[ old_rel; rel ];
+      bump_metadata d.dctl ~path:spelt ~kind
 
     let rename d old_path new_dir new_path =
       rename_with None d old_path new_dir new_path
@@ -1836,7 +1905,8 @@ module Crash = struct
       B.symlink ~link_to bv path;
       let rel = at d.dplace.prefix path in
       let kind = Symlink { target = link_to } in
-      record_metadata d.dctl ~path:rel ~kind;
+      let resolved = [ resolve ~follow_last:false d rel ] in
+      record_metadata d.dctl ~path:rel ~kind ~resolved;
       bump_metadata d.dctl ~path:rel ~kind
 
     let chmod d ~follow ~perm path =
@@ -1856,7 +1926,7 @@ module Crash = struct
        operation. *)
     let sync_dir d path =
       if d.dctl.crashed then raise_power_lost ();
-      commit_dir d.dctl ~dir:(at d.dplace.prefix path)
+      commit_dir d.dctl ~dir:(resolve d (at d.dplace.prefix path))
 
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in

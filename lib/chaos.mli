@@ -200,8 +200,10 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 (** A power-loss durability model over a base directory capability.
 
     Every write is tracked as un-synced until a successful {!Eio.File.sync}
-    makes that file's prior writes durable. A crash rewrites the base to a
-    post-crash image in which un-synced writes may be dropped or reordered,
+    makes that file's prior writes durable. A file is known by its path with
+    symbolic links, [.] and [..] resolved, so a sync through any name of it, a
+    read-only handle included, is a sync of that file. A crash rewrites the base
+    to a post-crash image in which un-synced writes may be dropped or reordered,
     which demonstrates the classic missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
@@ -223,7 +225,10 @@ module Crash : sig
     | Rename of { dest : string }  (** An entry moved to [dest]. *)
 
   type unsynced = {
-    path : string;  (** The path the change was made at, as opened. *)
+    path : string;
+        (** The path the change was made at: for a write or a truncation, the
+            file's path with its symbolic links resolved; for a directory
+            operation, the path as the caller gave it. *)
     kind : op_kind;  (** What the change is. *)
     offset : int;
         (** The byte offset of a {!Data} write, the new length of a {!Truncate},
