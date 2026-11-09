@@ -1566,16 +1566,23 @@ module Crash = struct
         cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
         bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
 
-  let wrap_cfile_ro ?fs ctl base : Eio.File.ro_ty r =
+  (* A directory opened as a file syncs as that directory's barrier. *)
+  let wrap_cfile_ro ?fs ?dir ctl base : Eio.File.ro_ty r =
     let cf =
       { ctl; cfs = None; cro = base; crw = None; cappend = false; cpos = ref 0 }
+    in
+    let sync cf =
+      match dir with
+      | Some dir ->
+          guard cf;
+          commit_dir ctl ~dir
+      | None -> sync_ro cf fs
     in
     Eio.Resource.T
       ( cf,
         Eio.Resource.handler
           (Eio.Resource.bindings (Eio.File.Pi.ro (module Cro_impl))
-          @ [ Eio.Resource.H (Eio_fs_sync.File_sync, fun cf -> sync_ro cf fs) ]
-          ) )
+          @ [ Eio.Resource.H (Eio_fs_sync.File_sync, sync) ]) )
 
   module Crw_impl = struct
     type t = cfile
@@ -1763,7 +1770,13 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = resolve d (at d.dplace.prefix path) in
       let fs = Hashtbl.find_opt d.dctl.files (file_key d.dplace.proot rel) in
-      wrap_cfile_ro ?fs d.dctl (B.open_in bv ~sw ~follow path)
+      let file = B.open_in bv ~sw ~follow path in
+      let dir =
+        match (Eio.File.stat file).kind with
+        | `Directory -> Some rel
+        | _ -> None
+      in
+      wrap_cfile_ro ?fs ?dir d.dctl file
 
     let open_out d ~sw ~follow ~append ~create path =
       live d;

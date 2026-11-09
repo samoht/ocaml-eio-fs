@@ -1882,6 +1882,21 @@ let test_crash_open_through_another_spelling () =
       Alcotest.(check string) alias "" (Eio.Path.load (post / "f")))
     [ "./f"; ".//f"; "././f" ]
 
+(* fsync(2) on a directory opened with open_in is that directory's barrier. *)
+let test_crash_sync_through_a_directory_handle () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Crash.sync_metadata ctl;
+  write_new ~sync:true (fs / "d" / "f") "data";
+  Eio.Switch.run (fun sw ->
+      let h = Eio.Path.open_in ~sw (fs / "d") in
+      Eio_fs_sync.Barrier.(sync_file portable) h);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the entry is durable" "data"
+    (Eio.Path.load (post / "d" / "f"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2195,6 +2210,8 @@ let suite =
         test_crash_sync_through_another_spelling;
       Alcotest.test_case "crash: an open through another spelling" `Quick
         test_crash_open_through_another_spelling;
+      Alcotest.test_case "crash: a sync through a directory handle" `Quick
+        test_crash_sync_through_a_directory_handle;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
