@@ -525,10 +525,15 @@ static long eio_fs_extents_fill(int fd, int64_t offset, int64_t length,
       free(map);
       return -1;
     }
-    /* An extent still in the page cache has no block address yet, so there is
-       no physical answer to give about it. That ends the batch the same way a
-       hole does. */
-    if (e->fe_flags & (FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNWRITTEN))
+    /* An extent still in the page cache has no block address yet, and one
+       stored inline in metadata, unaligned, encoded or encrypted has no block
+       address of its own (btrfs and ext4 report physical 0 for inline data),
+       so there is no physical answer to give about it. That ends the batch
+       the same way a hole does. */
+    if (e->fe_flags
+        & (FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNWRITTEN
+           | FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_NOT_ALIGNED
+           | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED))
       break;
     int64_t logical = (int64_t)e->fe_logical;
     int64_t elength = (int64_t)e->fe_length;
