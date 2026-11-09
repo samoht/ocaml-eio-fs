@@ -632,6 +632,12 @@ let test_chmod_masks_the_mode () =
   Eio.Path.chmod ~follow:true ~perm:0o100644 (env#fs / "f");
   Alcotest.(check int) "mode" 0o644 (perm (env#fs / "f"))
 
+(* A symbolic link's mode is 0o777, as Linux lstat(2) reports it. *)
+let test_symlink_mode () =
+  with_env @@ fun env ->
+  Eio.Path.symlink ~link_to:"f" (env#fs / "l");
+  Alcotest.(check int) "mode" 0o777 (perm (env#fs / "l"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1118,4 +1124,5 @@ let suite =
       Alcotest.test_case "permissions: load keeps modes" `Quick
         test_perm_load_keeps_modes;
       Alcotest.test_case "chmod masks the mode" `Quick test_chmod_masks_the_mode;
+      Alcotest.test_case "symbolic link mode" `Quick test_symlink_mode;
     ] )

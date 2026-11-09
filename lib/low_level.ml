@@ -829,7 +829,7 @@ let symlinkat ~link_to dir_fd path =
   let symlink r name =
     let new_stat =
       {
-        (new_stat fs ~user:dir_fd.Dir.user ~kind:`Symbolic_link ~perm:0o644 ()) with
+        (new_stat fs ~user:dir_fd.Dir.user ~kind:`Symbolic_link ~perm:0o777 ()) with
         size = Optint.Int63.of_int (String.length link_to);
       }
     in
