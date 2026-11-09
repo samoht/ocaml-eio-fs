@@ -37,7 +37,7 @@ module Nofollow : sig
       backend that honours [~follow:false] gets the same refusal, and a wrapper
       such as {!Chaos} observes the one open.
 
-      @raise Invalid_argument if [max_bytes] is negative or [max_int].
+      @raise Stdlib.Invalid_argument if [max_bytes] is negative or [max_int].
       @raise Eio.Io
         when the open or read fails, including when the final component is a
         symbolic link. *)
@@ -59,7 +59,7 @@ module Nofollow : sig
       [End_of_file] ends the file, and what [validate] or [read] raises
       otherwise is propagated.
 
-      @raise Invalid_argument if [max_bytes] is negative or [max_int]. *)
+      @raise Stdlib.Invalid_argument if [max_bytes] is negative or [max_int]. *)
 end
 
 (** Helpers over standard {!Eio.Path} values. The lexical arithmetic on the
@@ -87,7 +87,7 @@ module Path : sig
       Filesystem errors are propagated, so a caller deciding whether to remove a
       tree fails closed.
 
-      @raise Invalid_argument if [max_fibers] is not positive. *)
+      @raise Stdlib.Invalid_argument if [max_fibers] is not positive. *)
 
   val iter :
     ?max_fibers:int ->
@@ -103,7 +103,7 @@ module Path : sig
       Filesystem errors and those [f] raises are propagated, the walk's other
       workers cancelled.
 
-      @raise Invalid_argument if [max_fibers] is not positive. *)
+      @raise Stdlib.Invalid_argument if [max_fibers] is not positive. *)
 
   val name : _ Eio.Path.t -> string
   (** [name path] is what [path] is called outside the program: its native
@@ -128,14 +128,14 @@ end
     An entry's stat carries its kind, mode, size and inode, and the owner
     {!Eio.Path.chown} gives it. It keeps no times, no block count and no link
     count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
-    {!Path.usage} counts no allocated bytes, and [nlink] is [0].
+    {!Path.val-usage} counts no allocated bytes, and [nlink] is [0].
 
     Where POSIX systems differ, it answers as Linux does: {!Eio.Path.unlink} of
     a directory raises the error EISDIR names, not [Permission_denied]. Its
     paths have no native spelling ({!Eio.Path.native} is [None]), and an
     absolute symbolic link resolves from the filesystem's root, so through the
-    root that {!v} returns it is followed where eio_posix would refuse it. One
-    filesystem may be used from several domains at once.
+    root that {!Fs.v} returns it is followed where eio_posix would refuse it.
+    One filesystem may be used from several domains at once.
 
     A path resolves one component at a time, as path_resolution(7) describes: a
     [".."] climbs from the directory the walk has reached, a link's target
@@ -167,7 +167,7 @@ module Fs : sig
       An entry that is neither a regular file, a directory nor a symbolic link
       is not copied; it is traced with [Eio.traceln].
 
-      @raise Invalid_argument if [path] is not a directory.
+      @raise Stdlib.Invalid_argument if [path] is not a directory.
       @raise Eio.Io
         if [path] or an entry under it cannot be read, or a regular file is
         replaced between the stat that found it and the open that copies it:
@@ -200,7 +200,7 @@ module Crunch : sig
       that is neither a regular file, a directory nor a symbolic link is not
       recorded; it is traced with [Eio.traceln].
 
-      @raise Invalid_argument if [dir] is not a directory.
+      @raise Stdlib.Invalid_argument if [dir] is not a directory.
       @raise Eio.Io if [dir] or an entry under it cannot be read. *)
 
   val find : string -> t -> string option
@@ -248,4 +248,4 @@ val run : ?cwd:string -> (stdenv -> 'a) -> 'a
     {b Note.} This does not install an effect handler; wrap the call in
     something like [Eio_mock.Backend.run].
 
-    @raise Invalid_argument if [cwd] is not an absolute path. *)
+    @raise Stdlib.Invalid_argument if [cwd] is not an absolute path. *)

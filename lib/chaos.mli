@@ -299,7 +299,7 @@ module Crash : sig
       on the host descriptor [eio-fs.unix] locks, is gone from the post-crash
       image.
 
-      @raise Invalid_argument
+      @raise Stdlib.Invalid_argument
         if the tree under [base] holds an entry that is neither a regular file,
         a directory nor a symbolic link. *)
 
@@ -311,7 +311,7 @@ module Crash : sig
       exception ("power lost") and leaves the image as it is; re-read through
       {!post_crash}.
 
-      @raise Invalid_argument
+      @raise Stdlib.Invalid_argument
         if [t] was never {!wrap}ped; [t] is left uncrashed. *)
 
   val is_crashed : t -> bool
@@ -323,7 +323,7 @@ module Crash : sig
       handle itself, not a new one, and no wrapper is in front of it, so a test
       re-reads the image through it.
 
-      @raise Invalid_argument if [t] was never {!wrap}ped. *)
+      @raise Stdlib.Invalid_argument if [t] was never {!wrap}ped. *)
 
   val sync_metadata : t -> unit
   (** [sync_metadata t] commits the whole metadata journal: every pending

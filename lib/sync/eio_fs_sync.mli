@@ -37,7 +37,7 @@ val sync_dir : _ Eio.Path.t -> unit
     operation is a wiring error, which [sync_dir] reports rather than skip the
     barrier.
 
-    @raise Invalid_argument
+    @raise Stdlib.Invalid_argument
       if [dir]'s backend registers no {!Dir_sync} and its directory handle
       cannot sync.
     @raise Eio.Io
@@ -185,7 +185,7 @@ val config :
     - [max_bytes] is the ceiling on the bytes the producer writes, or on the
       logical size {!publish_sparse} publishes.
 
-    @raise Invalid_argument if [max_bytes] is negative. *)
+    @raise Stdlib.Invalid_argument if [max_bytes] is negative. *)
 
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
 (** Raised before a write that would exceed a {!type-config}'s [max_bytes], with
@@ -239,7 +239,7 @@ val publish :
     publication it reported durable. A program that links unix passes
     [Eio_fs_unix.barrier], whose file barrier is [F_FULLFSYNC] there.
 
-    @raise Invalid_argument
+    @raise Stdlib.Invalid_argument
       if [tmp] is [path] (the same directory and name, or the same file once
       created), or, in [`Exclusive] mode, if [path]'s directory has no exclusive
       rename of its own and [rename] is {!Rename.capability}.
@@ -271,7 +271,7 @@ val publish_sparse :
     and ordering are checked before any filesystem operation.
 
     @raise Limit_exceeded if [size_bytes] exceeds [config]'s [max_bytes].
-    @raise Invalid_argument
+    @raise Stdlib.Invalid_argument
       for a negative size or one past the largest file offset, negative offsets,
       unordered or overlapping extents, or data outside the logical file; and as
       {!publish} raises it for [tmp] and [rename].
@@ -317,7 +317,8 @@ val append_lines :
     the file is issued again by the next one. Appends from two writers are not
     ordered with each other: a caller with several takes a {!Lock} around each.
 
-    @raise Invalid_argument if a line holds LF, before anything is written.
+    @raise Stdlib.Invalid_argument
+      if a line holds LF, before anything is written.
     @raise Eio.Io as the open, the write and the barriers raise. *)
 
 val publish_generation :
