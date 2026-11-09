@@ -625,6 +625,13 @@ let test_perm_load_keeps_modes () =
   Alcotest.(check int) "directory" 0o777 (perm (copy / "d"));
   Alcotest.(check int) "file" 0o666 (perm (copy / "d/f"))
 
+(* chmod(2) keeps the permission bits of the mode only. *)
+let test_chmod_masks_the_mode () =
+  with_env @@ fun env ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#fs / "f") "x";
+  Eio.Path.chmod ~follow:true ~perm:0o100644 (env#fs / "f");
+  Alcotest.(check int) "mode" 0o644 (perm (env#fs / "f"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1110,4 +1117,5 @@ let suite =
         test_perm_root_and_user_differ;
       Alcotest.test_case "permissions: load keeps modes" `Quick
         test_perm_load_keeps_modes;
+      Alcotest.test_case "chmod masks the mode" `Quick test_chmod_masks_the_mode;
     ] )

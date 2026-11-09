@@ -739,7 +739,7 @@ let chmod ~follow dir_fd ~perm path =
   | _ -> ());
   if not (User.owns dir_fd.user (Resource.stat !r)) then
     Error.permission_denied path;
-  r := Resource.set_stat !r { (Resource.stat !r) with perm }
+  r := Resource.set_stat !r { (Resource.stat !r) with perm = perm land 0o7777 }
 
 (* chown(2): root gives a file to anyone; its owner only moves it to a group
    of their own. EPERM otherwise. *)
