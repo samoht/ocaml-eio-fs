@@ -18,7 +18,8 @@ opam install eio-fs
 ## Usage
 
 `Eio_fs.Fs.v ()` returns the root of a new, empty filesystem in memory. The
-code that uses it sees an ordinary `Eio.Path`.
+code that uses it sees an ordinary `Eio.Path`. The examples below link `eio-fs`
+and `eio_main`.
 
 ```ocaml
 Eio_main.run @@ fun _env ->
@@ -42,6 +43,7 @@ only a prefix of the uncommitted directory operations survives.
 
 In this test, a file saved with `Eio_fs_sync.save` survives the crash, because
 that call syncs the file and its directory. A file written with no sync is lost.
+The test also links `eio-fs.sync`.
 
 ```ocaml
 Eio_main.run @@ fun _env ->
@@ -77,7 +79,7 @@ regenerates them when the `static` directory changes:
 ```
 
 `Assets.load ()` rebuilds the tree in a new in-memory filesystem and returns its
-root. The example below uses the module built from
+root. The program links the `assets` library. The example below uses the module built from
 [examples/readme/static](examples/readme/static).
 
 ```ocaml
