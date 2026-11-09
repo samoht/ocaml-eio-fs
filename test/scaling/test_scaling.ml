@@ -67,11 +67,34 @@ let test_crash_syncs_beside_pending_writes () =
         Eio.File.sync hot
       done)
 
+(* 20k files made through the crash model, then a seeded crash: a model that
+   snapshot the whole tree on every directory operation read it 20k times. *)
+let test_crash_many_files () =
+  Eio_mock.Backend.run @@ fun () ->
+  let ctl = Crash.v ~policy:(Crash.Reorder_unsynced 1) () in
+  let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
+  within ~seconds:10. "20k files through the crash model and a crash" (fun () ->
+      for d = 0 to 99 do
+        let dir = fs / string_of_int d in
+        Eio.Path.mkdir ~perm:0o755 dir;
+        for i = 1 to 100 do
+          Eio.Path.save ~create:(`Exclusive 0o644) (dir / string_of_int i) "x"
+        done
+      done;
+      Eio.Path.mkdir ~perm:0o755 (fs / "flat");
+      for i = 1 to 10_000 do
+        Eio.Path.save ~create:(`Exclusive 0o644)
+          (fs / "flat" / string_of_int i)
+          "x"
+      done;
+      Crash.crash ctl)
+
 let suite =
   ( "scaling",
     [
       Alcotest.test_case "one directory" `Slow test_one_directory;
       Alcotest.test_case "crash: appends" `Slow test_crash_appends;
+      Alcotest.test_case "crash: many files" `Slow test_crash_many_files;
       Alcotest.test_case "crash: syncs beside pending writes" `Slow
         test_crash_syncs_beside_pending_writes;
     ] )

@@ -947,6 +947,7 @@ module Crash = struct
      root so a crash can rewrite it after intermediate subtrees close; both move
      on rename. *)
   type fstate = {
+    id : int;
     mutable owner : boxed;
     mutable rel : string;
     mutable perm : int;
@@ -960,8 +961,38 @@ module Crash = struct
 
   and entry = { efs : fstate; change : change; seq : int; egen : int }
 
+  let next_id = Atomic.make 0
+
   let fresh_file ~owner ~rel ~perm ~durable =
-    { owner; rel; perm; durable = image_of durable; pending = []; gen = 0 }
+    {
+      id = Atomic.fetch_and_add next_id 1;
+      owner;
+      rel;
+      perm;
+      durable = image_of durable;
+      pending = [];
+      gen = 0;
+    }
+
+  (* Maps keyed by a path, where the keys at or under one path are a range. *)
+  module Paths = Map.Make (String)
+  module Ids = Map.Make (Int)
+
+  (* The bindings of [m] at or under the path [k]. *)
+  let under k m =
+    let pre = if String.equal k "" || String.equal k "/" then k else k ^ "/" in
+    let exact =
+      match Paths.find_opt k m with
+      | Some v when not (String.equal pre k) -> [ (k, v) ]
+      | Some _ | None -> []
+    in
+    let rec go acc seq =
+      match seq () with
+      | Seq.Cons ((k', v), rest) when String.starts_with ~prefix:pre k' ->
+          go ((k', v) :: acc) rest
+      | Seq.Cons _ | Seq.Nil -> acc
+    in
+    go exact (Paths.to_seq_from pre m)
 
   let is_pending e = e.egen = e.efs.gen
 
@@ -997,24 +1028,62 @@ module Crash = struct
   }
   (* An un-synced change, as seen by a scripted survival predicate. *)
 
-  (* Directory durability uses whole-tree snapshots: metadata operations are
-     rare, and a snapshot makes rename rollback atomic and unambiguous. *)
+  (* A directory tree as an image holds it: the durable image, and the
+     subtrees a directory operation touched. *)
   type tree =
     | File of { data : Cstruct.t; perm : int }
-    | Dir of { perm : int; entries : (string * tree) list }
+    | Dir of { perm : int; entries : tree Paths.t }
     | Link of string
 
   type location = fstate * boxed * string
+
+  (* Where each tracked file sits in an image, by its path in the image, and
+     that path by the file: each file sits at one place at most. *)
+  type locs = { at : location list Paths.t; where : string Ids.t }
+
+  let no_locs = { at = Paths.empty; where = Ids.empty }
+
+  let unlocate (fs : fstate) t =
+    match Ids.find_opt fs.id t.where with
+    | None -> t
+    | Some k ->
+        let at =
+          Paths.update k
+            (function
+              | None -> None
+              | Some ls -> (
+                  match List.filter (fun (f, _, _) -> f != fs) ls with
+                  | [] -> None
+                  | ls -> Some ls))
+            t.at
+        in
+        { at; where = Ids.remove fs.id t.where }
+
+  let locate_at k ((fs, _, _) as l) t =
+    let t = unlocate fs t in
+    {
+      at = Paths.update k (fun o -> Some (l :: Option.value ~default:[] o)) t.at;
+      where = Ids.add fs.id k t.where;
+    }
+
+  let unlocate_under k t =
+    List.fold_left
+      (fun t (_, ls) -> List.fold_left (fun t (fs, _, _) -> unlocate fs t) t ls)
+      t (under k t.at)
+
+  let all_locations t = Paths.fold (fun _ ls acc -> ls @ acc) t.at []
+
   type delta = (string list * tree option) list
   (* The namespace effect of one directory operation: each path it touched and
      the node it holds afterwards, [None] for a name it freed. Replaying a
      set's deltas in program order reproduces those operations alone, which a
      whole-tree snapshot cannot do once the set is not a journal prefix. *)
 
-  (* [tree] and [locations] are the image a crash rebuilds when this entry is
-     the last to survive: the tree, and where each tracked file sits in it.
-     [recorded] is where the files sat when the entry was recorded, which a
-     replay of [delta] reads the moved files' new places from. *)
+  (* An entry keeps only what it changed: the image a crash rebuilds is the
+     durable one with the surviving entries' deltas replayed over it, built
+     when the crash needs it. [recorded] is where the files under the paths
+     [delta] touched sat when the entry was recorded, which a replay reads the
+     moved files' new places from. *)
   type metadata_entry = {
     meta : unsynced;
     dirs : string list;
@@ -1022,9 +1091,7 @@ module Crash = struct
     barred : string list;
         (* Those of [dirs] a barrier has reached since: the entry is durable
            once one of them is. *)
-    tree : tree;
     delta : delta;
-    locations : location list;
     recorded : location list;
   }
 
@@ -1077,7 +1144,8 @@ module Crash = struct
     mutable pending_changes : int; (* its entries still pending *)
     mutable metadata : metadata_entry list; (* newest first *)
     mutable durable_tree : tree option;
-    mutable durable_locations : location list;
+    mutable durable_locations : locs;
+    mutable by_rel : fstate list Paths.t; (* the files of [files] by path *)
     mutable seq : int;
     mutable ops : int;
     mutable crashed : bool;
@@ -1166,10 +1234,12 @@ module Crash = struct
         File { data; perm }
     | { kind = `Directory; perm; _ } ->
         let entries =
-          B.read_dir bv path |> List.sort String.compare
-          |> List.map (fun name ->
-              let child = Eio_fs_path.append path name in
-              (name, snapshot_at owner child))
+          B.read_dir bv path
+          |> List.fold_left
+               (fun m name ->
+                 let child = Eio_fs_path.append path name in
+                 Paths.add name (snapshot_at owner child) m)
+               Paths.empty
         in
         Dir { perm; entries }
     | { kind = `Symbolic_link; _ } -> Link (B.read_link bv path)
@@ -1191,8 +1261,8 @@ module Crash = struct
            narrows, is set after. *)
         if not (String.equal path "") then
           B.mkdir bv ~perm:(perm lor 0o700) path;
-        List.iter
-          (fun (name, child) ->
+        Paths.iter
+          (fun name child ->
             let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
           entries;
@@ -1205,8 +1275,8 @@ module Crash = struct
             let child = Eio_fs_path.append path name in
             remove_at owner child);
         if not (String.equal path "") then B.chmod bv ~follow:true ~perm path;
-        List.iter
-          (fun (name, child) ->
+        Paths.iter
+          (fun name child ->
             let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
           entries
@@ -1215,6 +1285,9 @@ module Crash = struct
 
   let locations ctl =
     Hashtbl.fold (fun _ fs acc -> (fs, fs.owner, fs.rel) :: acc) ctl.files []
+
+  (* The tracked files at or under [rel]. *)
+  let files_under ctl rel = List.concat_map snd (under rel ctl.by_rel)
 
   let root ctl =
     match ctl.base with
@@ -1307,42 +1380,31 @@ module Crash = struct
     | _, [] -> Some tree
     | (File _ | Link _), _ -> None
     | Dir { entries; _ }, name :: rest -> (
-        match List.assoc_opt name entries with
+        match Paths.find_opt name entries with
         | Some child -> tree_find child rest
         | None -> None)
 
   (* [tree_replace tree segs node] is [tree] with the entry at [segs] set to
      [node], or freed when [node] is [None]. A path whose parent the tree does
      not hold, or holds as something other than a directory, leaves the tree
-     untouched: the entry went with the directory that was to hold it. Entries
-     stay sorted, as [snapshot_at] leaves them. *)
+     untouched: the entry went with the directory that was to hold it. *)
   let rec tree_replace tree segs node =
     match (tree, segs) with
     | _, [] -> tree
     | (File _ | Link _), _ -> tree
     | Dir d, [ name ] ->
-        let entries = List.remove_assoc name d.entries in
         let entries =
           match node with
-          | None -> entries
-          | Some child -> (name, child) :: entries
-        in
-        let entries =
-          List.sort (fun (a, _) (b, _) -> String.compare a b) entries
+          | None -> Paths.remove name d.entries
+          | Some child -> Paths.add name child d.entries
         in
         Dir { d with entries }
     | Dir d, name :: rest -> (
-        match List.assoc_opt name d.entries with
+        match Paths.find_opt name d.entries with
         | None -> tree
         | Some child ->
             let child = tree_replace child rest node in
-            let entries =
-              List.map
-                (fun (n, c) ->
-                  if String.equal n name then (n, child) else (n, c))
-                d.entries
-            in
-            Dir { d with entries })
+            Dir { d with entries = Paths.add name child d.entries })
 
   let rec is_prefix prefix segs =
     match (prefix, segs) with
@@ -1369,36 +1431,53 @@ module Crash = struct
         in
         if not lands then (tree, locs)
         else
-          let covered (_, _, rel) =
-            match tree_path ~root rel with
-            | Some s -> is_prefix segs s
-            | None -> false
-          in
-          let moved =
-            match node with
-            | None -> []
-            | Some _ -> List.filter covered e.recorded
-          in
+          let locs = unlocate_under (String.concat "/" segs) locs in
           let locs =
-            List.filter
-              (fun ((fs, _, _) as l) ->
-                (not (covered l))
-                && not (List.exists (fun (fs', _, _) -> fs' == fs) moved))
-              locs
+            match node with
+            | None -> locs
+            | Some _ ->
+                List.fold_left
+                  (fun locs ((_, _, rel) as l) ->
+                    match tree_path ~root rel with
+                    | Some s when is_prefix segs s ->
+                        locate_at (String.concat "/" s) l locs
+                    | Some _ | None -> locs)
+                  locs e.recorded
           in
-          (tree_replace tree segs node, moved @ locs))
+          (tree_replace tree segs node, locs))
       (tree, locs) e.delta
 
-  (* The paths one directory operation touched, resolved: its own, and for a
-     rename the destination as well, since a rename frees one name and fills
-     another. *)
-  let delta_of ~root ~tree paths =
+  (* The paths one directory operation touched, resolved, with what each
+     holds now: its own, and for a rename the destination as well, since a
+     rename frees one name and fills another. Only those subtrees are read. *)
+  let delta_of ~root owner paths =
     List.filter_map
       (fun p ->
         match tree_path ~root p with
         | None -> None
-        | Some segs -> Some (segs, tree_find tree segs))
+        | Some segs ->
+            let node =
+              match snapshot_at owner p with
+              | node -> Some node
+              | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
+            in
+            Some (segs, node))
       paths
+
+  (* Whether [loc] lies at or under one of [delta]'s paths. *)
+  let covers ~root delta (_, _, rel) =
+    match tree_path ~root rel with
+    | None -> false
+    | Some s -> List.exists (fun (segs, _) -> is_prefix segs s) delta
+
+  (* [locs] in an image keyed below [root]. *)
+  let locs_of ~root locs =
+    List.fold_left
+      (fun t ((_, _, rel) as l) ->
+        match tree_path ~root rel with
+        | Some s -> locate_at (String.concat "/" s) l t
+        | None -> t)
+      no_locs locs
 
   let metadata_unsynced ~path ~kind ~seq =
     { path; kind; offset = 0; length = 0; seq }
@@ -1409,19 +1488,23 @@ module Crash = struct
     ctl.seq <- ctl.seq + 1;
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
-    let tree = snapshot_at owner root_path in
-    let delta = delta_of ~root:(path_segments root_path) ~tree resolved in
+    let root = path_segments root_path in
+    let delta = delta_of ~root owner resolved in
     (* A rename is committed by a barrier on either directory. *)
     let dirs = List.map parent_key resolved in
-    let locations = locations ctl in
-    ctl.metadata <-
-      { meta; dirs; barred = []; tree; delta; locations; recorded = locations }
-      :: ctl.metadata
+    let recorded =
+      List.concat_map (files_under ctl) resolved
+      |> List.sort_uniq (fun a b -> Int.compare a.id b.id)
+      |> List.map (fun fs -> (fs, fs.owner, fs.rel))
+      |> List.filter (covers ~root delta)
+    in
+    ctl.metadata <- { meta; dirs; barred = []; delta; recorded } :: ctl.metadata
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
     ctl.durable_tree <- Some (snapshot_at owner root_path);
-    ctl.durable_locations <- locations ctl;
+    ctl.durable_locations <-
+      locs_of ~root:(path_segments root_path) (locations ctl);
     ctl.metadata <- []
 
   (* fsync(2) on a directory commits that directory's entries and nothing else:
@@ -1429,11 +1512,9 @@ module Crash = struct
      a child of [dir]. A model
      that commits the journal whole cannot tell the two apart.
 
-     Those entries are not in general a journal prefix, so no snapshot can
-     become the durable image. The image advances by replaying the committed
-     entries' deltas, and the entries left pending are rebased onto the result:
-     [do_crash] reads the last surviving entry's snapshot, so that snapshot
-     must hold everything already durable at the moment of the crash.
+     Those entries are not in general a journal prefix. The durable image
+     advances by replaying the committed entries' deltas, and a crash replays
+     the surviving pending ones over it.
 
      An entry of a directory whose own entry is not durable cannot be durable
      yet: after the power cut there is no directory to hold it. The barrier is
@@ -1481,16 +1562,7 @@ module Crash = struct
                   in
                   ctl.durable_tree <- Some (fst durable);
                   ctl.durable_locations <- snd durable;
-                  let _, rebased =
-                    List.fold_left
-                      (fun (image, acc) e ->
-                        let ((tree, locations) as image) =
-                          replay ~root image e
-                        in
-                        (image, { e with tree; locations } :: acc))
-                      (durable, []) pending
-                  in
-                  ctl.metadata <- rebased;
+                  ctl.metadata <- List.rev pending;
                   settle ())
         in
         settle ()
@@ -1513,17 +1585,39 @@ module Crash = struct
         in
         (match ctl.durable_tree with
         | Some tree when holds tree ->
-            ctl.durable_locations <- location :: ctl.durable_locations
+            ctl.durable_locations <-
+              locate_at
+                (String.concat "/"
+                   (Option.value ~default:[]
+                      (tree_path ~root:(path_segments root_path) rel)))
+                location ctl.durable_locations
         | Some _ | None -> ());
+        (* An entry whose delta holds a regular file there carries it. *)
+        let root = path_segments root_path in
+        let in_delta e =
+          match tree_path ~root rel with
+          | None -> false
+          | Some s ->
+              List.exists
+                (fun (segs, node) ->
+                  match node with
+                  | Some node when is_prefix segs s -> (
+                      let rec drop p s =
+                        match (p, s) with
+                        | [], s -> s
+                        | _ :: p, _ :: s -> drop p s
+                        | _ :: _, [] -> []
+                      in
+                      match tree_find node (drop segs s) with
+                      | Some (File _) -> true
+                      | Some (Dir _ | Link _) | None -> false)
+                  | Some _ | None -> false)
+                e.delta
+        in
         ctl.metadata <-
           List.map
             (fun e ->
-              if holds e.tree then
-                {
-                  e with
-                  locations = location :: e.locations;
-                  recorded = location :: e.recorded;
-                }
+              if in_delta e then { e with recorded = location :: e.recorded }
               else e)
             ctl.metadata
 
@@ -1630,9 +1724,9 @@ module Crash = struct
         | Reorder_unsynced seed -> Some (Random.State.make [| seed |])
         | Drop_unsynced | Survive _ -> None
       in
-      let contents = ref [] in
+      let contents = Hashtbl.create 16 in
       let content fs =
-        match List.assq_opt fs !contents with
+        match Hashtbl.find_opt contents fs.id with
         | Some c -> c
         | None ->
             let mine = List.rev fs.pending in
@@ -1647,7 +1741,7 @@ module Crash = struct
                   |> replay_changes (bytes_of fs.durable)
               | _ -> copy_cs (bytes_of fs.durable)
             in
-            contents := (fs, c) :: !contents;
+            Hashtbl.replace contents fs.id c;
             c
       in
       let ordered_metadata = List.rev ctl.metadata in
@@ -1671,15 +1765,17 @@ module Crash = struct
             let n = Random.State.int rng (List.length ordered_metadata + 1) in
             List.filteri (fun i _ -> i < n) ordered_metadata
       in
-      let tree, locs =
-        match List.rev metadata_survivors with
-        | e :: _ -> (e.tree, e.locations)
-        | [] -> (
-            match ctl.durable_tree with
-            | Some tree -> (tree, ctl.durable_locations)
-            | None -> assert false)
-      in
       let owner, root_path = root ctl in
+      let tree, locs =
+        let durable =
+          match ctl.durable_tree with
+          | Some tree -> (tree, ctl.durable_locations)
+          | None -> assert false
+        in
+        List.fold_left
+          (replay ~root:(path_segments root_path))
+          durable metadata_survivors
+      in
       (* A barrier deferred on a directory holds once the directory does: an
          entry it covers survives whenever the image holds that directory,
          wherever the cut fell. Program order replays a directory's creation
@@ -1714,7 +1810,7 @@ module Crash = struct
               fs.rel <- rel;
               rewrite fs content
           | _ | (exception Eio.Io _) -> ())
-        locs
+        (all_locations locs)
     end
 
   (* Advance the durability op counter and fire the configured auto-trigger. *)
@@ -1973,32 +2069,50 @@ module Crash = struct
     && String.equal (String.sub path 0 n) parent
     && path.[n] = '/'
 
+  let track ctl fs =
+    Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs;
+    ctl.by_rel <-
+      Paths.update fs.rel
+        (fun o -> Some (fs :: Option.value ~default:[] o))
+        ctl.by_rel
+
+  let untrack ctl fs =
+    let key = file_key fs.owner fs.rel in
+    (match Hashtbl.find_opt ctl.files key with
+    | Some fs' when fs' == fs -> Hashtbl.remove ctl.files key
+    | Some _ | None -> ());
+    ctl.by_rel <-
+      Paths.update fs.rel
+        (function
+          | None -> None
+          | Some l -> (
+              match List.filter (fun f -> f != fs) l with
+              | [] -> None
+              | l -> Some l))
+        ctl.by_rel
+
   let move_state ctl ~old_owner ~old_rel ~new_owner ~new_rel =
-    let states = Hashtbl.fold (fun _ fs acc -> fs :: acc) ctl.files [] in
-    Hashtbl.clear ctl.files;
+    let mine owner = List.filter (fun fs -> fs.owner == owner) in
+    let moved = mine old_owner (files_under ctl old_rel) in
+    let replaced =
+      mine new_owner (files_under ctl new_rel)
+      |> List.filter (fun fs -> not (List.memq fs moved))
+    in
+    (* A replaced file leaves the name table but keeps its pending writes: a
+       handle may still sync them, and a crash that loses the rename brings
+       the file back under its name. *)
+    List.iter (untrack ctl) replaced;
     List.iter
       (fun fs ->
-        let moved =
-          fs.owner == old_owner && path_is_at_or_under ~parent:old_rel fs.rel
+        untrack ctl fs;
+        let suffix =
+          String.sub fs.rel (String.length old_rel)
+            (String.length fs.rel - String.length old_rel)
         in
-        let replaced =
-          fs.owner == new_owner && path_is_at_or_under ~parent:new_rel fs.rel
-        in
-        if moved then begin
-          let suffix =
-            String.sub fs.rel (String.length old_rel)
-              (String.length fs.rel - String.length old_rel)
-          in
-          fs.owner <- new_owner;
-          fs.rel <- new_rel ^ suffix;
-          Hashtbl.replace ctl.files (file_key new_owner fs.rel) fs
-        end
-          (* A replaced file leaves the name table but keeps its pending
-           writes: a handle may still sync them, and a crash that loses the
-           rename brings the file back under its name. *)
-        else if replaced then ()
-        else Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs)
-      states;
+        fs.owner <- new_owner;
+        fs.rel <- new_rel ^ suffix;
+        track ctl fs)
+      moved;
     List.iter
       (fun place ->
         if
@@ -2074,7 +2188,7 @@ module Crash = struct
             let fs =
               fresh_file ~owner:d.dplace.proot ~rel ~perm ~durable:prev
             in
-            Hashtbl.replace d.dctl.files key fs;
+            track d.dctl fs;
             if existed then locate_preexisting d.dctl (fs, d.dplace.proot, rel);
             fs
       in
@@ -2125,7 +2239,8 @@ module Crash = struct
       let rel = at d.dplace.prefix path in
       let resolved = resolve ~follow_last:false d rel in
       B.unlink bv path;
-      Hashtbl.remove d.dctl.files (file_key d.dplace.proot resolved);
+      Option.iter (untrack d.dctl)
+        (Hashtbl.find_opt d.dctl.files (file_key d.dplace.proot resolved));
       record_metadata d.dctl ~path:rel ~kind:Unlink ~resolved:[ resolved ];
       bump_metadata d.dctl ~path:rel ~kind:Unlink
 
@@ -2270,7 +2385,8 @@ module Crash = struct
       log = [];
       metadata = [];
       durable_tree = None;
-      durable_locations = [];
+      durable_locations = no_locs;
+      by_rel = Paths.empty;
       subtrees = [];
       seq = 0;
       logged = 0;
@@ -2284,7 +2400,7 @@ module Crash = struct
     ctl.base <- Some (base, path);
     let owner = box_dir base in
     ctl.durable_tree <- Some (snapshot_at owner path);
-    ctl.durable_locations <- [];
+    ctl.durable_locations <- no_locs;
     (wrap_cdir ctl ~root:(box_dir base) ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
