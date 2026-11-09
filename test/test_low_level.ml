@@ -173,17 +173,15 @@ let test_read_directory_fd () =
   expect_eio_io "positioned read of a directory descriptor" (fun () ->
       ignore (Eio.File.pread flow ~file_offset:Optint.Int63.zero [ buf ] : int))
 
+(* open(2) for writing refuses a directory with EISDIR, at the open. *)
 let test_write_directory_fd () =
   with_env @@ fun env ->
   Eio.Path.mkdir ~perm:0o755 (env#fs / "d");
-  Eio.Path.with_open_out ~create:`Never (env#fs / "d") @@ fun flow ->
-  let buf = Cstruct.of_string "x" in
-  expect_eio_io "writing to a directory descriptor" (fun () ->
-      ignore (Eio.Flow.single_write flow [ buf ] : int));
-  expect_eio_io "positioned write to a directory descriptor" (fun () ->
-      ignore
-        (Eio.File.pwrite_single flow ~file_offset:Optint.Int63.zero [ buf ]
-          : int))
+  List.iter
+    (fun create ->
+      expect_eio_io "opening a directory for writing" (fun () ->
+          Eio.Path.with_open_out ~create (env#fs / "d") ignore))
+    [ `Never; `If_missing 0o644; `Or_truncate 0o644 ]
 
 (* open(2) with O_CREAT answers ENOTDIR when a component of the path prefix is
    not a directory. *)

@@ -530,6 +530,9 @@ let open_locked ~mode dir_fd path flags =
   let fs = Dir.fs dir_fd in
   let opened r =
     (match !r with
+    (* Write access to a directory: EISDIR. *)
+    | Resource.Dir _ when Open_flags.(mem o_rdwr flags) ->
+        Error.err ("open: is a directory: " ^ path)
     | Resource.Dir _ -> ()
     (* O_DIRECTORY on anything else: ENOTDIR. *)
     | _ when directory -> Error.err ("open: not a directory: " ^ path)
