@@ -249,8 +249,9 @@ val run : ?cwd:string -> (stdenv -> 'a) -> 'a
     host's. Unlike [Eio_main.run], it starts no event loop and installs no
     effect handler: call it inside one, such as [Eio_main.run] or
     [Eio_mock.Backend.run]. [env] holds the root and the current directory of
-    the new filesystem. The current directory is the absolute path [cwd]
-    (defaults to ["/"]), made with its missing ancestors, mode [0o755], before
-    [fn] runs.
+    the new filesystem. The current directory is the directory at the absolute
+    path [cwd] (defaults to ["/"]), made with its missing ancestors, mode
+    [0o755], before [fn] runs. Like a process's, it follows that directory
+    through a rename.
 
     @raise Stdlib.Invalid_argument if [cwd] is not an absolute path. *)

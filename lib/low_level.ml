@@ -230,6 +230,9 @@ type fs = {
   mutable fds : resource ref Fd_table.t;
   mutable last_ino : Inode.t;
   cwd : string;
+  mutable cwd_dir : resource ref option;
+      (* The directory [cwd] named when first used: it follows that
+         directory, as a descriptor does, whatever later takes the path. *)
   lock : Mutex.t;
 }
 
@@ -479,7 +482,15 @@ module Filesystem = struct
       { tree; base = None; follows = ref max_follows; dirs = [ root tree ] }
     in
     let cwd () =
-      { (walk at_root (names fs.cwd)) with follows = ref max_follows }
+      let r =
+        match fs.cwd_dir with
+        | Some r -> r
+        | None ->
+            let r = here (walk at_root (names fs.cwd)) in
+            fs.cwd_dir <- Some r;
+            r
+      in
+      { at_root with dirs = [ r ] }
     in
     match dir_fd with
     | Dir.Fs _ when Eio_fs_path.is_abs path -> at_root
@@ -504,6 +515,7 @@ let v ?(cwd = "/") () =
     fds = Fd_table.empty;
     last_ino = 0L;
     cwd;
+    cwd_dir = None;
     lock = Mutex.create ();
   }
 

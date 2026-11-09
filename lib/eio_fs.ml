@@ -541,6 +541,8 @@ let run ?(cwd = "/") fn =
   let fs = (Eio.Path.of_dir (Fs.fs t) :> Eio.Fs.dir_ty Eio.Path.t) in
   Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 Eio.Path.(fs / cwd);
   let cwd = (Eio.Path.of_dir (Fs.cwd t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  (* Resolve the current directory now: it then follows its directory. *)
+  ignore (Eio.Path.stat ~follow:true cwd : Eio.File.Stat.t);
   fn
     object
       method fs = fs

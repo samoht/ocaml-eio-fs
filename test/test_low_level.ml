@@ -370,6 +370,24 @@ let test_removed_directory () =
   Alcotest.(check (list string)) "empty" [] (Eio.Path.read_dir a);
   Alcotest.(check string) "f stayed" "x" (Eio.Path.load (fs / "f"))
 
+(* The current directory is a directory, not a path: it follows a rename of
+   its directory, and a link planted at its old path changes nothing. *)
+let test_cwd_follows_its_directory () =
+  with_env ~cwd:"/a" @@ fun env ->
+  let fs = env#fs and cwd = env#cwd in
+  Eio.Path.save ~create:(`Exclusive 0o644) (cwd / "f") "mine";
+  Eio.Path.rename (fs / "/a") (fs / "/b");
+  Alcotest.(check string) "after the rename" "mine" (Eio.Path.load (cwd / "f"));
+  Eio.Path.mkdir ~perm:0o755 (fs / "/c");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "/c/f") "planted";
+  Eio.Path.symlink ~link_to:"/c" (fs / "/a");
+  Alcotest.(check string)
+    "past a planted link" "mine"
+    (Eio.Path.load (cwd / "f"));
+  Alcotest.(check string)
+    "relative through fs" "mine"
+    (Eio.Path.load (fs / "f"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -828,4 +846,6 @@ let suite =
       Alcotest.test_case "an open unlinked file is kept" `Quick
         test_unlinked_open_file_kept;
       Alcotest.test_case "a removed directory" `Quick test_removed_directory;
+      Alcotest.test_case "cwd follows its directory" `Quick
+        test_cwd_follows_its_directory;
     ] )

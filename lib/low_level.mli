@@ -53,7 +53,9 @@ type t
 
 val v : ?cwd:string -> unit -> t
 (** [v ~cwd ()] is a new file system holding only an empty root directory, whose
-    current directory is the absolute path [cwd] (defaults to ["/"]). *)
+    current directory is the directory at the absolute path [cwd] (defaults to
+    ["/"]) when first used: it then follows that directory, as a descriptor
+    does. *)
 
 (** File descriptors. *)
 module Fd : sig
