@@ -352,6 +352,24 @@ let test_unlinked_open_file_kept () =
         "read" (String.make 64 'a') (Cstruct.to_string buf));
   Alcotest.(check bool) "closed" true (collected weak 0)
 
+(* A removed directory takes no new entry, even through an open handle. *)
+let test_removed_directory () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "x";
+  Eio.Switch.run @@ fun sw ->
+  let a = Eio.Path.open_dir ~sw (fs / "a") in
+  Eio.Path.rmdir (fs / "a");
+  expect_io_error "not found" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (a / "f") "y");
+  expect_io_error "not found" (fun () -> Eio.Path.mkdir ~perm:0o755 (a / "d"));
+  expect_io_error "not found" (fun () ->
+      Eio.Path.symlink ~link_to:"t" (a / "l"));
+  expect_io_error "not found" (fun () -> Eio.Path.rename (fs / "f") (a / "f"));
+  Alcotest.(check (list string)) "empty" [] (Eio.Path.read_dir a);
+  Alcotest.(check string) "f stayed" "x" (Eio.Path.load (fs / "f"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -809,4 +827,5 @@ let suite =
         test_unlinked_file_freed;
       Alcotest.test_case "an open unlinked file is kept" `Quick
         test_unlinked_open_file_kept;
+      Alcotest.test_case "a removed directory" `Quick test_removed_directory;
     ] )

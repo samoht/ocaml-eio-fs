@@ -530,6 +530,11 @@ let check_access path flags r =
       Error.permission_denied path
   | _ -> ()
 
+(* A directory removed while a handle held it takes no new entry: ENOENT. *)
+let check_live fs rdir path =
+  if not (Entries.mem (Resource.stat !rdir).ino fs.tree) then
+    Error.not_found path
+
 (* [.] and [..] name a directory already there, never an entry to make,
    remove or move. *)
 let is_dot name = String.equal name "." || String.equal name ".."
@@ -543,7 +548,9 @@ let new_entry ?(dir = false) dir_fd path add =
   match Filesystem.child w name with
   | Some _ -> Error.already_exists path
   | None when slash && not dir -> Error.not_found path
-  | None -> add (Filesystem.here w) name
+  | None ->
+      check_live (Dir.fs dir_fd) (Filesystem.here w) path;
+      add (Filesystem.here w) name
 
 (* Create [name] in the directory [w] is in, register the new file in the
    filesystem, and return its resource. *)
@@ -552,6 +559,7 @@ let new_file ~mode fs (w : Filesystem.walk) name ~slash =
      macOS answers ENOENT, Linux EISDIR. *)
   if slash then Error.not_found name;
   let rdir = Filesystem.here w in
+  check_live fs rdir name;
   let dir = as_dir ~path:name !rdir in
   let stat = new_stat fs ~perm:(mode land 0o7777) () in
   let f = File.v ~stat in
@@ -843,6 +851,7 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let ino = Resource.(stat !old_res).ino in
   let old_parent = Filesystem.here old_w in
   let new_parent = Filesystem.here new_w in
+  check_live (Dir.fs new_dir) new_parent new_path;
   let existing =
     List.find_opt
       (fun (_, name) -> String.equal name new_name)
