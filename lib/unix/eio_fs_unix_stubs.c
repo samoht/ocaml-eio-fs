@@ -837,6 +837,20 @@ CAMLprim value caml_eio_fs_getxattrat(value dirfd_v, value entry_v,
   CAMLreturn(eio_fs_read_sized(dirfd_v, entry_v, some, "getxattr"));
 }
 
+/* The errno of an attribute that is not there: ENOATTR on Darwin, ENODATA
+   on Linux, which Unix reports as EUNKNOWNERR. */
+CAMLprim value caml_eio_fs_enoattr(value unit)
+{
+  (void)unit;
+#if defined(__APPLE__)
+  return Val_int(ENOATTR);
+#elif defined(ENODATA)
+  return Val_int(ENODATA);
+#else
+  return Val_int(-1);
+#endif
+}
+
 CAMLprim value caml_eio_fs_setxattrat(value dirfd_v, value entry_v,
                                       value name_v, value data_v)
 {

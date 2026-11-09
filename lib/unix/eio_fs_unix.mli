@@ -571,7 +571,8 @@ val lock_section :
 val xattrs : _ Eio.Path.t -> (string * string) list
 (** [xattrs path] is every extended attribute of [path] as [(name, value)]
     pairs, in ascending byte order of name, and [[]] for an entry that has none.
-    A value is the attribute's bytes, NUL bytes included.
+    A value is the attribute's bytes, NUL bytes included. An attribute removed
+    between the listing and the read is left out.
 
     @raise Eio.Io
       as the platform call fails ([ENOTSUP] where the filesystem keeps none,

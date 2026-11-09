@@ -1564,13 +1564,22 @@ external setxattr_at : Unix.file_descr -> string -> string -> string -> unit
 let names_of_list s =
   String.split_on_char '\000' s |> List.filter (fun n -> n <> "")
 
+external enoattr : unit -> int = "caml_eio_fs_enoattr" [@@noalloc]
+
+let enoattr = enoattr ()
+
+(* A name removed between the list and the get is dropped. *)
 let xattrs path =
   with_entry ~label:"xattrs" path @@ fun dir entry ->
   eio_unix_errors @@ fun () ->
   Eio_unix.run_in_systhread ~label:"eio-fs-xattrs" @@ fun () ->
   names_of_list (listxattr_at dir entry)
   |> List.sort String.compare
-  |> List.map (fun name -> (name, getxattr_at dir entry name))
+  |> List.filter_map (fun name ->
+      match getxattr_at dir entry name with
+      | v -> Some (name, v)
+      | exception Unix.Unix_error (Unix.EUNKNOWNERR n, _, _) when n = enoattr ->
+          None)
 
 let set_xattr path name v =
   with_entry ~label:"set_xattr" path @@ fun dir entry ->
