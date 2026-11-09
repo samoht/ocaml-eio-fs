@@ -266,6 +266,19 @@ let test_trailing_slash () =
     "a directory takes the slash" [ "f"; "l" ]
     (List.sort String.compare (Eio.Path.read_dir fs))
 
+(* A file grows by doubling its capacity, so many small writes cost linear
+   time: 16384 appends of 1 KiB copy 16 MiB, not 128 GiB. *)
+let test_many_small_writes () =
+  with_env @@ fun env ->
+  let chunk = String.make 1024 'x' in
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (env#fs / "big") (fun f ->
+      for _ = 1 to 16384 do
+        Eio.Flow.copy_string chunk f
+      done);
+  Alcotest.(check int)
+    "size" (16384 * 1024)
+    (Optint.Int63.to_int (Eio.Path.stat ~follow:false (env#fs / "big")).size)
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -717,4 +730,5 @@ let suite =
       Alcotest.test_case "directory ops under a regular file" `Quick
         test_dir_ops_under_regular_file;
       Alcotest.test_case "trailing slash" `Quick test_trailing_slash;
+      Alcotest.test_case "many small writes" `Quick test_many_small_writes;
     ] )

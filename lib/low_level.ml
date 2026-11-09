@@ -116,23 +116,51 @@ end
 module File = struct
   (* [Literal] aliases an immutable string (an embedded asset) and is turned
      into an owned [Buffer] by the first write, so embedding a file costs no
-     copy until someone mutates it. *)
+     copy until someone mutates it. A [Buffer] is at least as long as the file,
+     whose length is the stat's size, and grows by doubling, so a run of writes
+     costs linear time. *)
   type contents = Literal of string | Buffer of Cstruct.t
   type t = { stat : Eio.File.Stat.t; contents : contents }
 
   let v ~stat = { stat; contents = Buffer Cstruct.empty }
   let literal ~stat contents = { stat; contents = Literal contents }
-
-  let length = function
-    | Literal s -> String.length s
-    | Buffer b -> Cstruct.length b
-
-  let buffer = function Literal s -> Cstruct.of_string s | Buffer b -> b
+  let size f = Optint.Int63.to_int f.stat.size
 
   let blit t ~src_off dst ~dst_off ~len =
     match t with
     | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
     | Buffer b -> Cstruct.blit b src_off dst dst_off len
+
+  (* A buffer holding [f]'s bytes with room for [need], and every byte from
+     [f]'s size to [need] zero: a truncation leaves stale bytes past the end. *)
+  let reserve f need =
+    let size = size f in
+    let buf =
+      match f.contents with
+      | Buffer b when Cstruct.length b >= need -> b
+      | contents ->
+          let cap =
+            match contents with Buffer b -> Cstruct.length b | Literal _ -> 0
+          in
+          let b = Cstruct.create (max need (2 * cap)) in
+          blit contents ~src_off:0 b ~dst_off:0 ~len:size;
+          b
+    in
+    if need > size then Cstruct.memset (Cstruct.sub buf size (need - size)) 0;
+    buf
+
+  (* [f] with [src] written at [off]. *)
+  let write f ~off src =
+    let len = Cstruct.length src in
+    let buf = reserve f (off + len) in
+    Cstruct.blit src 0 buf off len;
+    let size = Optint.Int63.of_int (max (size f) (off + len)) in
+    { stat = { f.stat with size }; contents = Buffer buf }
+
+  (* [f] cut or zero-extended to [n] bytes. *)
+  let truncate f n =
+    let contents = if n <= size f then f.contents else Buffer (reserve f n) in
+    { stat = { f.stat with size = Optint.Int63.of_int n }; contents }
 end
 
 module Fd_table = Map.Make (Num)
@@ -827,23 +855,6 @@ let check_offset op off =
 
 (* TODO: update access times *)
 
-let blit_and_grow ~src ~dst ~off =
-  let src_len = Cstruct.length src in
-  let dst_len = Cstruct.length dst in
-  let required_size = off + src_len in
-  (* If there's enough space in the destination, then we can blit. *)
-  if required_size <= dst_len then begin
-    Cstruct.blit src 0 dst off src_len;
-    dst
-  end
-  else begin
-    (* Otherwise we need a big buf. *)
-    let new_dst = Cstruct.create required_size in
-    Cstruct.blit dst 0 new_dst 0 dst_len;
-    Cstruct.blit src 0 new_dst off src_len;
-    new_dst
-  end
-
 (* EISDIR, naming the operation and never the contents. *)
 let not_a_file op r =
   Error.err
@@ -863,14 +874,7 @@ let writev t bufs =
          append descriptor, at the end. *)
       let src = Cstruct.concat bufs in
       if t.append then t.pos <- e.stat.size;
-      let contents =
-        File.Buffer
-          (blit_and_grow ~src ~dst:(File.buffer e.contents)
-             ~off:(Optint.Int63.to_int t.pos))
-      in
-      let new_size = Optint.Int63.of_int @@ File.length contents in
-      let stat = { e.stat with size = new_size } in
-      r := File { stat; contents };
+      r := File (File.write e ~off:(Optint.Int63.to_int t.pos) src);
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
       Cstruct.length src
   | r -> not_a_file "writev" r
@@ -904,7 +908,7 @@ let preadv t ~file_offset bufs =
   check_offset "pread" file_offset;
   match !(resource_of t) with
   | Resource.File e ->
-      let size = File.length e.contents in
+      let size = File.size e in
       let start = Optint.Int63.to_int file_offset in
       if start >= size then raise End_of_file
       else begin
@@ -930,12 +934,7 @@ let pwritev t ~file_offset bufs =
   | Resource.File e ->
       let src = Cstruct.concat bufs in
       let off = Optint.Int63.to_int file_offset in
-      let contents =
-        File.Buffer (blit_and_grow ~src ~dst:(File.buffer e.contents) ~off)
-      in
-      let new_size = Optint.Int63.of_int (File.length contents) in
-      let stat = { e.stat with size = new_size } in
-      r := Resource.File { contents; stat };
+      r := Resource.File (File.write e ~off src);
       Cstruct.length src
   | r -> not_a_file "pwrite" r
 
@@ -961,18 +960,7 @@ let truncate_fd t len =
   let r = resource_of t in
   match !r with
   | Resource.File e ->
-      let target = Optint.Int63.to_int len in
-      let cur = File.length e.contents in
-      let contents =
-        if target = cur then e.contents
-        else begin
-          let c = Cstruct.create target in
-          File.blit e.contents ~src_off:0 c ~dst_off:0 ~len:(min cur target);
-          File.Buffer c
-        end
-      in
-      let stat = { e.stat with size = Optint.Int63.of_int target } in
-      r := Resource.File { contents; stat }
+      r := Resource.File (File.truncate e (Optint.Int63.to_int len))
   | r -> not_a_file "truncate" r
 
 module Flow = struct
