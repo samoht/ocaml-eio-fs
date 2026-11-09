@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-# hermetic is pinned from its repository until it is on opam.
-env:
-  HERMETIC_PIN: https://github.com/samoht/ocaml-hermetic.git
-
 jobs:
   build:
     name: Build and test
@@ -33,7 +29,6 @@ jobs:
         with:
           ocaml-compiler: ${{ matrix.ocaml-compiler }}
 
-      - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-test
       - run: opam exec -- dune build
       - run: opam exec -- dune test
@@ -49,7 +44,6 @@ jobs:
         with:
           ocaml-compiler: '5.4'
 
-      - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only
       - run: opam exec -- dune build -p eio-fs @install
 
@@ -69,7 +63,6 @@ jobs:
       # Resolve every dependency to the oldest version its lower bound allows,
       # so a call that only compiles against a newer API fails here rather than
       # in a downstream opam build.
-      - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-test --criteria="+count[version-lag,solution]"
       - run: opam exec -- dune build
       - run: opam exec -- dune test
@@ -85,7 +78,6 @@ jobs:
         with:
           ocaml-compiler: '5.4'
 
-      - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-doc
       - run: opam install odoc
       - run: opam exec -- dune build @doc
@@ -120,7 +112,6 @@ jobs:
         with:
           ocaml-compiler: '5.4'
 
-      - run: opam pin add -n hermetic "$HERMETIC_PIN"
       - run: opam install . --deps-only --with-test
       - run: opam exec -- dune build @check
       # The binary is cached by the overlay's commit and the compiler's
