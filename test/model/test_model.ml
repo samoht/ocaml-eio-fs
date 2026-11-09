@@ -14,7 +14,7 @@ let i63 = Optint.Int63.of_int
 (* ---------- users ---------- *)
 type who = Root | Alice
 
-let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 }
+let alice_user = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 }
 let uid_of = function Root -> 0 | Alice -> 1000
 let gid_of = function Root -> 0 | Alice -> 1000
 
@@ -363,6 +363,7 @@ type op =
   | Hsync of int
   | Hclose of int
   | Commit
+  | Sync_dir of string
 
 let pp_op ppf = function
   | Create { p; mode; data; sync } ->
@@ -385,6 +386,7 @@ let pp_op ppf = function
   | Hsync h -> Fmt.pf ppf "h%d fsync" h
   | Hclose h -> Fmt.pf ppf "h%d close" h
   | Commit -> Fmt.pf ppf "sync_metadata"
+  | Sync_dir p -> Fmt.pf ppf "sync_dir %S" p
 
 let paths =
   [|
@@ -420,7 +422,7 @@ let existing m =
   go "" m.root;
   Array.of_list !acc
 
-let gen_op ~crash ~users m rng =
+let gen_op ~crash ~users ~alice ~dirsync m rng =
   let pick a = a.(Random.State.int rng (Array.length a)) in
   let ex = existing m in
   let path () =
@@ -436,45 +438,55 @@ let gen_op ~crash ~users m rng =
       (1 + Random.State.int rng 12)
       (fun _ -> Char.chr (97 + Random.State.int rng 26))
   in
-  let who = if users && Random.State.int rng 3 = 0 then Alice else Root in
+  let who =
+    if alice || (users && Random.State.int rng 3 = 0) then Alice else Root
+  in
   let op =
-    match Random.State.int rng (if crash then 18 else 17) with
-    | 0 | 1 ->
-        Create
-          {
-            p = path ();
-            mode = pick [| `Excl; `Ifm; `Trunc |];
-            data = data ();
-            sync = Random.State.bool rng;
-          }
-    | 2 -> Pwrite { p = path (); off = Random.State.int rng 20; data = data () }
-    | 3 -> Append { p = path (); data = data () }
-    | 4 -> Trunc { p = path (); len = Random.State.int rng 20 }
-    | 5 -> Rename { src = path (); dst = path () }
-    | 6 -> Unlink (path ())
-    | (7 | 16) when (not crash) || Random.State.bool rng ->
-        Mkdir { p = path (); perm = (if users then pick dperms else 0o755) }
-    | 8 -> Rmdir (path ())
-    | 9 -> Symlink { p = leaf (); target = pick targets }
-    | 10 -> Fsync (path ())
-    | 11 ->
-        Chmod
-          {
-            p = path ();
-            perm = (if Random.State.bool rng then pick fperms else pick dperms);
-          }
-    | 12 -> Hopen { h = Random.State.int rng 3; p = path () }
-    | 13 | 14 ->
-        Hwrite
-          {
-            h = Random.State.int rng 3;
-            off = Random.State.int rng 20;
-            data = data ();
-          }
-    | 15 ->
-        if Random.State.bool rng then Hsync (Random.State.int rng 3)
-        else Hclose (Random.State.int rng 3)
-    | _ -> Commit
+    match if dirsync then Random.State.int rng 6 else 5 with
+    | 0 -> Sync_dir (pick [| ""; "d0"; "d1"; "d0/d2" |])
+    | 1 -> Rename { src = path (); dst = path () }
+    | 2 -> Mkdir { p = pick [| "d0"; "d1"; "d0/d2" |]; perm = 0o755 }
+    | _ -> (
+        match Random.State.int rng (if crash then 18 else 17) with
+        | 0 | 1 ->
+            Create
+              {
+                p = path ();
+                mode = pick [| `Excl; `Ifm; `Trunc |];
+                data = data ();
+                sync = Random.State.bool rng;
+              }
+        | 2 ->
+            Pwrite
+              { p = path (); off = Random.State.int rng 20; data = data () }
+        | 3 -> Append { p = path (); data = data () }
+        | 4 -> Trunc { p = path (); len = Random.State.int rng 20 }
+        | 5 -> Rename { src = path (); dst = path () }
+        | 6 -> Unlink (path ())
+        | (7 | 16) when (not crash) || Random.State.bool rng ->
+            Mkdir { p = path (); perm = (if users then pick dperms else 0o755) }
+        | 8 -> Rmdir (path ())
+        | 9 -> Symlink { p = leaf (); target = pick targets }
+        | 10 -> Fsync (path ())
+        | 11 ->
+            Chmod
+              {
+                p = path ();
+                perm =
+                  (if Random.State.bool rng then pick fperms else pick dperms);
+              }
+        | 12 -> Hopen { h = Random.State.int rng 3; p = path () }
+        | 13 | 14 ->
+            Hwrite
+              {
+                h = Random.State.int rng 3;
+                off = Random.State.int rng 20;
+                data = data ();
+              }
+        | 15 ->
+            if Random.State.bool rng then Hsync (Random.State.int rng 3)
+            else Hclose (Random.State.int rng 3)
+        | _ -> Commit)
   in
   (who, op)
 
@@ -530,7 +542,8 @@ let real_op ~dir ~alice_dir who op =
   | Fsync p ->
       Eio.Path.with_open_out ~create:`Never (d // p) (fun f -> Eio.File.sync f)
   | Chmod { p; perm } -> Eio.Path.chmod ~follow:true ~perm (d // p)
-  | Hopen _ | Hwrite _ | Hsync _ | Hclose _ | Commit -> assert false
+  | Hopen _ | Hwrite _ | Hsync _ | Hclose _ | Commit | Sync_dir _ ->
+      assert false
 
 let model_op m who op =
   match op with
@@ -562,7 +575,8 @@ let model_op m who op =
       let id = m_open m who p ~create:`Never in
       m_sync m id
   | Chmod { p; perm } -> m_chmod m who p perm
-  | Hopen _ | Hwrite _ | Hsync _ | Hclose _ | Commit -> assert false
+  | Hopen _ | Hwrite _ | Hsync _ | Hclose _ | Commit | Sync_dir _ ->
+      assert false
 
 let new_model () =
   let root = { ents = SM.empty; dperm = 0o755; duid = 0; dgid = 0 } in
@@ -590,10 +604,11 @@ let fail_with trace msg =
        (Fmt.str "%s@.trace:@.%a" msg Fmt.string
           (String.concat "\n" (List.rev trace))))
 
-let run_workload ?env ~mode ~seed ~len () =
+let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
   let rng = Random.State.make [| seed |] in
   let crash = mode <> `Nocrash in
-  let users = mode = `Nocrash in
+  let users = mode = `Nocrash || alice in
+  let dirsync = mode = `Full in
   (match env with None -> Eio_mock.Backend.run | Some _ -> fun f -> f ())
   @@ fun () ->
   let admin =
@@ -609,24 +624,31 @@ let run_workload ?env ~mode ~seed ~len () =
     | `Drop -> Some (Crash.v ())
     | `Reorder (s, bs) ->
         Some (Crash.v ~policy:(Crash.Reorder_unsynced s) ~block_size:bs ())
+    | `Full -> Some (Crash.v ~policy:(Crash.Survive (fun _ -> true)) ())
   in
-  let dir =
-    match ctl with
-    | None -> admin
-    | Some c -> (Crash.wrap c admin :> Eio.Fs.dir_ty Eio.Path.t)
-  in
-  let alice_dir = (Eio_fs.Fs.as_user alice admin :> Eio.Fs.dir_ty Eio.Path.t) in
-  let dir = (dir :> Eio.Fs.dir_ty Eio.Path.t) in
   let m = new_model () in
   if users then begin
     Eio.Path.chmod ~follow:true ~perm:0o777 admin;
-    m.root <- { m.root with dperm = 0o777 }
+    m.root <- { m.root with dperm = 0o777 };
+    m.committed <- (m.root, snd m.committed)
   end;
+  let as_alice =
+    (Eio_fs.Fs.as_user alice_user admin :> Eio.Fs.dir_ty Eio.Path.t)
+  in
+  (* As a user, the crash model wraps that user's view of the tree. *)
+  let dir, alice_dir =
+    match ctl with
+    | None -> (admin, as_alice)
+    | Some c when alice ->
+        let w = (Crash.wrap c as_alice :> Eio.Fs.dir_ty Eio.Path.t) in
+        (w, w)
+    | Some c -> ((Crash.wrap c admin :> Eio.Fs.dir_ty Eio.Path.t), as_alice)
+  in
   let handles = Array.make 3 None in
   let trace = ref [] in
   Eio.Switch.run @@ fun sw ->
   for _ = 1 to len do
-    let who, op = gen_op ~crash ~users m rng in
+    let who, op = gen_op ~crash ~users ~alice ~dirsync m rng in
     if not (unsafe m op) then begin
       let snapshot_files = Hashtbl.copy m.files in
       let saved =
@@ -664,7 +686,7 @@ let run_workload ?env ~mode ~seed ~len () =
       let expected =
         match op with
         | Hopen { h; p } -> (
-            match m_open m Root p ~create:`Never with
+            match m_open m (if alice then who else Root) p ~create:`Never with
             | id -> Ok (`Open (h, id))
             | exception Err e -> Error e
             | exception Skip -> Error "skip")
@@ -687,6 +709,7 @@ let run_workload ?env ~mode ~seed ~len () =
         | Commit ->
             m_commit m;
             Ok `Unit
+        | Sync_dir _ -> Ok `Unit
         | op -> (
             match model_op m who op with
             | () -> Ok `Unit
@@ -736,6 +759,11 @@ let run_workload ?env ~mode ~seed ~len () =
           | Commit ->
               Crash.sync_metadata (Option.get ctl);
               Ok ignore
+          | Sync_dir p -> (
+              let d = match who with Root -> dir | Alice -> alice_dir in
+              match Eio_fs_sync.sync_dir (if p = "" then d else d // p) with
+              | () -> Ok ignore
+              | exception Eio.Io _ -> Ok ignore)
           | op -> (
               match real_op ~dir ~alice_dir who op with
               | () -> Ok ignore
@@ -770,7 +798,9 @@ let run_workload ?env ~mode ~seed ~len () =
   match ctl with
   | None -> ()
   | Some ctl -> (
-      let pc = Crash.post_crash ctl in
+      let live = render_real admin in
+      (* Read the image as root: a user may not read all of it. *)
+      let pc = Eio_fs.Fs.as_user Eio_fs.root (Crash.post_crash ctl) in
       let got = render_real pc in
       let perm_of perms id =
         try List.assoc id perms with Not_found -> 0o7777
@@ -783,13 +813,20 @@ let run_workload ?env ~mode ~seed ~len () =
           perms
       in
       match mode with
+      | `Full ->
+          if got <> live then
+            fail_with !trace
+              (Fmt.str
+                 "every change survived, but the image is not the live \
+                  tree@.live:@.%s@.image:@.%s"
+                 live got)
       | `Drop ->
           let tree, perms = m.committed in
           let perms = synced perms in
           let exp =
             render_model tree
               (fun id -> Hashtbl.find m.durable id)
-              (fun id -> (perm_of perms id, 0))
+              (fun id -> (perm_of perms id, (finfo m id).fuid))
           in
           if exp <> got then
             fail_with !trace
@@ -850,7 +887,9 @@ let run_workload ?env ~mode ~seed ~len () =
           (* parse got into path -> line *)
           let ok_state1 (tree, perms) =
             let shape =
-              render_model tree (fun _ -> "") (fun id -> (perm_of perms id, 0))
+              render_model tree
+                (fun _ -> "")
+                (fun id -> (perm_of perms id, (finfo m id).fuid))
             in
             let strip s =
               String.split_on_char '\n' s
@@ -897,16 +936,26 @@ let run_workload ?env ~mode ~seed ~len () =
 
 let modes =
   [
-    ("no crash, root and a user", fun _ -> `Nocrash);
-    ("Drop_unsynced", fun _ -> `Drop);
-    ("Reorder_unsynced, 4096-byte blocks", fun seed -> `Reorder (seed, 4096));
-    ("Reorder_unsynced, 1-byte blocks", fun seed -> `Reorder (seed, 1));
+    ("no crash, root and a user", false, fun _ -> `Nocrash);
+    ("Drop_unsynced", false, fun _ -> `Drop);
+    ("Drop_unsynced, as a user", true, fun _ -> `Drop);
+    ( "Reorder_unsynced, 4096-byte blocks",
+      false,
+      fun seed -> `Reorder (seed, 4096) );
+    ( "Reorder_unsynced, 4096-byte blocks, as a user",
+      true,
+      fun seed -> `Reorder (seed, 4096) );
+    ("Reorder_unsynced, 1-byte blocks", false, fun seed -> `Reorder (seed, 1));
+    ("every change survives, with directory barriers", false, fun _ -> `Full);
+    ( "every change survives, with directory barriers, as a user",
+      true,
+      fun _ -> `Full );
   ]
 
-(* Each mode runs 1000 seeds of 40 operations: a second or so in all. *)
-let test mode () =
+(* Each mode runs 1000 seeds of 40 operations. *)
+let test (alice, mode) () =
   for seed = 0 to 999 do
-    match run_workload ~mode:(mode seed) ~seed ~len:40 () with
+    match run_workload ~alice ~mode:(mode seed) ~seed ~len:40 () with
     | () -> ()
     | exception Mismatch s -> Alcotest.failf "seed %d: %s" seed s
   done
@@ -914,5 +963,6 @@ let test mode () =
 let suite =
   ( "model",
     List.map
-      (fun (name, mode) -> Alcotest.test_case name `Quick (test mode))
+      (fun (name, alice, mode) ->
+        Alcotest.test_case name `Quick (test (alice, mode)))
       modes )
