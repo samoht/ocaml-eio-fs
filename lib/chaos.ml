@@ -2025,8 +2025,9 @@ module Crash = struct
       let spelt = at d.dplace.prefix path in
       let rel = resolve d spelt in
       let key = file_key d.dplace.proot rel in
+      (* A dangling link names a file the open creates. *)
       let existed =
-        match B.stat bv ~follow:false path with
+        match B.stat bv ~follow:true path with
         | _ -> true
         | exception Eio.Io _ -> false
       in

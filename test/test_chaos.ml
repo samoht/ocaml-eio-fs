@@ -2137,6 +2137,24 @@ let test_crash_rename_over_an_open_file () =
   Alcotest.(check string) "b" "NEW" (Eio.Path.load (post / "b"));
   Alcotest.(check string) "a" "other" (Eio.Path.load (post / "a"))
 
+(* A file created through a dangling symbolic link is a new entry at the
+   link's target, journaled as any create. *)
+let test_crash_create_through_a_dangling_link () =
+  let ctl = Crash.v () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.symlink ~link_to:"target" (fs / "l");
+  Eio.Path.with_open_out ~create:(`If_missing 0o644) (fs / "l") (fun f ->
+      Eio.Flow.copy_string "data" f;
+      Eio.File.sync f);
+  Alcotest.(check bool)
+    "the create is pending" true
+    (List.exists
+       (fun (u : Crash.unsynced) -> u.kind = Crash.Create)
+       (Crash.unsynced ctl));
+  Eio_fs_sync.sync_dir fs;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "target" "data" (Eio.Path.load (post / "target"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2471,6 +2489,8 @@ let suite =
       Alcotest.test_case "crash: the block size" `Quick test_crash_block_size;
       Alcotest.test_case "crash: a rename over an open file" `Quick
         test_crash_rename_over_an_open_file;
+      Alcotest.test_case "crash: a create through a dangling link" `Quick
+        test_crash_create_through_a_dangling_link;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
