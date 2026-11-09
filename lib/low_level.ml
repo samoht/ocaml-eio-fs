@@ -493,11 +493,13 @@ let is_dot name = String.equal name "." || String.equal name ".."
 
 (* Create the entry [path] with [add parent name] unless its name is taken,
    by a dangling symbolic link included: EEXIST, as mkdir(2) and symlink(2)
-   answer. *)
-let new_entry dir_fd path add =
-  let w, name, _ = Filesystem.locate_from dir_fd path in
+   answer. Only a directory is made under a name with a trailing slash: ENOENT
+   otherwise. *)
+let new_entry ?(dir = false) dir_fd path add =
+  let w, name, slash = Filesystem.locate_from dir_fd path in
   match Filesystem.child w name with
   | Some _ -> Error.already_exists path
+  | None when slash && not dir -> Error.not_found path
   | None -> add (Filesystem.here w) name
 
 (* Create [name] in the directory [w] is in, register the new file in the
@@ -610,13 +612,15 @@ let remove_entry (w : Filesystem.walk) name =
 
 let unlink dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let w, name, _ = Filesystem.locate_from dir_fd path in
+  let w, name, slash = Filesystem.locate_from dir_fd path in
   (* EISDIR, as Linux answers; macOS answers EPERM. *)
   let is_a_directory () = Error.err ("unlink: is a directory: " ^ path) in
   if is_dot name then is_a_directory ();
   match Filesystem.child w name with
   | None -> Error.not_found path
   | Some { contents = Resource.Dir _ } -> is_a_directory ()
+  (* A trailing slash on anything else, a link to a directory included. *)
+  | Some _ when slash -> Error.not_a_directory path
   | Some _ -> remove_entry w name
 
 let mkdirat dir_fd ~perm path =
@@ -631,7 +635,7 @@ let mkdirat dir_fd ~perm path =
     let entries = (ino, name) :: d.entries in
     r := Dir { d with entries }
   in
-  new_entry dir_fd path mkdir
+  new_entry ~dir:true dir_fd path mkdir
 
 let embed dir_fd ~perm path ~contents =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -771,8 +775,8 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   if Dir.fs dir_fd != Dir.fs new_dir then
     Error.err ("rename: invalid cross-device link: " ^ new_path);
   let tree = (Dir.fs dir_fd).tree in
-  let old_w, old_name, _ = Filesystem.locate_from dir_fd old_path in
-  let new_w, new_name, _ = Filesystem.locate_from new_dir new_path in
+  let old_w, old_name, old_slash = Filesystem.locate_from dir_fd old_path in
+  let new_w, new_name, new_slash = Filesystem.locate_from new_dir new_path in
   (* rename(2) answers EINVAL or EBUSY for a last [.] or [..]. *)
   if is_dot old_name || is_dot new_name then
     Error.err ("rename: invalid argument: " ^ new_path);
@@ -783,6 +787,11 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
     | Some r -> r
     | None -> Error.not_found old_path
   in
+  (* A trailing slash on either name requires a directory, never followed. *)
+  (match !old_res with
+  | Resource.Dir _ -> ()
+  | _ when old_slash || new_slash -> Error.not_a_directory old_path
+  | _ -> ());
   let ino = Resource.(stat !old_res).ino in
   let old_parent = Filesystem.here old_w in
   let new_parent = Filesystem.here new_w in

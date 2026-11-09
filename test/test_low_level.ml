@@ -240,6 +240,34 @@ let test_dir_ops_under_regular_file () =
   expect_enotdir "mkdirs ~exists_ok" (fun () ->
       Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (under / "deeper"))
 
+(* A trailing slash names a directory: on anything else it is ENOTDIR, and a
+   non-directory is never created under such a name. *)
+let test_trailing_slash () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "x";
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.symlink ~link_to:"d" (fs / "l");
+  expect_enotdir "unlink f/" (fun () -> Eio.Path.unlink (fs / "f/"));
+  expect_enotdir "unlink l/" (fun () -> Eio.Path.unlink (fs / "l/"));
+  expect_enotdir "rmdir l/" (fun () -> Eio.Path.rmdir (fs / "l/"));
+  expect_enotdir "rename f g/" (fun () ->
+      Eio.Path.rename (fs / "f") (fs / "g/"));
+  expect_enotdir "rename f/ g" (fun () ->
+      Eio.Path.rename (fs / "f/") (fs / "g"));
+  expect_enotdir "rename l/ m" (fun () ->
+      Eio.Path.rename (fs / "l/") (fs / "m"));
+  expect_io_error "not found" (fun () ->
+      Eio.Path.symlink ~link_to:"t" (fs / "s/"));
+  Alcotest.(check (list string))
+    "nothing moved" [ "d"; "f"; "l" ]
+    (List.sort String.compare (Eio.Path.read_dir fs));
+  Eio.Path.rename (fs / "d/") (fs / "e/");
+  Eio.Path.rmdir (fs / "e/");
+  Alcotest.(check (list string))
+    "a directory takes the slash" [ "f"; "l" ]
+    (List.sort String.compare (Eio.Path.read_dir fs))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -690,4 +718,5 @@ let suite =
         test_create_directory_syntax;
       Alcotest.test_case "directory ops under a regular file" `Quick
         test_dir_ops_under_regular_file;
+      Alcotest.test_case "trailing slash" `Quick test_trailing_slash;
     ] )
