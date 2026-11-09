@@ -826,17 +826,6 @@ module Crash = struct
     go 0 bufs;
     b
 
-  (* Seeded Fisher-Yates: same seed and same list yield the same permutation. *)
-  let shuffle rng lst =
-    let a = Array.of_list lst in
-    for i = Array.length a - 1 downto 1 do
-      let j = Random.State.int rng (i + 1) in
-      let tmp = a.(i) in
-      a.(i) <- a.(j);
-      a.(j) <- tmp
-    done;
-    Array.to_list a
-
   let read_all (ro : Eio.File.ro_ty r) =
     let size = Optint.Int63.to_int (Eio.File.stat ro).size in
     if size <= 0 then Cstruct.empty
@@ -1007,6 +996,7 @@ module Crash = struct
   type t = {
     policy : policy;
     trigger : trigger;
+    block_size : int;
     mutable base : base_dir option;
     files : (string, fstate) Hashtbl.t;
     mutable subtrees : place list;
@@ -1455,6 +1445,93 @@ module Crash = struct
               else e)
             ctl.metadata
 
+  (* Writeback in blocks of [bs] bytes. For each block a pending change
+     dirtied, a crash keeps the block as it was durable or as it stood after
+     any one of those changes, drawn from [rng]; the length is one a change
+     left, or a block boundary between the shortest and longest of those. A
+     block is never torn, and a later change never lands in a block without
+     the earlier ones. *)
+  let writeback ~rng ~bs durable changes =
+    let changes = Array.of_list changes in
+    let n = Array.length changes in
+    let sizes = Array.make (n + 1) (Cstruct.length durable) in
+    let versions = Hashtbl.create 16 in
+    for k = 0 to n - 1 do
+      let prev = sizes.(k) in
+      let lo, hi =
+        match changes.(k) with
+        | Write { offset; data } ->
+            let len = Cstruct.length data in
+            sizes.(k + 1) <- max prev (offset + len);
+            (offset, offset + len)
+        | Resize m ->
+            sizes.(k + 1) <- m;
+            (min m prev, max m prev)
+      in
+      if hi > lo then
+        for b = lo / bs to (hi - 1) / bs do
+          let vs = Option.value ~default:[] (Hashtbl.find_opt versions b) in
+          Hashtbl.replace versions b ((k + 1) :: vs)
+        done
+    done;
+    (* Each dirty block's version, in block order: [0] is the durable one, [k]
+       the one after change [k]. *)
+    let blocks =
+      Hashtbl.fold (fun b _ acc -> b :: acc) versions []
+      |> List.sort Int.compare
+    in
+    let chosen = Hashtbl.create 16 in
+    List.iter
+      (fun b ->
+        let vs = 0 :: List.rev (Hashtbl.find versions b) in
+        let v = List.nth vs (Random.State.int rng (List.length vs)) in
+        if v > 0 then Hashtbl.replace chosen b v)
+      blocks;
+    let size =
+      let lo = Array.fold_left min max_int sizes in
+      let hi = Array.fold_left max 0 sizes in
+      let first = (lo / bs) + 1 and last = (hi - 1) / bs in
+      if Random.State.bool rng || last < first then
+        sizes.(Random.State.int rng (n + 1))
+      else (first + Random.State.int rng (last - first + 1)) * bs
+    in
+    (* Replay once, taking each chosen block as it stood after its change. *)
+    let at = Hashtbl.create 16 in
+    Hashtbl.iter
+      (fun b v ->
+        Hashtbl.replace at v
+          (b :: Option.value ~default:[] (Hashtbl.find_opt at v)))
+      chosen;
+    let taken = Hashtbl.create 16 in
+    let block_of buf b =
+      let off = b * bs in
+      let len = max 0 (min bs (Cstruct.length buf - off)) in
+      if len = 0 then Cstruct.empty else copy_cs (Cstruct.sub buf off len)
+    in
+    let _ =
+      Array.fold_left
+        (fun (k, live) change ->
+          let live = apply live change in
+          List.iter
+            (fun b -> Hashtbl.replace taken b (block_of live b))
+            (Option.value ~default:[] (Hashtbl.find_opt at (k + 1)));
+          (k + 1, live))
+        (0, copy_cs durable)
+        changes
+    in
+    let image = Cstruct.create size in
+    if size > 0 then
+      for b = 0 to (size - 1) / bs do
+        let src =
+          match Hashtbl.find_opt taken b with
+          | Some blk -> blk
+          | None -> block_of durable b
+        in
+        let len = min (Cstruct.length src) (size - (b * bs)) in
+        if len > 0 then Cstruct.blit src 0 image (b * bs) len
+      done;
+    image
+
   let do_crash ctl =
     if not ctl.crashed then begin
       if Option.is_none ctl.base then
@@ -1464,14 +1541,31 @@ module Crash = struct
         List.rev ctl.log
         (* program order *)
       in
-      let data_survivors =
+      let data_rng =
         match ctl.policy with
-        | Drop_unsynced -> []
-        | Survive pred -> List.filter (fun e -> pred (to_unsynced e)) ordered
-        | Reorder_unsynced seed ->
-            let rng = Random.State.make [| seed |] in
-            let kept = List.filter (fun _ -> Random.State.bool rng) ordered in
-            shuffle rng kept
+        | Reorder_unsynced seed -> Some (Random.State.make [| seed |])
+        | Drop_unsynced | Survive _ -> None
+      in
+      let contents = ref [] in
+      let content fs =
+        match List.assq_opt fs !contents with
+        | Some c -> c
+        | None ->
+            let mine = List.filter (fun e -> e.efs == fs) ordered in
+            let c =
+              match (ctl.policy, data_rng) with
+              | Reorder_unsynced _, Some rng ->
+                  writeback ~rng ~bs:ctl.block_size fs.durable
+                    (List.map (fun e -> e.change) mine)
+              | Survive pred, _ ->
+                  List.filter (fun e -> pred (to_unsynced e)) mine
+                  |> List.fold_left
+                       (fun b e -> apply b e.change)
+                       (copy_cs fs.durable)
+              | _ -> copy_cs fs.durable
+            in
+            contents := (fs, c) :: !contents;
+            c
       in
       let ordered_metadata = List.rev ctl.metadata in
       let rec take_prefix pred = function
@@ -1506,12 +1600,7 @@ module Crash = struct
       restore_root owner root_path tree;
       List.iter
         (fun (fs, owner, rel) ->
-          let changes =
-            List.filter_map
-              (fun e -> if e.efs == fs then Some e.change else None)
-              data_survivors
-          in
-          let content = List.fold_left apply (copy_cs fs.durable) changes in
+          let content = content fs in
           let (Base_dir ((module B), bv)) = owner in
           match B.stat bv ~follow:false rel with
           | { kind = `Regular_file; _ } ->
@@ -2043,10 +2132,12 @@ module Crash = struct
     crash_dir_hook :=
       fun ctl ~root ~prefix ~base -> wrap_cdir ctl ~root ~prefix ~base
 
-  let v ?(policy = Drop_unsynced) ?(trigger = Manual) () =
+  let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(block_size = 4096) () =
+    if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
     {
       policy;
       trigger;
+      block_size;
       base = None;
       files = Hashtbl.create 8;
       log = [];

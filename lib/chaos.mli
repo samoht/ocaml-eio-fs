@@ -257,19 +257,25 @@ module Crash : sig
             to land, such as a rename that reaches the disk before the data it
             names; {!Reorder_unsynced} over many seeds finds those. *)
     | Reorder_unsynced of int
-        (** Seeded: each un-synced write survives on an even coin and the
-            survivors are applied in a seeded-shuffled order, so a later write
-            may land while an earlier one is lost. Uncommitted directory
+        (** Seeded: writes go back to the disk in blocks, as a page cache writes
+            them. Each block an un-synced change dirtied comes back as it was
+            durable or as it stood after any one of those changes, drawn
+            independently of the other blocks. The length is one a change left,
+            or a block boundary between them. So a multi-block write may keep
+            any subset of its blocks, while a block is never torn and never
+            holds a later write without the earlier ones. Uncommitted directory
             operations survive as a prefix of program order whose length is
             drawn uniformly: metadata never reorders. The [int] is the seed; the
             same seed and workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
-            survivors keep program order. An uncommitted directory operation
-            survives iff the predicate holds for it {e and} every earlier
-            uncommitted directory operation survived (the prefix rule). It pins
-            an exact scenario, for example keeping a generation pointer but
-            dropping the data block it references. *)
+            survivors keep program order. Writes are kept or dropped whole,
+            whatever block they share, so it can build a state no page cache
+            would. An uncommitted directory operation survives iff the predicate
+            holds for it {e and} every earlier uncommitted directory operation
+            survived (the prefix rule). It pins an exact scenario, for example
+            keeping a generation pointer but dropping the data block it
+            references. *)
 
   (** The type for when a crash fires while the workload runs. *)
   type trigger =
@@ -296,10 +302,14 @@ module Crash : sig
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The type for the backing store handed back after a crash. *)
 
-  val v : ?policy:policy -> ?trigger:trigger -> unit -> t
-  (** [v ~policy ~trigger ()] is a fresh controller that rebuilds the post-crash
-      image by [policy] (defaults to {!Drop_unsynced}, a single state) and
-      crashes on [trigger] (defaults to {!Manual}). *)
+  val v : ?policy:policy -> ?trigger:trigger -> ?block_size:int -> unit -> t
+  (** [v ~policy ~trigger ~block_size ()] is a fresh controller that rebuilds
+      the post-crash image by [policy] (defaults to {!Drop_unsynced}, a single
+      state) and crashes on [trigger] (defaults to {!Manual}). [block_size]
+      (defaults to [4096]) is the byte size of the blocks {!Reorder_unsynced}
+      writes back.
+
+      @raise Stdlib.Invalid_argument if [block_size] is not positive. *)
 
   val wrap : t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [wrap t base] is [base] with durability tracked by [t]; files and

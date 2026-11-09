@@ -1981,6 +1981,75 @@ let test_crash_sync_failure_beneath () =
   let post = Crash.post_crash ctl in
   Alcotest.(check string) "lost" "" (Eio.Path.load (post / "f"))
 
+(* {2 Writeback in blocks} *)
+
+(* The images seeds 0 to 199 rebuild of one workload. *)
+let images ?block_size workload =
+  let seen = Hashtbl.create 8 in
+  for seed = 0 to 199 do
+    let ctl = Crash.v ?block_size ~policy:(Reorder_unsynced seed) () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "";
+    Eio_fs_sync.sync_dir fs;
+    workload fs;
+    let post = Crash.post_crash ctl in
+    Hashtbl.replace seen (Eio.Path.load (post / "f")) ()
+  done;
+  Hashtbl.fold (fun k () acc -> k :: acc) seen []
+
+(* A write of three blocks is not atomic: a crash keeps any of its blocks. *)
+let test_crash_multi_block_write () =
+  let block = 4096 in
+  let data =
+    String.init (3 * block) (fun i -> Char.chr (65 + Int.div i block))
+  in
+  let states = images (fun fs -> overwrite (fs / "f") data) in
+  let partial s = s <> "" && s <> data in
+  Alcotest.(check bool)
+    "some state is partial" true
+    (List.exists partial states);
+  Alcotest.(check bool)
+    "some state is a block prefix" true
+    (List.mem (String.sub data 0 block) states);
+  Alcotest.(check bool)
+    "blocks come whole" true
+    (List.for_all
+       (fun s ->
+         let ok = ref true in
+         for b = 0 to Int.div (String.length s - 1) block do
+           let blk =
+             String.sub s (b * block)
+               (min block (String.length s - (b * block)))
+           in
+           let mine = String.make (String.length blk) (Char.chr (65 + b)) in
+           let zero = String.make (String.length blk) '\000' in
+           if blk <> mine && blk <> zero then ok := false
+         done;
+         !ok)
+       states)
+
+(* Two appends in one block: the block is written back whole, so the second
+   never lands without the first. *)
+let appends fs =
+  Eio.Path.with_open_out ~append:true ~create:`Never (fs / "f") (fun f ->
+      Eio.Flow.copy_string "aaaa" f;
+      Eio.Flow.copy_string "bbbb" f)
+
+let test_crash_appends_in_one_block () =
+  let states = images appends in
+  Alcotest.(check bool)
+    "no second append over a hole" false
+    (List.mem "\000\000\000\000bbbb" states);
+  Alcotest.(check bool) "both appends" true (List.mem "aaaabbbb" states);
+  Alcotest.(check bool) "first append" true (List.mem "aaaa" states)
+
+(* With blocks of four bytes the two appends are separate blocks. *)
+let test_crash_block_size () =
+  let states = images ~block_size:4 appends in
+  Alcotest.(check bool)
+    "the second append alone" true
+    (List.mem "\000\000\000\000bbbb" states)
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2304,6 +2373,11 @@ let suite =
         test_crash_sync_retry_after_failure;
       Alcotest.test_case "crash: a sync failure beneath the model" `Quick
         test_crash_sync_failure_beneath;
+      Alcotest.test_case "crash: a multi-block write" `Quick
+        test_crash_multi_block_write;
+      Alcotest.test_case "crash: two appends in one block" `Quick
+        test_crash_appends_in_one_block;
+      Alcotest.test_case "crash: the block size" `Quick test_crash_block_size;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
