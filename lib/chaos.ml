@@ -837,32 +837,6 @@ module Crash = struct
     Cstruct.blit c 0 b 0 n;
     b
 
-  (* Blit [src] into [dst] at [offset], growing (and zero-filling any hole) when
-     the write runs past the current end. *)
-  let grow_blit dst ~offset src =
-    let src_len = Cstruct.length src in
-    let need = offset + src_len in
-    let cur = Cstruct.length dst in
-    if need <= cur then (
-      Cstruct.blit src 0 dst offset src_len;
-      dst)
-    else begin
-      let b = Cstruct.create need in
-      Cstruct.blit dst 0 b 0 cur;
-      Cstruct.blit src 0 b offset src_len;
-      b
-    end
-
-  let resize buf n =
-    let cur = Cstruct.length buf in
-    if n = cur then buf
-    else if n < cur then Cstruct.sub buf 0 n
-    else begin
-      let b = Cstruct.create n in
-      Cstruct.blit buf 0 b 0 cur;
-      b
-    end
-
   (* An independent copy of the first [n] bytes offered by [bufs]. The caller's
      buffers may be reused after the write returns, so the log must not alias
      them. *)
@@ -1095,9 +1069,38 @@ module Crash = struct
       (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
       (data @ metadata)
 
-  let apply buf = function
-    | Write { offset; data } -> grow_blit buf ~offset data
-    | Resize n -> resize buf n
+  (* A file's bytes while changes replay over them: the first [len] bytes of
+     [buf], which grows by doubling, so a run of appends costs linear time. *)
+  type image = { mutable buf : Cstruct.t; mutable len : int }
+
+  let image_of c = { buf = copy_cs c; len = Cstruct.length c }
+  let bytes_of img = Cstruct.sub img.buf 0 img.len
+
+  (* Room for [n] bytes, those past [len] zero. *)
+  let extend img n =
+    if n > Cstruct.length img.buf then begin
+      let b = Cstruct.create (max n (2 * Cstruct.length img.buf)) in
+      Cstruct.blit img.buf 0 b 0 img.len;
+      img.buf <- b
+    end
+    else if n > img.len then
+      Cstruct.memset (Cstruct.sub img.buf img.len (n - img.len)) 0
+
+  let apply img = function
+    | Write { offset; data } ->
+        let n = offset + Cstruct.length data in
+        extend img n;
+        Cstruct.blit data 0 img.buf offset (Cstruct.length data);
+        img.len <- max img.len n
+    | Resize n ->
+        extend img n;
+        img.len <- n
+
+  (* [durable] with [changes] replayed over it, in order. *)
+  let replay_changes durable changes =
+    let img = image_of durable in
+    List.iter (apply img) changes;
+    bytes_of img
 
   (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
      staged read-only or write-only cannot be reopened O_RDWR, so grant the
@@ -1574,17 +1577,14 @@ module Crash = struct
       let len = max 0 (min bs (Cstruct.length buf - off)) in
       if len = 0 then Cstruct.empty else copy_cs (Cstruct.sub buf off len)
     in
-    let _ =
-      Array.fold_left
-        (fun (k, live) change ->
-          let live = apply live change in
-          List.iter
-            (fun b -> Hashtbl.replace taken b (block_of live b))
-            (Option.value ~default:[] (Hashtbl.find_opt at (k + 1)));
-          (k + 1, live))
-        (0, copy_cs durable)
-        changes
-    in
+    let live = image_of durable in
+    Array.iteri
+      (fun k change ->
+        apply live change;
+        List.iter
+          (fun b -> Hashtbl.replace taken b (block_of (bytes_of live) b))
+          (Option.value ~default:[] (Hashtbl.find_opt at (k + 1))))
+      changes;
     let image = Cstruct.create size in
     if size > 0 then
       for b = 0 to (size - 1) / bs do
@@ -1625,9 +1625,8 @@ module Crash = struct
                     (List.map (fun e -> e.change) mine)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
-                  |> List.fold_left
-                       (fun b e -> apply b e.change)
-                       (copy_cs fs.durable)
+                  |> List.map (fun e -> e.change)
+                  |> replay_changes fs.durable
               | _ -> copy_cs fs.durable
             in
             contents := (fs, c) :: !contents;
@@ -1756,9 +1755,7 @@ module Crash = struct
     | () ->
         let pending = List.rev (List.filter (fun e -> e.efs == fs) ctl.log) in
         fs.durable <-
-          List.fold_left
-            (fun b e -> apply b e.change)
-            (copy_cs fs.durable) pending;
+          replay_changes fs.durable (List.map (fun e -> e.change) pending);
         lose ctl fs;
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->

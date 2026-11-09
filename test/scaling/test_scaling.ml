@@ -24,5 +24,33 @@ let test_one_directory () =
         ignore (Eio.Path.stat ~follow:false (fs / string_of_int i))
       done)
 
+module Crash = Eio_fs.Chaos.Crash
+
+(* 32k appends replayed by a sync and by a seeded crash: a replay that
+   reallocated the file per write copied it once per append. *)
+let test_crash_appends () =
+  Eio_mock.Backend.run @@ fun () ->
+  let ctl = Crash.v ~policy:(Crash.Reorder_unsynced 1) () in
+  let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
+  let line = String.make 100 'x' in
+  within ~seconds:10. "32k appends, a sync, 32k appends and a crash" (fun () ->
+      Eio.Switch.run (fun sw ->
+          let f =
+            Eio.Path.open_out ~sw ~append:true ~create:(`Exclusive 0o644)
+              (fs / "log")
+          in
+          for _ = 1 to 32_000 do
+            Eio.Flow.copy_string line f
+          done;
+          Eio.File.sync f;
+          for _ = 1 to 32_000 do
+            Eio.Flow.copy_string line f
+          done);
+      Crash.crash ctl)
+
 let suite =
-  ("scaling", [ Alcotest.test_case "one directory" `Slow test_one_directory ])
+  ( "scaling",
+    [
+      Alcotest.test_case "one directory" `Slow test_one_directory;
+      Alcotest.test_case "crash: appends" `Slow test_crash_appends;
+    ] )
