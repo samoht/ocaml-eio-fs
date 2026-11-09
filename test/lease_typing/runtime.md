@@ -139,7 +139,8 @@ The owner takes a real shared lease, forks a reader which inherits its
 open file description, announces the reader and exits inside the callback.
 The observer reaps that owner before trying an exclusive hold. The reader
 waits at a pipe until explicitly released; it then closes the lease before
-reporting completion. Both child waits have a two-second bound.
+reporting completion. Both child waits block until the child writes; a child
+that never does hangs the test rather than failing it on a slow machine.
 
 ```ocaml
 # let () =
@@ -152,11 +153,9 @@ reporting completion. Both child waits have a two-second bound.
       | result -> result
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap pid in
     let ready fd =
-      let until = Unix.gettimeofday () +. 2. in
       let rec wait () =
-        let remaining = Float.max 0. (until -. Unix.gettimeofday ()) in
-        match Unix.select [ fd ] [] [] remaining with
-        | ([], [], []) -> false
+        match Unix.select [ fd ] [] [] (-1.) with
+        | ([], [], []) -> wait ()
         | _ -> true
         | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
       wait () in
