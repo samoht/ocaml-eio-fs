@@ -1506,9 +1506,14 @@ module Crash = struct
             let len = Cstruct.length data in
             sizes.(k + 1) <- max prev (offset + len);
             (offset, offset + len)
+        | Resize m when m < prev ->
+            (* A shrink rewrites only the block cut at its new end; the blocks
+               past it keep their bytes until the new length lands. *)
+            sizes.(k + 1) <- m;
+            (m, if m mod bs = 0 then m else m + 1)
         | Resize m ->
             sizes.(k + 1) <- m;
-            (min m prev, max m prev)
+            (prev, m)
       in
       if hi > lo then
         for b = lo / bs to (hi - 1) / bs do

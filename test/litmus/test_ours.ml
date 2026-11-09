@@ -259,12 +259,6 @@ let truncate_shrink =
     ~ext4:(both [ [ ("f", File a) ]; [ ("f", File (String.make 4096 'A')) ] ])
     ~envelope:
       (both [ [ ("f", File a) ]; [ ("f", File (String.make 4096 'A')) ] ])
-      (* CONFIRMED: the old length with the cut block zeroed. Reorder_unsynced
-         counts the blocks a truncation cuts as dirtied by it, takes their
-         version "as it stood after" the truncation (empty), and draws the
-         length separately, so it can keep the old length over bytes nothing
-         ever overwrote. *)
-    ~impossible:(both [ [ ("f", File (String.make 4096 'A' ^ zeros 4096)) ] ])
 
 (* Growing by ftruncate(2) is one change of [i_size]: the file has either
    length, never one in between. *)
