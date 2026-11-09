@@ -122,16 +122,23 @@ module Inode = struct
   let equal = Int64.equal
 end
 
+module Names = Map.Make (String)
+
 module Dir_node = struct
   (* A node holds no name of its own: its names are the entries of the
-     directories that hold it. *)
-  type 'a t = { stat : Eio.File.Stat.t; entries : 'a list }
+     directories that hold it. [entries] maps each name but [.] and [..] to
+     its inode, so a lookup costs the log of the directory's size. *)
+  type t = {
+    stat : Eio.File.Stat.t;
+    parent : Inode.t;
+    entries : Inode.t Names.t;
+  }
 
-  let v ~parent stat = { stat; entries = [ (stat.ino, "."); (parent, "..") ] }
-  let is_empty dir = List.length dir.entries = 2
-
-  let parent dir =
-    List.find (function _, ".." -> true | _ -> false) dir.entries
+  let v ~parent stat = { stat; parent; entries = Names.empty }
+  let is_empty dir = Names.is_empty dir.entries
+  let find name dir = Names.find_opt name dir.entries
+  let add name ino dir = { dir with entries = Names.add name ino dir.entries }
+  let remove name dir = { dir with entries = Names.remove name dir.entries }
 end
 
 module Symlink = struct
@@ -216,10 +223,7 @@ module Fd_table = Map.Make (Num)
    standard streams to open: descriptors 0 to 2 are reserved by {!first_fd} and
    never resolve to anything. *)
 module Resource = struct
-  type t =
-    | File of File.t
-    | Dir of (Inode.t * string) Dir_node.t
-    | Symlink of Symlink.t
+  type t = File of File.t | Dir of Dir_node.t | Symlink of Symlink.t
 
   let stat = function
     | File f -> f.stat
@@ -364,7 +368,8 @@ module Filesystem = struct
               uid = User.id owner.uid;
               gid = User.id owner.gid;
             };
-          entries = [ (0L, "."); (0L, "..") ];
+          parent = 0L;
+          entries = Names.empty;
         }
     in
     Entries.empty |> Entries.add 0L (ref root)
@@ -374,9 +379,7 @@ module Filesystem = struct
 
   (* A removed directory's parent may be gone too: ENOENT. *)
   let parent_dir (tree : t) r =
-    match
-      Entries.find_opt (fst (Dir_node.parent (as_dir ~path:".." !r))) tree
-    with
+    match Entries.find_opt (as_dir ~path:".." !r).parent tree with
     | Some parent -> parent
     | None -> Error.not_found ".."
 
@@ -388,7 +391,7 @@ module Filesystem = struct
         Inode.equal d.stat.ino ino
         || (not (Inode.equal d.stat.ino 0L))
            &&
-           match Entries.find_opt (fst (Dir_node.parent d)) tree with
+           match Entries.find_opt d.parent tree with
            | Some parent -> within tree parent ino
            | None -> false)
     | _ -> false
@@ -458,9 +461,9 @@ module Filesystem = struct
     | ".." -> Some (here (up w []))
     | name -> (
         let d = as_dir ~path:name !(here w) in
-        match List.find_opt (fun (_, n) -> String.equal n name) d.entries with
+        match Dir_node.find name d with
         | None -> None
-        | Some (ino, _) -> Entries.find_opt ino w.tree)
+        | Some ino -> Entries.find_opt ino w.tree)
 
   (* A link to the empty path names nothing: ENOENT. *)
   let link_target name (s : Symlink.t) =
@@ -665,7 +668,7 @@ let new_file ~mode fs (w : Filesystem.walk) name ~slash =
   let dir = as_dir ~path:name !rdir in
   let stat = new_stat fs ~user:w.user ~perm:(masked ~user:w.user mode) () in
   let f = File.v ~stat in
-  let dir = { dir with entries = (f.stat.ino, name) :: dir.entries } in
+  let dir = Dir_node.add name f.stat.ino dir in
   rdir := Resource.Dir dir;
   let file = ref (Resource.File f) in
   Filesystem.add_file fs f.stat.ino file;
@@ -779,11 +782,10 @@ let chown ~follow ?uid ?gid dir_fd path =
 let remove_entry fs (w : Filesystem.walk) name =
   let r = Filesystem.here w in
   let d = as_dir ~path:name !r in
-  let gone, entries =
-    List.partition (fun (_, n) -> String.equal name n) d.entries
-  in
-  r := Resource.Dir { d with entries };
-  List.iter (fun (ino, _) -> fs.tree <- Entries.remove ino fs.tree) gone
+  r := Resource.Dir (Dir_node.remove name d);
+  Option.iter
+    (fun ino -> fs.tree <- Entries.remove ino fs.tree)
+    (Dir_node.find name d)
 
 let unlink dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -814,8 +816,7 @@ let mkdirat dir_fd ~perm path =
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Dir dir));
-    let entries = (ino, name) :: d.entries in
-    r := Dir { d with entries }
+    r := Dir (Dir_node.add name ino d)
   in
   new_entry ~dir:true dir_fd path mkdir
 
@@ -832,7 +833,7 @@ let embed dir_fd ~perm path ~contents =
     let d = as_dir ~path !r in
     let f = File.literal ~stat contents in
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
-    r := Dir { d with entries = (stat.ino, name) :: d.entries }
+    r := Dir (Dir_node.add name stat.ino d)
   in
   new_entry dir_fd path add
 
@@ -852,8 +853,7 @@ let symlinkat ~link_to dir_fd path =
     let dir = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Symlink dir));
-    let entries = (ino, name) :: d.entries in
-    r := Dir { d with entries }
+    r := Dir (Dir_node.add name ino d)
   in
   new_entry dir_fd path symlink
 
@@ -876,8 +876,7 @@ let read_dir dir_fd path =
   check_read ~user:dir_fd.user path r;
   match !r with
   | Resource.Dir dir ->
-      List.map snd dir.entries
-      |> List.filter (function "." | ".." -> false | _ -> true)
+      Names.fold (fun name _ acc -> name :: acc) dir.entries [] |> List.rev
   | _ -> Error.err "Not a directory"
 
 let read_dir_entries dir_fd path =
@@ -886,15 +885,16 @@ let read_dir_entries dir_fd path =
   check_read ~user:dir_fd.user path r;
   match !r with
   | Resource.Dir dir ->
-      dir.entries
-      |> List.filter (fun (_, name) -> name <> "." && name <> "..")
-      |> List.map (fun (ino, name) ->
+      Names.fold
+        (fun name ino acc ->
           let kind =
             match Entries.find_opt ino (Dir.fs dir_fd).tree with
             | Some res -> (Resource.stat !res).kind
             | None -> `Unknown
           in
-          (kind, name))
+          (kind, name) :: acc)
+        dir.entries []
+      |> List.rev
   | _ -> Error.err "Not a directory"
 
 let rmdir dir_fd path =
@@ -932,10 +932,6 @@ let check_rename tree ~src ~new_parent ~dst new_path =
       Error.err ("rename: is a directory: " ^ new_path)
   | _ -> ()
 
-(* [entries] without the entry [name]. *)
-let without name entries =
-  List.filter (fun (_, n) -> not (String.equal n name)) entries
-
 (* A rename MOVES: the source loses [old_name] and the target gains [new_name]
    pointing at [ino]. Same-parent edits go to one entries list, so the move is
    atomic. *)
@@ -943,32 +939,21 @@ let move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name new_path
     =
   if old_parent == new_parent then begin
     let d = as_dir ~path:new_path !new_parent in
-    let entries =
-      (ino, new_name) :: without new_name (without old_name d.entries)
-    in
-    new_parent := Resource.Dir { d with entries }
+    new_parent :=
+      Resource.Dir (Dir_node.add new_name ino (Dir_node.remove old_name d))
   end
   else begin
     let dst = as_dir ~path:new_path !new_parent in
-    let entries = (ino, new_name) :: without new_name dst.entries in
-    new_parent := Resource.Dir { dst with entries };
+    new_parent := Resource.Dir (Dir_node.add new_name ino dst);
     let src = as_dir ~path:old_path !old_parent in
-    old_parent :=
-      Resource.Dir { src with entries = without old_name src.entries }
+    old_parent := Resource.Dir (Dir_node.remove old_name src)
   end
 
 (* A directory's [..] names its new parent. *)
 let reparent res ~new_parent =
   match !res with
   | Resource.Dir d ->
-      let parent = (Resource.stat !new_parent).ino in
-      let entries =
-        List.map
-          (fun ((_, name) as e) ->
-            if String.equal name ".." then (parent, "..") else e)
-          d.entries
-      in
-      res := Resource.Dir { d with entries }
+      res := Resource.Dir { d with parent = (Resource.stat !new_parent).ino }
   | File _ | Symlink _ -> ()
 
 let rename ?(replace = true) dir_fd old_path new_dir new_path =
@@ -1000,9 +985,9 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let new_parent = Filesystem.here new_w in
   check_live (Dir.fs new_dir) new_parent new_path;
   let existing =
-    List.find_opt
-      (fun (_, name) -> String.equal name new_name)
-      (as_dir ~path:new_path !new_parent).entries
+    Option.map
+      (fun ino -> (ino, new_name))
+      (Dir_node.find new_name (as_dir ~path:new_path !new_parent))
   in
   match existing with
   (* Two names of one entry: rename(2) does nothing. *)
