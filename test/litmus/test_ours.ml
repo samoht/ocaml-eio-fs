@@ -302,6 +302,211 @@ let rename_across =
          ]
       @ marked [ [ ("a/f", Absent); ("b/f", File "x") ] ])
 
+(* {1 Directory barriers and renamed directories}
+
+   ext4 journals every directory as an inode: fsync(2) on a directory makes
+   that inode's entries durable, whatever name the directory has then or
+   later, and its own name is an entry of its parent's. The envelope keeps
+   exactly that much: a barrier on a directory commits the entries it holds,
+   once the directory itself is durable, and nothing of its parent's. *)
+
+(* A file made in [d] and synced, moved to the root, then barriers on the
+   root and on [d]. The root's barrier commits the rename, [d]'s the
+   creation; both landing leaves [b] alone, never [b] and [d/b] at once. *)
+let rename_out_of_dir =
+  let pre =
+    [
+      [ ("b", Absent); ("d/b", Absent) ];
+      [ ("b", Absent); ("d/b", File "") ];
+      [ ("b", Absent); ("d/b", File "x") ];
+      [ ("b", File "x"); ("d/b", Absent) ];
+    ]
+  in
+  case
+    {
+      name = "a synced file moved out of its directory, then both barriers";
+      setup = [ Mkdir "d" ];
+      body =
+        [
+          Creat "d/b";
+          Write ("d/b", "x");
+          Fsync "d/b";
+          Rename ("d/b", "b");
+          Fsync_dir "";
+          Fsync_dir "d";
+          Mark;
+        ];
+      observe = [ "b"; "d/b" ];
+    }
+    ~ext4:(unmarked pre @ marked [ [ ("b", File "x"); ("d/b", Absent) ] ])
+    ~envelope:
+      (unmarked (pre @ [ [ ("b", Absent); ("d/b", File (zeros 1)) ] ])
+      @ marked [ [ ("b", File "x"); ("d/b", Absent) ] ])
+    ~extra:(unmarked [ [ ("b", Absent); ("d/b", File (zeros 1)) ] ])
+
+(* The old [d] moved to [x], a new [d] made in its place, a synced file in
+   the new one and a barrier on it. The barrier holds for the new
+   directory's inode: the file is in the new [d] whenever that survives, and
+   never in the old directory, whatever its name. *)
+let recreated_dir =
+  let st o f xo =
+    [ ("d/old", o); ("d/f", f); ("x/old", xo); ("x/f", Absent) ]
+  in
+  let o = File "O" in
+  case
+    {
+      name = "a barrier on a directory made again under a moved one's name";
+      setup = [ Mkdir "d"; Creat "d/old"; Write ("d/old", "O") ];
+      body =
+        [
+          Rename ("d", "x");
+          Mkdir "d";
+          Creat "d/f";
+          Write ("d/f", "F");
+          Fsync "d/f";
+          Fsync_dir "d";
+          Mark;
+        ];
+      observe = [ "d/old"; "d/f"; "x/old"; "x/f" ];
+    }
+    ~ext4:
+      (unmarked
+         [
+           st o Absent Absent;
+           st Absent Absent o;
+           st Absent (File "") o;
+           st Absent (File "F") o;
+         ]
+      @ marked [ st Absent (File "F") o ])
+    ~envelope:
+      (unmarked
+         [
+           st o Absent Absent;
+           st Absent Absent o;
+           st Absent (File "") o;
+           st Absent (File (zeros 1)) o;
+           st Absent (File "F") o;
+         ]
+      @ marked
+          [ st o Absent Absent; st Absent Absent o; st Absent (File "F") o ])
+    ~extra:
+      (unmarked [ st Absent (File (zeros 1)) o ]
+      @ marked [ st o Absent Absent; st Absent Absent o ])
+
+(* The states of a synced file [f] made in a new or a durable [d], which a
+   rename takes to [e]. *)
+let moved_dir_states =
+  [
+    [ ("d/f", Absent); ("e/f", Absent) ];
+    [ ("d/f", File ""); ("e/f", Absent) ];
+    [ ("d/f", File "F"); ("e/f", Absent) ];
+    [ ("d/f", Absent); ("e/f", File "F") ];
+  ]
+
+let moved_dir_envelope =
+  moved_dir_states @ [ [ ("d/f", File (zeros 1)); ("e/f", Absent) ] ]
+
+(* A barrier on [d] before its own entry is durable, then [d] renamed and a
+   barrier on the root. The barrier follows the directory: once the root's
+   commits the mkdir and the rename, [e] holds [f]. *)
+let barrier_then_rename_then_parent =
+  case
+    {
+      name = "a deferred barrier, then the directory renamed and its parent's";
+      setup = [];
+      body =
+        [
+          Mkdir "d";
+          Creat "d/f";
+          Write ("d/f", "F");
+          Fsync "d/f";
+          Fsync_dir "d";
+          Rename ("d", "e");
+          Fsync_dir "";
+          Mark;
+        ];
+      observe = [ "d/f"; "e/f" ];
+    }
+    ~ext4:
+      (unmarked moved_dir_states
+      @ marked [ [ ("d/f", Absent); ("e/f", File "F") ] ])
+    ~envelope:
+      (unmarked moved_dir_envelope
+      @ marked [ [ ("d/f", Absent); ("e/f", File "F") ] ])
+    ~extra:(unmarked [ [ ("d/f", File (zeros 1)); ("e/f", Absent) ] ])
+
+(* mkdir d; a synced d/f; a barrier on d; rename d e. ext4: the barrier
+   commits everything before it, the rename may be lost. The envelope: [d]'s
+   own entry may be lost too, and [f] goes with whichever name survives. *)
+let barrier_then_rename =
+  case
+    {
+      name = "a barrier on a new directory, then the directory renamed";
+      setup = [];
+      body =
+        [
+          Mkdir "d";
+          Creat "d/f";
+          Write ("d/f", "F");
+          Fsync "d/f";
+          Fsync_dir "d";
+          Rename ("d", "e");
+          Mark;
+        ];
+      observe = [ "d/f"; "e/f" ];
+    }
+    ~ext4:
+      (unmarked moved_dir_states
+      @ marked
+          [
+            [ ("d/f", File "F"); ("e/f", Absent) ];
+            [ ("d/f", Absent); ("e/f", File "F") ];
+          ])
+    ~envelope:
+      (unmarked moved_dir_envelope
+      @ marked
+          [
+            [ ("d/f", Absent); ("e/f", Absent) ];
+            [ ("d/f", File "F"); ("e/f", Absent) ];
+            [ ("d/f", Absent); ("e/f", File "F") ];
+          ])
+    ~extra:
+      (unmarked [ [ ("d/f", File (zeros 1)); ("e/f", Absent) ] ]
+      @ marked [ [ ("d/f", Absent); ("e/f", Absent) ] ])
+
+(* A synced file in a durable [d], [d] renamed, a barrier on [e]: the barrier
+   is on [d]'s inode, so [f] is durable under whichever name survives.
+   ext4 commits the rename with it. *)
+let rename_then_barrier =
+  case
+    {
+      name = "a directory renamed, then a barrier on its new name";
+      setup = [ Mkdir "d" ];
+      body =
+        [
+          Creat "d/f";
+          Write ("d/f", "F");
+          Fsync "d/f";
+          Rename ("d", "e");
+          Fsync_dir "e";
+          Mark;
+        ];
+      observe = [ "d/f"; "e/f" ];
+    }
+    ~ext4:
+      (unmarked moved_dir_states
+      @ marked [ [ ("d/f", Absent); ("e/f", File "F") ] ])
+    ~envelope:
+      (unmarked moved_dir_envelope
+      @ marked
+          [
+            [ ("d/f", File "F"); ("e/f", Absent) ];
+            [ ("d/f", Absent); ("e/f", File "F") ];
+          ])
+    ~extra:
+      (unmarked [ [ ("d/f", File (zeros 1)); ("e/f", Absent) ] ]
+      @ marked [ [ ("d/f", File "F"); ("e/f", Absent) ] ])
+
 (* {1 fsync after a failed fsync} *)
 
 (* The failed fsync loses the write; the next one succeeds and writes
@@ -349,6 +554,11 @@ let cases =
     truncate_shrink;
     truncate_grow;
     rename_across;
+    rename_out_of_dir;
+    recreated_dir;
+    barrier_then_rename_then_parent;
+    barrier_then_rename;
+    rename_then_barrier;
     fsync_after_failure;
     fsync_after_rewrite;
   ]
