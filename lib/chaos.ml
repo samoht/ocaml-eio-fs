@@ -918,9 +918,19 @@ module Crash = struct
     mutable rel : string;
     mutable perm : int;
     mutable durable : Cstruct.t;
+    mutable pending : entry list;
+        (* this file's pending changes, newest first *)
+    mutable gen : int;
+        (* Bumped when the pending changes go, durable or lost: an entry of an
+           older generation in the controller's log is stale. *)
   }
 
-  type entry = { efs : fstate; change : change; seq : int }
+  and entry = { efs : fstate; change : change; seq : int; egen : int }
+
+  let fresh_file ~owner ~rel ~perm ~durable =
+    { owner; rel; perm; durable; pending = []; gen = 0 }
+
+  let is_pending e = e.egen = e.efs.gen
 
   (* What kind of un-synced change a journal entry records, as seen by a
      scripted survival predicate. *)
@@ -1027,7 +1037,11 @@ module Crash = struct
     mutable base : base_dir option;
     files : (string, fstate) Hashtbl.t;
     mutable subtrees : place list;
-    mutable log : entry list; (* newest first *)
+    mutable log : entry list;
+        (* Every file's changes, newest first, stale ones included until the
+           log is compacted. *)
+    mutable logged : int; (* the log's length *)
+    mutable pending_changes : int; (* its entries still pending *)
     mutable metadata : metadata_entry list; (* newest first *)
     mutable durable_tree : tree option;
     mutable durable_locations : location list;
@@ -1038,7 +1052,11 @@ module Crash = struct
 
   let clog_change ctl fs change =
     ctl.seq <- ctl.seq + 1;
-    ctl.log <- { efs = fs; change; seq = ctl.seq } :: ctl.log
+    let e = { efs = fs; change; seq = ctl.seq; egen = fs.gen } in
+    ctl.log <- e :: ctl.log;
+    fs.pending <- e :: fs.pending;
+    ctl.logged <- ctl.logged + 1;
+    ctl.pending_changes <- ctl.pending_changes + 1
 
   let clog_write ctl fs ~offset data =
     clog_change ctl fs (Write { offset; data })
@@ -1063,7 +1081,11 @@ module Crash = struct
         }
 
   let unsynced ctl =
-    let data = List.map to_unsynced ctl.log in
+    let data =
+      List.filter_map
+        (fun e -> if is_pending e then Some (to_unsynced e) else None)
+        ctl.log
+    in
     let metadata = List.map (fun e -> e.meta) ctl.metadata in
     List.sort
       (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
@@ -1603,10 +1625,6 @@ module Crash = struct
       if Option.is_none ctl.base then
         invalid_arg "Chaos.Crash: controller was never wrapped";
       ctl.crashed <- true;
-      let ordered =
-        List.rev ctl.log
-        (* program order *)
-      in
       let data_rng =
         match ctl.policy with
         | Reorder_unsynced seed -> Some (Random.State.make [| seed |])
@@ -1617,7 +1635,7 @@ module Crash = struct
         match List.assq_opt fs !contents with
         | Some c -> c
         | None ->
-            let mine = List.filter (fun e -> e.efs == fs) ordered in
+            let mine = List.rev fs.pending in
             let c =
               match (ctl.policy, data_rng) with
               | Reorder_unsynced _, Some rng ->
@@ -1745,7 +1763,15 @@ module Crash = struct
 
   (* fsyncgate: a failed fsync(2) marks the file's dirty pages clean without
      writing them, so they are lost whatever a later sync reports. *)
-  let lose ctl fs = ctl.log <- List.filter (fun e -> not (e.efs == fs)) ctl.log
+  let lose ctl fs =
+    ctl.pending_changes <- ctl.pending_changes - List.length fs.pending;
+    fs.pending <- [];
+    fs.gen <- fs.gen + 1;
+    (* Compact once stale entries outnumber pending ones. *)
+    if ctl.logged > (2 * ctl.pending_changes) + 64 then begin
+      ctl.log <- List.filter is_pending ctl.log;
+      ctl.logged <- ctl.pending_changes
+    end
 
   (* A barrier makes the file's pending changes durable, replayed over its
      durable bytes: a change lost to a failed barrier, or made around the
@@ -1753,7 +1779,7 @@ module Crash = struct
   let barrier ctl fs sync =
     match sync () with
     | () ->
-        let pending = List.rev (List.filter (fun e -> e.efs == fs) ctl.log) in
+        let pending = List.rev fs.pending in
         fs.durable <-
           replay_changes fs.durable (List.map (fun e -> e.change) pending);
         lose ctl fs;
@@ -2023,12 +2049,21 @@ module Crash = struct
       let rel = resolve d spelt in
       let key = file_key d.dplace.proot rel in
       (* A dangling link names a file the open creates. *)
-      let existed =
+      let found =
         match B.stat bv ~follow:true path with
-        | _ -> true
-        | exception Eio.Io _ -> false
+        | stat -> Some stat
+        | exception Eio.Io _ -> None
       in
-      let prev = read_existing d.dboxed path in
+      let existed = Option.is_some found in
+      (* A file's bytes are read once, when the model first meets it, before
+         a truncating open loses them. *)
+      let known = Hashtbl.mem d.dctl.files key in
+      let prev = if known then Cstruct.empty else read_existing d.dboxed path in
+      let had_bytes =
+        match found with
+        | Some { size; _ } -> Optint.Int63.compare size Optint.Int63.zero > 0
+        | None -> false
+      in
       let base = B.open_out bv ~sw ~follow ~append ~create path in
       let perm = create_perm create in
       let fs =
@@ -2037,15 +2072,16 @@ module Crash = struct
             fs.perm <- perm;
             fs
         | None ->
-            let fs = { owner = d.dplace.proot; rel; perm; durable = prev } in
+            let fs =
+              fresh_file ~owner:d.dplace.proot ~rel ~perm ~durable:prev
+            in
             Hashtbl.replace d.dctl.files key fs;
             if existed then locate_preexisting d.dctl (fs, d.dplace.proot, rel);
             fs
       in
       (* An unsynced truncation of pre-existing durable data is itself a change
          that a crash may lose. *)
-      if is_trunc create && Cstruct.length prev > 0 then
-        clog_change d.dctl fs (Resize 0);
+      if is_trunc create && had_bytes then clog_change d.dctl fs (Resize 0);
       if not existed then begin
         record_metadata d.dctl ~path:spelt ~kind:Create ~resolved:[ rel ];
         bump_metadata d.dctl ~path:spelt ~kind:Create
@@ -2238,6 +2274,8 @@ module Crash = struct
       durable_locations = [];
       subtrees = [];
       seq = 0;
+      logged = 0;
+      pending_changes = 0;
       ops = 0;
       crashed = false;
     }

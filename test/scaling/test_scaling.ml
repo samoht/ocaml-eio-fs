@@ -48,9 +48,30 @@ let test_crash_appends () =
           done);
       Crash.crash ctl)
 
+(* 16k syncs of one file while another holds 64k pending writes: a sync that
+   scanned every file's changes did 10^9 steps. *)
+let test_crash_syncs_beside_pending_writes () =
+  Eio_mock.Backend.run @@ fun () ->
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
+  let i63 = Optint.Int63.of_int in
+  Eio.Switch.run @@ fun sw ->
+  let dirty = Eio.Path.open_out ~sw ~create:(`Exclusive 0o644) (fs / "dirty") in
+  let hot = Eio.Path.open_out ~sw ~create:(`Exclusive 0o644) (fs / "hot") in
+  within ~seconds:10. "16k syncs beside 64k pending writes" (fun () ->
+      for i = 1 to 64_000 do
+        Eio.File.pwrite_all dirty ~file_offset:(i63 i) [ Cstruct.of_string "y" ]
+      done;
+      for _ = 1 to 16_000 do
+        Eio.File.pwrite_all hot ~file_offset:(i63 0) [ Cstruct.of_string "z" ];
+        Eio.File.sync hot
+      done)
+
 let suite =
   ( "scaling",
     [
       Alcotest.test_case "one directory" `Slow test_one_directory;
       Alcotest.test_case "crash: appends" `Slow test_crash_appends;
+      Alcotest.test_case "crash: syncs beside pending writes" `Slow
+        test_crash_syncs_beside_pending_writes;
     ] )
