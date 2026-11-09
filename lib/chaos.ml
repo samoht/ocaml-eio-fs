@@ -1031,9 +1031,9 @@ module Crash = struct
   (* A directory tree as an image holds it: the durable image, and the
      subtrees a directory operation touched. *)
   type tree =
-    | File of { data : Cstruct.t; perm : int }
-    | Dir of { perm : int; entries : tree Paths.t }
-    | Link of string
+    | File of { data : Cstruct.t; perm : int; uid : int64; gid : int64 }
+    | Dir of { perm : int; uid : int64; gid : int64; entries : tree Paths.t }
+    | Link of { target : string; uid : int64; gid : int64 }
 
   type location = fstate * boxed * string
 
@@ -1235,15 +1235,15 @@ module Crash = struct
 
   let rec snapshot_at (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:false path with
-    | { kind = `Regular_file; perm; _ } ->
+    | { kind = `Regular_file; perm; uid; gid; _ } ->
         let data =
           with_readable owner path (fun () ->
               Switch.run (fun sw ->
                   read_all (B.open_in bv ~sw ~follow:true path)))
           |> copy_cs
         in
-        File { data; perm }
-    | { kind = `Directory; perm; _ } ->
+        File { data; perm; uid; gid }
+    | { kind = `Directory; perm; uid; gid; _ } ->
         let entries =
           B.read_dir bv path
           |> List.fold_left
@@ -1252,22 +1252,33 @@ module Crash = struct
                  Paths.add name (snapshot_at owner child) m)
                Paths.empty
         in
-        Dir { perm; entries }
-    | { kind = `Symbolic_link; _ } -> Link (B.read_link bv path)
+        Dir { perm; uid; gid; entries }
+    | { kind = `Symbolic_link; uid; gid; _ } ->
+        Link { target = B.read_link bv path; uid; gid }
     | _ -> invalid_arg "Chaos.Crash: unsupported filesystem entry"
 
+  (* The entry at [path] given back to its owner, unless it has them: a host
+     process that is not root may give a file only to itself. *)
+  let restore_owner (Base_dir ((module B), bv)) path ~uid ~gid =
+    let s = B.stat bv ~follow:false path in
+    if not (Int64.equal s.uid uid && Int64.equal s.gid gid) then
+      B.chown ~follow:false ~uid ~gid bv path
+
   let rec restore_at (Base_dir ((module B), bv) as owner) path = function
-    | File { data; perm } ->
-        Switch.run @@ fun sw ->
-        let f =
-          B.open_out bv ~sw ~follow:true ~append:false
-            ~create:(`Or_truncate perm) path
-        in
-        if Cstruct.length data > 0 then
-          Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ];
-        B.chmod bv ~follow:true ~perm path
-    | Link target -> B.symlink ~link_to:target bv path
-    | Dir { perm; entries } ->
+    | File { data; perm; uid; gid } ->
+        ( Switch.run @@ fun sw ->
+          let f =
+            B.open_out bv ~sw ~follow:true ~append:false
+              ~create:(`Or_truncate perm) path
+          in
+          if Cstruct.length data > 0 then
+            Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ];
+          B.chmod bv ~follow:true ~perm path );
+        restore_owner owner path ~uid ~gid
+    | Link { target; uid; gid } ->
+        B.symlink ~link_to:target bv path;
+        restore_owner owner path ~uid ~gid
+    | Dir { perm; uid; gid; entries } ->
         (* Writable while it fills; the mode, which the umask also
            narrows, is set after. *)
         if not (String.equal path "") then
@@ -1277,15 +1288,21 @@ module Crash = struct
             let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
           entries;
-        if not (String.equal path "") then B.chmod bv ~follow:false ~perm path
+        if not (String.equal path "") then begin
+          B.chmod bv ~follow:false ~perm path;
+          restore_owner owner path ~uid ~gid
+        end
 
   let restore_root (Base_dir ((module B), bv) as owner) path = function
-    | Dir { perm; entries } ->
+    | Dir { perm; uid; gid; entries } ->
         B.read_dir bv path
         |> List.iter (fun name ->
             let child = Eio_fs_path.append path name in
             remove_at owner child);
-        if not (String.equal path "") then B.chmod bv ~follow:true ~perm path;
+        if not (String.equal path "") then begin
+          B.chmod bv ~follow:true ~perm path;
+          restore_owner owner path ~uid ~gid
+        end;
         Paths.iter
           (fun name child ->
             let child_path = Eio_fs_path.append path name in

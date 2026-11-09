@@ -2183,6 +2183,29 @@ let test_crash_over_a_user_view () =
     (List.sort String.compare (Eio.Path.read_dir (root / "home")));
   Alcotest.(check string) "d/f" "x" (Eio.Path.load (root / "home/d/f"))
 
+(* A crash rebuilds each entry with its owner. *)
+let test_crash_restores_owners () =
+  Eio_mock.Backend.run @@ fun () ->
+  let root = Eio_fs.Fs.v () in
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl root in
+  write_new ~sync:true (fs / "f") "x";
+  Eio.Path.chown ~follow:true ~uid:1000L ~gid:1000L (fs / "f");
+  Eio.Path.mkdir ~perm:0o700 (fs / "d");
+  Eio.Path.chown ~follow:true ~uid:1000L ~gid:1000L (fs / "d");
+  Eio.Path.symlink ~link_to:"f" (fs / "l");
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (fs / "l");
+  Crash.sync_metadata ctl;
+  let post = Crash.post_crash ctl in
+  let owner p =
+    let s = Eio.Path.stat ~follow:false (post / p) in
+    (s.uid, s.gid)
+  in
+  List.iter
+    (fun p -> Alcotest.(check (pair int64 int64)) p (1000L, 1000L) (owner p))
+    [ "f"; "d"; "l" ];
+  Eio.Path.save ~create:`Never (Eio_fs.Fs.as_user alice post / "f") "y"
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2521,6 +2544,8 @@ let suite =
         test_crash_create_through_a_dangling_link;
       Alcotest.test_case "crash: over a user's view" `Quick
         test_crash_over_a_user_view;
+      Alcotest.test_case "crash: owners are restored" `Quick
+        test_crash_restores_owners;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
