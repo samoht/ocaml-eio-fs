@@ -249,6 +249,7 @@ module Fs = struct
     val sync_dir : t -> Eio.Fs.path -> unit
     val v : label:string -> path:string -> dir_fd -> t
     val fd : t -> dir_fd
+    val as_root : t -> t
     val close : t -> unit
 
     val rename_exclusive :
@@ -283,6 +284,8 @@ module Fs = struct
 
     let v ~label ~path:dir_path fd =
       { fd; dir_path; label; root_closed = false }
+
+    let as_root t = { t with fd = { t.fd with user = Low_level.User.root } }
 
     (* [~follow:false] refuses a symlink at [path] itself, as O_NOFOLLOW. *)
     let nofollow ~follow flags =
@@ -373,24 +376,33 @@ module Fs = struct
         [ `Dir | `Close | `Dir_sync | `Process_local ] )
       Eio.Resource.handler
   end = struct
-    let v =
-      Eio.Resource.handler
-        [
-          H (Eio.Fs.Pi.Dir, (module Dir));
-          H (Eio.Resource.Close, Dir.close);
-          H (Memfs_dir, Dir.fd);
-          H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
-          H (Eio_fs_sync.Dir_sync, fun t ~path -> Dir.sync_dir t path);
-          (* The tree lives in this process's heap. It answers no native path
+    let rec self =
+      lazy
+        (Eio.Resource.handler
+           [
+             H (Eio.Fs.Pi.Dir, (module Dir));
+             H (Eio.Resource.Close, Dir.close);
+             H (Memfs_dir, Dir.fd);
+             (* The crash model reads and rebuilds a tree as root. *)
+             H
+               ( Eio_fs_internal.Admin,
+                 fun t ->
+                   (Eio.Resource.T (Dir.as_root t, Lazy.force self)
+                     :> Eio.Fs.dir_ty Eio.Resource.t) );
+             H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
+             H (Eio_fs_sync.Dir_sync, fun t ~path -> Dir.sync_dir t path);
+             (* The tree lives in this process's heap. It answers no native path
              and hands out no descriptor, so nothing outside this process can
              reach a file of it: an exclusion between fibers here is the whole
              exclusion these files admit. *)
-          H
-            ( Eio_fs_sync.Process_local,
-              fun t ->
-                ignore (Dir.fd t);
-                true );
-        ]
+             H
+               ( Eio_fs_sync.Process_local,
+                 fun t ->
+                   ignore (Dir.fd t);
+                   true );
+           ])
+
+    let v = Lazy.force self
   end
 
   let dir ~label ~path fd =

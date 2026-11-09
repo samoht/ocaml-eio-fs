@@ -341,6 +341,12 @@ module Crash : sig
       on the host descriptor [eio-fs.unix] locks, is gone from the post-crash
       image.
 
+      The model reads and rebuilds the tree with root's rights, whatever user
+      [base] runs as: on an in-memory directory of {!Eio_fs.Fs} it does so
+      through the same directory as {!Eio_fs.root}. A host directory gives the
+      model only the rights of the process, which must be able to read and write
+      every entry of the tree, as its owner or root can.
+
       @raise Stdlib.Invalid_argument
         if the tree under [base] holds an entry that is neither a regular file,
         a directory nor a symbolic link. *)

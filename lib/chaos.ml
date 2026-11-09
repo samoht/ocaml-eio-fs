@@ -626,7 +626,7 @@ let wrap_dir_hook :
    name go through here. *)
 let rec remove_at (Base_dir ((module B), bv) as owner) path =
   match B.stat bv ~follow:false path with
-  | exception Eio.Io _ -> ()
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
   | { kind = `Directory; _ } ->
       let rec clear () =
         match B.read_dir bv path with
@@ -1145,11 +1145,22 @@ module Crash = struct
     mutable metadata : metadata_entry list; (* newest first *)
     mutable durable_tree : tree option;
     mutable durable_locations : locs;
+    mutable root_box : boxed option; (* the base given to [wrap] *)
+    mutable admin : boxed option;
+        (* The base with root's rights, which the model reads and rebuilds
+           the tree through: the code under test may run as a user who cannot
+           read all of it. *)
     mutable by_rel : fstate list Paths.t; (* the files of [files] by path *)
     mutable seq : int;
     mutable ops : int;
     mutable crashed : bool;
   }
+
+  (* [owner] with root's rights when it is the wrapped base. *)
+  let as_admin ctl owner =
+    match (ctl.root_box, ctl.admin) with
+    | Some proot, Some admin when proot == owner -> admin
+    | _ -> owner
 
   let clog_change ctl fs change =
     ctl.seq <- ctl.seq + 1;
@@ -1196,8 +1207,8 @@ module Crash = struct
      staged read-only or write-only cannot be reopened O_RDWR, so grant the
      owner read and write bits for the duration of the rewrite and restore
      the exact mode after. *)
-  let rewrite fs content =
-    let (Base_dir ((module B), bv)) = fs.owner in
+  let rewrite ctl fs content =
+    let (Base_dir ((module B), bv)) = as_admin ctl fs.owner in
     let restore =
       match B.stat bv ~follow:true fs.rel with
       | exception Eio.Io _ -> None
@@ -1290,9 +1301,9 @@ module Crash = struct
   let files_under ctl rel = List.concat_map snd (under rel ctl.by_rel)
 
   let root ctl =
-    match ctl.base with
-    | Some (base, path) -> (box_dir (base :> Eio.Fs.dir_ty r), path)
-    | None -> invalid_arg "Chaos.Crash: controller was never wrapped"
+    match (ctl.admin, ctl.base) with
+    | Some admin, Some (_, path) -> (admin, path)
+    | _ -> invalid_arg "Chaos.Crash: controller was never wrapped"
 
   (* A journal path as the model records it: root-relative, '/'-separated, ""
      for the root itself. A barrier names its directory in whatever spelling
@@ -1803,12 +1814,12 @@ module Crash = struct
       List.iter
         (fun (fs, owner, rel) ->
           let content = content fs in
-          let (Base_dir ((module B), bv)) = owner in
+          let (Base_dir ((module B), bv)) = as_admin ctl owner in
           match B.stat bv ~follow:false rel with
           | { kind = `Regular_file; _ } ->
               fs.owner <- owner;
               fs.rel <- rel;
-              rewrite fs content
+              rewrite ctl fs content
           | _ | (exception Eio.Io _) -> ())
         (all_locations locs)
     end
@@ -2171,7 +2182,10 @@ module Crash = struct
       (* A file's bytes are read once, when the model first meets it, before
          a truncating open loses them. *)
       let known = Hashtbl.mem d.dctl.files key in
-      let prev = if known then Cstruct.empty else read_existing d.dboxed path in
+      let prev =
+        if known then Cstruct.empty
+        else read_existing (as_admin d.dctl d.dplace.proot) rel
+      in
       let had_bytes =
         match found with
         | Some { size; _ } -> Optint.Int63.compare size Optint.Int63.zero > 0
@@ -2387,6 +2401,8 @@ module Crash = struct
       durable_tree = None;
       durable_locations = no_locs;
       by_rel = Paths.empty;
+      root_box = None;
+      admin = None;
       subtrees = [];
       seq = 0;
       logged = 0;
@@ -2398,10 +2414,17 @@ module Crash = struct
   let wrap ctl (base, path) =
     let base = (base :> Eio.Fs.dir_ty r) in
     ctl.base <- Some (base, path);
-    let owner = box_dir base in
-    ctl.durable_tree <- Some (snapshot_at owner path);
+    let proot = box_dir base in
+    let admin =
+      match Eio_fs_internal.admin base with
+      | Some admin -> box_dir admin
+      | None -> proot
+    in
+    ctl.root_box <- Some proot;
+    ctl.admin <- Some admin;
+    ctl.durable_tree <- Some (snapshot_at admin path);
     ctl.durable_locations <- no_locs;
-    (wrap_cdir ctl ~root:(box_dir base) ~prefix:"" ~base, path)
+    (wrap_cdir ctl ~root:proot ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
   let is_crashed ctl = ctl.crashed

@@ -2155,6 +2155,34 @@ let test_crash_create_through_a_dangling_link () =
   let post = Crash.post_crash ctl in
   Alcotest.(check string) "target" "data" (Eio.Path.load (post / "target"))
 
+(* The model over a user's view reads and rebuilds the tree as root: the
+   user cannot read root's files, and may lock themselves out of a
+   directory. *)
+let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 }
+
+let test_crash_over_a_user_view () =
+  Eio_mock.Backend.run @@ fun () ->
+  let root = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o600) (root / "shadow") "s";
+  Eio.Path.mkdir ~perm:0o755 (root / "home");
+  Eio.Path.chown ~follow:true ~uid:1000L ~gid:1000L (root / "home");
+  let a = Eio_fs.Fs.as_user alice root in
+  ignore (Crash.wrap (Crash.v ()) a);
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl (a / "home") in
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  write_new ~sync:true (fs / "d/f") "x";
+  Crash.sync_metadata ctl;
+  Eio.Path.chmod ~follow:true ~perm:0o600 (fs / "d");
+  Eio.Path.mkdir ~perm:0o755 (fs / "e");
+  Eio.Path.chmod ~follow:true ~perm:0o000 (fs / "e");
+  Eio.Path.mkdir ~perm:0o755 (fs / "g");
+  Crash.crash ctl;
+  Alcotest.(check (list string))
+    "the durable tree" [ "d" ]
+    (List.sort String.compare (Eio.Path.read_dir (root / "home")));
+  Alcotest.(check string) "d/f" "x" (Eio.Path.load (root / "home/d/f"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2491,6 +2519,8 @@ let suite =
         test_crash_rename_over_an_open_file;
       Alcotest.test_case "crash: a create through a dangling link" `Quick
         test_crash_create_through_a_dangling_link;
+      Alcotest.test_case "crash: over a user's view" `Quick
+        test_crash_over_a_user_view;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

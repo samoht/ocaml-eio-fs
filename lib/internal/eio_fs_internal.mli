@@ -15,6 +15,10 @@ type (_, _, _) Eio.Resource.pi +=
   | Base_file :
       ('t, 't -> Eio.File.ro_ty Eio.Resource.t, [> `Base_file ]) Eio.Resource.pi
         (** The file a file wrapper wraps. *)
+  | Admin :
+      ('t, 't -> Eio.Fs.dir_ty Eio.Resource.t, [> `Admin ]) Eio.Resource.pi
+        (** The same directory with root's rights, which {!Eio_fs.Chaos.Crash}
+            reads and rebuilds a tree through. *)
 
 val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
 (** [base_dir r] is the directory [r] wraps, or [None] when [r] binds no
@@ -23,3 +27,7 @@ val base_dir : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
 val base_file : _ Eio.Resource.t -> Eio.File.ro_ty Eio.Resource.t option
 (** [base_file r] is the file [r] wraps, or [None] when [r] binds no
     {!Base_file}. *)
+
+val admin : _ Eio.Resource.t -> Eio.Fs.dir_ty Eio.Resource.t option
+(** [admin r] is [r] with root's rights, or [None] when [r] binds no {!Admin}.
+*)
