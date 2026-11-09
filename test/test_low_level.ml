@@ -666,6 +666,40 @@ let test_perm_open_directory () =
       Eio.Switch.run (fun sw -> ignore (Eio.Path.open_in ~sw (a / "d"))));
   Eio.Switch.run (fun sw -> ignore (Eio.Path.open_dir ~sw (a / "d")))
 
+(* Linux: a setgid directory gives new entries its group, and new
+   subdirectories its setgid bit; a chown, or a write by a user, clears the
+   setuid and setgid bits of a file; a chmod by a user outside the file's
+   group drops setgid. *)
+let test_perm_setgid_and_privileges () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  let carol = { alice with groups = [ 50 ] } in
+  let a = Eio_fs.Fs.as_user carol fs in
+  let owner p =
+    let s = Eio.Path.stat ~follow:false (fs / p) in
+    Fmt.str "%Ld:%Ld %o" s.uid s.gid s.perm
+  in
+  let check what expected p = Alcotest.(check string) what expected (owner p) in
+  Eio.Path.mkdir ~perm:0o755 (fs / "g");
+  Eio.Path.chown ~follow:false ~gid:50L (fs / "g");
+  Eio.Path.chmod ~follow:false ~perm:0o2777 (fs / "g");
+  Eio.Path.save ~create:(`Exclusive 0o644) (a / "g/f") "";
+  Eio.Path.mkdir ~perm:0o755 (a / "g/d");
+  check "a file in a setgid directory" "1000:50 644" "g/f";
+  check "a directory in a setgid directory" "1000:50 2755" "g/d";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "sx") "";
+  Eio.Path.chmod ~follow:false ~perm:0o6755 (fs / "sx");
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (fs / "sx");
+  check "chown clears setuid and setgid" "1000:1000 755" "sx";
+  Eio.Path.chmod ~follow:false ~perm:0o6755 (a / "sx");
+  Eio.Path.with_open_out ~append:true ~create:`Never (a / "sx") (fun f ->
+      Eio.Flow.copy_string "x" f);
+  check "a user's write clears them" "1000:1000 755" "sx";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "sg") "";
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:60L (fs / "sg");
+  Eio.Path.chmod ~follow:false ~perm:0o2755 (a / "sg");
+  check "chmod outside the group drops setgid" "1000:60 755" "sg"
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1157,4 +1191,6 @@ let suite =
         test_perm_move_directory;
       Alcotest.test_case "permissions: open a directory" `Quick
         test_perm_open_directory;
+      Alcotest.test_case "permissions: setgid directories and privilege bits"
+        `Quick test_perm_setgid_and_privileges;
     ] )

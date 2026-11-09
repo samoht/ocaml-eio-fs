@@ -83,6 +83,22 @@ module User = struct
   let id i = Int64.of_int i
   let owns u (stat : Eio.File.Stat.t) = u.uid = 0 || stat.uid = id u.uid
 
+  let in_group u g =
+    Int64.equal g (id u.gid)
+    || List.exists (fun g' -> Int64.equal g (id g')) u.groups
+
+  (* Linux clears setuid, and setgid with the group's execute bit, from a
+     regular file a chown changes or a user other than root writes. *)
+  let without_privileges (stat : Eio.File.Stat.t) =
+    match stat.kind with
+    | `Regular_file ->
+        let perm = stat.perm land lnot 0o4000 in
+        let perm =
+          if perm land 0o010 <> 0 then perm land lnot 0o2000 else perm
+        in
+        { stat with perm }
+    | _ -> stat
+
   (* [u] may [want] on [stat] by its owner's, group's or others' bits. Root
      needs no bit to read, write or search a directory, and one x bit to
      execute a file, as on Linux. *)
@@ -286,12 +302,13 @@ module Fd = struct
     fs : fs;
     num : Num.t;
     append : bool;
+    user : User.t; (* who opened it *)
     mutable pos : Optint.Int63.t;
     mutable closed : bool;
   }
 
-  let v ?(append = false) fs num =
-    { fs; num; append; pos = Optint.Int63.zero; closed = false }
+  let v ?(append = false) ~user fs num =
+    { fs; num; append; user; pos = Optint.Int63.zero; closed = false }
 
   let closed t = t.closed
 
@@ -337,16 +354,25 @@ let default_stat =
       blocks = 0L;
     }
 
-(* A new entry is owned by the user who makes it. *)
-let new_stat fs ~(user : User.t) ?kind ?perm () =
+(* A new entry is owned by the user who makes it, in the group of a setgid
+   [parent], from which a new directory also takes the setgid bit. *)
+let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
   fs.last_ino <- Int64.succ fs.last_ino;
+  let kind = Option.value ~default:default_stat.kind kind in
+  let perm = Option.value ~default:default_stat.perm perm in
+  let gid, perm =
+    match parent with
+    | Some (p : Eio.File.Stat.t) when p.perm land 0o2000 <> 0 ->
+        (p.gid, if kind = `Directory then perm lor 0o2000 else perm)
+    | Some _ | None -> (User.id user.gid, perm)
+  in
   {
     default_stat with
     ino = fs.last_ino;
-    kind = Option.value ~default:default_stat.kind kind;
-    perm = Option.value ~default:default_stat.perm perm;
+    kind;
+    perm;
     uid = User.id user.uid;
-    gid = User.id user.gid;
+    gid;
   }
 
 module Filesystem = struct
@@ -666,7 +692,10 @@ let new_file ~mode fs (w : Filesystem.walk) name ~slash =
   check_live fs rdir name;
   check_dir_write ~user:w.user rdir name;
   let dir = as_dir ~path:name !rdir in
-  let stat = new_stat fs ~user:w.user ~perm:(masked ~user:w.user mode) () in
+  let stat =
+    new_stat fs ~user:w.user ~parent:dir.stat ~perm:(masked ~user:w.user mode)
+      ()
+  in
   let f = File.v ~stat in
   let dir = Dir_node.add name f.stat.ino dir in
   rdir := Resource.Dir dir;
@@ -734,7 +763,7 @@ let open_locked ~mode dir_fd path flags =
   in
   let num = next_fd_of_fds fs.fds in
   fs.fds <- Fd_table.add num r fs.fds;
-  Fd.v ~append fs num
+  Fd.v ~append ~user:dir_fd.user fs num
 
 let openat ~mode ~sw dir_fd path flags =
   let fd =
@@ -757,7 +786,15 @@ let chmod ~follow dir_fd ~perm path =
   | _ -> ());
   if not (User.owns dir_fd.user (Resource.stat !r)) then
     Error.permission_denied path;
-  r := Resource.set_stat !r { (Resource.stat !r) with perm = perm land 0o7777 }
+  let s = Resource.stat !r in
+  let perm = perm land 0o7777 in
+  (* Outside the file's group, a user cannot set setgid. *)
+  let perm =
+    if dir_fd.user.uid <> 0 && not (User.in_group dir_fd.user s.gid) then
+      perm land lnot 0o2000
+    else perm
+  in
+  r := Resource.set_stat !r { s with perm }
 
 (* chown(2): root gives a file to anyone; its owner only moves it to a group
    of their own. EPERM otherwise. *)
@@ -775,7 +812,7 @@ let chown ~follow ?uid ?gid dir_fd path =
     user.uid <> 0
     && not (User.owns user s && uid = s.uid && (gid = s.gid || mine gid))
   then Error.permission_denied path;
-  r := Resource.set_stat !r { s with uid; gid }
+  r := Resource.set_stat !r (User.without_privileges { s with uid; gid })
 
 (* The directory [w] is in, without its entry [name]. The entry's inode leaves
    the tree with its only name, and is freed once no descriptor holds it. *)
@@ -809,10 +846,11 @@ let mkdirat dir_fd ~perm path =
   let fs = Dir.fs dir_fd in
   let mkdir r name =
     let user = dir_fd.Dir.user in
-    let new_stat =
-      new_stat fs ~user ~kind:`Directory ~perm:(masked ~user perm) ()
-    in
     let d = as_dir ~path !r in
+    let new_stat =
+      new_stat fs ~user ~parent:d.stat ~kind:`Directory
+        ~perm:(masked ~user perm) ()
+    in
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Dir dir));
@@ -845,7 +883,9 @@ let symlinkat ~link_to dir_fd path =
   let symlink r name =
     let new_stat =
       {
-        (new_stat fs ~user:dir_fd.Dir.user ~kind:`Symbolic_link ~perm:0o777 ()) with
+        (new_stat fs ~user:dir_fd.Dir.user ~parent:(Resource.stat !r)
+           ~kind:`Symbolic_link ~perm:0o777 ())
+        with
         size = Optint.Int63.of_int (String.length link_to);
       }
     in
@@ -1040,6 +1080,10 @@ let not_a_file op r =
    [Eio.Path.open_in] on a directory is legal and the portable directory
    barrier depends on it -- so the operations below refuse one with EISDIR, as
    read(2) and write(2) do. *)
+(* A write by a user other than root clears the file's privilege bits. *)
+let written (t : Fd.t) (f : File.t) =
+  if t.user.uid = 0 then f else { f with stat = User.without_privileges f.stat }
+
 let writev t bufs =
   locked t.Fd.fs @@ fun () ->
   let r = resource_of t in
@@ -1049,7 +1093,7 @@ let writev t bufs =
          append descriptor, at the end. *)
       let src = Cstruct.concat bufs in
       if t.append then t.pos <- e.stat.size;
-      r := File (File.write e ~off:(Optint.Int63.to_int t.pos) src);
+      r := File (written t (File.write e ~off:(Optint.Int63.to_int t.pos) src));
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
       Cstruct.length src
   | r -> not_a_file "writev" r
@@ -1112,7 +1156,7 @@ let pwritev t ~file_offset bufs =
       let off =
         if t.append then File.size e else Optint.Int63.to_int file_offset
       in
-      r := Resource.File (File.write e ~off src);
+      r := Resource.File (written t (File.write e ~off src));
       Cstruct.length src
   | r -> not_a_file "pwrite" r
 
@@ -1140,7 +1184,7 @@ let truncate_fd t len =
   let r = resource_of t in
   match !r with
   | Resource.File e ->
-      r := Resource.File (File.truncate e (Optint.Int63.to_int len))
+      r := Resource.File (written t (File.truncate e (Optint.Int63.to_int len)))
   | r -> not_a_file "truncate" r
 
 module Flow = struct
