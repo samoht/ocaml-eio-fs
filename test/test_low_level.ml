@@ -638,6 +638,23 @@ let test_symlink_mode () =
   Eio.Path.symlink ~link_to:"f" (env#fs / "l");
   Alcotest.(check int) "mode" 0o777 (perm (env#fs / "l"))
 
+(* Moving a directory to another parent rewrites its [..] entry, so a user
+   needs write permission on the directory itself. *)
+let test_perm_move_directory () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o777 (fs / "pub");
+  Eio.Path.chmod ~follow:false ~perm:0o777 (fs / "pub");
+  Eio.Path.mkdir ~perm:0o755 (fs / "pub/rootdir");
+  let a = Eio_fs.Fs.as_user alice fs in
+  Eio.Path.mkdir ~perm:0o777 (a / "pub/other");
+  denied "move to another parent" (fun () ->
+      Eio.Path.rename (a / "pub/rootdir") (a / "pub/other/x"));
+  Eio.Path.rename (a / "pub/rootdir") (a / "pub/same");
+  Alcotest.(check bool)
+    "renamed in place" true
+    (Eio.Path.is_directory (fs / "pub/same"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1125,4 +1142,6 @@ let suite =
         test_perm_load_keeps_modes;
       Alcotest.test_case "chmod masks the mode" `Quick test_chmod_masks_the_mode;
       Alcotest.test_case "symbolic link mode" `Quick test_symlink_mode;
+      Alcotest.test_case "permissions: move a directory" `Quick
+        test_perm_move_directory;
     ] )

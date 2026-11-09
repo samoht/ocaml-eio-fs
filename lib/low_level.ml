@@ -1004,6 +1004,12 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       check_sticky ~user old_parent old_res old_path;
       check_dir_write ~user new_parent new_path;
       Option.iter (fun dst -> check_sticky ~user new_parent dst new_path) dst;
+      (* A directory moved to another parent has its [..] rewritten. *)
+      (match !old_res with
+      | Resource.Dir _ when old_parent != new_parent ->
+          if not (User.can user (Resource.stat !old_res) User.w) then
+            Error.permission_denied old_path
+      | _ -> ());
       move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
       reparent old_res ~new_parent;
