@@ -1372,6 +1372,26 @@ let test_crash_held_subtree_follows_a_rename () =
 (* Metadata survival is a prefix of program order: refusing an early directory
    op drops everything after it, even ops the predicate would accept, because
    a journal never commits out of order. *)
+(* A rename over a file whose new data was never synced: the default policy
+   shows only the state at the last barriers, and seeds show the rename
+   landing before the data. *)
+let rename_before_data policy =
+  let ctl = Crash.v ?policy () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio_fs_sync.save (fs / "state") "v1";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "state.tmp") "v2";
+  Eio.Path.rename (fs / "state.tmp") (fs / "state");
+  let post = Crash.post_crash ctl in
+  Eio.Path.load (post / "state")
+
+let test_crash_default_is_one_state () =
+  Alcotest.(check string) "the last barrier" "v1" (rename_before_data None);
+  let seeds =
+    List.init 100 (fun seed ->
+        rename_before_data (Some (Crash.Reorder_unsynced seed)))
+  in
+  Alcotest.(check bool) "some seed loses the data" true (List.mem "" seeds)
+
 (* The same seed and workload rebuild the same image, temporaries of
    [Eio_fs_sync.save] included. *)
 let image_of_seed seed =
@@ -2112,6 +2132,8 @@ let suite =
         test_crash_reorder_prefix_uniform;
       Alcotest.test_case "crash: a seed reproduces a save's image" `Quick
         test_crash_seed_reproduces_save;
+      Alcotest.test_case "crash: the default policy is one state" `Quick
+        test_crash_default_is_one_state;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

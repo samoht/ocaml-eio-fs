@@ -239,8 +239,11 @@ module Crash : sig
       changes. *)
   type policy =
     | Drop_unsynced
-        (** Every un-synced write is lost and every uncommitted directory
-            operation is rolled back; only committed state survives. *)
+        (** The state at the last barriers: every un-synced write is lost and
+            every uncommitted directory operation is rolled back. It is one
+            crash state among many. It hides the bugs that need a later change
+            to land, such as a rename that reaches the disk before the data it
+            names; {!Reorder_unsynced} over many seeds finds those. *)
     | Reorder_unsynced of int
         (** Seeded: each un-synced write survives on an even coin and the
             survivors are applied in a seeded-shuffled order, so a later write
@@ -283,8 +286,8 @@ module Crash : sig
 
   val v : ?policy:policy -> ?trigger:trigger -> unit -> t
   (** [v ~policy ~trigger ()] is a fresh controller that rebuilds the post-crash
-      image by [policy] (defaults to {!Drop_unsynced}) and crashes on [trigger]
-      (defaults to {!Manual}). *)
+      image by [policy] (defaults to {!Drop_unsynced}, a single state) and
+      crashes on [trigger] (defaults to {!Manual}). *)
 
   val wrap : t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [wrap t base] is [base] with durability tracked by [t]; files and

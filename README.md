@@ -38,23 +38,32 @@ failed syncs. A torn write stores part of its bytes and then fails.
 
 `Eio_fs.Chaos.Crash` simulates a power cut. A write stays unsynced until
 `Eio.File.sync` runs on its file. Directory operations go into a journal in the
-order they ran. At the crash, unsynced writes may be lost or reordered, and
-only a prefix of the uncommitted directory operations survives.
+order they ran. At the crash, unsynced writes may be lost, and only a prefix
+of the uncommitted directory operations survives.
 
-In this test, a file saved with `Eio_fs_sync.save` survives the crash, because
-that call syncs the file and its directory. A file written with no sync is lost.
-The test also links `eio-fs.sync`.
+One crash can end in many states. The default policy, `Drop_unsynced`, builds
+only one of them: the state at the last barriers. `Reorder_unsynced seed` draws
+a different state for each seed, so a test loops over seeds.
+
+In this test, a file saved with `Eio_fs_sync.save` survives every crash,
+because that call syncs the file and its directory. A file written with no sync
+is lost in some of them. The test also links `eio-fs.sync`.
 
 ```ocaml
 Eio_main.run @@ fun _env ->
 let module Crash = Eio_fs.Chaos.Crash in
-let ctl = Crash.v () in
-let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
-Eio_fs_sync.save Eio.Path.(fs / "state") "committed";
-Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(fs / "draft") "unsynced";
-let after = Crash.post_crash ctl in
-assert (Eio.Path.load Eio.Path.(after / "state") = "committed");
-assert (Eio.Path.kind ~follow:false Eio.Path.(after / "draft") = `Not_found)
+let lost = ref 0 in
+for seed = 0 to 99 do
+  let ctl = Crash.v ~policy:(Crash.Reorder_unsynced seed) () in
+  let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
+  Eio_fs_sync.save Eio.Path.(fs / "state") "committed";
+  Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(fs / "draft") "unsynced";
+  let after = Crash.post_crash ctl in
+  assert (Eio.Path.load Eio.Path.(after / "state") = "committed");
+  if Eio.Path.kind ~follow:false Eio.Path.(after / "draft") = `Not_found then
+    incr lost
+done;
+assert (!lost > 0)
 ```
 
 ## Embedding a file tree

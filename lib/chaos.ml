@@ -953,8 +953,7 @@ module Crash = struct
   (** How the post-crash image reconstructs from the un-synced writes. *)
   type policy =
     | Drop_unsynced
-        (** Every un-synced write is lost; only synced data survives. The strict
-            "power cut, nothing pending reached the platter" model. *)
+        (** The state at the last barriers: every un-synced write is lost. *)
     | Reorder_unsynced of int
         (** Seeded: each un-synced write survives on an even coin and the
             survivors are applied in a seeded-shuffled order, so a later write
