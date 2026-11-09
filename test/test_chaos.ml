@@ -2274,6 +2274,27 @@ let test_crash_synced_chmod_of_a_new_file () =
   Alcotest.(check int)
     "mode" 0o600 (Eio.Path.stat ~follow:false (post / "f")).perm
 
+(* A sync makes the file's mode durable wherever the file's name is: a
+   pending rename, a rename onto itself, or a later directory of the old name
+   change nothing. *)
+let test_crash_synced_mode_follows_the_file () =
+  let ctl = Crash.v () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "b") "x";
+  Crash.sync_metadata ctl;
+  Eio.Path.chmod ~follow:true ~perm:0o777 (fs / "b");
+  Eio.Path.rename (fs / "b") (fs / "l");
+  Eio.Path.chmod ~follow:true ~perm:0o700 (fs / "l");
+  Eio.Path.rename (fs / "l") (fs / "l");
+  Eio.Path.with_open_out ~create:`Never (fs / "l") Eio.File.sync;
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.chmod ~follow:true ~perm:0o711 (fs / "d");
+  Eio.Path.rmdir (fs / "d");
+  write_new ~sync:true (fs / "d") "y";
+  let post = Crash.post_crash ctl in
+  Alcotest.(check int) "b" 0o700 (Eio.Path.stat ~follow:false (post / "b")).perm;
+  Alcotest.(check bool) "d" true (absent (post / "d"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2621,6 +2642,8 @@ let suite =
         test_crash_chmod_journaled;
       Alcotest.test_case "crash: a synced chmod of a file whose name is pending"
         `Quick test_crash_synced_chmod_of_a_new_file;
+      Alcotest.test_case "crash: a synced mode follows the file" `Quick
+        test_crash_synced_mode_follows_the_file;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

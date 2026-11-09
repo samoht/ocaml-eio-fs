@@ -952,6 +952,9 @@ module Crash = struct
     mutable rel : string;
     mutable perm : int;
     durable : image;
+    mutable attrs : (int * int * int64 * int64) option;
+        (* The latest mode and owner a barrier made durable, with the seq of
+           the change that set them. *)
     mutable pending : entry list;
         (* this file's pending changes, newest first *)
     mutable gen : int;
@@ -970,6 +973,7 @@ module Crash = struct
       rel;
       perm;
       durable = image_of durable;
+      attrs = None;
       pending = [];
       gen = 0;
     }
@@ -1106,6 +1110,9 @@ module Crash = struct
     attrs_of : string option;
         (* For a chmod or a chown, the resolved node it changed: a sync of
            that file commits it. *)
+    attrs_file : fstate option;
+        (* The tracked file it changed, which the attributes land on only
+           where an image holds that file. *)
   }
 
   (** How the post-crash image reconstructs from the un-synced writes. *)
@@ -1158,6 +1165,9 @@ module Crash = struct
     mutable metadata : metadata_entry list; (* newest first *)
     mutable durable_tree : tree option;
     mutable durable_locations : locs;
+    mutable snapshot_seq : int;
+        (* The seq at the last whole snapshot, which holds every attribute
+           set before it. *)
     mutable root_box : boxed option; (* the base given to [wrap] *)
     mutable admin : boxed option;
         (* The base with root's rights, which the model reads and rebuilds
@@ -1469,12 +1479,24 @@ module Crash = struct
       (fun (tree, locs) (segs, edit) ->
         match edit with
         | Attrs { perm; uid; gid } -> (
-            match (segs, tree_find tree segs) with
-            | _, None -> (tree, locs)
-            | [], Some node -> (with_attrs ~perm ~uid ~gid node, locs)
-            | _, Some node ->
-                ( tree_replace tree segs (Some (with_attrs ~perm ~uid ~gid node)),
-                  locs ))
+            (* A tracked file's attributes land wherever the image holds
+               that file; a directory's, at its path. *)
+            let segs =
+              match e.attrs_file with
+              | None -> Some segs
+              | Some fs ->
+                  Option.map path_segments (Ids.find_opt fs.id locs.where)
+            in
+            match segs with
+            | None -> (tree, locs)
+            | Some segs -> (
+                match (segs, tree_find tree segs) with
+                | _, None -> (tree, locs)
+                | [], Some node -> (with_attrs ~perm ~uid ~gid node, locs)
+                | _, Some node ->
+                    ( tree_replace tree segs
+                        (Some (with_attrs ~perm ~uid ~gid node)),
+                      locs )))
         | Node node ->
             let lands =
               match List.rev segs with
@@ -1544,9 +1566,16 @@ module Crash = struct
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let root = path_segments root_path in
+    (* A directory's attributes are committed by barriers, never by the
+       sync of a file. *)
     let attrs_of =
       match (kind, resolved) with
-      | (Chmod _ | Chown _), [ p ] -> Some (path_key p)
+      | (Chmod _ | Chown _), [ p ] -> (
+          let (Base_dir ((module B), bv)) = owner in
+          match B.stat bv ~follow:false p with
+          | { kind = `Directory; _ } -> None
+          | _ -> Some (path_key p)
+          | exception Eio.Io _ -> None)
       | _ -> None
     in
     let delta, dirs =
@@ -1573,11 +1602,15 @@ module Crash = struct
       |> List.map (fun fs -> (fs, fs.owner, fs.rel))
       |> List.filter (covers ~root delta)
     in
-    (* A barrier on a directory holds for that directory: once it is removed
-       or renamed, a new one of its name neither inherits a deferred barrier
-       nor commits the old one's entries. *)
+    (* A barrier holds for a directory or a file, not its name: once it is
+       removed or renamed, a new one of its name neither inherits a deferred
+       barrier nor commits the old one's entries or attributes. *)
     (match kind with
-    | Rmdir | Rename _ ->
+    | (Rmdir | Rename _ | Unlink)
+      when not
+             (match resolved with
+             | [ a; b ] -> String.equal (path_key a) (path_key b)
+             | _ -> false) ->
         let gone = List.map path_key resolved in
         let stays d =
           not
@@ -1593,19 +1626,37 @@ module Crash = struct
                 e with
                 dirs = List.filter stays e.dirs;
                 barred = List.filter stays e.barred;
+                attrs_of =
+                  Option.bind e.attrs_of (fun a ->
+                      if stays a then Some a else None);
               })
             ctl.metadata
-    | Data | Truncate | Create | Mkdir | Unlink | Symlink _ | Chmod _ | Chown _
-      ->
+    | Rmdir | Rename _ | Unlink | Data | Truncate | Create | Mkdir | Symlink _
+    | Chmod _ | Chown _ ->
         ());
+    let attrs_file =
+      Option.bind attrs_of (fun _ ->
+          match resolved with
+          | [ p ] -> (
+              match
+                List.filter
+                  (fun fs -> String.equal fs.rel p)
+                  (files_under ctl p)
+              with
+              | fs :: _ -> Some fs
+              | [] -> None)
+          | _ -> None)
+    in
     ctl.metadata <-
-      { meta; dirs; barred = []; delta; recorded; attrs_of } :: ctl.metadata
+      { meta; dirs; barred = []; delta; recorded; attrs_of; attrs_file }
+      :: ctl.metadata
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
     ctl.durable_tree <- Some (snapshot_at owner root_path);
     ctl.durable_locations <-
       locs_of ~root:(path_segments root_path) (locations ctl);
+    ctl.snapshot_seq <- ctl.seq;
     ctl.metadata <- []
 
   (* fsync(2) on a directory commits that directory's entries and nothing else:
@@ -1644,13 +1695,19 @@ module Crash = struct
           List.for_all
             (fun (segs, edit) ->
               match edit with
-              | Attrs _ -> Option.is_some (tree_find durable segs)
+              | Attrs _ -> (
+                  match e.attrs_file with
+                  | None -> Option.is_some (tree_find durable segs)
+                  | Some fs -> Ids.mem fs.id ctl.durable_locations.where)
               | Node _ -> true)
             e.delta
         in
         let committed, pending =
           List.partition
-            (fun e -> List.exists durable_dir e.barred && node_held e)
+            (fun e ->
+              node_held e
+              && (List.exists durable_dir e.barred
+                 || (Option.is_some e.attrs_file && e.barred <> [])))
             (List.rev ctl.metadata)
         in
         match committed with
@@ -1663,6 +1720,13 @@ module Crash = struct
             in
             ctl.durable_tree <- Some (fst durable);
             ctl.durable_locations <- snd durable;
+            List.iter
+              (fun e ->
+                match (e.attrs_file, e.delta) with
+                | Some fs, [ (_, Attrs { perm; uid; gid }) ] ->
+                    fs.attrs <- Some (e.meta.seq, perm, uid, gid)
+                | _ -> ())
+              committed;
             ctl.metadata <- List.rev pending;
             settle ctl)
 
@@ -1681,10 +1745,12 @@ module Crash = struct
 
   (* fsync(2) of a file commits its inode, attributes included: they hold
      once its directory does. *)
-  let commit_attrs ctl ~rel =
-    let key = Some (path_key rel) in
-    bar ctl ~dir:(parent_key rel) (fun e ->
-        Option.equal String.equal e.attrs_of key)
+  let commit_attrs ctl fs =
+    let key = Some (path_key fs.rel) in
+    bar ctl ~dir:(parent_key fs.rel) (fun e ->
+        match e.attrs_file with
+        | Some f -> f == fs
+        | None -> Option.equal String.equal e.attrs_of key)
 
   (* A file the wrapper first meets on an open that finds it on disk was created
      by nothing the model recorded, so its name is part of every image that
@@ -1895,6 +1961,7 @@ module Crash = struct
           (replay ~root:(path_segments root_path))
           durable metadata_survivors
       in
+      let replayed = ref (List.rev metadata_survivors) in
       (* A barrier deferred on a directory holds once the directory does: an
          entry it covers survives whenever the image holds that directory,
          wherever the cut fell. Program order replays a directory's creation
@@ -1914,9 +1981,25 @@ module Crash = struct
           ordered_metadata
         |> List.fold_left
              (fun ((tree, _) as image) e ->
-               if List.exists (holds tree) e.barred then replay ~root image e
+               if
+                 List.exists (holds tree) e.barred
+                 || (Option.is_some e.attrs_file && e.barred <> [])
+               then (
+                 replayed := e :: !replayed;
+                 replay ~root image e)
                else image)
              (tree, locs)
+      in
+      (* A file keeps the attributes a barrier made durable, unless a later
+         change the image replays set others: a node an earlier entry
+         replaced carries the attributes it had then. *)
+      let latest fs =
+        List.fold_left
+          (fun acc e ->
+            match e.attrs_file with
+            | Some f when f == fs -> max acc e.meta.seq
+            | Some _ | None -> acc)
+          ctl.snapshot_seq !replayed
       in
       restore_root owner root_path tree;
       List.iter
@@ -1924,10 +2007,15 @@ module Crash = struct
           let content = content fs in
           let (Base_dir ((module B), bv)) = as_admin ctl owner in
           match B.stat bv ~follow:false rel with
-          | { kind = `Regular_file; _ } ->
+          | { kind = `Regular_file; _ } -> (
               fs.owner <- owner;
               fs.rel <- rel;
-              rewrite ctl fs content
+              rewrite ctl fs content;
+              match fs.attrs with
+              | Some (seq, perm, uid, gid) when seq > latest fs ->
+                  B.chmod bv ~follow:false ~perm rel;
+                  restore_owner (as_admin ctl owner) rel ~uid ~gid
+              | Some _ | None -> ())
           | _ | (exception Eio.Io _) -> ())
         (all_locations locs)
     end
@@ -1997,7 +2085,7 @@ module Crash = struct
         let pending = List.rev fs.pending in
         List.iter (fun e -> apply fs.durable e.change) pending;
         lose ctl fs;
-        commit_attrs ctl ~rel:fs.rel;
+        commit_attrs ctl fs;
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
         lose ctl fs;
@@ -2407,11 +2495,14 @@ module Crash = struct
       (* A successful rename moves the durability identity with the file. A
          tracked target it replaced keeps its own, for a crash that loses the
          rename. *)
-      move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
-        ~new_rel:rel;
-      let kind = Rename { dest } in
-      record_metadata d.dctl ~path:spelt ~kind ~resolved:[ old_rel; rel ];
-      bump_metadata d.dctl ~path:spelt ~kind
+      (* A rename of an entry onto itself does nothing. *)
+      if not (owner == d.dplace.proot && String.equal old_rel rel) then begin
+        move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
+          ~new_rel:rel;
+        let kind = Rename { dest } in
+        record_metadata d.dctl ~path:spelt ~kind ~resolved:[ old_rel; rel ];
+        bump_metadata d.dctl ~path:spelt ~kind
+      end
 
     let rename d old_path new_dir new_path =
       rename_with None d old_path new_dir new_path
@@ -2520,6 +2611,7 @@ module Crash = struct
       metadata = [];
       durable_tree = None;
       durable_locations = no_locs;
+      snapshot_seq = 0;
       by_rel = Paths.empty;
       root_box = None;
       admin = None;
