@@ -227,10 +227,11 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     which demonstrates the classic missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
-    [rmdir], [symlink] and [rename] enter a metadata journal in program order;
-    {!Crash.sync_metadata} commits it whole, and a directory barrier (a sync of
-    the directory, opened as a file or not) commits only the entries of that
-    directory. A barrier on a directory that is not itself durable yet holds
+    [rmdir], [symlink], [rename], [chmod] and [chown] enter a metadata journal
+    in program order; {!Crash.sync_metadata} commits it whole, and a directory
+    barrier (a sync of the directory, opened as a file or not) commits only the
+    entries of that directory. A sync of a file also commits a [chmod] or
+    [chown] of it. A barrier on a directory that is not itself durable yet holds
     from the moment it is. At a crash the policy decides how much of the
     uncommitted suffix survives, always a prefix of program order, and a dropped
     operation is rolled back whole; an entry a deferred barrier covers survives
@@ -246,6 +247,8 @@ module Crash : sig
     | Rmdir  (** A removed directory. *)
     | Symlink of { target : string }  (** A new symbolic link to [target]. *)
     | Rename of { dest : string }  (** An entry moved to [dest]. *)
+    | Chmod of { perm : int }  (** A new mode. *)
+    | Chown of { uid : int64; gid : int64 }  (** A new owner. *)
 
   type unsynced = {
     path : string;

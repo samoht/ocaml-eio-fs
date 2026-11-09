@@ -2235,6 +2235,33 @@ let test_crash_deferred_barrier_identity () =
   Alcotest.(check (list string)) "after rename, the new d" [] renamed;
   Alcotest.(check (list string)) "the root" [ "d"; "x" ] top
 
+(* A change of mode or owner is metadata: lost unless a sync of the file or a
+   barrier on its directory commits it. *)
+let test_crash_chmod_journaled () =
+  let mode ~sync =
+    let ctl = Crash.v () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "k";
+    Eio.Path.mkdir ~perm:0o755 (fs / "d");
+    Crash.sync_metadata ctl;
+    Eio.Path.chmod ~follow:true ~perm:0o600 (fs / "f");
+    Eio.Path.chown ~follow:true ~uid:1000L ~gid:1000L (fs / "f");
+    Eio.Path.chmod ~follow:true ~perm:0o700 (fs / "d");
+    sync ctl fs;
+    let post = Crash.post_crash ctl in
+    let st p = Eio.Path.stat ~follow:false (post / p) in
+    ((st "f").perm, (st "f").uid, (st "d").perm)
+  in
+  let check what expected got =
+    Alcotest.(check (triple int int64 int)) what expected got
+  in
+  check "no sync" (0o644, 0L, 0o755) (mode ~sync:(fun _ _ -> ()));
+  check "a sync of the file" (0o600, 1000L, 0o755)
+    (mode ~sync:(fun _ fs ->
+         Eio.Path.with_open_out ~create:`Never (fs / "f") Eio.File.sync));
+  check "a barrier on the directory" (0o600, 1000L, 0o700)
+    (mode ~sync:(fun _ fs -> Eio_fs_sync.sync_dir fs))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2578,6 +2605,8 @@ let suite =
       Alcotest.test_case
         "crash: a deferred barrier holds for its directory only" `Quick
         test_crash_deferred_barrier_identity;
+      Alcotest.test_case "crash: chmod and chown are journaled" `Quick
+        test_crash_chmod_journaled;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
