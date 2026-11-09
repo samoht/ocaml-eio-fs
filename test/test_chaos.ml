@@ -1372,6 +1372,21 @@ let test_crash_held_subtree_follows_a_rename () =
 (* Metadata survival is a prefix of program order: refusing an early directory
    op drops everything after it, even ops the predicate would accept, because
    a journal never commits out of order. *)
+(* The same seed and workload rebuild the same image, temporaries of
+   [Eio_fs_sync.save] included. *)
+let image_of_seed seed =
+  let ctl = Crash.v ~policy:(Reorder_unsynced seed) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio_fs_sync.save ~durable:false (fs / "state") "v1";
+  let post = Crash.post_crash ctl in
+  List.sort String.compare (Eio.Path.read_dir post)
+
+let test_crash_seed_reproduces_save () =
+  for seed = 0 to 50 do
+    Alcotest.(check (list string))
+      (Fmt.str "seed %d" seed) (image_of_seed seed) (image_of_seed seed)
+  done
+
 (* The surviving prefix of the journal has a uniform length: the last of
    twelve pending directory operations survives in about one seed in
    thirteen. *)
@@ -2095,6 +2110,8 @@ let suite =
         test_seeded_pp_rebuilds;
       Alcotest.test_case "crash: the surviving prefix is uniform" `Quick
         test_crash_reorder_prefix_uniform;
+      Alcotest.test_case "crash: a seed reproduces a save's image" `Quick
+        test_crash_seed_reproduces_save;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

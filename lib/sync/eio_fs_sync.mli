@@ -223,9 +223,11 @@ val publish :
     directory backends without a registered operation; POSIX callers use the
     backend provided by [Eio_fs_unix.exclusive_rename].
 
-    An omitted [tmp] is a fresh sibling name, opened exclusively and drawn
-    again, at most 127 times, while the name is taken. An explicit one is also
-    exclusive, must not exist, must differ from [path] and live on the same
+    An omitted [tmp] is a sibling name, opened exclusively: [path]'s name with
+    [".tmp.0"] appended, then [".tmp.1"] and so on while the name is taken, so
+    one workload names the same temporaries in every run. Past 64 taken names
+    the rest come from {!fresh_name}, up to 128 names in all. An explicit one is
+    also exclusive, must not exist, must differ from [path] and live on the same
     filesystem, and is never drawn again: a taken name raises [Already_exists].
     A process killed between the create and the rename leaves the temporary in
     place, so a caller naming [tmp] owns every way that name can already be

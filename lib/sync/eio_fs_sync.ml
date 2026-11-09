@@ -232,7 +232,15 @@ let fresh_name stem =
   let n = Atomic.fetch_and_add tmp_sequence 1 in
   stem ^ ".tmp." ^ string_of_int tmp_salt ^ "." ^ string_of_int n
 
-let fresh_tmp (dir, target) = (dir, fresh_name target)
+(* The first names are numbered from [0], so one workload names the same
+   temporaries in every run; past [replayable] taken names, the rest are
+   salted, so stale leftovers cannot exhaust them. *)
+let replayable = 64
+
+let fresh_tmp ~collisions (dir, target) =
+  if collisions < replayable then
+    (dir, target ^ ".tmp." ^ string_of_int collisions)
+  else (dir, fresh_name target)
 
 let same_file (a : Eio.File.Stat.t) (b : Eio.File.Stat.t) =
   Int64.equal a.dev b.dev && Int64.equal a.ino b.ino
@@ -240,7 +248,9 @@ let same_file (a : Eio.File.Stat.t) (b : Eio.File.Stat.t) =
 let produce ~config ~requested_tmp ((dir, target) as path) write =
   let rec produce collisions =
     let tmp =
-      match requested_tmp with Some tmp -> tmp | None -> fresh_tmp path
+      match requested_tmp with
+      | Some tmp -> tmp
+      | None -> fresh_tmp ~collisions path
     in
     let tmp_resource, tmp_path = tmp in
     if tmp_resource == dir && String.equal tmp_path target then
