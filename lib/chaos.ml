@@ -946,6 +946,9 @@ module Crash = struct
     meta : unsynced;
     dirs : string list;
         (* The resolved directories whose barrier commits the entry. *)
+    barred : string list;
+        (* Those of [dirs] a barrier has reached since: the entry is durable
+           once one of them is. *)
     tree : tree;
     delta : delta;
     locations : location list;
@@ -1325,7 +1328,7 @@ module Crash = struct
     let dirs = match resolved with p :: _ -> [ parent_key p ] | [] -> [] in
     let locations = locations ctl in
     ctl.metadata <-
-      { meta; dirs; tree; delta; locations; recorded = locations }
+      { meta; dirs; barred = []; tree; delta; locations; recorded = locations }
       :: ctl.metadata
 
   let commit_metadata ctl =
@@ -1341,52 +1344,68 @@ module Crash = struct
      Those entries are not in general a journal prefix, so no snapshot can
      become the durable image. The image advances by replaying the committed
      entries' deltas, and the entries left pending are rebased onto the result:
-     [do_crash] reads the last
-     surviving entry's snapshot, so that snapshot must hold everything already
-     durable at the moment of the crash.
+     [do_crash] reads the last surviving entry's snapshot, so that snapshot
+     must hold everything already durable at the moment of the crash.
 
      An entry of a directory whose own entry is not durable cannot be durable
-     either -- after the power cut there is no directory to hold it -- so a
-     barrier on such a directory commits nothing. A rename committed through its
-     source's directory lands the same way round: [apply_delta] drops the half
-     whose parent the durable image does not hold. *)
+     yet: after the power cut there is no directory to hold it. The barrier is
+     remembered on the entry, which becomes durable as soon as its directory
+     does, as the directory's inode already holds it. A rename lands the same
+     way round: [replay] drops the half whose parent the durable image does not
+     hold. *)
   let commit_dir ctl ~dir =
     match (ctl.base, ctl.durable_tree) with
     | None, _ | _, None -> ()
-    | Some (_, root_path), Some durable -> (
+    | Some (_, root_path), Some _ ->
         let root = path_segments root_path in
-        let in_image =
-          match tree_path ~root dir with
-          | None -> None
-          | Some segs -> tree_find durable segs
-        in
         let dir = path_key dir in
-        match in_image with
-        | None | Some (File _ | Link _) -> ()
-        | Some (Dir _) -> (
-            let committed, pending =
-              List.partition
-                (fun e -> List.exists (String.equal dir) e.dirs)
-                (List.rev ctl.metadata)
-            in
-            match committed with
-            | [] -> ()
-            | _ :: _ ->
-                let durable =
-                  List.fold_left (replay ~root)
-                    (durable, ctl.durable_locations)
-                    committed
-                in
-                ctl.durable_tree <- Some (fst durable);
-                ctl.durable_locations <- snd durable;
-                let _, rebased =
-                  List.fold_left
-                    (fun (image, acc) e ->
-                      let ((tree, locations) as image) = replay ~root image e in
-                      (image, { e with tree; locations } :: acc))
-                    (durable, []) pending
-                in
-                ctl.metadata <- rebased))
+        ctl.metadata <-
+          List.map
+            (fun e ->
+              if List.exists (String.equal dir) e.dirs then
+                { e with barred = dir :: e.barred }
+              else e)
+            ctl.metadata;
+        let durable_dir durable d =
+          match tree_path ~root d with
+          | None -> false
+          | Some segs -> (
+              match tree_find durable segs with
+              | Some (Dir _) -> true
+              | Some (File _ | Link _) | None -> false)
+        in
+        let rec settle () =
+          match ctl.durable_tree with
+          | None -> ()
+          | Some durable -> (
+              let committed, pending =
+                List.partition
+                  (fun e -> List.exists (durable_dir durable) e.barred)
+                  (List.rev ctl.metadata)
+              in
+              match committed with
+              | [] -> ()
+              | _ :: _ ->
+                  let durable =
+                    List.fold_left (replay ~root)
+                      (durable, ctl.durable_locations)
+                      committed
+                  in
+                  ctl.durable_tree <- Some (fst durable);
+                  ctl.durable_locations <- snd durable;
+                  let _, rebased =
+                    List.fold_left
+                      (fun (image, acc) e ->
+                        let ((tree, locations) as image) =
+                          replay ~root image e
+                        in
+                        (image, { e with tree; locations } :: acc))
+                      (durable, []) pending
+                  in
+                  ctl.metadata <- rebased;
+                  settle ())
+        in
+        settle ()
 
   (* A file the wrapper first meets on an open that finds it on disk was created
      by nothing the model recorded, so its name is part of every image that

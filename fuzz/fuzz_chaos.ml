@@ -185,6 +185,9 @@ module Model = struct
   type entry = {
     path : string;
     delta : (string * (string * shape) list option) list;
+    mutable barred : bool;
+        (* A barrier on its directory has run: it lands once that directory
+           is durable. *)
   }
 
   type t = {
@@ -220,7 +223,9 @@ module Model = struct
       let below = SM.filter (fun k _ -> at_or_under p k) m.live in
       (p, if SM.mem p below then Some (SM.bindings below) else None)
     in
-    m.journal <- { path; delta = List.map touched (path :: paths) } :: m.journal
+    m.journal <-
+      { path; delta = List.map touched (path :: paths); barred = false }
+      :: m.journal
 
   (* The metadata barrier: the durable world becomes the live one. *)
   let commit m =
@@ -241,21 +246,31 @@ module Model = struct
           List.fold_left (fun d (k, v) -> SM.add k v d) durable below
 
   (* The barrier on directory [dir]: the pending operations on its entries
-     land, oldest first, provided [dir] itself is durable; the others stay
-     pending. *)
+     are barred, and every barred operation whose directory is durable lands,
+     oldest first, until none is left; the others stay pending. *)
   let commit_dir m dir =
-    if String.equal dir "" || SM.find_opt dir m.durable = Some Dir then begin
+    List.iter
+      (fun e -> if String.equal (parent e.path) dir then e.barred <- true)
+      m.journal;
+    let durable_dir d =
+      String.equal d "" || SM.find_opt d m.durable = Some Dir
+    in
+    let rec settle () =
       let mine, others =
         List.partition
-          (fun e -> String.equal (parent e.path) dir)
+          (fun e -> e.barred && durable_dir (parent e.path))
           (List.rev m.journal)
       in
-      m.durable <-
-        List.fold_left
-          (fun d e -> List.fold_left land_half d e.delta)
-          m.durable mine;
-      m.journal <- List.rev others
-    end
+      if mine <> [] then begin
+        m.durable <-
+          List.fold_left
+            (fun d e -> List.fold_left land_half d e.delta)
+            m.durable mine;
+        m.journal <- List.rev others;
+        settle ()
+      end
+    in
+    settle ()
 
   (* Move the subtree at [src] over [dst], removing whatever the move
      replaces -- rename semantics. *)
