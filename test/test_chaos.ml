@@ -2295,6 +2295,61 @@ let test_crash_synced_mode_follows_the_file () =
   Alcotest.(check int) "b" 0o700 (Eio.Path.stat ~follow:false (post / "b")).perm;
   Alcotest.(check bool) "d" true (absent (post / "d"))
 
+(* The model knows a file and a directory by inode, not by name: a user's
+   file renamed over root's is never rewritten into root's, a file planted
+   in a directory made again under a moved one's name never lands in the old
+   one, and a mode synced through a read-only handle, or after a rename, is
+   the file's. *)
+let test_crash_inode_identity () =
+  let setup () =
+    let root = Eio_fs.Fs.v () in
+    Eio.Path.mkdir ~perm:0o755 (root / "u");
+    Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (root / "u");
+    root
+  in
+  let render post p = try Eio.Path.load (post / p) with Eio.Io _ -> "-" in
+  ( Eio_mock.Backend.run @@ fun () ->
+    let root = setup () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (root / "u/passwd") "root";
+    Eio.Path.save ~create:(`Exclusive 0o644) (root / "u/mine") "alice";
+    Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (root / "u/mine");
+    let ctl = Crash.v () in
+    let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice root) in
+    Eio.Path.rename (fs / "u/mine") (fs / "u/passwd");
+    Eio.Path.with_open_out ~create:`Never (fs / "u/passwd") ignore;
+    let post = Crash.post_crash ctl in
+    Alcotest.(check (pair string string))
+      "root's file keeps its bytes" ("root", "alice")
+      (render post "u/passwd", render post "u/mine") );
+  ( Eio_mock.Backend.run @@ fun () ->
+    let root = setup () in
+    Eio.Path.mkdir ~perm:0o755 (root / "u/d");
+    let ctl = Crash.v () in
+    let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice root) in
+    Eio.Path.rename (fs / "u/d") (fs / "u/x");
+    Eio.Path.mkdir ~perm:0o755 (fs / "u/d");
+    write_new ~sync:true (fs / "u/d/planted") "evil";
+    Eio_fs_sync.sync_dir (fs / "u/d");
+    let post = Crash.post_crash ctl in
+    Alcotest.(check (list string))
+      "root's directory is untouched" []
+      (Eio.Path.read_dir (post / "u/d")) );
+  Eio_mock.Backend.run @@ fun () ->
+  let root = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o644) (root / "f") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (root / "g") "y";
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl root in
+  Eio.Path.chmod ~follow:false ~perm:0o600 (fs / "f");
+  Eio.Switch.run (fun sw ->
+      Eio_fs_sync.Barrier.(sync_file portable) (Eio.Path.open_in ~sw (fs / "f")));
+  Eio.Path.chmod ~follow:false ~perm:0o600 (fs / "g");
+  Eio.Path.rename (fs / "g") (fs / "h");
+  Eio.Path.with_open_out ~create:`Never (fs / "h") Eio.File.sync;
+  let post = Crash.post_crash ctl in
+  let mode p = (Eio.Path.stat ~follow:false (post / p)).perm in
+  Alcotest.(check (pair int int)) "modes" (0o600, 0o600) (mode "f", mode "g")
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2644,6 +2699,8 @@ let suite =
         `Quick test_crash_synced_chmod_of_a_new_file;
       Alcotest.test_case "crash: a synced mode follows the file" `Quick
         test_crash_synced_mode_follows_the_file;
+      Alcotest.test_case "crash: files and directories are known by inode"
+        `Quick test_crash_inode_identity;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

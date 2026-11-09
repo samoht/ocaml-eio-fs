@@ -176,23 +176,31 @@ module Model = struct
   module SM = Map.Make (String)
   module IM = Map.Make (Int)
 
-  (* Shapes keyed by path; file contents keyed by a rename-stable id. *)
-  type shape = File of int | Dir | Link of string
+  (* Shapes keyed by path. Every node has an id that a rename keeps, as an
+     inode, which also keys a file's contents; the root's is [root]. *)
+  type shape = File of int | Dir of int | Link of string * int
 
-  (* One directory operation: each path it touched, whose parent's barrier
-     commits it, with what the live tree held at and below that path just
-     after it, [None] for a name it freed. *)
+  let root = -1
+  let id_of = function File i | Dir i | Link (_, i) -> i
+
+  (* One half of a directory operation, by identity: a node put in the
+     directory [parent] at [path], with what is below it, or a node taken
+     out wherever it is. *)
+  type half =
+    | Place of { parent : int; path : string; below : (string * shape) list }
+    | Remove of int
+
   type entry = {
-    delta : (string * (string * shape) list option) list;
-    mutable barred : string list;
-        (* The directories, its own or a rename's destination's, a barrier
-           has reached: it lands once one of them is durable. *)
+    halves : half list;
+    dirs : int list; (* the directories it changed *)
+    mutable barred : int list; (* those a barrier has reached *)
+    mutable committed : bool;
   }
 
   type t = {
     mutable live : shape SM.t;
-    mutable durable : shape SM.t;
-    mutable journal : entry list; (* newest first *)
+    mutable snapshot : shape SM.t;
+    mutable journal : entry list; (* since the snapshot, newest first *)
     mutable live_data : string IM.t;
     mutable durable_data : string IM.t;
     mutable next_id : int;
@@ -201,7 +209,7 @@ module Model = struct
   let v () =
     {
       live = SM.empty;
-      durable = SM.empty;
+      snapshot = SM.empty;
       journal = [];
       live_data = IM.empty;
       durable_data = IM.empty;
@@ -217,56 +225,135 @@ module Model = struct
   let parent p =
     match String.rindex_opt p '/' with None -> "" | Some i -> String.sub p 0 i
 
-  let log ?(paths = []) m path =
-    let touched p =
-      let below = SM.filter (fun k _ -> at_or_under p k) m.live in
-      (p, if SM.mem p below then Some (SM.bindings below) else None)
+  let base p =
+    match String.rindex_opt p '/' with
+    | None -> p
+    | Some i -> String.sub p (i + 1) (String.length p - i - 1)
+
+  let join up name = if String.equal up "" then name else up ^ "/" ^ name
+
+  let fresh m =
+    let id = m.next_id in
+    m.next_id <- id + 1;
+    id
+
+  (* Where the node [id] is in [map]. *)
+  let path_of map id =
+    if id = root then Some ""
+    else
+      SM.fold
+        (fun k v acc -> if acc = None && id_of v = id then Some k else acc)
+        map None
+
+  let is_dir map path id =
+    if String.equal path "" then id = root
+    else SM.find_opt path map = Some (Dir id)
+
+  let dir_id map path =
+    if String.equal path "" then root
+    else match SM.find path map with Dir id -> id | _ -> assert false
+
+  let remove_under p map = SM.filter (fun k _ -> not (at_or_under p k)) map
+
+  (* A half lands by identity: a node goes into its directory at the path it
+     had, or wherever that directory is now, and only once. *)
+  let land_half map = function
+    | Remove id -> (
+        match path_of map id with
+        | Some p when not (String.equal p "") -> remove_under p map
+        | Some _ | None -> map)
+    | Place { parent = pid; path; below } -> (
+        let up = parent path in
+        let target =
+          if is_dir map up pid then Some up
+          else
+            match path_of map pid with
+            | Some p when is_dir map p pid -> Some p
+            | Some _ | None -> None
+        in
+        match target with
+        | None -> map
+        | Some up ->
+            let at = join up (base path) in
+            let id = id_of (List.assoc "" below) in
+            let map =
+              match path_of map id with
+              | Some old when not (String.equal old at) -> remove_under old map
+              | Some _ | None -> map
+            in
+            let map = remove_under at map in
+            List.fold_left
+              (fun map (suffix, v) -> SM.add (at ^ suffix) v map)
+              map below)
+
+  let replay map e = List.fold_left land_half map e.halves
+
+  (* The durable world: the snapshot with every committed entry, in program
+     order. *)
+  let durable m =
+    List.fold_left
+      (fun map e -> if e.committed then replay map e else map)
+      m.snapshot (List.rev m.journal)
+
+  (* Log the operation that touched [path] and [paths], with [gone] the id
+     a path held before an operation took it away. *)
+  let log ?(paths = []) ?gone m path =
+    let half p =
+      let pid = dir_id m.live (parent p) in
+      match gone with
+      | Some (q, id) when String.equal q p -> Some (pid, Remove id)
+      | _ -> (
+          match SM.find_opt p m.live with
+          | None -> None
+          | Some _ ->
+              let below =
+                SM.fold
+                  (fun k v acc ->
+                    if at_or_under p k then
+                      ( String.sub k (String.length p)
+                          (String.length k - String.length p),
+                        v )
+                      :: acc
+                    else acc)
+                  m.live []
+              in
+              Some (pid, Place { parent = pid; path = p; below }))
     in
+    let halves = List.filter_map half (path :: paths) in
     m.journal <-
-      { delta = List.map touched (path :: paths); barred = [] } :: m.journal
+      {
+        halves = List.map snd halves;
+        dirs = List.map fst halves;
+        barred = [];
+        committed = false;
+      }
+      :: m.journal
 
   (* The metadata barrier: the durable world becomes the live one. *)
   let commit m =
-    m.durable <- m.live;
+    m.snapshot <- m.live;
     m.journal <- []
 
-  (* A half of a delta lands only where the durable world holds its parent
-     directory, and then replaces everything at and below its path. *)
-  let land_half durable (p, node) =
-    let up = parent p in
-    if not (String.equal up "" || SM.find_opt up durable = Some Dir) then
-      durable
-    else
-      let durable = SM.filter (fun k _ -> not (at_or_under p k)) durable in
-      match node with
-      | None -> durable
-      | Some below ->
-          List.fold_left (fun d (k, v) -> SM.add k v d) durable below
-
-  (* The barrier on directory [dir]: the pending operations on its entries
-     are barred, and every barred operation whose directory is durable lands,
-     oldest first, until none is left; the others stay pending. *)
+  (* The barrier on directory [dir]: the pending operations that changed it,
+     by id, are barred, and every barred operation whose directory is
+     durable commits, until none is left. *)
   let commit_dir m dir =
+    let id = dir_id m.live dir in
     List.iter
-      (fun e ->
-        if List.exists (fun (p, _) -> String.equal (parent p) dir) e.delta then
-          e.barred <- dir :: e.barred)
+      (fun e -> if List.mem id e.dirs then e.barred <- id :: e.barred)
       m.journal;
-    let durable_dir d =
-      String.equal d "" || SM.find_opt d m.durable = Some Dir
-    in
     let rec settle () =
-      let mine, others =
-        List.partition
-          (fun e -> List.exists durable_dir e.barred)
-          (List.rev m.journal)
+      let d = durable m in
+      let held id =
+        match path_of d id with Some p -> is_dir d p id | None -> false
       in
-      if mine <> [] then begin
-        m.durable <-
-          List.fold_left
-            (fun d e -> List.fold_left land_half d e.delta)
-            m.durable mine;
-        m.journal <- List.rev others;
+      let ready =
+        List.filter
+          (fun e -> (not e.committed) && List.exists held e.barred)
+          m.journal
+      in
+      if ready <> [] then begin
+        List.iter (fun e -> e.committed <- true) ready;
         settle ()
       end
     in
@@ -294,8 +381,7 @@ module Model = struct
     match SM.find path m.live with File id -> id | _ -> assert false
 
   let new_file m path =
-    let id = m.next_id in
-    m.next_id <- id + 1;
+    let id = fresh m in
     m.live <- SM.add path (File id) m.live;
     m.live_data <- IM.add id "" m.live_data;
     m.durable_data <- IM.add id "" m.durable_data;
@@ -311,37 +397,38 @@ module Model = struct
     let id = file_id m path in
     m.durable_data <- IM.add id (IM.find id m.live_data) m.durable_data
 
-  let unlink m path =
+  let remove m path =
+    let id = id_of (SM.find path m.live) in
     m.live <- SM.remove path m.live;
-    log m path
+    log ~gone:(path, id) m path
+
+  let unlink = remove
+  let rmdir = remove
 
   let mkdir m path =
-    m.live <- SM.add path Dir m.live;
-    log m path
-
-  let rmdir m path =
-    m.live <- SM.remove path m.live;
+    m.live <- SM.add path (Dir (fresh m)) m.live;
     log m path
 
   let symlink m path target =
-    m.live <- SM.add path (Link target) m.live;
+    m.live <- SM.add path (Link (target, fresh m)) m.live;
     log m path
 
   let rename m ~src ~dst =
+    let id = id_of (SM.find src m.live) in
     m.live <- move ~src ~dst m.live;
-    log ~paths:[ dst ] m src
+    log ~paths:[ dst ] ~gone:(src, id) m src
 
   let image shapes data =
     SM.map
       (function
         | File id -> `File (IM.find id data)
-        | Dir -> `Dir
-        | Link target -> `Link target)
+        | Dir _ -> `Dir
+        | Link (target, _) -> `Link target)
       shapes
 
   (* The exact post-crash tree under [Drop_unsynced]: committed shapes over
      per-file durable contents. *)
-  let expected m = image m.durable m.durable_data
+  let expected m = image (durable m) m.durable_data
 
   (* The exact post-crash tree when every change survives: the live one. *)
   let live m = image m.live m.live_data
@@ -381,7 +468,7 @@ let pp_tree ppf t =
 let rename_ok (m : Model.t) ~src ~dst =
   let src_is_dir =
     match Model.SM.find src m.Model.live with
-    | Model.Dir -> true
+    | Model.Dir _ -> true
     | Model.File _ | Model.Link _ -> false
   in
   (not (String.equal dst src))
@@ -389,7 +476,7 @@ let rename_ok (m : Model.t) ~src ~dst =
   &&
   match Model.SM.find_opt dst m.Model.live with
   | None -> true
-  | Some Model.Dir -> false
+  | Some (Model.Dir _) -> false
   | Some (Model.File _ | Model.Link _) -> not src_is_dir
 
 (* Create [path] with unsynced [content], in the tree and the model. *)
@@ -416,7 +503,8 @@ let keys (m : Model.t) pred =
   |> List.rev
 
 (* The live directories, the root [""] first. *)
-let dirs m = "" :: keys m (fun _ v -> v = Model.Dir)
+let dirs m =
+  "" :: keys m (fun _ v -> match v with Model.Dir _ -> true | _ -> false)
 
 let files m =
   keys m (fun _ v -> match v with Model.File _ -> true | _ -> false)
@@ -503,7 +591,7 @@ let apply_op ~dir_barriers fs ctl (m : Model.t) b0 b1 b2 b3 =
       (* remove an empty directory *)
       let empty_dirs =
         keys m (fun k v ->
-            v = Model.Dir
+            (match v with Model.Dir _ -> true | _ -> false)
             && not (Model.SM.exists (fun q _ -> Model.under k q) m.Model.live))
       in
       match pick empty_dirs b1 with
@@ -580,13 +668,9 @@ let test_crash_reference_model tape =
 
 (* {b Every change kept.} When the policy keeps every pending change, each
    write replayed where it landed and each directory operation in program
-   order, the recovered tree is the live one. The tapes have no barrier on a
-   single directory: one commits a rename whole through either directory,
-   after which the surviving image need not be the live one. *)
+   order, the recovered tree is the live one, whatever barriers ran. *)
 let test_crash_keep_all_model tape =
-  let m, actual =
-    run_tape ~dir_barriers:false ~policy:(Crash.Survive (fun _ -> true)) tape
-  in
+  let m, actual = run_tape ~policy:(Crash.Survive (fun _ -> true)) tape in
   check_eq ~pp:pp_tree ~eq:(Model.SM.equal ( = )) actual (Model.live m)
 
 (* {b Reorder determinism.} The same tape and seed recover the same tree, over
