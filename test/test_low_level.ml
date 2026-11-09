@@ -393,6 +393,14 @@ let test_cwd_follows_its_directory () =
     "relative through fs" "mine"
     (Eio.Path.load (fs / "f"))
 
+(* lstat(2) gives a symbolic link the length of its target as its size. *)
+let test_symlink_size () =
+  with_env @@ fun env ->
+  Eio.Path.symlink ~link_to:"hello" (env#fs / "l");
+  Alcotest.(check int)
+    "size" 5
+    (Optint.Int63.to_int (Eio.Path.stat ~follow:false (env#fs / "l")).size)
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -853,4 +861,5 @@ let suite =
       Alcotest.test_case "a removed directory" `Quick test_removed_directory;
       Alcotest.test_case "cwd follows its directory" `Quick
         test_cwd_follows_its_directory;
+      Alcotest.test_case "symbolic link size" `Quick test_symlink_size;
     ] )

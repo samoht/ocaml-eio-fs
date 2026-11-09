@@ -725,7 +725,12 @@ let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let fs = Dir.fs dir_fd in
   let symlink r name =
-    let new_stat = new_stat fs ~kind:`Symbolic_link ~perm:0o644 () in
+    let new_stat =
+      {
+        (new_stat fs ~kind:`Symbolic_link ~perm:0o644 ()) with
+        size = Optint.Int63.of_int (String.length link_to);
+      }
+    in
     let d = as_dir ~path !r in
     let dir = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
