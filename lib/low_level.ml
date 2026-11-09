@@ -589,11 +589,16 @@ let close (fd : Fd.t) =
    mode asks for; the mode given at creation does not restrict the creating
    open itself. This backend opens files O_RDONLY or O_RDWR, so the read bit
    is always required and the write bit with o_rdwr. A directory opened to be
-   read is listed by [read_dir], which checks its read bit. *)
+   read needs its read bit too; one opened with O_DIRECTORY needs none, as
+   eio_posix opens it O_PATH. *)
 let check_access ~user path flags r =
   let want = if Open_flags.(mem o_rdwr flags) then User.(r lor w) else User.r in
   match !r with
   | Resource.File f when not (User.can user f.stat want) ->
+      Error.permission_denied path
+  | Resource.Dir d
+    when (not Open_flags.(mem o_directory flags))
+         && not (User.can user d.stat want) ->
       Error.permission_denied path
   | _ -> ()
 

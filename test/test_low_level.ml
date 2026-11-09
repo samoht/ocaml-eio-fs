@@ -655,6 +655,17 @@ let test_perm_move_directory () =
     "renamed in place" true
     (Eio.Path.is_directory (fs / "pub/same"))
 
+(* Opening a directory to read it needs its read bit; open_dir does not, as
+   eio_posix opens it O_PATH. *)
+let test_perm_open_directory () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o711 (fs / "d");
+  let a = Eio_fs.Fs.as_user alice fs in
+  denied "open_in" (fun () ->
+      Eio.Switch.run (fun sw -> ignore (Eio.Path.open_in ~sw (a / "d"))));
+  Eio.Switch.run (fun sw -> ignore (Eio.Path.open_dir ~sw (a / "d")))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1144,4 +1155,6 @@ let suite =
       Alcotest.test_case "symbolic link mode" `Quick test_symlink_mode;
       Alcotest.test_case "permissions: move a directory" `Quick
         test_perm_move_directory;
+      Alcotest.test_case "permissions: open a directory" `Quick
+        test_perm_open_directory;
     ] )
