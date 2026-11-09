@@ -2206,6 +2206,35 @@ let test_crash_restores_owners () =
     [ "f"; "d"; "l" ];
   Eio.Path.save ~create:`Never (Eio_fs.Fs.as_user alice post / "f") "y"
 
+(* A barrier deferred on a directory belongs to that directory: once it is
+   removed or renamed, a new directory of the same name does not inherit it. *)
+let test_crash_deferred_barrier_identity () =
+  let replaced how =
+    let ctl = Crash.v () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    Eio.Path.mkdir ~perm:0o755 (fs / "d");
+    write_new ~sync:true (fs / "d/f") "x";
+    Eio_fs_sync.sync_dir (fs / "d");
+    how fs;
+    Eio.Path.mkdir ~perm:0o755 (fs / "d");
+    Eio_fs_sync.sync_dir fs;
+    Eio_fs_sync.sync_dir (fs / "d");
+    let post = Crash.post_crash ctl in
+    ( Eio.Path.read_dir (post / "d"),
+      List.sort String.compare (Eio.Path.read_dir post) )
+  in
+  let removed, _ =
+    replaced (fun fs ->
+        Eio.Path.unlink (fs / "d/f");
+        Eio.Path.rmdir (fs / "d"))
+  in
+  Alcotest.(check (list string)) "after rmdir, the new d" [] removed;
+  let renamed, top =
+    replaced (fun fs -> Eio.Path.rename (fs / "d") (fs / "x"))
+  in
+  Alcotest.(check (list string)) "after rename, the new d" [] renamed;
+  Alcotest.(check (list string)) "the root" [ "d"; "x" ] top
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2546,6 +2575,9 @@ let suite =
         test_crash_over_a_user_view;
       Alcotest.test_case "crash: owners are restored" `Quick
         test_crash_restores_owners;
+      Alcotest.test_case
+        "crash: a deferred barrier holds for its directory only" `Quick
+        test_crash_deferred_barrier_identity;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

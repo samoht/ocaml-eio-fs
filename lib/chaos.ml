@@ -1526,6 +1526,29 @@ module Crash = struct
       |> List.map (fun fs -> (fs, fs.owner, fs.rel))
       |> List.filter (covers ~root delta)
     in
+    (* A barrier on a directory holds for that directory: once it is removed
+       or renamed, a new one of its name neither inherits a deferred barrier
+       nor commits the old one's entries. *)
+    (match kind with
+    | Rmdir | Rename _ ->
+        let gone = List.map path_key resolved in
+        let stays d =
+          not
+            (List.exists
+               (fun g ->
+                 String.equal d g || String.starts_with ~prefix:(g ^ "/") d)
+               gone)
+        in
+        ctl.metadata <-
+          List.map
+            (fun e ->
+              {
+                e with
+                dirs = List.filter stays e.dirs;
+                barred = List.filter stays e.barred;
+              })
+            ctl.metadata
+    | Data | Truncate | Create | Mkdir | Unlink | Symlink _ -> ());
     ctl.metadata <- { meta; dirs; barred = []; delta; recorded } :: ctl.metadata
 
   let commit_metadata ctl =
