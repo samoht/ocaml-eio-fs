@@ -909,6 +909,39 @@ module Crash = struct
      survivors onto the durable baseline. *)
   type change = Write of { offset : int; data : Cstruct.t } | Resize of int
 
+  (* A file's bytes while changes replay over them: the first [len] bytes of
+     [buf], which grows by doubling, so a run of appends costs linear time. *)
+  type image = { mutable buf : Cstruct.t; mutable len : int }
+
+  let image_of c = { buf = copy_cs c; len = Cstruct.length c }
+  let bytes_of img = Cstruct.sub img.buf 0 img.len
+
+  (* Room for [n] bytes, those past [len] zero. *)
+  let extend img n =
+    if n > Cstruct.length img.buf then begin
+      let b = Cstruct.create (max n (2 * Cstruct.length img.buf)) in
+      Cstruct.blit img.buf 0 b 0 img.len;
+      img.buf <- b
+    end
+    else if n > img.len then
+      Cstruct.memset (Cstruct.sub img.buf img.len (n - img.len)) 0
+
+  let apply img = function
+    | Write { offset; data } ->
+        let n = offset + Cstruct.length data in
+        extend img n;
+        Cstruct.blit data 0 img.buf offset (Cstruct.length data);
+        img.len <- max img.len n
+    | Resize n ->
+        extend img n;
+        img.len <- n
+
+  (* [durable] with [changes] replayed over it, in order. *)
+  let replay_changes durable changes =
+    let img = image_of durable in
+    List.iter (apply img) changes;
+    bytes_of img
+
   (* [durable] is the content as of the last [sync]; the pending changes live in
      the controller's log. [owner] and [rel] locate the file under the wrapped
      root so a crash can rewrite it after intermediate subtrees close; both move
@@ -917,7 +950,7 @@ module Crash = struct
     mutable owner : boxed;
     mutable rel : string;
     mutable perm : int;
-    mutable durable : Cstruct.t;
+    durable : image;
     mutable pending : entry list;
         (* this file's pending changes, newest first *)
     mutable gen : int;
@@ -928,7 +961,7 @@ module Crash = struct
   and entry = { efs : fstate; change : change; seq : int; egen : int }
 
   let fresh_file ~owner ~rel ~perm ~durable =
-    { owner; rel; perm; durable; pending = []; gen = 0 }
+    { owner; rel; perm; durable = image_of durable; pending = []; gen = 0 }
 
   let is_pending e = e.egen = e.efs.gen
 
@@ -1090,39 +1123,6 @@ module Crash = struct
     List.sort
       (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
       (data @ metadata)
-
-  (* A file's bytes while changes replay over them: the first [len] bytes of
-     [buf], which grows by doubling, so a run of appends costs linear time. *)
-  type image = { mutable buf : Cstruct.t; mutable len : int }
-
-  let image_of c = { buf = copy_cs c; len = Cstruct.length c }
-  let bytes_of img = Cstruct.sub img.buf 0 img.len
-
-  (* Room for [n] bytes, those past [len] zero. *)
-  let extend img n =
-    if n > Cstruct.length img.buf then begin
-      let b = Cstruct.create (max n (2 * Cstruct.length img.buf)) in
-      Cstruct.blit img.buf 0 b 0 img.len;
-      img.buf <- b
-    end
-    else if n > img.len then
-      Cstruct.memset (Cstruct.sub img.buf img.len (n - img.len)) 0
-
-  let apply img = function
-    | Write { offset; data } ->
-        let n = offset + Cstruct.length data in
-        extend img n;
-        Cstruct.blit data 0 img.buf offset (Cstruct.length data);
-        img.len <- max img.len n
-    | Resize n ->
-        extend img n;
-        img.len <- n
-
-  (* [durable] with [changes] replayed over it, in order. *)
-  let replay_changes durable changes =
-    let img = image_of durable in
-    List.iter (apply img) changes;
-    bytes_of img
 
   (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
      staged read-only or write-only cannot be reopened O_RDWR, so grant the
@@ -1639,13 +1639,13 @@ module Crash = struct
             let c =
               match (ctl.policy, data_rng) with
               | Reorder_unsynced _, Some rng ->
-                  writeback ~rng ~bs:ctl.block_size fs.durable
+                  writeback ~rng ~bs:ctl.block_size (bytes_of fs.durable)
                     (List.map (fun e -> e.change) mine)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> e.change)
-                  |> replay_changes fs.durable
-              | _ -> copy_cs fs.durable
+                  |> replay_changes (bytes_of fs.durable)
+              | _ -> copy_cs (bytes_of fs.durable)
             in
             contents := (fs, c) :: !contents;
             c
@@ -1780,8 +1780,7 @@ module Crash = struct
     match sync () with
     | () ->
         let pending = List.rev fs.pending in
-        fs.durable <-
-          replay_changes fs.durable (List.map (fun e -> e.change) pending);
+        List.iter (fun e -> apply fs.durable e.change) pending;
         lose ctl fs;
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
