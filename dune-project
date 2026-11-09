@@ -44,6 +44,7 @@
   optint
   (cmdliner (>= 1.1.0))
   eio_main
+  (conf-linux-libc-dev (= :os linux))
   (mdx :with-test)
   (alcotest (and :with-test (>= 1.7.0)))
   (alcobar :with-test)
