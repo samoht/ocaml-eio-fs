@@ -40,8 +40,7 @@ module Fault : sig
       generates [`Swap]: a swap needs a target it cannot draw. *)
 
   (** The type for injected faults. A fault fires on one operation; one that
-      does not apply to that operation's kind (a write fault on a read, say)
-      injects nothing. *)
+      does not apply to that operation's kind injects nothing. *)
   type t =
     | Short_read of int
         (** Deliver at most [max 1 n] bytes of the requested read, forcing the
