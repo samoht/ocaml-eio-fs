@@ -193,9 +193,10 @@ val extents :
     [FS_IOC_FIEMAP] on Linux, neither of which [Unix] binds.
 
     The answer stops at the first hole, the end of the range, [max], or bytes
-    the filesystem accepted but has not placed. A walk steps past the last
-    extent returned and asks again, ending when the answer is empty. [max] is
-    the batch, so one system-thread hop covers many extents.
+    the filesystem accepted but has not placed. An empty range has no extent. A
+    walk steps past the last extent returned and asks again, ending when the
+    answer is empty. [max] is the batch, so one system-thread hop covers many
+    extents.
 
     @raise Stdlib.Invalid_argument
       if [max] is not between 1 and 65536, [file_offset] or [length] is

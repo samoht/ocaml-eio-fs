@@ -605,6 +605,13 @@ let test_extents_honour_max () =
     "at most one extent when one was asked for" true
     (List.length es <= 1)
 
+(* An empty range has no extent, on every platform. *)
+let test_extents_of_an_empty_range () =
+  with_sparse_file @@ fun _env fd ~size:_ ->
+  Alcotest.(check int)
+    "none" 0
+    (List.length (Eio_fs_unix.extents fd ~file_offset:0 ~length:0 ~max:16))
+
 let test_extents_refuse_a_batch_they_cannot_hold () =
   with_sparse_file @@ fun _env fd ~size:_ ->
   let refuses name f =
@@ -3160,6 +3167,8 @@ let suite =
       Alcotest.test_case "extents stop at a hole" `Quick
         test_extents_stop_at_a_hole;
       Alcotest.test_case "extents honour max" `Quick test_extents_honour_max;
+      Alcotest.test_case "extents of an empty range" `Quick
+        test_extents_of_an_empty_range;
       Alcotest.test_case "extents refuse a batch they cannot hold" `Quick
         test_extents_refuse_a_batch_they_cannot_hold;
       Alcotest.test_case "the sparse map does not block Eio" `Quick

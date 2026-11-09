@@ -581,6 +581,9 @@ CAMLprim value caml_eio_fs_extents(value fd_v, value offset_v, value length_v,
     caml_invalid_argument("Eio_fs_unix.extents: negative offset or length");
   if (length > (int64_t)Max_long - offset)
     caml_invalid_argument("Eio_fs_unix.extents: range past the largest offset");
+  /* An empty range has no extent; FIEMAP refuses one with EINVAL. */
+  if (length == 0)
+    CAMLreturn(Val_emptylist);
 
   struct eio_fs_extent *out =
       malloc((size_t)max * sizeof(struct eio_fs_extent));
