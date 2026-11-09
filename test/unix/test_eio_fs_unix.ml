@@ -546,7 +546,12 @@ let test_seek_data_and_hole_walk_the_file () =
     "no hole past the end" true
     (Option.is_none (Eio_fs_unix.seek_hole fd ~file_offset:size))
 
+(* tmpfs and virtiofs have no FIEMAP: EOPNOTSUPP. *)
+let mapped f =
+  try f () with Unix.Unix_error (Unix.EOPNOTSUPP, _, _) -> Alcotest.skip ()
+
 let test_extents_report_the_physical_map () =
+  mapped @@ fun () ->
   with_sparse_file @@ fun _env fd ~size:_ ->
   let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:4096 ~max:16 in
   Alcotest.(check bool) "the first block is backed" true (es <> []);
@@ -568,6 +573,7 @@ let test_extents_report_the_physical_map () =
       : int)
 
 let test_extents_stop_at_a_hole () =
+  mapped @@ fun () ->
   with_sparse_file @@ fun _env fd ~size ->
   (* Inside the hole nothing is allocated, so there is nothing to say. An empty
      answer is what ends a caller's walk, and it is the only thing that does:
@@ -592,6 +598,7 @@ let test_extents_stop_at_a_hole () =
     es
 
 let test_extents_honour_max () =
+  mapped @@ fun () ->
   with_sparse_file @@ fun _env fd ~size ->
   let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:size ~max:1 in
   Alcotest.(check bool)
@@ -629,6 +636,7 @@ let test_extents_refuse_a_batch_they_cannot_hold () =
    the domain for each whole call. [test_lock_wait_does_not_block_eio] binds
    that half, holding its call open while another process holds the lock. *)
 let test_sparse_map_does_not_block_eio () =
+  mapped @@ fun () ->
   with_sparse_file @@ fun _env fd ~size ->
   let ran = ref false in
   Eio.Switch.run @@ fun sw ->
