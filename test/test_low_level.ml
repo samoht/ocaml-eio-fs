@@ -469,6 +469,24 @@ let test_crash_pwrite_appends () =
     "replayed at the end" "abcZ"
     (Eio.Path.load (Crash.post_crash ctl / "f"))
 
+(* Linux refuses chmod(2) through AT_SYMLINK_NOFOLLOW on a link
+   (EOPNOTSUPP) and symlink(2) to the empty path (ENOENT). *)
+let test_linux_link_refusals () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "x";
+  Eio.Path.symlink ~link_to:"f" (fs / "l");
+  expect_eio_io "chmod a link" (fun () ->
+      Eio.Path.chmod ~follow:false ~perm:0o600 (fs / "l"));
+  Alcotest.(check int)
+    "the target kept its mode" 0o644
+    (Eio.Path.stat ~follow:true (fs / "l")).perm;
+  expect_io_error "not found" (fun () ->
+      Eio.Path.symlink ~link_to:"" (fs / "e"));
+  Alcotest.(check bool)
+    "no link made" true
+    (Eio.Path.kind ~follow:false (fs / "e") = `Not_found)
+
 (* {2 Permissions} *)
 
 let bob = { alice with uid = 1001; gid = 1001 }
@@ -1075,6 +1093,7 @@ let suite =
       Alcotest.test_case "pwrite appends" `Quick test_pwrite_appends;
       Alcotest.test_case "crash: pwrite appends" `Quick
         test_crash_pwrite_appends;
+      Alcotest.test_case "Linux link refusals" `Quick test_linux_link_refusals;
       Alcotest.test_case "permissions: search" `Quick test_perm_search;
       Alcotest.test_case "permissions: directory write" `Quick
         test_perm_dir_write;

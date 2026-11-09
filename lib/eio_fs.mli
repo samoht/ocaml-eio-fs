@@ -147,12 +147,14 @@ val root : user
     GiB: a write or a truncation past that raises {!Eio.Fs.File_too_large}.
 
     Where POSIX systems differ, it answers as Linux does: {!Eio.Path.unlink} of
-    a directory raises the error EISDIR names, not [Permission_denied], and a
-    positioned write to a file opened to append lands at its end. Its paths have
-    no native spelling ({!Eio.Path.native} is [None]), and an absolute symbolic
-    link resolves from the filesystem's root, so through the root that {!Fs.v}
-    returns it is followed where eio_posix would refuse it. One filesystem may
-    be used from several domains at once.
+    a directory raises the error EISDIR names, not [Permission_denied], a
+    positioned write to a file opened to append lands at its end,
+    [Eio.Path.chmod ~follow:false] on a symbolic link raises the error
+    EOPNOTSUPP names, and a symbolic link to the empty path is refused with
+    [Not_found]. Its paths have no native spelling ({!Eio.Path.native} is
+    [None]), and an absolute symbolic link resolves from the filesystem's root,
+    so through the root that {!Fs.v} returns it is followed where eio_posix
+    would refuse it. One filesystem may be used from several domains at once.
 
     A path resolves one component at a time, as path_resolution(7) describes: a
     [".."] climbs from the directory the walk has reached, a link's target

@@ -733,6 +733,10 @@ let statat ~follow dir_fd path =
 let chmod ~follow dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let r = Filesystem.lookup ~follow dir_fd path in
+  (* Linux keeps no mode on a link: EOPNOTSUPP. *)
+  (match !r with
+  | Resource.Symlink _ -> Error.err ("chmod: not supported on a link: " ^ path)
+  | _ -> ());
   if not (User.owns dir_fd.user (Resource.stat !r)) then
     Error.permission_denied path;
   r := Resource.set_stat !r { (Resource.stat !r) with perm }
@@ -819,6 +823,8 @@ let embed dir_fd ~perm path ~contents =
 
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
+  (* Linux makes no link to the empty path: ENOENT. *)
+  if String.equal link_to "" then Error.not_found path;
   let fs = Dir.fs dir_fd in
   let symlink r name =
     let new_stat =
