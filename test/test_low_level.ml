@@ -303,6 +303,55 @@ let test_file_too_large () =
     "the file is empty" 0
     (Optint.Int63.to_int (Eio.File.size f))
 
+(* An unlinked or replaced file is freed once no name and no descriptor
+   holds it. An embedded file aliases its string, which so becomes
+   collectable. *)
+let embedded names =
+  let weak = Weak.create (List.length names) in
+  let entries =
+    List.mapi
+      (fun i name ->
+        let contents =
+          Sys.opaque_identity (String.make 64 (Char.chr (97 + i)))
+        in
+        Weak.set weak i (Some contents);
+        Eio_fs.Crunch.File { path = "/" ^ name; perm = 0o644; contents })
+      names
+  in
+  ( weak,
+    Eio_fs.Crunch.load
+      (Eio_fs.Crunch.Dir { path = "/"; perm = 0o755 } :: entries) )
+
+let collected weak i =
+  Gc.full_major ();
+  Option.is_none (Weak.get weak i)
+
+let test_unlinked_file_freed () =
+  Eio_mock.Backend.run @@ fun () ->
+  let weak, fs = embedded [ "a"; "b"; "c" ] in
+  Eio.Path.unlink (fs / "a");
+  Eio.Path.rename (fs / "b") (fs / "c");
+  Alcotest.(check bool) "the unlinked file" true (collected weak 0);
+  Alcotest.(check bool) "the replaced file" true (collected weak 2);
+  Alcotest.(check bool) "the renamed file" false (collected weak 1);
+  Alcotest.(check string)
+    "still read" (String.make 64 'b')
+    (Eio.Path.load (fs / "c"))
+
+(* A descriptor keeps an unlinked file alive. *)
+let test_unlinked_open_file_kept () =
+  Eio_mock.Backend.run @@ fun () ->
+  let weak, fs = embedded [ "a" ] in
+  Eio.Switch.run (fun sw ->
+      let f = Eio.Path.open_in ~sw (fs / "a") in
+      Eio.Path.unlink (fs / "a");
+      Alcotest.(check bool) "held" false (collected weak 0);
+      let buf = Cstruct.create 64 in
+      Eio.Flow.read_exact f buf;
+      Alcotest.(check string)
+        "read" (String.make 64 'a') (Cstruct.to_string buf));
+  Alcotest.(check bool) "closed" true (collected weak 0)
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -756,4 +805,8 @@ let suite =
       Alcotest.test_case "trailing slash" `Quick test_trailing_slash;
       Alcotest.test_case "many small writes" `Quick test_many_small_writes;
       Alcotest.test_case "file too large" `Quick test_file_too_large;
+      Alcotest.test_case "an unlinked file is freed" `Quick
+        test_unlinked_file_freed;
+      Alcotest.test_case "an open unlinked file is kept" `Quick
+        test_unlinked_open_file_kept;
     ] )

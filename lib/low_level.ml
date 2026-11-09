@@ -325,8 +325,13 @@ module Filesystem = struct
   let add_file fs ino r = fs.tree <- Entries.add ino r fs.tree
   let root (tree : t) = Entries.find 0L tree
 
+  (* A removed directory's parent may be gone too: ENOENT. *)
   let parent_dir (tree : t) r =
-    Entries.find (fst (Dir_node.parent (as_dir ~path:".." !r))) tree
+    match
+      Entries.find_opt (fst (Dir_node.parent (as_dir ~path:".." !r))) tree
+    with
+    | Some parent -> parent
+    | None -> Error.not_found ".."
 
   (* Whether the directory [r] is the directory [ino] or lies below it, by the
      parent links of the tree itself. *)
@@ -642,14 +647,16 @@ let chown ~follow ?uid ?gid dir_fd path =
   let gid = Option.value ~default:s.gid gid in
   r := Resource.set_stat !r { s with uid; gid }
 
-(* The directory [w] is in, without its entry [name]. *)
-let remove_entry (w : Filesystem.walk) name =
+(* The directory [w] is in, without its entry [name]. The entry's inode leaves
+   the tree with its only name, and is freed once no descriptor holds it. *)
+let remove_entry fs (w : Filesystem.walk) name =
   let r = Filesystem.here w in
   let d = as_dir ~path:name !r in
-  let entries =
-    List.filter (fun (_, n) -> not (String.equal name n)) d.entries
+  let gone, entries =
+    List.partition (fun (_, n) -> String.equal name n) d.entries
   in
-  r := Resource.Dir { d with entries }
+  r := Resource.Dir { d with entries };
+  List.iter (fun (ino, _) -> fs.tree <- Entries.remove ino fs.tree) gone
 
 let unlink dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -662,7 +669,7 @@ let unlink dir_fd path =
   | Some { contents = Resource.Dir _ } -> is_a_directory ()
   (* A trailing slash on anything else, a link to a directory included. *)
   | Some _ when slash -> Error.not_a_directory path
-  | Some _ -> remove_entry w name
+  | Some _ -> remove_entry (Dir.fs dir_fd) w name
 
 let mkdirat dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -750,7 +757,7 @@ let rmdir dir_fd path =
   | None -> Error.not_found path
   | Some { contents = Resource.Dir d } ->
       if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
-      else remove_entry w name
+      else remove_entry (Dir.fs dir_fd) w name
   | Some _ -> Error.err ("rmdir: not a directory: " ^ path)
 
 (* rename(2) refuses to move a directory below itself (EINVAL), a directory
@@ -853,7 +860,13 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       check_rename tree ~src:old_res ~new_parent ~dst new_path;
       move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
-      reparent old_res ~new_parent
+      reparent old_res ~new_parent;
+      (* The replaced entry lost its only name. *)
+      Option.iter
+        (fun (dst_ino, _) ->
+          let fs = Dir.fs dir_fd in
+          fs.tree <- Entries.remove dst_ino fs.tree)
+        existing
 
 let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 
