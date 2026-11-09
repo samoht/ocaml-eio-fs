@@ -14,12 +14,15 @@
     directory operations a barrier has made durable, and rebuilds the base as a
     crash would leave it. *)
 
-type code = [ `Enoent | `Eacces | `Enospc | `Eio ]
+type code = [ `Enoent | `Eacces | `Eperm | `Erofs | `Enospc | `Eio ]
 (** The type for the POSIX error codes an injected fault raises. An
-    {!Fault.t.Open_error}, or a {!Fault.t.Stat_error} on a stat of a path,
-    raises {!Eio.Fs.Not_found} for [`Enoent] and {!Eio.Fs.Permission_denied} for
-    [`Eacces]; every other injected error, a stat of an open file included, is
-    an {!Eio.Io} whose message names the code. *)
+    {!Fault.t.Open_error}, a {!Fault.t.Change_error}, or a {!Fault.t.Stat_error}
+    on a stat of a path, raises {!Eio.Fs.Not_found} for [`Enoent] and
+    {!Eio.Fs.Permission_denied} for [`Eacces] and [`Eperm]; every other injected
+    error, a stat of an open file included, is an {!Eio.Io} whose message names
+    the code. [`Eacces], [`Eperm] and [`Erofs] (a read-only filesystem) are for
+    code that assumes it can always write: a directory it cannot create in, a
+    read-only mount, a file another user owns. *)
 
 (** The fault kinds the wrapper can inject. Byte counts on the short-read,
     short-write and torn-write faults are relative to the current operation's
@@ -34,6 +37,7 @@ module Fault : sig
     | `Sync_error
     | `Open_error
     | `Stat_error
+    | `Change_error
     | `Swap ]
   (** The type for fault families: one per constructor of {!t}, named after it,
       and [`Swap] for {!constructor-Swap_symlink}. A seeded schedule never
@@ -60,6 +64,10 @@ module Fault : sig
     | Open_error of code
         (** Fail an open or a directory open with {!type-code}. *)
     | Stat_error of code  (** Fail a stat with {!type-code}. *)
+    | Change_error of code
+        (** Fail a change to a directory's entries (a [mkdir], [symlink],
+            [unlink], [rmdir] or [rename]) with {!type-code}, before it is made.
+            A seeded schedule draws [`Eacces], [`Eperm] or [`Erofs]. *)
     | Swap_symlink of string
         (** Perform an open or a stat, then replace its path with a symbolic
             link to the given target: the check-to-use window a TOCTOU exploits.
@@ -88,8 +96,13 @@ module Op : sig
           {!Fault.t.Read_error}, never a byte-oriented short read. *)
     | `Write  (** A write of a file's bytes, streaming or positioned. *)
     | `Sync  (** A file's sync. *)
-    | `Open  (** An open of a file or a subdirectory. *)
-    | `Stat  (** A stat, of a path or of an open file. *) ]
+    | `Open
+      (** An open of a file or a subdirectory, which may create the file. *)
+    | `Stat  (** A stat, of a path or of an open file. *)
+    | `Change
+      (** A change to a directory's entries: a [mkdir], [symlink], [unlink],
+          [rmdir] or [rename]. Its path is the entry made or removed, a rename's
+          source. *) ]
   (** The type for operation kinds. *)
 
   type t = {
@@ -115,7 +128,8 @@ module Schedule : sig
   type trigger =
     | Nth_op of int
         (** Fire on the [n]th operation the schedule is consulted for (1-based,
-            counting reads, directory reads, writes, syncs, opens and stats). *)
+            counting reads, directory reads, writes, syncs, opens, stats and
+            directory changes). *)
     | Op_on_path of { kind : Op.kind; path : string }
         (** Fire on the first [kind] operation on [path]. *)
     | Nth_op_on_path of { n : int; kind : Op.kind; path : string }

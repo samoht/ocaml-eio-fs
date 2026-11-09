@@ -33,8 +33,9 @@ tree at `dir`. `Eio_fs.Path.pp_tree` prints a tree on any backend.
 
 ## Testing crash consistency
 
-`Eio_fs.Chaos.wrap` injects faults into a directory, such as torn writes or
-failed syncs. A torn write stores part of its bytes and then fails.
+`Eio_fs.Chaos.wrap` injects faults into a directory, such as torn writes,
+failed syncs or a read-only filesystem. A torn write stores part of its bytes
+and then fails.
 
 `Eio_fs.Chaos.Crash` simulates a power cut. A write stays unsynced until
 `Eio.File.sync` runs on its file. Directory operations go into a journal in the

@@ -7,11 +7,13 @@
 open! Hermetic
 open Eio.Std
 
-type code = [ `Enoent | `Eacces | `Enospc | `Eio ]
+type code = [ `Enoent | `Eacces | `Eperm | `Erofs | `Enospc | `Eio ]
 
 let code_name = function
   | `Enoent -> "ENOENT"
   | `Eacces -> "EACCES"
+  | `Eperm -> "EPERM"
+  | `Erofs -> "EROFS"
   | `Enospc -> "ENOSPC"
   | `Eio -> "EIO"
 
@@ -31,9 +33,10 @@ let backend code ctx = Fmt.kstr (fun s -> Chaos s) "%s %s" (code_name code) ctx
 let raise_open code path =
   match code with
   | `Enoent -> raise (Eio.Fs.err (Eio.Fs.Not_found (backend `Enoent path)))
-  | `Eacces ->
-      raise (Eio.Fs.err (Eio.Fs.Permission_denied (backend `Eacces path)))
-  | (`Enospc | `Eio) as c -> raise (Eio.Exn.create (Eio.Exn.X (backend c path)))
+  | (`Eacces | `Eperm) as c ->
+      raise (Eio.Fs.err (Eio.Fs.Permission_denied (backend c path)))
+  | (`Erofs | `Enospc | `Eio) as c ->
+      raise (Eio.Exn.create (Eio.Exn.X (backend c path)))
 
 let raise_io code ctx = raise (Eio.Exn.create (Eio.Exn.X (backend code ctx)))
 
@@ -47,6 +50,7 @@ module Fault = struct
     | `Sync_error
     | `Open_error
     | `Stat_error
+    | `Change_error
     | `Swap ]
 
   type t =
@@ -61,6 +65,7 @@ module Fault = struct
     | Sync_error of code  (** Fail a flush/sync. *)
     | Open_error of code  (** Fail an open/open_dir. *)
     | Stat_error of code  (** Fail a stat. *)
+    | Change_error of code  (** Fail a directory change. *)
     | Swap_symlink of string
         (** Perform the operation, then replace its path with a symlink to the
             given target: the check-to-use window a TOCTOU exploits. Scripted on
@@ -79,7 +84,8 @@ module Fault = struct
     | Write_error x, Write_error y
     | Sync_error x, Sync_error y
     | Open_error x, Open_error y
-    | Stat_error x, Stat_error y ->
+    | Stat_error x, Stat_error y
+    | Change_error x, Change_error y ->
         x = y
     | Swap_symlink x, Swap_symlink y -> String.equal x y
     | _ -> false
@@ -87,8 +93,10 @@ module Fault = struct
   let code_rank = function
     | `Enoent -> 0
     | `Eacces -> 1
-    | `Enospc -> 2
-    | `Eio -> 3
+    | `Eperm -> 2
+    | `Erofs -> 3
+    | `Enospc -> 4
+    | `Eio -> 5
 
   let rank = function
     | Short_read _ -> 0
@@ -99,7 +107,8 @@ module Fault = struct
     | Sync_error _ -> 5
     | Open_error _ -> 6
     | Stat_error _ -> 7
-    | Swap_symlink _ -> 8
+    | Change_error _ -> 8
+    | Swap_symlink _ -> 9
 
   let compare a b =
     match (a, b) with
@@ -111,7 +120,8 @@ module Fault = struct
     | Write_error x, Write_error y
     | Sync_error x, Sync_error y
     | Open_error x, Open_error y
-    | Stat_error x, Stat_error y ->
+    | Stat_error x, Stat_error y
+    | Change_error x, Change_error y ->
         Int.compare (code_rank x) (code_rank y)
     | Swap_symlink x, Swap_symlink y -> String.compare x y
     | _ -> Int.compare (rank a) (rank b)
@@ -125,11 +135,12 @@ module Fault = struct
     | Sync_error c -> Fmt.pf ppf "sync-error(%s)" (code_name c)
     | Open_error c -> Fmt.pf ppf "open-error(%s)" (code_name c)
     | Stat_error c -> Fmt.pf ppf "stat-error(%s)" (code_name c)
+    | Change_error c -> Fmt.pf ppf "change-error(%s)" (code_name c)
     | Swap_symlink t -> Fmt.pf ppf "swap-symlink(%s)" t
 end
 
 module Op = struct
-  type kind = [ `Read | `Read_dir | `Write | `Sync | `Open | `Stat ]
+  type kind = [ `Read | `Read_dir | `Write | `Sync | `Open | `Stat | `Change ]
 
   let equal_kind (a : kind) (b : kind) = a = b
 
@@ -147,6 +158,7 @@ module Op = struct
     | `Sync -> Fmt.string ppf "sync"
     | `Open -> Fmt.string ppf "open"
     | `Stat -> Fmt.string ppf "stat"
+    | `Change -> Fmt.string ppf "change"
 
   let pp ppf t =
     Fmt.pf ppf "%a %s @%d+%d" pp_kind t.kind t.path t.file_offset t.length
@@ -161,6 +173,7 @@ module Op = struct
   let sync path = { kind = `Sync; path; file_offset = 0; length = 0 }
   let open_ path = { kind = `Open; path; file_offset = 0; length = 0 }
   let stat path = { kind = `Stat; path; file_offset = 0; length = 0 }
+  let change path = { kind = `Change; path; file_offset = 0; length = 0 }
 end
 
 module Schedule = struct
@@ -208,6 +221,7 @@ module Schedule = struct
       `Sync_error;
       `Open_error;
       `Stat_error;
+      `Change_error;
     ]
 
   let seeded ?(probability = 0.5) ?(kinds = all_kinds) ~seed () =
@@ -239,6 +253,7 @@ module Schedule = struct
     | `Sync, `Sync_error -> true
     | `Open, `Open_error -> true
     | `Stat, `Stat_error -> true
+    | `Change, `Change_error -> true
     | _ -> false
 
   (* A count in [1, len-1] so the operation is split rather than passed through
@@ -257,6 +272,12 @@ module Schedule = struct
     | `Sync_error -> Sync_error `Eio
     | `Open_error -> Open_error (some_code rng)
     | `Stat_error -> Stat_error (some_code rng)
+    | `Change_error ->
+        Change_error
+          (match Random.State.int rng 3 with
+          | 0 -> `Eacces
+          | 1 -> `Eperm
+          | _ -> `Erofs)
     | `Swap ->
         (* A swap needs a concrete symlink target, so it has no random form; it is
            driven by a scripted rule, never a seed. [all_kinds] omits it, and
@@ -305,6 +326,7 @@ module Schedule = struct
     | `Sync_error -> "`Sync_error"
     | `Open_error -> "`Open_error"
     | `Stat_error -> "`Stat_error"
+    | `Change_error -> "`Change_error"
     | `Swap -> "`Swap"
 
   (* OCaml syntax: a negative literal needs parentheses as a labelled
@@ -660,7 +682,15 @@ module Dir_impl = struct
     swap_after t.boxed fault path;
     result
 
+  (* A change to a directory's entries, named by the entry it makes or
+     removes. *)
+  let change t path =
+    match Schedule.next t.sched (Op.change path) with
+    | Some (Fault.Change_error c) -> raise_open c path
+    | _ -> ()
+
   let mkdir t ~perm path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.mkdir bv ~perm path
 
@@ -679,14 +709,17 @@ module Dir_impl = struct
     B.with_dir_entries bv path fn
 
   let unlink t path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.unlink bv path
 
   let rmdir t path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.rmdir bv path
 
   let rename t old_path new_dir new_path =
+    change t old_path;
     let target =
       match base_dir new_dir with
       | Some base -> base
@@ -696,6 +729,7 @@ module Dir_impl = struct
     B.rename bv old_path target new_path
 
   let rename_exclusive t backend ~source ~target:(new_dir, new_path) =
+    change t source;
     let target =
       match base_dir new_dir with Some base -> base | None -> new_dir
     in
@@ -706,6 +740,7 @@ module Dir_impl = struct
     B.read_link bv path
 
   let symlink ~link_to t path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.symlink ~link_to bv path
 

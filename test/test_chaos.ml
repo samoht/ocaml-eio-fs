@@ -802,6 +802,50 @@ let test_seed_reproduces () =
   let b = run_workload (Schedule.seeded ~seed:99 ~probability:0.4 ()) in
   Alcotest.(check (pair string string)) "same outcome and bytes" a b
 
+(* Permission faults: a directory change or an open for writing refused with
+   EACCES, EPERM or EROFS, and nothing changed. *)
+let test_change_error () =
+  let rule kind path fault =
+    { Schedule.trigger = Op_on_path { kind; path }; fault }
+  in
+  with_chaos
+    (Schedule.scripted
+       [
+         rule `Change "f" (Change_error `Erofs);
+         rule `Change "d" (Change_error `Eperm);
+         {
+           trigger = Nth_op_on_path { n = 2; kind = `Change; path = "f" };
+           fault = Change_error `Eacces;
+         };
+         rule `Open "conf" (Open_error `Erofs);
+       ])
+  @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "x";
+  expect_io "unlink on a read-only filesystem" (fun () ->
+      Eio.Path.unlink (chaos / "f"));
+  (match Eio.Path.mkdir ~perm:0o755 (chaos / "d") with
+  | () -> Alcotest.fail "mkdir succeeded"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ());
+  (match Eio.Path.rename (chaos / "f") (chaos / "g") with
+  | () -> Alcotest.fail "rename succeeded"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ());
+  expect_io "open for writing on a read-only filesystem" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (chaos / "conf") "y");
+  Alcotest.(check (list string))
+    "nothing changed" [ "f" ] (Eio.Path.read_dir raw)
+
+let test_seeded_change_error () =
+  let s = Schedule.seeded ~probability:1. ~kinds:[ `Change_error ] ~seed:3 () in
+  Alcotest.(check string)
+    "printed"
+    "Eio_fs.Chaos.Schedule.seeded ~probability:1. ~kinds:[ `Change_error ] \
+     ~seed:3 ()"
+    (Fmt.str "%a" Schedule.pp s);
+  with_chaos s @@ fun ~raw ~chaos ->
+  expect_io "a seeded mkdir" (fun () ->
+      Eio.Path.mkdir ~perm:0o755 (chaos / "d"));
+  Alcotest.(check (list string)) "nothing made" [] (Eio.Path.read_dir raw)
+
 (* A seeded schedule prints as the expression that rebuilds it. *)
 let test_seeded_pp_rebuilds () =
   let s =
@@ -2349,6 +2393,8 @@ let suite =
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
       Alcotest.test_case "chaos perturbs" `Quick test_chaos_perturbs;
+      Alcotest.test_case "change error" `Quick test_change_error;
+      Alcotest.test_case "seeded change error" `Quick test_seeded_change_error;
       Alcotest.test_case "a seeded schedule prints its rebuild" `Quick
         test_seeded_pp_rebuilds;
       Alcotest.test_case "crash: the surviving prefix is uniform" `Quick
