@@ -100,4 +100,5 @@ assert (
 
 ISC, see [LICENSE.md](LICENSE.md). The in-memory backend started as Patrick
 Ferris's [eio_mem](https://tangled.org/patrick.sirref.org/eio_mem), and
-`eio-fs.path` adapts [fpath](https://github.com/dbuenzli/fpath).
+`eio-fs.path` adapts its POSIX-only modification of
+[fpath](https://github.com/dbuenzli/fpath).

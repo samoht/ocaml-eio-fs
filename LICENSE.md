@@ -2,7 +2,8 @@ ISC License
 
 Copyright (c) 2026 Thomas Gazagnaire <thomas@gazagnaire.org>
 Copyright (c) Thomas Leonard and Patrick Ferris (eio_mem)
-Copyright (c) 2015 The fpath programmers (lib/path/eio_fs_path.ml)
+Copyright (c) 2015 The fpath programmers (lib/path/eio_fs_path.ml,
+adapted from Patrick Ferris's POSIX-only modification in eio_mem)
 
 Permission to use, copy, modify, and distribute this software for any
 purpose with or without fee is hereby granted, provided that the above

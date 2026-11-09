@@ -1,4 +1,5 @@
-(* A POSIX-only modification of fpath's lexical path handling.
+(* Adapted from Patrick Ferris's POSIX-only modification of fpath, src/path.ml
+   in eio_mem (https://tangled.org/patrick.sirref.org/eio_mem).
    Copyright (c) 2015 The fpath programmers, ISC; see LICENSE.md. *)
 
 open! Hermetic
