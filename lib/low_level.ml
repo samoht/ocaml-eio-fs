@@ -454,6 +454,9 @@ module Filesystem = struct
     (match w.base with
     | Some base when not (within w.tree (here w) base) ->
         Error.outside_sandbox path
+    (* A last [..] at the base names the directory above it. *)
+    | Some _ when String.equal name ".." && List.length w.dirs = 1 ->
+        Error.outside_sandbox name
     | _ -> ());
     let len = String.length path in
     (w, name, len > 0 && path.[len - 1] = '/')

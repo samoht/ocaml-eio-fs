@@ -428,6 +428,17 @@ let test_name_limits () =
       Eio.Path.mkdir ~perm:0o755 (fs / "a\000b"));
   Alcotest.(check int) "one entry" 1 (List.length (Eio.Path.read_dir fs))
 
+(* A last [..] at a confined directory's base names its parent, outside it. *)
+let test_dotdot_at_base () =
+  with_env ~cwd:"/d" @@ fun env ->
+  let cwd = env#cwd in
+  Eio.Path.mkdir ~perm:0o755 (cwd / "a");
+  expect_io_error "permission denied" (fun () -> Eio.Path.rmdir (cwd / ".."));
+  expect_io_error "permission denied" (fun () ->
+      Eio.Path.rename (cwd / "a") (cwd / ".."));
+  expect_io_error "permission denied" (fun () ->
+      Eio.Path.rename (cwd / "..") (cwd / "a/a"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -892,4 +903,5 @@ let suite =
       Alcotest.test_case "seek a directory descriptor" `Quick
         test_seek_directory_fd;
       Alcotest.test_case "name limits" `Quick test_name_limits;
+      Alcotest.test_case "dot-dot at the base" `Quick test_dotdot_at_base;
     ] )
