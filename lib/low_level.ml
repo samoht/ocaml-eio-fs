@@ -441,6 +441,10 @@ module Filesystem = struct
      [path] ends in a separator. A confined walk checks by the tree's own
      parent links that the directory it reached is below its base. *)
   let locate w path =
+    (* NUL ends a C path: ENOENT. A name holds at most NAME_MAX bytes. *)
+    if String.exists (Char.equal '\000') path then Error.not_found path;
+    if List.exists (fun n -> String.length n > 255) (names path) then
+      Error.err ("file name too long: " ^ path);
     let w = enter w path in
     let w, name =
       match List.rev (names path) with

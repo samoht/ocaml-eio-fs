@@ -410,6 +410,24 @@ let test_seek_directory_fd () =
     "offset" 0
     (Optint.Int63.to_int (Eio.File.seek f Optint.Int63.zero `Set))
 
+(* A name holds at most 255 bytes (ENAMETOOLONG) and no NUL (ENOENT). *)
+let test_name_limits () =
+  with_env @@ fun env ->
+  let fs = env#fs in
+  let long = String.make 256 'n' in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / String.make 255 'n') "ok";
+  expect_eio_io "a 256-byte name" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (fs / long) "x");
+  expect_eio_io "a 256-byte directory" (fun () ->
+      Eio.Path.mkdir ~perm:0o755 (fs / long));
+  expect_eio_io "a 256-byte component" (fun () ->
+      ignore (Eio.Path.load (fs / long / "f") : string));
+  expect_io_error "not found" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (fs / "a\000b") "x");
+  expect_io_error "not found" (fun () ->
+      Eio.Path.mkdir ~perm:0o755 (fs / "a\000b"));
+  Alcotest.(check int) "one entry" 1 (List.length (Eio.Path.read_dir fs))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -873,4 +891,5 @@ let suite =
       Alcotest.test_case "symbolic link size" `Quick test_symlink_size;
       Alcotest.test_case "seek a directory descriptor" `Quick
         test_seek_directory_fd;
+      Alcotest.test_case "name limits" `Quick test_name_limits;
     ] )
