@@ -173,8 +173,9 @@ module Schedule : sig
       always yield the same fault sequence. *)
 
   val pp : t Fmt.t
-  (** [pp] formats a schedule for logs: its seed and probability, or how many of
-      its rules are pending. *)
+  (** [pp] formats a schedule for logs. A seeded schedule prints as the OCaml
+      expression that rebuilds it; a scripted one prints how many of its rules
+      are pending. *)
 end
 
 val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
@@ -244,9 +245,9 @@ module Crash : sig
         (** Seeded: each un-synced write survives on an even coin and the
             survivors are applied in a seeded-shuffled order, so a later write
             may land while an earlier one is lost. Uncommitted directory
-            operations survive as a seeded-length prefix of program order:
-            metadata never reorders. The [int] is the seed; the same seed and
-            workload reproduce the same image. *)
+            operations survive as a prefix of program order whose length is
+            drawn uniformly: metadata never reorders. The [int] is the seed; the
+            same seed and workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
             survivors keep program order. An uncommitted directory operation

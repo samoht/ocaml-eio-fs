@@ -296,10 +296,36 @@ module Schedule = struct
               let k = List.nth ks (Random.State.int s.rng (List.length ks)) in
               Some (build_fault s.rng op k))
 
+  let kind_name : Fault.kind -> string = function
+    | `Short_read -> "`Short_read"
+    | `Read_error -> "`Read_error"
+    | `Short_write -> "`Short_write"
+    | `Torn_write -> "`Torn_write"
+    | `Write_error -> "`Write_error"
+    | `Sync_error -> "`Sync_error"
+    | `Open_error -> "`Open_error"
+    | `Stat_error -> "`Stat_error"
+    | `Swap -> "`Swap"
+
+  (* OCaml syntax: a negative literal needs parentheses as a labelled
+     argument. *)
+  let pp_float ppf f =
+    if f < 0. then Fmt.pf ppf "(%s)" (Float.to_string f)
+    else Fmt.string ppf (Float.to_string f)
+
+  let pp_int ppf i = if i < 0 then Fmt.pf ppf "(%d)" i else Fmt.int ppf i
+
+  (* A seeded schedule prints as the expression that rebuilds it. *)
   let rec pp ppf = function
     | Empty -> Fmt.string ppf "empty"
     | Scripted s -> Fmt.pf ppf "scripted(%d rules)" (List.length s.rules)
-    | Seeded s -> Fmt.pf ppf "seeded(seed=%d p=%g)" s.seed s.config.probability
+    | Seeded s ->
+        Fmt.pf ppf
+          "Eio_fs.Chaos.Schedule.seeded ~probability:%a ~kinds:[ %s ] ~seed:%a \
+           ()"
+          pp_float s.config.probability
+          (String.concat "; " (List.map kind_name s.config.kinds))
+          pp_int s.seed
     | Observed { inner; _ } -> Fmt.pf ppf "observed(%a)" pp inner
 end
 
@@ -1375,7 +1401,10 @@ module Crash = struct
                value, and so the fault-injection sequence, is unchanged. *)
             let salt = (0x4d45 lsl 16) lor 0x5441 in
             let rng = Random.State.make [| seed; salt |] in
-            take_prefix (fun _ -> Random.State.bool rng) ordered_metadata
+            (* A uniform length: late crash points are as likely as early
+               ones. *)
+            let n = Random.State.int rng (List.length ordered_metadata + 1) in
+            List.filteri (fun i _ -> i < n) ordered_metadata
       in
       let tree, locs =
         match List.rev metadata_survivors with

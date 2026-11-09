@@ -802,6 +802,28 @@ let test_seed_reproduces () =
   let b = run_workload (Schedule.seeded ~seed:99 ~probability:0.4 ()) in
   Alcotest.(check (pair string string)) "same outcome and bytes" a b
 
+(* A seeded schedule prints as the expression that rebuilds it. *)
+let test_seeded_pp_rebuilds () =
+  let s =
+    Schedule.seeded ~probability:0.25
+      ~kinds:[ `Torn_write; `Sync_error ]
+      ~seed:42 ()
+  in
+  Alcotest.(check string)
+    "printed"
+    "Eio_fs.Chaos.Schedule.seeded ~probability:0.25 ~kinds:[ `Torn_write; \
+     `Sync_error ] ~seed:42 ()"
+    (Fmt.str "%a" Schedule.pp s);
+  let rebuilt =
+    Eio_fs.Chaos.Schedule.seeded ~probability:0.25
+      ~kinds:[ `Torn_write; `Sync_error ]
+      ~seed:42 ()
+  in
+  let faults s = List.map (Chaos.Private.next s) ops_fixture in
+  Alcotest.(check bool)
+    "same faults" true
+    (List.equal (Option.equal Fault.equal) (faults s) (faults rebuilt))
+
 let test_chaos_perturbs () =
   let clean = run_workload Schedule.empty in
   Alcotest.(check (pair string string))
@@ -1350,6 +1372,25 @@ let test_crash_held_subtree_follows_a_rename () =
 (* Metadata survival is a prefix of program order: refusing an early directory
    op drops everything after it, even ops the predicate would accept, because
    a journal never commits out of order. *)
+(* The surviving prefix of the journal has a uniform length: the last of
+   twelve pending directory operations survives in about one seed in
+   thirteen. *)
+let test_crash_reorder_prefix_uniform () =
+  let full = ref 0 in
+  for seed = 0 to 999 do
+    let ctl = Crash.v ~policy:(Crash.Reorder_unsynced seed) () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    for i = 1 to 12 do
+      Eio.Path.mkdir ~perm:0o755 (fs / Fmt.str "d%02d" i)
+    done;
+    let post = Crash.post_crash ctl in
+    if not (absent (post / "d12")) then incr full
+  done;
+  Alcotest.(check bool)
+    (Fmt.str "late entries survive (%d/1000)" !full)
+    true
+    (!full > 40 && !full < 120)
+
 let test_crash_survive_prefix_rule () =
   let pred (u : Crash.unsynced) =
     match u.kind with Crash.Mkdir -> false | _ -> true
@@ -2050,6 +2091,10 @@ let suite =
       Alcotest.test_case "seed determinism" `Quick test_seed_determinism;
       Alcotest.test_case "seed reproduces" `Quick test_seed_reproduces;
       Alcotest.test_case "chaos perturbs" `Quick test_chaos_perturbs;
+      Alcotest.test_case "a seeded schedule prints its rebuild" `Quick
+        test_seeded_pp_rebuilds;
+      Alcotest.test_case "crash: the surviving prefix is uniform" `Quick
+        test_crash_reorder_prefix_uniform;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
