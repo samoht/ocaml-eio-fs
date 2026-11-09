@@ -988,7 +988,10 @@ let pwritev t ~file_offset bufs =
   match !r with
   | Resource.File e ->
       let src = Cstruct.concat bufs in
-      let off = Optint.Int63.to_int file_offset in
+      (* On an O_APPEND descriptor Linux appends, whatever the offset. *)
+      let off =
+        if t.append then File.size e else Optint.Int63.to_int file_offset
+      in
       r := Resource.File (File.write e ~off src);
       Cstruct.length src
   | r -> not_a_file "pwrite" r

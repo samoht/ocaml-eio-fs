@@ -439,6 +439,32 @@ let test_dotdot_at_base () =
   expect_io_error "permission denied" (fun () ->
       Eio.Path.rename (cwd / "..") (cwd / "a/a"))
 
+(* pwrite(2) on an O_APPEND descriptor appends on Linux, whatever the
+   offset. *)
+let test_pwrite_appends () =
+  with_env @@ fun env ->
+  let p = env#fs / "f" in
+  Eio.Path.save ~create:(`Exclusive 0o644) p "abc";
+  Eio.Path.with_open_out ~append:true ~create:`Never p (fun f ->
+      Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero
+        [ Cstruct.of_string "Z" ]);
+  Alcotest.(check string) "appended" "abcZ" (Eio.Path.load p)
+
+(* So does the crash model. *)
+let test_crash_pwrite_appends () =
+  with_env @@ fun env ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  let fs = Crash.wrap ctl env#fs in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "f") "abc";
+  Crash.sync_metadata ctl;
+  Eio.Path.with_open_out ~append:true ~create:`Never (fs / "f") (fun f ->
+      Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero
+        [ Cstruct.of_string "Z" ]);
+  Alcotest.(check string)
+    "replayed at the end" "abcZ"
+    (Eio.Path.load (Crash.post_crash ctl / "f"))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -904,4 +930,7 @@ let suite =
         test_seek_directory_fd;
       Alcotest.test_case "name limits" `Quick test_name_limits;
       Alcotest.test_case "dot-dot at the base" `Quick test_dotdot_at_base;
+      Alcotest.test_case "pwrite appends" `Quick test_pwrite_appends;
+      Alcotest.test_case "crash: pwrite appends" `Quick
+        test_crash_pwrite_appends;
     ] )

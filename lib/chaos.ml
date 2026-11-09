@@ -447,9 +447,12 @@ let do_single_write sched path ~append ~pos (base : Eio.File.rw_ty r) bufs =
       pos := off + got;
       got
 
-let do_pwrite sched path (base : Eio.File.rw_ty r) ~file_offset bufs =
+let do_pwrite sched path ~append (base : Eio.File.rw_ty r) ~file_offset bufs =
   let len = Cstruct.lenv bufs in
-  let off = Optint.Int63.to_int file_offset in
+  let off =
+    if append then write_offset ~append ~pos:(ref 0) base
+    else Optint.Int63.to_int file_offset
+  in
   let op = Op.write path ~offset:off ~len in
   match Schedule.next sched op with
   | Some (Fault.Short_write n) ->
@@ -544,7 +547,7 @@ module Rw_impl = struct
   let copy t ~src = Eio.Flow.Pi.simple_copy ~single_write t ~src
 
   let pwrite t ~file_offset bufs =
-    do_pwrite t.sched t.path (writable t) ~file_offset bufs
+    do_pwrite t.sched t.path ~append:t.append (writable t) ~file_offset bufs
 
   let sync t = do_sync t.sched t.path (writable t)
   let truncate t len = Eio.File.truncate (writable t) len
@@ -1765,7 +1768,10 @@ module Crash = struct
     let pwrite cf ~file_offset bufs =
       guard cf;
       let fs = fstate_of cf in
-      let off = Optint.Int63.to_int file_offset in
+      let off =
+        if cf.cappend then write_offset ~append:true ~pos:cf.cpos cf.cro
+        else Optint.Int63.to_int file_offset
+      in
       let got = Eio.File.pwrite_single (writable cf) ~file_offset bufs in
       clog_write cf.ctl fs ~offset:off (capture bufs got);
       bump cf.ctl fs ~kind:`Write ~offset:off ~len:got;
