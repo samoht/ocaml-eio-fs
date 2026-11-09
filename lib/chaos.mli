@@ -398,4 +398,8 @@ end
 module Private : sig
   val next : Schedule.t -> Op.t -> Fault.t option
   (** [next t op] advances [t] by one operation and is the fault to inject. *)
+
+  val replay_copied : unit -> int
+  (** [replay_copied ()] is how many bytes {!Crash} has copied into the images
+      it replays a file's changes over, since the program started. *)
 end

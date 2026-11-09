@@ -1,3 +1,19 @@
 (test
  (name test)
+ (modules test test_scaling)
  (libraries eio eio.mock eio_fs alcotest cstruct optint))
+
+; A list scan allocates nothing, so a directory that went back to a list of
+; entries shows only in time. The test that times it reads a clock, which a
+; loaded CI worker makes flaky, so it is not part of @runtest: run it by hand
+; with `dune build @scaling`.
+
+(executable
+ (name by_hand)
+ (modules by_hand)
+ (libraries eio eio.mock eio_fs))
+
+(rule
+ (alias scaling)
+ (action
+  (run %{exe:by_hand.exe})))

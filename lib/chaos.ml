@@ -913,13 +913,20 @@ module Crash = struct
      [buf], which grows by doubling, so a run of appends costs linear time. *)
   type image = { mutable buf : Cstruct.t; mutable len : int }
 
-  let image_of c = { buf = copy_cs c; len = Cstruct.length c }
+  (* The bytes replays have copied into images, which a test bounds. *)
+  let copied = Atomic.make 0
+
+  let image_of c =
+    ignore (Atomic.fetch_and_add copied (Cstruct.length c) : int);
+    { buf = copy_cs c; len = Cstruct.length c }
+
   let bytes_of img = Cstruct.sub img.buf 0 img.len
 
   (* Room for [n] bytes, those past [len] zero. *)
   let extend img n =
     if n > Cstruct.length img.buf then begin
       let b = Cstruct.create (max n (2 * Cstruct.length img.buf)) in
+      ignore (Atomic.fetch_and_add copied img.len : int);
       Cstruct.blit img.buf 0 b 0 img.len;
       img.buf <- b
     end
@@ -2669,4 +2676,5 @@ end
 
 module Private = struct
   let next = Schedule.next
+  let replay_copied () = Atomic.get Crash.copied
 end
