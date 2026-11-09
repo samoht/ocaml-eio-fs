@@ -2119,6 +2119,24 @@ let test_crash_block_size () =
     "the second append alone" true
     (List.mem "\000\000\000\000bbbb" states)
 
+(* A rename over a file whose handle stays open: the write synced through
+   the handle is durable in that file, which an uncommitted rename leaves at
+   its name. *)
+let test_crash_rename_over_an_open_file () =
+  let ctl = Crash.v () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "b") "old";
+  write_new ~sync:true (fs / "a") "other";
+  Crash.sync_metadata ctl;
+  Eio.Switch.run (fun sw ->
+      let h = Eio.Path.open_out ~sw ~create:`Never (fs / "b") in
+      Eio.File.pwrite_all h ~file_offset:(i63 0) [ Cstruct.of_string "NEW" ];
+      Eio.Path.rename (fs / "a") (fs / "b");
+      Eio.File.sync h);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "b" "NEW" (Eio.Path.load (post / "b"));
+  Alcotest.(check string) "a" "other" (Eio.Path.load (post / "a"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2451,6 +2469,8 @@ let suite =
       Alcotest.test_case "crash: two appends in one block" `Quick
         test_crash_appends_in_one_block;
       Alcotest.test_case "crash: the block size" `Quick test_crash_block_size;
+      Alcotest.test_case "crash: a rename over an open file" `Quick
+        test_crash_rename_over_an_open_file;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

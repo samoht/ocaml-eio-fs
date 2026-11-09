@@ -1971,8 +1971,10 @@ module Crash = struct
           fs.rel <- new_rel ^ suffix;
           Hashtbl.replace ctl.files (file_key new_owner fs.rel) fs
         end
-        else if replaced then
-          ctl.log <- List.filter (fun e -> not (e.efs == fs)) ctl.log
+          (* A replaced file leaves the name table but keeps its pending
+           writes: a handle may still sync them, and a crash that loses the
+           rename brings the file back under its name. *)
+        else if replaced then ()
         else Hashtbl.replace ctl.files (file_key fs.owner fs.rel) fs)
       states;
     List.iter
@@ -2131,9 +2133,9 @@ module Crash = struct
       | Some backend ->
           Eio_fs_sync.Rename.exclusive backend (d.dbase, old_path)
             (target, new_path));
-      (* A successful rename moves the durability identity with the file. If a
-         tracked target was replaced, its pending writes no longer describe a
-         reachable file and must not be replayed after a crash. *)
+      (* A successful rename moves the durability identity with the file. A
+         tracked target it replaced keeps its own, for a crash that loses the
+         rename. *)
       move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
         ~new_rel:rel;
       let kind = Rename { dest } in
