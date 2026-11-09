@@ -20,21 +20,11 @@
  (synopsis "Filesystem helpers and an in-memory backend for Eio")
  (tags (eio filesystem in-memory))
  (description
-  "eio-fs is filesystem support for Eio. Eio_fs.Fs is an in-memory
-   filesystem backend for Eio paths, Eio_fs.Crunch embeds a directory tree in
-   a program, and Eio_fs.Path measures, walks and prints a tree on any
-   backend. Eio_fs.Chaos wraps a directory to inject short and torn writes,
-   failed syncs and power loss, for crash-consistency tests. The eio-fs.sync
-   library publishes a file or a directory tree atomically and durably on any
-   backend, through a temporary, a sync, a rename and a directory barrier.
-   The eio-fs.unix library adds the POSIX calls Eio and Unix do not bind: the
-   platform's strongest sync, advisory locks, filesystem capacity, the sparse
-   map, extended attributes and confined batches of directory operations.
-   The eio-fs.path library is lexical arithmetic on path strings. The
-   eio-fs-crunch binary writes the module that embeds a tree, in the style of
-   ocaml-crunch. The in-memory backend is adapted from Patrick Ferris's
-   eio_mem (https://git.sirref.org/eio_mem), itself derived
-   from the Eio filesystem interfaces.")
+  "eio-fs is an in-memory filesystem for Eio, with wrappers that inject
+   faults and simulate power loss for crash-consistency tests. It also writes
+   files atomically and durably on any backend, binds POSIX calls that Eio
+   lacks, and embeds a directory tree in a program. The in-memory backend is
+   adapted from Patrick Ferris's eio_mem (https://git.sirref.org/eio_mem).")
  (depends
   (hermetic (>= 0.1.0))
   (ocaml (>= 5.3))
