@@ -66,6 +66,33 @@ done;
 assert (!lost > 0)
 ```
 
+## Testing as a user
+
+Code that passes its tests as root in CI can fail for a user, or the reverse:
+a configuration directory it cannot create, a file another user owns, a mode
+that locks it out. An in-memory filesystem runs its operations as a user and
+checks them as POSIX does. The default user is root, which passes every check,
+so a test names a user to find these bugs. `Eio_fs.Fs.as_user` runs a
+directory's operations as another user, to set a tree up as root first.
+
+This test saves a configuration file under `/etc`, which root owns. It works as
+root and fails as a user.
+
+```ocaml
+Eio_main.run @@ fun _env ->
+let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 } in
+let save_config user =
+  Eio_fs.run ~user ~cwd:"/home/alice" @@ fun env ->
+  let dir = Eio.Path.(env#fs / "/etc/app") in
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 dir;
+  Eio.Path.save ~create:(`Or_truncate 0o644) Eio.Path.(dir / "conf") "x"
+in
+save_config Eio_fs.root;
+match save_config alice with
+| () -> assert false
+| exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> ()
+```
+
 ## Embedding a file tree
 
 The `eio-fs-crunch` binary turns a directory tree into an OCaml module, as
