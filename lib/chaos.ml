@@ -1638,9 +1638,19 @@ module Crash = struct
               | Some (Dir _) -> true
               | Some (File _ | Link _) | None -> false)
         in
+        (* New attributes land on a node the durable image holds; until it
+           does, a crash applies them wherever the image holds it. *)
+        let node_held e =
+          List.for_all
+            (fun (segs, edit) ->
+              match edit with
+              | Attrs _ -> Option.is_some (tree_find durable segs)
+              | Node _ -> true)
+            e.delta
+        in
         let committed, pending =
           List.partition
-            (fun e -> List.exists durable_dir e.barred)
+            (fun e -> List.exists durable_dir e.barred && node_held e)
             (List.rev ctl.metadata)
         in
         match committed with

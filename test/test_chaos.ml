@@ -2262,6 +2262,18 @@ let test_crash_chmod_journaled () =
   check "a barrier on the directory" (0o600, 1000L, 0o700)
     (mode ~sync:(fun _ fs -> Eio_fs_sync.sync_dir fs))
 
+(* A sync makes a new file's mode durable before its name: whenever a crash
+   keeps the name, the file has that mode. *)
+let test_crash_synced_chmod_of_a_new_file () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "f") (fun f ->
+      Eio.Path.chmod ~follow:true ~perm:0o600 (fs / "f");
+      Eio.File.sync f);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check int)
+    "mode" 0o600 (Eio.Path.stat ~follow:false (post / "f")).perm
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2607,6 +2619,8 @@ let suite =
         test_crash_deferred_barrier_identity;
       Alcotest.test_case "crash: chmod and chown are journaled" `Quick
         test_crash_chmod_journaled;
+      Alcotest.test_case "crash: a synced chmod of a file whose name is pending"
+        `Quick test_crash_synced_chmod_of_a_new_file;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
