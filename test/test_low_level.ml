@@ -102,7 +102,8 @@ let test_unreadable_reopen_denied () =
       Eio.Path.save ~create:(`Or_truncate 0o200) (env#fs / "wo") "y")
 
 (* A directory capability opened for a switch dies with the switch, as a real
-   O_DIRECTORY fd does: using it afterwards is EBADF, not silent success. *)
+   O_DIRECTORY fd does: using it afterwards raises [Invalid_argument], as
+   eio_posix does, not silent success. *)
 let test_subtree_fd_dies_with_switch () =
   with_env @@ fun env ->
   Eio.Path.mkdir ~perm:0o755 (env#fs / "d");
@@ -114,12 +115,13 @@ let test_subtree_fd_dies_with_switch () =
   match Eio.Path.load Eio.Path.(stale / "f") with
   | (_ : string) ->
       Alcotest.fail "stale directory fd still resolves after its switch exited"
-  | exception Eio.Io _ -> ()
+  | exception Invalid_argument _ -> ()
 
 (* close(2): "the file descriptor is deallocated" and the next open may be
    handed the same number. A handle answers on its own state: closing it a
    second time does nothing (as [Eio.Resource.close] specifies), and using it
-   is EBADF, whatever file has taken its number since. Each case opens [a],
+   raises [Invalid_argument], as eio_posix does, whatever file has taken its
+   number since. Each case opens [a],
    closes it, then opens [b], which takes the number [a] had. *)
 let with_reused_number env fn =
   let fs = env#fs in
@@ -141,9 +143,12 @@ let test_stale_close_spares_reused_fd () =
 let test_closed_handle_write_refused () =
   with_env @@ fun env ->
   with_reused_number env (fun a _ ->
-      match Eio.Flow.copy_string "stale" a with
+      (match Eio.Flow.copy_string "stale" a with
       | () -> Alcotest.fail "a write through a closed handle succeeded"
-      | exception Eio.Io _ -> ());
+      | exception Invalid_argument _ -> ());
+      match Eio.File.stat a with
+      | _ -> Alcotest.fail "a stat through a closed handle succeeded"
+      | exception Invalid_argument _ -> ());
   Alcotest.(check string)
     "the file holding the number is untouched" ""
     (Eio.Path.load (env#fs / "b"))

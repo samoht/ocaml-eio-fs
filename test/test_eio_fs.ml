@@ -529,11 +529,12 @@ let test_tree_labels_each_node_by_its_last_component () =
   Alcotest.(check string) "depth 0 prints nothing" "" (render ~depth:0 fs)
 
 (* Eio 1.4 Resource.close: closing prevents new operations, repeated close
-   succeeds, and a switch may still release a handle closed by its caller. *)
+   succeeds, and a switch may still release a handle closed by its caller. A
+   use after close raises [Invalid_argument], as on eio_posix. *)
 let expect_closed what fn =
   match fn () with
   | _ -> Alcotest.failf "%s succeeded through a closed directory" what
-  | exception Eio.Io _ -> ()
+  | exception Invalid_argument _ -> ()
 
 let test_root_close_invalidates_aliases () =
   Eio_mock.Backend.run @@ fun () ->

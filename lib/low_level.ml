@@ -60,9 +60,8 @@ module Error = struct
   (* ELOOP, which Eio raises as [Symlink]. *)
   let symlink_loop () = raise (Eio.Fs.err Eio.Fs.Symlink)
 
-  let badf () =
-    let exn = Eio.Exn.create (Eio.Exn.X (Eio_fs "Bad file descriptor")) in
-    raise exn
+  (* A caller's mistake, as eio_posix reports it. *)
+  let badf () = invalid_arg "file descriptor used after calling close!"
 
   let err ctx =
     let exn = Eio.Exn.create (Eio.Exn.X (Eio_fs ctx)) in
