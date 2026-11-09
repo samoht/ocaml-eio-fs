@@ -12,7 +12,11 @@ let expect_io_error expected fn =
       | _ -> Alcotest.failf "expected %s, got another filesystem error" expected
       )
 
-let with_env ?cwd fn = Eio_mock.Backend.run @@ fun () -> Eio_fs.run ?cwd fn
+let with_env ?cwd ?user fn =
+  Eio_mock.Backend.run @@ fun () -> Eio_fs.run ?cwd ?user fn
+
+(* A user who is not root, whom file modes bind. *)
+let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 }
 
 let test_missing_file () =
   with_env @@ fun env ->
@@ -63,9 +67,9 @@ let test_create_mode_recorded () =
 
 (* open(2): EACCES when "the file exists and the permissions specified by
    oflag are denied". Reopening an existing 0o444 file for writing must fail,
-   even for the owner. *)
+   even for the owner, unless root. *)
 let test_readonly_reopen_denied () =
-  with_env @@ fun env ->
+  with_env ~user:alice @@ fun env ->
   Eio.Path.save ~create:(`Or_truncate 0o444) (env#fs / "ro") "x";
   expect_io_error "permission denied" (fun () ->
       Eio.Path.with_open_out ~create:(`Or_truncate 0o444) (env#fs / "ro")
@@ -94,7 +98,7 @@ let test_chmod_restores_writability () =
    can be created -- the creating open is unrestricted -- but not reopened:
    this backend opens files O_RDONLY or O_RDWR, and both need the read bit. *)
 let test_unreadable_reopen_denied () =
-  with_env @@ fun env ->
+  with_env ~user:alice @@ fun env ->
   Eio.Path.save ~create:(`Or_truncate 0o200) (env#fs / "wo") "x";
   expect_io_error "permission denied" (fun () ->
       ignore (Eio.Path.load (env#fs / "wo")));
@@ -464,6 +468,144 @@ let test_crash_pwrite_appends () =
   Alcotest.(check string)
     "replayed at the end" "abcZ"
     (Eio.Path.load (Crash.post_crash ctl / "f"))
+
+(* {2 Permissions} *)
+
+let bob = { alice with uid = 1001; gid = 1001 }
+
+let denied what fn =
+  expect_io_error "permission denied" fn |> fun () -> ignore what
+
+let perm p = (Eio.Path.stat ~follow:false p).perm
+
+(* Every directory a path walks needs its search bit; root needs none. *)
+let test_perm_search () =
+  with_env ~user:alice ~cwd:"/home/alice" @@ fun env ->
+  let d = env#cwd / "d" in
+  Eio.Path.mkdir ~perm:0o755 d;
+  Eio.Path.save ~create:(`Exclusive 0o644) (d / "f") "x";
+  Eio.Path.chmod ~follow:false ~perm:0o600 d;
+  denied "load" (fun () -> ignore (Eio.Path.load (d / "f") : string));
+  denied "stat" (fun () -> ignore (Eio.Path.stat ~follow:false (d / "f")));
+  Eio.Path.chmod ~follow:false ~perm:0o000 d;
+  let as_root = Eio_fs.Fs.as_user Eio_fs.root env#cwd in
+  Alcotest.(check string) "root" "x" (Eio.Path.load (as_root / "d" / "f"))
+
+(* Making, removing or renaming an entry needs write and search on its
+   directory. *)
+let test_perm_dir_write () =
+  with_env ~user:alice ~cwd:"/home/alice" @@ fun env ->
+  let d = env#cwd / "d" in
+  Eio.Path.mkdir ~perm:0o755 d;
+  Eio.Path.save ~create:(`Exclusive 0o644) (d / "f") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (env#cwd / "g") "y";
+  Eio.Path.chmod ~follow:false ~perm:0o500 d;
+  denied "create" (fun () ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (d / "new") "z");
+  denied "mkdir" (fun () -> Eio.Path.mkdir ~perm:0o755 (d / "e"));
+  denied "symlink" (fun () -> Eio.Path.symlink ~link_to:"f" (d / "l"));
+  denied "unlink" (fun () -> Eio.Path.unlink (d / "f"));
+  denied "rename out" (fun () -> Eio.Path.rename (d / "f") (env#cwd / "h"));
+  denied "rename in" (fun () -> Eio.Path.rename (env#cwd / "g") (d / "g"));
+  Eio.Path.save ~create:`Never (d / "f") "w";
+  Alcotest.(check string)
+    "a file in it is still writable" "w"
+    (Eio.Path.load (d / "f"))
+
+(* In a sticky directory a user removes or renames only their own entries. *)
+let test_perm_sticky () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o777 (fs / "tmp");
+  Eio.Path.chmod ~follow:false ~perm:0o1777 (fs / "tmp");
+  let as_alice = Eio_fs.Fs.as_user alice fs in
+  let as_bob = Eio_fs.Fs.as_user bob fs in
+  Eio.Path.save ~create:(`Exclusive 0o666) (as_bob / "tmp" / "b") "bob's";
+  Eio.Path.save ~create:(`Exclusive 0o666) (as_alice / "tmp" / "a") "alice's";
+  denied "unlink" (fun () -> Eio.Path.unlink (as_alice / "tmp" / "b"));
+  denied "rename" (fun () ->
+      Eio.Path.rename (as_alice / "tmp" / "b") (as_alice / "tmp" / "c"));
+  denied "replace" (fun () ->
+      Eio.Path.rename (as_alice / "tmp" / "a") (as_alice / "tmp" / "b"));
+  Eio.Path.unlink (as_alice / "tmp" / "a");
+  Eio.Path.unlink (fs / "tmp" / "b");
+  Alcotest.(check (list string)) "empty" [] (Eio.Path.read_dir (fs / "tmp"))
+
+(* Listing a directory needs its read bit; looking a name up does not. *)
+let test_perm_read_dir () =
+  with_env ~user:alice ~cwd:"/home/alice" @@ fun env ->
+  let d = env#cwd / "d" in
+  Eio.Path.mkdir ~perm:0o755 d;
+  Eio.Path.save ~create:(`Exclusive 0o644) (d / "f") "x";
+  Eio.Path.chmod ~follow:false ~perm:0o300 d;
+  denied "read_dir" (fun () -> ignore (Eio.Path.read_dir d : string list));
+  Alcotest.(check string) "lookup" "x" (Eio.Path.load (d / "f"))
+
+(* Opening a file reads the owner's, the group's or the others' bits. *)
+let test_perm_open_classes () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o640) (fs / "f") "x";
+  let carol = { bob with uid = 1002; groups = [ 0 ] } in
+  let as_carol = Eio_fs.Fs.as_user carol fs in
+  Alcotest.(check string) "group reads" "x" (Eio.Path.load (as_carol / "f"));
+  denied "group writes" (fun () ->
+      Eio.Path.save ~create:`Never (as_carol / "f") "y");
+  denied "others read" (fun () ->
+      ignore (Eio.Path.load (Eio_fs.Fs.as_user alice fs / "f") : string))
+
+(* A new entry loses the umask's bits and belongs to its maker. *)
+let test_perm_umask_and_owner () =
+  with_env ~user:alice ~cwd:"/home/alice" @@ fun env ->
+  Eio.Path.mkdir ~perm:0o777 (env#cwd / "d");
+  Eio.Path.save ~create:(`Exclusive 0o666) (env#cwd / "f") "x";
+  Alcotest.(check int) "directory" 0o755 (perm (env#cwd / "d"));
+  Alcotest.(check int) "file" 0o644 (perm (env#cwd / "f"));
+  let stat = Eio.Path.stat ~follow:false (env#cwd / "f") in
+  Alcotest.(check (pair int64 int64)) "owner" (1000L, 1000L) (stat.uid, stat.gid);
+  let strict = Eio_fs.Fs.as_user { alice with umask = 0o077 } env#cwd in
+  Eio.Path.save ~create:(`Exclusive 0o666) (strict / "g") "y";
+  Alcotest.(check int) "umask 0o077" 0o600 (perm (env#cwd / "g"))
+
+(* Only a file's owner changes its mode; only root gives it away. *)
+let test_perm_chmod_chown () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "root's") "x";
+  let as_alice = Eio_fs.Fs.as_user alice fs in
+  denied "chmod" (fun () ->
+      Eio.Path.chmod ~follow:false ~perm:0o666 (as_alice / "root's"));
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (fs / "root's");
+  Eio.Path.chmod ~follow:false ~perm:0o600 (as_alice / "root's");
+  denied "chown" (fun () ->
+      Eio.Path.chown ~follow:false ~uid:1001L (as_alice / "root's"));
+  Alcotest.(check int) "mode" 0o600 (perm (fs / "root's"))
+
+(* The same workload as root and as a user: a config directory under a tree
+   the user does not own. *)
+let test_perm_root_and_user_differ () =
+  let workload user =
+    with_env ~user ~cwd:"/home/alice" @@ fun env ->
+    match
+      Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (env#fs / "/etc/app");
+      Eio.Path.save ~create:(`Or_truncate 0o644) (env#fs / "/etc/app/conf") "x"
+    with
+    | () -> "saved"
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> "denied"
+  in
+  Alcotest.(check string) "root" "saved" (workload Eio_fs.root);
+  Alcotest.(check string) "a user" "denied" (workload alice)
+
+(* A copied tree keeps its modes, whatever the umask. *)
+let test_perm_load_keeps_modes () =
+  with_env @@ fun env ->
+  Eio.Path.mkdir ~perm:0o777 (env#fs / "d");
+  Eio.Path.chmod ~follow:false ~perm:0o777 (env#fs / "d");
+  Eio.Path.save ~create:(`Exclusive 0o666) (env#fs / "d/f") "x";
+  Eio.Path.chmod ~follow:false ~perm:0o666 (env#fs / "d/f");
+  let copy = Eio_fs.Fs.load (env#fs / "d") in
+  Alcotest.(check int) "directory" 0o777 (perm (copy / "d"));
+  Alcotest.(check int) "file" 0o666 (perm (copy / "d/f"))
 
 (* {2 The file offset belongs to the open file description}
 
@@ -933,4 +1075,20 @@ let suite =
       Alcotest.test_case "pwrite appends" `Quick test_pwrite_appends;
       Alcotest.test_case "crash: pwrite appends" `Quick
         test_crash_pwrite_appends;
+      Alcotest.test_case "permissions: search" `Quick test_perm_search;
+      Alcotest.test_case "permissions: directory write" `Quick
+        test_perm_dir_write;
+      Alcotest.test_case "permissions: sticky bit" `Quick test_perm_sticky;
+      Alcotest.test_case "permissions: read a directory" `Quick
+        test_perm_read_dir;
+      Alcotest.test_case "permissions: owner, group, others" `Quick
+        test_perm_open_classes;
+      Alcotest.test_case "permissions: umask and owner" `Quick
+        test_perm_umask_and_owner;
+      Alcotest.test_case "permissions: chmod and chown" `Quick
+        test_perm_chmod_chown;
+      Alcotest.test_case "permissions: root and a user differ" `Quick
+        test_perm_root_and_user_differ;
+      Alcotest.test_case "permissions: load keeps modes" `Quick
+        test_perm_load_keeps_modes;
     ] )

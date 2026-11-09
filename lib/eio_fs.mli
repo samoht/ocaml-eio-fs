@@ -125,6 +125,17 @@ module Path : sig
         before stays formatted. *)
 end
 
+type user = {
+  uid : int;  (** The user id. *)
+  gid : int;  (** The primary group id. *)
+  groups : int list;  (** The supplementary group ids. *)
+  umask : int;  (** The mode bits a new file or directory loses. *)
+}
+(** The type for the user an in-memory filesystem's operations run as. *)
+
+val root : user
+(** [root] is uid [0], gid [0], no supplementary group and umask [0o022]. *)
+
 (** An in-memory filesystem for {!Eio}.
 
     An entry's stat carries its kind, mode, size and inode, and the owner
@@ -149,12 +160,32 @@ end
     the filesystem is confined as eio_posix confines one: an absolute path, an
     absolute link target and a [".."] above that directory are refused with
     [Eio.Fs.Permission_denied], whose message names the path asked for and not
-    where the directory sits. *)
+    where the directory sits.
+
+    {b Permissions.} Each operation runs as a {!type-user} and meets the POSIX
+    rules: search ([x]) on every directory a path walks; write and search on the
+    directory where an entry is made, removed or renamed, with the sticky bit
+    keeping removal and renaming to the entry's or the directory's owner; read
+    on a directory to list it; read, or read and write, on a file to open it. A
+    new file or directory loses the user's umask bits and belongs to the user's
+    uid and gid. Only a file's owner changes its mode, and only root gives a
+    file away. Root needs no bit to read, write or search, as on Linux, so a
+    test that runs as {!root}, the default, misses the bugs a user meets: a
+    directory it cannot create in, a file it cannot open. *)
 module Fs : sig
-  val v : unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [v ()] is the root of a fresh, empty in-memory filesystem. Closing this
-      capability prevents further operations through its aliases. Directories
-      already opened from it keep their own lifetimes. *)
+  val v : ?user:user -> unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [v ~user ()] is the root of a fresh, empty in-memory filesystem whose
+      operations run as [user] (defaults to {!root}), who owns its root
+      directory. Closing this capability prevents further operations through its
+      aliases. Directories already opened from it keep their own lifetimes. *)
+
+  val as_user : user -> 'a Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [as_user user path] is [path], an in-memory directory, with its operations
+      run as [user]. A test sets a tree up as {!root} and runs the code under
+      test as a user. A directory opened from the result shares its descriptor
+      with [path]'s.
+
+      @raise Stdlib.Invalid_argument if [path] is not an in-memory directory. *)
 
   val load :
     ?filter:('a Eio.Path.t -> bool) ->
@@ -245,14 +276,15 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 (** The type for the standard environment {!run} passes on: an in-memory
     filesystem and current directory. *)
 
-val run : ?cwd:string -> (stdenv -> 'a) -> 'a
-(** [run ~cwd fn] calls [fn] with a new in-memory filesystem in place of the
-    host's. Unlike [Eio_main.run], it starts no event loop and installs no
+val run : ?cwd:string -> ?user:user -> (stdenv -> 'a) -> 'a
+(** [run ~cwd ~user fn] calls [fn] with a new in-memory filesystem in place of
+    the host's. Unlike [Eio_main.run], it starts no event loop and installs no
     effect handler: call it inside one, such as [Eio_main.run] or
     [Eio_mock.Backend.run]. [env] holds the root and the current directory of
     the new filesystem. The current directory is the directory at the absolute
     path [cwd] (defaults to ["/"]), made with its missing ancestors, mode
     [0o755], before [fn] runs. Like a process's, it follows that directory
-    through a rename.
+    through a rename. Both run as [user] (defaults to {!root}). Root owns the
+    tree and gives [user] the current directory.
 
     @raise Stdlib.Invalid_argument if [cwd] is not an absolute path. *)

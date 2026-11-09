@@ -46,16 +46,27 @@ module Open_flags : sig
   (** [f0 + f1] is the union of the flag sets [f0] and [f1]. *)
 end
 
+(** Who runs an operation. *)
+module User : sig
+  type t = { uid : int; gid : int; groups : int list; umask : int }
+  (** The type for users: their user and group ids, their supplementary groups
+      and the umask their new files and directories lose. *)
+
+  val root : t
+  (** [root] is uid and gid [0], no supplementary group, umask [0o022]. *)
+end
+
 type t
 (** The type for in-memory file systems: a tree and the descriptors open on it.
     Two file systems share neither. Each operation below runs whole under a lock
     of its file system, so fibers of several domains may share one. *)
 
-val v : ?cwd:string -> unit -> t
-(** [v ~cwd ()] is a new file system holding only an empty root directory, whose
-    current directory is the directory at the absolute path [cwd] (defaults to
-    ["/"]) when first used: it then follows that directory, as a descriptor
-    does. *)
+val v : ?cwd:string -> ?owner:User.t -> unit -> t
+(** [v ~cwd ~owner ()] is a new file system holding only an empty root
+    directory, whose current directory is the directory at the absolute path
+    [cwd] (defaults to ["/"]) when first used: it then follows that directory,
+    as a descriptor does. Its root directory, mode [0o755], belongs to [owner]
+    (defaults to {!User.root}). *)
 
 (** File descriptors. *)
 module Fd : sig
@@ -74,7 +85,10 @@ module Dir : sig
       full access. The other two confine a resolution below themselves: an
       absolute path or link target, and a [..] above them, are refused with
       [Eio.Fs.Permission_denied]. *)
-  type fd = Fs of t | Cwd of t | Dir_fd of Fd.t
+  type at = Fs of t | Cwd of t | Dir_fd of Fd.t
+
+  type fd = { at : at; user : User.t }
+  (** A directory and the user each operation through it runs as. *)
 end
 
 val close : Fd.t -> unit

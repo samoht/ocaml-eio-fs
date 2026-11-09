@@ -17,6 +17,15 @@
 open! Hermetic
 open Eio.Std
 
+type user = Low_level.User.t = {
+  uid : int;
+  gid : int;
+  groups : int list;
+  umask : int;
+}
+
+let root = Low_level.User.root
+
 module Nofollow = struct
   type error = [ `Invalid of string | `Too_large ]
 
@@ -259,7 +268,7 @@ module Fs = struct
     (* Descriptor state belongs to the descriptor, including switch release.
        Only descriptor-free root and cwd capabilities need their own flag. *)
     let closed t =
-      match t.fd with
+      match t.fd.at with
       | Fs _ | Cwd _ -> t.root_closed
       | Dir_fd fd -> Low_level.Fd.closed fd
 
@@ -268,7 +277,7 @@ module Fs = struct
       t.fd
 
     let close t =
-      match t.fd with
+      match t.fd.at with
       | Fs _ | Cwd _ -> t.root_closed <- true
       | Dir_fd fd -> Low_level.close fd
 
@@ -334,7 +343,10 @@ module Fs = struct
       let fd = Low_level.openat ~sw ~mode:0 (fd t) path flags in
       let label = last_component path in
       let full_path = Eio_fs_path.append t.dir_path path in
-      let d = v ~label ~path:full_path (Low_level.Dir.Dir_fd fd) in
+      let d =
+        v ~label ~path:full_path
+          { at = Low_level.Dir.Dir_fd fd; user = t.fd.user }
+      in
       (* The upcast drops the barrier tag from the static row to fit
          [Pi.DIR]; the operation itself stays probeable on the resource. *)
       (Eio.Resource.T (d, Handler.v) :> [ `Close | `Dir ] Eio.Resource.t)
@@ -381,17 +393,27 @@ module Fs = struct
         ]
   end
 
-  (* Full access to the file system [t]. *)
-  let fs t =
-    (Eio.Resource.T (Dir.v ~label:"fs" ~path:"." (Fs t), Handler.v)
+  let dir ~label ~path fd =
+    (Eio.Resource.T (Dir.v ~label ~path fd, Handler.v)
       :> [ `Close | Eio.Fs.dir_ty ] Eio.Resource.t)
+
+  (* Full access to the file system [t]. *)
+  let fs ?(user = Low_level.User.root) t =
+    dir ~label:"fs" ~path:"." { at = Fs t; user }
 
   (* Access confined to the current directory of [t]. *)
-  let cwd t =
-    (Eio.Resource.T (Dir.v ~label:"cwd" ~path:"." (Cwd t), Handler.v)
-      :> [ `Close | Eio.Fs.dir_ty ] Eio.Resource.t)
+  let cwd ?(user = Low_level.User.root) t =
+    dir ~label:"cwd" ~path:"." { at = Cwd t; user }
 
-  let v () = (fs (Low_level.v ()), "/")
+  let v ?(user = Low_level.User.root) () =
+    (fs ~user (Low_level.v ~owner:user ()), "/")
+
+  let as_user user ((d, path) : _ Eio.Path.t) =
+    match as_memfs_dir d with
+    | None -> invalid_arg "Eio_fs.Fs.as_user: not an in-memory directory"
+    | Some fd ->
+        let label = Fmt.str "%a" Eio.Path.pp (d, "") in
+        (dir ~label ~path:"." { fd with user }, path)
 
   (* The root is followed and must be a directory; the filter is asked about
      it before anything is made, and every entry below it is copied as it is,
@@ -403,6 +425,11 @@ module Fs = struct
     let t = Low_level.v () in
     let fs = fs t in
     let switch_filesystem (_, path) = (fs, path) in
+    (* The copy keeps each mode, which the umask narrowed. *)
+    let keep_mode stat v =
+      Eio.Path.chmod ~follow:false ~perm:stat.Eio.File.Stat.perm
+        (switch_filesystem v)
+    in
     let rec make_fs v =
       let stat = Eio.Path.stat ~follow:false v in
       match stat.kind with
@@ -418,15 +445,16 @@ module Fs = struct
               Fmt.kstr Low_level.Error.err "%a changed while it was copied"
                 Eio.Path.pp v;
             Eio.Path.with_open_out ~create:(`If_missing stat.perm)
-              (switch_filesystem v)
-            @@ fun o -> Eio.Flow.copy i o
+              (switch_filesystem v) (fun o -> Eio.Flow.copy i o);
+            keep_mode stat v
       | `Directory ->
           if filter v then begin
             Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm
               (switch_filesystem v);
             List.iter
               (fun fname -> make_fs Eio.Path.(v / fname))
-              (Eio.Path.read_dir v)
+              (Eio.Path.read_dir v);
+            keep_mode stat v
           end
       | `Symbolic_link ->
           if not (filter v) then ()
@@ -439,7 +467,8 @@ module Fs = struct
       Eio.Path.mkdirs ~exists_ok:true ~perm:stat.perm (fs, snd path);
       List.iter
         (fun name -> make_fs Eio.Path.(path / name))
-        (Eio.Path.read_dir path)
+        (Eio.Path.read_dir path);
+      keep_mode stat path
     end;
     (fs, "/")
 end
@@ -496,7 +525,9 @@ module Crunch = struct
             if path <> "/" then Eio.Path.mkdirs ~exists_ok:true ~perm (mem path);
             Eio.Path.chmod ~follow:false ~perm (mem path)
         | File { path; perm; contents } ->
-            Low_level.embed (Low_level.Dir.Fs t) ~perm path ~contents
+            Low_level.embed
+              { at = Low_level.Dir.Fs t; user = Low_level.User.root }
+              ~perm path ~contents
         | Symlink { path; target } ->
             Eio.Path.symlink ~link_to:target (mem path))
       entries;
@@ -534,13 +565,20 @@ module Chaos = Chaos
 
 type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 
-let run ?(cwd = "/") fn =
+(* Root owns the tree and makes the current directory, which it gives to
+   [user]. *)
+let run ?(cwd = "/") ?(user = root) fn =
   if not (Eio_fs_path.is_abs cwd) then
     Fmt.invalid_arg "Eio_fs.run: the cwd %S is not an absolute path" cwd;
   let t = Low_level.v ~cwd () in
-  let fs = (Eio.Path.of_dir (Fs.fs t) :> Eio.Fs.dir_ty Eio.Path.t) in
-  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 Eio.Path.(fs / cwd);
-  let cwd = (Eio.Path.of_dir (Fs.cwd t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  let admin = (Eio.Path.of_dir (Fs.fs t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 Eio.Path.(admin / cwd);
+  if user.uid <> 0 then
+    Eio.Path.chown ~follow:true ~uid:(Int64.of_int user.uid)
+      ~gid:(Int64.of_int user.gid)
+      Eio.Path.(admin / cwd);
+  let fs = (Eio.Path.of_dir (Fs.fs ~user t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  let cwd = (Eio.Path.of_dir (Fs.cwd ~user t) :> Eio.Fs.dir_ty Eio.Path.t) in
   (* Resolve the current directory now: it then follows its directory. *)
   ignore (Eio.Path.stat ~follow:true cwd : Eio.File.Stat.t);
   fn

@@ -72,6 +72,34 @@ module Error = struct
   let not_a_directory path = err ("not a directory: " ^ path)
 end
 
+(* Who runs an operation, and the POSIX permission rules it meets. *)
+module User = struct
+  type t = { uid : int; gid : int; groups : int list; umask : int }
+
+  let root = { uid = 0; gid = 0; groups = []; umask = 0o022 }
+  let r = 0o4
+  let w = 0o2
+  let x = 0o1
+  let id i = Int64.of_int i
+  let owns u (stat : Eio.File.Stat.t) = u.uid = 0 || stat.uid = id u.uid
+
+  (* [u] may [want] on [stat] by its owner's, group's or others' bits. Root
+     needs no bit to read, write or search a directory, and one x bit to
+     execute a file, as on Linux. *)
+  let can u (stat : Eio.File.Stat.t) want =
+    if u.uid = 0 then
+      want land x = 0 || stat.kind = `Directory || stat.perm land 0o111 <> 0
+    else
+      let in_group g = stat.gid = id g in
+      let bits =
+        if stat.uid = id u.uid then stat.perm lsr 6
+        else if in_group u.gid || List.exists in_group u.groups then
+          stat.perm lsr 3
+        else stat.perm
+      in
+      bits land want = want
+end
+
 (* The number a descriptor table hands out. *)
 module Num : sig
   type t = private int
@@ -259,9 +287,10 @@ module Fd = struct
 end
 
 module Dir = struct
-  type fd = Fs of fs | Cwd of fs | Dir_fd of Fd.t
+  type at = Fs of fs | Cwd of fs | Dir_fd of Fd.t
+  type fd = { at : at; user : User.t }
 
-  let fs = function Fs fs | Cwd fs -> fs | Dir_fd fd -> fd.fs
+  let fs t = match t.at with Fs fs | Cwd fs -> fs | Dir_fd fd -> fd.fs
 end
 
 (* Each operation runs whole under its file system's lock and never yields
@@ -294,13 +323,16 @@ let default_stat =
       blocks = 0L;
     }
 
-let new_stat fs ?kind ?perm () =
+(* A new entry is owned by the user who makes it. *)
+let new_stat fs ~(user : User.t) ?kind ?perm () =
   fs.last_ino <- Int64.succ fs.last_ino;
   {
     default_stat with
     ino = fs.last_ino;
     kind = Option.value ~default:default_stat.kind kind;
     perm = Option.value ~default:default_stat.perm perm;
+    uid = User.id user.uid;
+    gid = User.id user.gid;
   }
 
 module Filesystem = struct
@@ -308,7 +340,7 @@ module Filesystem = struct
 
   (* A function, not a value: the root is a [ref] mutated in place as entries
      are added, so each empty filesystem needs its own fresh root ref. *)
-  let empty () : t =
+  let empty ~(owner : User.t) () : t =
     let root =
       Resource.Dir
         {
@@ -318,6 +350,9 @@ module Filesystem = struct
               size = Optint.Int63.of_int 4096;
               ino = 0L;
               kind = `Directory;
+              perm = 0o755;
+              uid = User.id owner.uid;
+              gid = User.id owner.gid;
             };
           entries = [ (0L, "."); (0L, "..") ];
         }
@@ -365,6 +400,7 @@ module Filesystem = struct
      its parent, the root being its own. *)
   type walk = {
     tree : t;
+    user : User.t;
     base : Inode.t option;
     follows : int ref;
     dirs : resource ref list;
@@ -398,9 +434,15 @@ module Filesystem = struct
       | Some _ -> Error.absolute_path ()
       | None -> { w with dirs = [ root w.tree ] }
 
+  (* A lookup in a directory needs its search (x) bit: EACCES. *)
+  let search w name =
+    if not (User.can w.user (Resource.stat !(here w)) User.x) then
+      Error.permission_denied name
+
   (* The entry [name] names in the directory [w] is in, [.] and [..] included,
      or [None]. *)
   let child w name =
+    search w name;
     match name with
     | "." -> Some (here w)
     | ".." -> Some (here (up w []))
@@ -421,7 +463,9 @@ module Filesystem = struct
   let rec walk ?(after = []) w = function
     | [] -> w
     | "." :: rest -> walk ~after w rest
-    | ".." :: rest -> walk ~after (up w (rest @ after)) rest
+    | ".." :: rest ->
+        search w "..";
+        walk ~after (up w (rest @ after)) rest
     | name :: rest -> walk ~after (into w name) rest
 
   and into w name =
@@ -485,7 +529,13 @@ module Filesystem = struct
     let fs = Dir.fs dir_fd in
     let tree = fs.tree in
     let at_root =
-      { tree; base = None; follows = ref max_follows; dirs = [ root tree ] }
+      {
+        tree;
+        user = dir_fd.Dir.user;
+        base = None;
+        follows = ref max_follows;
+        dirs = [ root tree ];
+      }
     in
     let cwd () =
       let r =
@@ -498,7 +548,7 @@ module Filesystem = struct
       in
       { at_root with dirs = [ r ] }
     in
-    match dir_fd with
+    match dir_fd.Dir.at with
     | Dir.Fs _ when Eio_fs_path.is_abs path -> at_root
     | Dir.Fs _ -> cwd ()
     | Dir.Cwd _ ->
@@ -515,9 +565,9 @@ module Filesystem = struct
     final ~follow w name ~slash
 end
 
-let v ?(cwd = "/") () =
+let v ?(cwd = "/") ?(owner = User.root) () =
   {
-    tree = Filesystem.empty ();
+    tree = Filesystem.empty ~owner ();
     fds = Fd_table.empty;
     last_ino = 0L;
     cwd;
@@ -538,15 +588,32 @@ let close (fd : Fd.t) =
 (* open(2): opening an existing file requires the permission bits the access
    mode asks for; the mode given at creation does not restrict the creating
    open itself. This backend opens files O_RDONLY or O_RDWR, so the read bit
-   is always required and the write bit with o_rdwr. The model is
-   single-user, so the owner bits are the ones consulted. Directories are
-   exempt: fixtures predate recorded directory modes. *)
-let check_access path flags r =
-  let need = if Open_flags.(mem o_rdwr flags) then 0o600 else 0o400 in
+   is always required and the write bit with o_rdwr. A directory opened to be
+   read is listed by [read_dir], which checks its read bit. *)
+let check_access ~user path flags r =
+  let want = if Open_flags.(mem o_rdwr flags) then User.(r lor w) else User.r in
   match !r with
-  | Resource.File f when f.stat.perm land need <> need ->
+  | Resource.File f when not (User.can user f.stat want) ->
       Error.permission_denied path
   | _ -> ()
+
+(* Making or removing an entry needs write and search on its directory. *)
+let check_dir_write ~user rdir path =
+  if not (User.can user (Resource.stat !rdir) User.(w lor x)) then
+    Error.permission_denied path
+
+(* In a sticky directory only the entry's or the directory's owner removes or
+   renames an entry: EPERM. *)
+let check_sticky ~user rdir victim path =
+  let dir = Resource.stat !rdir in
+  if
+    dir.perm land 0o1000 <> 0
+    && (not (User.owns user (Resource.stat !victim)))
+    && not (User.owns user dir)
+  then Error.permission_denied path
+
+(* The mode of a new file or directory: [perm] without the umask's bits. *)
+let masked ~(user : User.t) perm = perm land 0o7777 land lnot user.umask
 
 (* A directory removed while a handle held it takes no new entry: ENOENT. *)
 let check_live fs rdir path =
@@ -568,6 +635,7 @@ let new_entry ?(dir = false) dir_fd path add =
   | None when slash && not dir -> Error.not_found path
   | None ->
       check_live (Dir.fs dir_fd) (Filesystem.here w) path;
+      check_dir_write ~user:dir_fd.user (Filesystem.here w) path;
       add (Filesystem.here w) name
 
 (* Create [name] in the directory [w] is in, register the new file in the
@@ -578,8 +646,9 @@ let new_file ~mode fs (w : Filesystem.walk) name ~slash =
   if slash then Error.not_found name;
   let rdir = Filesystem.here w in
   check_live fs rdir name;
+  check_dir_write ~user:w.user rdir name;
   let dir = as_dir ~path:name !rdir in
-  let stat = new_stat fs ~perm:(mode land 0o7777) () in
+  let stat = new_stat fs ~user:w.user ~perm:(masked ~user:w.user mode) () in
   let f = File.v ~stat in
   let dir = { dir with entries = (f.stat.ino, name) :: dir.entries } in
   rdir := Resource.Dir dir;
@@ -606,7 +675,7 @@ let open_locked ~mode dir_fd path flags =
     (* O_DIRECTORY on anything else: ENOTDIR. *)
     | _ when directory -> Error.err ("open: not a directory: " ^ path)
     | _ -> ());
-    check_access path flags r;
+    check_access ~user:dir_fd.user path flags r;
     if truncate then truncate_file r;
     r
   in
@@ -660,17 +729,30 @@ let statat ~follow dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   Resource.stat !(Filesystem.lookup ~follow dir_fd path)
 
+(* chmod(2): only the owner or root: EPERM. *)
 let chmod ~follow dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let r = Filesystem.lookup ~follow dir_fd path in
+  if not (User.owns dir_fd.user (Resource.stat !r)) then
+    Error.permission_denied path;
   r := Resource.set_stat !r { (Resource.stat !r) with perm }
 
+(* chown(2): root gives a file to anyone; its owner only moves it to a group
+   of their own. EPERM otherwise. *)
 let chown ~follow ?uid ?gid dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let r = Filesystem.lookup ~follow dir_fd path in
   let s = Resource.stat !r in
   let uid = Option.value ~default:s.uid uid in
   let gid = Option.value ~default:s.gid gid in
+  let (user : User.t) = dir_fd.user in
+  let mine g =
+    g = User.id user.gid || List.exists (fun g' -> g = User.id g') user.groups
+  in
+  if
+    user.uid <> 0
+    && not (User.owns user s && uid = s.uid && (gid = s.gid || mine gid))
+  then Error.permission_denied path;
   r := Resource.set_stat !r { s with uid; gid }
 
 (* The directory [w] is in, without its entry [name]. The entry's inode leaves
@@ -695,13 +777,20 @@ let unlink dir_fd path =
   | Some { contents = Resource.Dir _ } -> is_a_directory ()
   (* A trailing slash on anything else, a link to a directory included. *)
   | Some _ when slash -> Error.not_a_directory path
-  | Some _ -> remove_entry (Dir.fs dir_fd) w name
+  | Some victim ->
+      let rdir = Filesystem.here w in
+      check_dir_write ~user:dir_fd.user rdir path;
+      check_sticky ~user:dir_fd.user rdir victim path;
+      remove_entry (Dir.fs dir_fd) w name
 
 let mkdirat dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let fs = Dir.fs dir_fd in
   let mkdir r name =
-    let new_stat = new_stat fs ~kind:`Directory ~perm () in
+    let user = dir_fd.Dir.user in
+    let new_stat =
+      new_stat fs ~user ~kind:`Directory ~perm:(masked ~user perm) ()
+    in
     let d = as_dir ~path !r in
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
@@ -717,7 +806,7 @@ let embed dir_fd ~perm path ~contents =
   let add r name =
     let stat =
       {
-        (new_stat fs ~perm:(perm land 0o7777) ()) with
+        (new_stat fs ~user:dir_fd.Dir.user ~perm:(perm land 0o7777) ()) with
         size = Optint.Int63.of_int (String.length contents);
       }
     in
@@ -734,7 +823,7 @@ let symlinkat ~link_to dir_fd path =
   let symlink r name =
     let new_stat =
       {
-        (new_stat fs ~kind:`Symbolic_link ~perm:0o644 ()) with
+        (new_stat fs ~user:dir_fd.Dir.user ~kind:`Symbolic_link ~perm:0o644 ()) with
         size = Optint.Int63.of_int (String.length link_to);
       }
     in
@@ -753,9 +842,18 @@ let read_link dir_fd path =
   | Symlink s -> s.link_to
   | _ -> Error.err ("not a symbolic link: " ^ path)
 
+(* Listing a directory needs its read bit: EACCES. *)
+let check_read ~user path r =
+  match !r with
+  | Resource.Dir d when not (User.can user d.stat User.r) ->
+      Error.permission_denied path
+  | _ -> ()
+
 let read_dir dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  match !(Filesystem.lookup ~follow:true dir_fd path) with
+  let r = Filesystem.lookup ~follow:true dir_fd path in
+  check_read ~user:dir_fd.user path r;
+  match !r with
   | Resource.Dir dir ->
       List.map snd dir.entries
       |> List.filter (function "." | ".." -> false | _ -> true)
@@ -763,7 +861,9 @@ let read_dir dir_fd path =
 
 let read_dir_entries dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  match !(Filesystem.lookup ~follow:true dir_fd path) with
+  let r = Filesystem.lookup ~follow:true dir_fd path in
+  check_read ~user:dir_fd.user path r;
+  match !r with
   | Resource.Dir dir ->
       dir.entries
       |> List.filter (fun (_, name) -> name <> "." && name <> "..")
@@ -786,7 +886,10 @@ let rmdir dir_fd path =
   (* A final symbolic link is not followed: ENOTDIR. *)
   match Filesystem.child w name with
   | None -> Error.not_found path
-  | Some { contents = Resource.Dir d } ->
+  | Some ({ contents = Resource.Dir d } as victim) ->
+      let rdir = Filesystem.here w in
+      check_dir_write ~user:dir_fd.user rdir path;
+      check_sticky ~user:dir_fd.user rdir victim path;
       if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
       else remove_entry (Dir.fs dir_fd) w name
   | Some _ -> Error.err ("rmdir: not a directory: " ^ path)
@@ -890,6 +993,11 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
         Option.bind existing (fun (dst_ino, _) -> Entries.find_opt dst_ino tree)
       in
       check_rename tree ~src:old_res ~new_parent ~dst new_path;
+      let user = dir_fd.user in
+      check_dir_write ~user old_parent old_path;
+      check_sticky ~user old_parent old_res old_path;
+      check_dir_write ~user new_parent new_path;
+      Option.iter (fun dst -> check_sticky ~user new_parent dst new_path) dst;
       move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
       reparent old_res ~new_parent;

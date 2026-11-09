@@ -1112,12 +1112,16 @@ module Crash = struct
         B.chmod bv ~follow:true ~perm path
     | Link target -> B.symlink ~link_to:target bv path
     | Dir { perm; entries } ->
-        if not (String.equal path "") then B.mkdir bv ~perm path;
+        (* Writable while it fills; the mode, which the umask also
+           narrows, is set after. *)
+        if not (String.equal path "") then
+          B.mkdir bv ~perm:(perm lor 0o700) path;
         List.iter
           (fun (name, child) ->
             let child_path = Eio_fs_path.append path name in
             restore_at owner child_path child)
-          entries
+          entries;
+        if not (String.equal path "") then B.chmod bv ~follow:false ~perm path
 
   let restore_root (Base_dir ((module B), bv) as owner) path = function
     | Dir { perm; entries } ->
