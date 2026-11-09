@@ -186,9 +186,7 @@ let test_write_directory_fd () =
           : int))
 
 (* open(2) with O_CREAT answers ENOTDIR when a component of the path prefix is
-   not a directory. This backend already reports a walk through a regular file
-   as a path that does not resolve; creating under one must agree instead of
-   escaping the error model. *)
+   not a directory. *)
 let test_create_under_regular_file () =
   with_env @@ fun env ->
   Eio.Path.save ~create:(`Or_truncate 0o600) (env#fs / "reg") "x";
@@ -211,23 +209,36 @@ let test_create_directory_syntax () =
         (Eio.Path.kind ~follow:false (env#fs / "x") = `Not_found))
     [ "x/"; "x/." ]
 
-(* ENOTDIR is an error of the filesystem's own model, not a caller mistake:
-   with a regular file in the tree, every directory operation that walks
-   through it must answer through [Eio.Io], not an [Invalid_argument] this
-   backend alone raises. The five below are one operation set and must agree,
-   so [Not_found] is pinned for all five. *)
+(* ENOTDIR, which Eio.Fs has no constructor for: an [Eio.Io] that is not
+   [Not_found], so a [~missing_ok] does not swallow it, as on eio_posix. *)
+let expect_enotdir what fn =
+  match fn () with
+  | _ -> Alcotest.failf "%s: expected ENOTDIR" what
+  | exception Eio.Io (Eio.Exn.X _, _) -> ()
+  | exception Eio.Io (Eio.Fs.E e, _) ->
+      Alcotest.failf "%s: expected ENOTDIR, got %a" what Eio.Exn.pp_err
+        (Eio.Fs.E e)
+
 let test_dir_ops_under_regular_file () =
   with_env @@ fun env ->
   let fs = env#fs in
   Eio.Path.save ~create:(`Or_truncate 0o600) (fs / "reg") "x";
-  expect_io_error "not found" (fun () ->
-      Eio.Path.mkdir ~perm:0o755 (fs / "reg" / "sub"));
-  expect_io_error "not found" (fun () -> Eio.Path.unlink (fs / "reg" / "child"));
-  expect_io_error "not found" (fun () ->
-      Eio.Path.symlink ~link_to:"t" (fs / "reg" / "l"));
-  expect_io_error "not found" (fun () -> Eio.Path.rmdir (fs / "reg" / "sub"));
-  expect_io_error "not found" (fun () ->
-      ignore (Eio.Path.read_dir (fs / "reg" / "sub") : string list))
+  let under = fs / "reg" / "sub" in
+  expect_enotdir "mkdir" (fun () -> Eio.Path.mkdir ~perm:0o755 under);
+  expect_enotdir "unlink" (fun () -> Eio.Path.unlink under);
+  expect_enotdir "unlink ~missing_ok" (fun () ->
+      Eio.Path.unlink ~missing_ok:true under);
+  expect_enotdir "rmtree ~missing_ok" (fun () ->
+      Eio.Path.rmtree ~missing_ok:true under);
+  expect_enotdir "symlink" (fun () -> Eio.Path.symlink ~link_to:"t" under);
+  expect_enotdir "rmdir" (fun () -> Eio.Path.rmdir under);
+  expect_enotdir "read_dir" (fun () -> Eio.Path.read_dir under);
+  expect_enotdir "kind" (fun () -> Eio.Path.kind ~follow:true under);
+  expect_enotdir "stat" (fun () -> Eio.Path.stat ~follow:false under);
+  expect_enotdir "load" (fun () -> Eio.Path.load under);
+  expect_enotdir "read_link" (fun () -> Eio.Path.read_link under);
+  expect_enotdir "mkdirs ~exists_ok" (fun () ->
+      Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 (under / "deeper"))
 
 (* {2 The file offset belongs to the open file description}
 

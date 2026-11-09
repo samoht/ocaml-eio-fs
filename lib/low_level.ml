@@ -67,6 +67,10 @@ module Error = struct
   let err ctx =
     let exn = Eio.Exn.create (Eio.Exn.X (Eio_fs ctx)) in
     raise exn
+
+  (* ENOTDIR, which Eio.Fs has no constructor for and eio_posix raises as a
+     bare [Eio.Io]: never [Not_found], which a [~missing_ok] would swallow. *)
+  let not_a_directory path = err ("not a directory: " ^ path)
 end
 
 (* The number a descriptor table hands out. *)
@@ -156,12 +160,10 @@ end
 
 type resource = Resource.t
 
-(* A component that had to be a directory and is not: POSIX answers ENOTDIR,
-   which every real Eio backend surfaces as an [Eio.Io]. Eio.Fs has no ENOTDIR
-   constructor, so report the path does not resolve. *)
+(* A component that had to be a directory and is not: ENOTDIR. *)
 let as_dir ~path = function
   | Resource.Dir dir -> dir
-  | _ -> Error.not_found path
+  | _ -> Error.not_a_directory path
 
 let truncate_file r =
   match !r with
@@ -387,8 +389,7 @@ module Filesystem = struct
             follow_link w.follows;
             let target = link_target name s in
             walk (enter w target) (names target)
-        (* ENOTDIR, which Eio.Fs has no constructor for. *)
-        | File _ -> Error.not_found name)
+        | File _ -> Error.not_a_directory name)
 
   (* [locate w path] is the walk into the directory holding [path]'s last
      component, that component (["."] when [path] has none) and whether
@@ -421,7 +422,7 @@ module Filesystem = struct
         let w, name, slash' = locate w (link_target name s) in
         final ~follow:true w name ~slash:(slash || slash')
     | Resource.Dir _ -> r
-    | _ when slash -> Error.not_found name
+    | _ when slash -> Error.not_a_directory name
     | _ -> r
 
   (* Where [path] given to [dir_fd] starts. Full access resolves a relative
