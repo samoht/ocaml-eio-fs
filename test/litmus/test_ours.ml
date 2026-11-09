@@ -274,11 +274,6 @@ let truncate_grow =
       (both [ [ ("f", File "AAAA") ]; [ ("f", File ("AAAA" ^ zeros 8188)) ] ])
     ~envelope:
       (both [ [ ("f", File "AAAA") ]; [ ("f", File ("AAAA" ^ zeros 8188)) ] ])
-      (* CONFIRMED: a length of 4096, which neither the file nor the
-         truncation ever had. Reorder_unsynced draws a block boundary between
-         the shortest and longest length a change left, which models the
-         writeback of a multi-block write, for a truncation too. *)
-    ~impossible:(both [ [ ("f", File ("AAAA" ^ zeros 4092)) ] ])
 
 (* {1 rename across directories} *)
 

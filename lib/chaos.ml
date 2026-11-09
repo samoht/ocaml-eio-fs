@@ -1490,21 +1490,27 @@ module Crash = struct
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
-     left, or a block boundary between the shortest and longest of those. A
-     block is never torn, and a later change never lands in a block without
+     left, or a block boundary a write grew the file across, as writeback
+     lands a long append block by block. A truncation changes the length in
+     one step. A block is never torn, and a later change never lands in a block without
      the earlier ones. *)
   let writeback ~rng ~bs durable changes =
     let changes = Array.of_list changes in
     let n = Array.length changes in
     let sizes = Array.make (n + 1) (Cstruct.length durable) in
     let versions = Hashtbl.create 16 in
+    let boundaries = ref [] in
     for k = 0 to n - 1 do
       let prev = sizes.(k) in
       let lo, hi =
         match changes.(k) with
         | Write { offset; data } ->
             let len = Cstruct.length data in
-            sizes.(k + 1) <- max prev (offset + len);
+            let size = max prev (offset + len) in
+            sizes.(k + 1) <- size;
+            for b = (prev / bs) + 1 to (size - 1) / bs do
+              boundaries := (b * bs) :: !boundaries
+            done;
             (offset, offset + len)
         | Resize m when m < prev ->
             (* A shrink rewrites only the block cut at its new end; the blocks
@@ -1535,12 +1541,10 @@ module Crash = struct
         if v > 0 then Hashtbl.replace chosen b v)
       blocks;
     let size =
-      let lo = Array.fold_left min max_int sizes in
-      let hi = Array.fold_left max 0 sizes in
-      let first = (lo / bs) + 1 and last = (hi - 1) / bs in
-      if Random.State.bool rng || last < first then
+      let boundaries = List.sort_uniq Int.compare !boundaries in
+      if Random.State.bool rng || boundaries = [] then
         sizes.(Random.State.int rng (n + 1))
-      else (first + Random.State.int rng (last - first + 1)) * bs
+      else List.nth boundaries (Random.State.int rng (List.length boundaries))
     in
     (* Replay once, taking each chosen block as it stood after its change. *)
     let at = Hashtbl.create 16 in
