@@ -1382,20 +1382,25 @@ let probe_opened ~name path =
   Eio.Switch.run @@ fun sw ->
   check_lock_name ~name path;
   let file = Eio.Path.open_in ~sw path in
-  let opened = Eio.File.stat file in
-  match named_kind path with
-  | None ->
-      raise
-        (Eio.Fs.err
-           (Eio.Fs.Not_found (Eio_unix.Unix_error (Unix.ENOENT, "stat", name))))
-  | Some named
-    when is_regular opened.kind && is_regular named.kind
-         && (Int64.compare opened.dev named.dev <> 0
-            || Int64.compare opened.ino named.ino <> 0) ->
-      `Renamed
-  | Some named ->
-      check_same_file ~name ~opened named;
-      `Answer (probe_file ~name file opened)
+  (* virtiofs and FUSE answer ENOENT to an fstat of a file replaced since the
+     open. *)
+  match Eio.File.stat file with
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> `Renamed
+  | opened -> (
+      match named_kind path with
+      | None ->
+          raise
+            (Eio.Fs.err
+               (Eio.Fs.Not_found
+                  (Eio_unix.Unix_error (Unix.ENOENT, "stat", name))))
+      | Some named
+        when is_regular opened.kind && is_regular named.kind
+             && (Int64.compare opened.dev named.dev <> 0
+                || Int64.compare opened.ino named.ino <> 0) ->
+          `Renamed
+      | Some named ->
+          check_same_file ~name ~opened named;
+          `Answer (probe_file ~name file opened))
 
 (* The probes a name given to new files over and over may take before it is
    refused: each needs the name to be given to another file while the probe
