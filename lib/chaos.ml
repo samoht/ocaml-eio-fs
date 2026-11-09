@@ -365,7 +365,8 @@ let close_resource r =
    The base file stays reachable through [Eio_fs_internal.Base_file] alone,
    which no library outside this package can name: eio-fs.unix takes the
    host descriptor a record lock is taken on from it. *)
-let rw_boxed (type s) (module X : Eio.File.Pi.WRITE with type t = s) (state : s)
+let rw_boxed (type s) ?(extra = [])
+    (module X : Eio.File.Pi.WRITE with type t = s) (state : s)
     ~(base : Eio.File.rw_ty r) : Eio.File.rw_ty r =
   Eio.Resource.T
     ( state,
@@ -375,7 +376,16 @@ let rw_boxed (type s) (module X : Eio.File.Pi.WRITE with type t = s) (state : s)
             Eio.Resource.H (Eio_fs_sync.File_sync, X.sync);
             Eio.Resource.H
               (Eio_fs_internal.Base_file, fun _ -> (base :> Eio.File.ro_ty r));
-          ]) )
+          ]
+        @ extra) )
+
+(* A sync the wrapper failed on purpose, told to the file beneath it, so a
+   power-loss model there loses what that sync would have written. *)
+type (_, _, _) Eio.Resource.pi +=
+  | Sync_failed : ('t, 't -> unit, [> `Sync_failed ]) Eio.Resource.pi
+
+let sync_failed (Eio.Resource.T (v, ops)) =
+  match Eio.Resource.get_opt ops Sync_failed with Some f -> f v | None -> ()
 
 (* {2 File wrappers} *)
 
@@ -453,7 +463,9 @@ let do_pwrite sched path (base : Eio.File.rw_ty r) ~file_offset bufs =
 
 let do_sync sched path (base : Eio.File.rw_ty r) =
   match Schedule.next sched (Op.sync path) with
-  | Some (Fault.Sync_error c) -> raise_io c path
+  | Some (Fault.Sync_error c) ->
+      sync_failed base;
+      raise_io c path
   | _ -> Eio.File.sync base
 
 let do_stat sched path (base : Eio.File.ro_ty r) =
@@ -501,7 +513,9 @@ let sync_base (Eio.Resource.T (v, ops) as base) =
 
 let sync_ro t =
   match Schedule.next t.sched (Op.sync t.path) with
-  | Some (Fault.Sync_error c) -> raise_io c t.path
+  | Some (Fault.Sync_error c) ->
+      sync_failed t.ro;
+      raise_io c t.path
   | _ -> sync_base t.ro
 
 let ro_handler =
@@ -1551,6 +1565,28 @@ module Crash = struct
   }
 
   let guard cf = if cf.ctl.crashed then raise_power_lost ()
+
+  (* fsyncgate: a failed fsync(2) marks the file's dirty pages clean without
+     writing them, so they are lost whatever a later sync reports. *)
+  let lose ctl fs = ctl.log <- List.filter (fun e -> not (e.efs == fs)) ctl.log
+
+  (* A barrier makes the file's pending changes durable, replayed over its
+     durable bytes: a change lost to a failed barrier, or made around the
+     wrapper, never becomes durable. *)
+  let barrier ctl fs sync =
+    match sync () with
+    | () ->
+        let pending = List.rev (List.filter (fun e -> e.efs == fs) ctl.log) in
+        fs.durable <-
+          List.fold_left
+            (fun b e -> apply b e.change)
+            (copy_cs fs.durable) pending;
+        lose ctl fs;
+        bump ctl fs ~kind:`Sync ~offset:0 ~len:0
+    | exception (Eio.Io _ as e) ->
+        lose ctl fs;
+        raise e
+
   let fstate_of cf = match cf.cfs with Some fs -> fs | None -> assert false
   let writable cf = match cf.crw with Some rw -> rw | None -> assert false
 
@@ -1582,10 +1618,7 @@ module Crash = struct
     guard cf;
     match fs with
     | None -> ()
-    | Some fs ->
-        fs.durable <- read_all cf.cro;
-        cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
-        bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
+    | Some fs -> barrier cf.ctl fs (fun () -> sync_base cf.cro)
 
   (* A directory opened as a file syncs as that directory's barrier. *)
   let wrap_cfile_ro ?fs ?dir ctl base : Eio.File.ro_ty r =
@@ -1603,7 +1636,11 @@ module Crash = struct
       ( cf,
         Eio.Resource.handler
           (Eio.Resource.bindings (Eio.File.Pi.ro (module Cro_impl))
-          @ [ Eio.Resource.H (Eio_fs_sync.File_sync, sync) ]) )
+          @ [
+              Eio.Resource.H (Eio_fs_sync.File_sync, sync);
+              Eio.Resource.H
+                (Sync_failed, fun cf -> Option.iter (lose cf.ctl) fs);
+            ]) )
 
   module Crw_impl = struct
     type t = cfile
@@ -1653,10 +1690,7 @@ module Crash = struct
     let sync cf =
       guard cf;
       let fs = fstate_of cf in
-      Eio.File.sync (writable cf);
-      fs.durable <- read_all cf.cro;
-      cf.ctl.log <- List.filter (fun e -> not (e.efs == fs)) cf.ctl.log;
-      bump cf.ctl fs ~kind:`Sync ~offset:0 ~len:0
+      barrier cf.ctl fs (fun () -> Eio.File.sync (writable cf))
 
     let truncate cf len =
       guard cf;
@@ -1677,7 +1711,10 @@ module Crash = struct
         cpos = ref 0;
       }
     in
-    rw_boxed (module Crw_impl) state ~base
+    rw_boxed
+      ~extra:[ Eio.Resource.H (Sync_failed, fun cf -> lose cf.ctl fs) ]
+      (module Crw_impl)
+      state ~base
 
   (* [dplace] is where this directory sits under the boxed directory the
      controller was wrapped over: tracked files are addressed through that

@@ -1928,6 +1928,59 @@ let test_crash_rename_destination_barrier () =
   Alcotest.(check string) "b/f" "data" (Eio.Path.load (post / "b" / "f"));
   Alcotest.(check bool) "a/f" true (absent (post / "a" / "f"))
 
+(* fsyncgate: Linux marks the pages of a failed fsync clean, so a retry that
+   succeeds does not write them. *)
+let test_crash_sync_retry_after_failure () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "f") "";
+  Eio_fs_sync.sync_dir fs;
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Sync; path = "f" };
+          fault = Sync_error `Eio;
+        };
+      ]
+  in
+  let cfs = Chaos.wrap sched fs in
+  Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "record" ];
+      (try Eio.File.sync f with Eio.Io _ -> ());
+      Eio.File.sync f;
+      Eio.File.pwrite_all f ~file_offset:(i63 6) [ Cstruct.of_string "next" ];
+      Eio.File.sync f);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the failed write is lost, the later one kept"
+    "\000\000\000\000\000\000next"
+    (Eio.Path.load (post / "f"))
+
+(* The same with the failure beneath the model. *)
+let test_crash_sync_failure_beneath () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let sched =
+    Schedule.scripted
+      [
+        {
+          trigger = Nth_op_on_path { n = 2; kind = `Sync; path = "f" };
+          fault = Sync_error `Eio;
+        };
+      ]
+  in
+  let fs = Crash.wrap ctl (Chaos.wrap sched env#fs) in
+  write_new ~sync:true (fs / "f") "";
+  Eio_fs_sync.sync_dir fs;
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "record" ];
+      (try Eio.File.sync f with Eio.Io _ -> ());
+      Eio.File.sync f);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "lost" "" (Eio.Path.load (post / "f"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2247,6 +2300,10 @@ let suite =
         test_crash_bottom_up_barriers;
       Alcotest.test_case "crash: a barrier on a rename's destination" `Quick
         test_crash_rename_destination_barrier;
+      Alcotest.test_case "crash: a sync retried after a failure" `Quick
+        test_crash_sync_retry_after_failure;
+      Alcotest.test_case "crash: a sync failure beneath the model" `Quick
+        test_crash_sync_failure_beneath;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

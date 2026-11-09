@@ -202,8 +202,14 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     Every write is tracked as un-synced until a successful {!Eio.File.sync}
     makes that file's prior writes durable. A file is known by its path with
     symbolic links, [.] and [..] resolved, so a sync through any name of it, a
-    read-only handle included, is a sync of that file. A crash rewrites the base
-    to a post-crash image in which un-synced writes may be dropped or reordered,
+    read-only handle included, is a sync of that file.
+
+    {b A failed sync loses the file's pending writes.} Linux marks their pages
+    clean without writing them, so a later sync that succeeds does not make them
+    durable. This holds for a sync failure {!Chaos.wrap} injects above the model
+    and for one the base raises beneath it. The only safe recovery is to write
+    the data again from the application's own copy. A crash rewrites the base to
+    a post-crash image in which un-synced writes may be dropped or reordered,
     which demonstrates the classic missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
