@@ -132,6 +132,9 @@ end
     count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
     {!Path.val-usage} counts no allocated bytes, and [nlink] is [0].
 
+    A file's bytes live in memory, holes included, and a file holds at most 4
+    GiB: a write or a truncation past that raises {!Eio.Fs.File_too_large}.
+
     Where POSIX systems differ, it answers as Linux does: {!Eio.Path.unlink} of
     a directory raises the error EISDIR names, not [Permission_denied]. Its
     paths have no native spelling ({!Eio.Path.native} is [None]), and an

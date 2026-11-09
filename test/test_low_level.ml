@@ -279,6 +279,30 @@ let test_many_small_writes () =
     "size" (16384 * 1024)
     (Optint.Int63.to_int (Eio.Path.stat ~follow:false (env#fs / "big")).size)
 
+(* EFBIG past the size cap, never an allocation failure or an overflow. *)
+let test_file_too_large () =
+  with_env @@ fun env ->
+  let too_large what fn =
+    match fn () with
+    | _ -> Alcotest.failf "%s: expected File_too_large" what
+    | exception Eio.Io (Eio.Fs.E Eio.Fs.File_too_large, _) -> ()
+  in
+  let huge = Optint.Int63.of_int (1 lsl 47) in
+  let x = [ Cstruct.of_string "x" ] in
+  Eio.Path.with_open_out ~create:(`Exclusive 0o644) (env#fs / "f") @@ fun f ->
+  too_large "pwrite at 2^47" (fun () ->
+      Eio.File.pwrite_single f ~file_offset:huge x);
+  too_large "pwrite at max_int - 1" (fun () ->
+      Eio.File.pwrite_single f
+        ~file_offset:(Optint.Int63.of_int (max_int - 1))
+        [ Cstruct.of_string "abcd" ]);
+  too_large "truncate to 2^47" (fun () -> Eio.File.truncate f huge);
+  ignore (Eio.File.seek f huge `Set : Optint.Int63.t);
+  too_large "write after a seek to 2^47" (fun () -> Eio.Flow.single_write f x);
+  Alcotest.(check int)
+    "the file is empty" 0
+    (Optint.Int63.to_int (Eio.File.size f))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -731,4 +755,5 @@ let suite =
         test_dir_ops_under_regular_file;
       Alcotest.test_case "trailing slash" `Quick test_trailing_slash;
       Alcotest.test_case "many small writes" `Quick test_many_small_writes;
+      Alcotest.test_case "file too large" `Quick test_file_too_large;
     ] )

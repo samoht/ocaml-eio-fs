@@ -149,9 +149,18 @@ module File = struct
     if need > size then Cstruct.memset (Cstruct.sub buf size (need - size)) 0;
     buf
 
+  (* The largest file, 4 GiB: the bytes live in memory, holes included. *)
+  let max_size = 1 lsl 32
+
+  (* EFBIG past [max_size], checked without overflowing. *)
+  let check_size ~off ~len =
+    if off > max_size || len > max_size - off then
+      raise (Eio.Fs.err Eio.Fs.File_too_large)
+
   (* [f] with [src] written at [off]. *)
   let write f ~off src =
     let len = Cstruct.length src in
+    check_size ~off ~len;
     let buf = reserve f (off + len) in
     Cstruct.blit src 0 buf off len;
     let size = Optint.Int63.of_int (max (size f) (off + len)) in
@@ -159,6 +168,7 @@ module File = struct
 
   (* [f] cut or zero-extended to [n] bytes. *)
   let truncate f n =
+    check_size ~off:n ~len:0;
     let contents = if n <= size f then f.contents else Buffer (reserve f n) in
     { stat = { f.stat with size = Optint.Int63.of_int n }; contents }
 end
