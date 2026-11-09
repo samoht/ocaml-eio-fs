@@ -868,6 +868,31 @@ let test_seeded_pp_rebuilds () =
     "same faults" true
     (List.equal (Option.equal Fault.equal) (faults s) (faults rebuilt))
 
+(* A probability prints exactly, so the printed schedule draws the same
+   faults. *)
+let test_seeded_pp_floats () =
+  let printed p =
+    Fmt.str "%a" Schedule.pp
+      (Schedule.seeded ~probability:p ~kinds:[] ~seed:1 ())
+  in
+  let expect p lit =
+    Alcotest.(check string)
+      lit
+      ("Eio_fs.Chaos.Schedule.seeded ~probability:" ^ lit
+     ^ " ~kinds:[] ~seed:1 ()")
+      (printed p)
+  in
+  expect (0.1 +. 0.2) "0.30000000000000004";
+  expect 0.3 "0.3";
+  expect 1. "1.";
+  expect infinity "infinity";
+  expect neg_infinity "neg_infinity";
+  expect (-0.5) "(-0.5)";
+  expect 1e-300 "1e-300";
+  Alcotest.(check bool)
+    "the literal is the float" true
+    (Float.equal (0.1 +. 0.2) 0.30000000000000004)
+
 let test_chaos_perturbs () =
   let clean = run_workload Schedule.empty in
   Alcotest.(check (pair string string))
@@ -2397,6 +2422,8 @@ let suite =
       Alcotest.test_case "seeded change error" `Quick test_seeded_change_error;
       Alcotest.test_case "a seeded schedule prints its rebuild" `Quick
         test_seeded_pp_rebuilds;
+      Alcotest.test_case "a seeded schedule prints its probability exactly"
+        `Quick test_seeded_pp_floats;
       Alcotest.test_case "crash: the surviving prefix is uniform" `Quick
         test_crash_reorder_prefix_uniform;
       Alcotest.test_case "crash: a seed reproduces a save's image" `Quick

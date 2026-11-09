@@ -331,9 +331,23 @@ module Schedule = struct
 
   (* OCaml syntax: a negative literal needs parentheses as a labelled
      argument. *)
+  (* The shortest literal that reads back as [f], and [infinity],
+     [neg_infinity] or [nan] by name. *)
+  let float_literal f =
+    match Float.classify_float f with
+    | FP_infinite -> if f > 0. then "infinity" else "neg_infinity"
+    | FP_nan -> "nan"
+    | _ ->
+        let s =
+          List.find
+            (fun s -> Float.equal (float_of_string s) f)
+            [ Fmt.str "%.15g" f; Fmt.str "%.16g" f; Fmt.str "%.17g" f ]
+        in
+        if String.exists (fun c -> c = '.' || c = 'e') s then s else s ^ "."
+
   let pp_float ppf f =
-    if f < 0. then Fmt.pf ppf "(%s)" (Float.to_string f)
-    else Fmt.string ppf (Float.to_string f)
+    let s = float_literal f in
+    if s.[0] = '-' then Fmt.pf ppf "(%s)" s else Fmt.string ppf s
 
   let pp_int ppf i = if i < 0 then Fmt.pf ppf "(%d)" i else Fmt.int ppf i
 
@@ -343,10 +357,11 @@ module Schedule = struct
     | Scripted s -> Fmt.pf ppf "scripted(%d rules)" (List.length s.rules)
     | Seeded s ->
         Fmt.pf ppf
-          "Eio_fs.Chaos.Schedule.seeded ~probability:%a ~kinds:[ %s ] ~seed:%a \
-           ()"
+          "Eio_fs.Chaos.Schedule.seeded ~probability:%a ~kinds:%s ~seed:%a ()"
           pp_float s.config.probability
-          (String.concat "; " (List.map kind_name s.config.kinds))
+          (match s.config.kinds with
+          | [] -> "[]"
+          | kinds -> "[ " ^ String.concat "; " (List.map kind_name kinds) ^ " ]")
           pp_int s.seed
     | Observed { inner; _ } -> Fmt.pf ppf "observed(%a)" pp inner
 end
