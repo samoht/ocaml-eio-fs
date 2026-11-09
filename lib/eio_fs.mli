@@ -48,14 +48,16 @@ module Nofollow : sig
     stat:Eio.File.Stat.t ->
     read:(Cstruct.t -> int) ->
     (Cstruct.t, error) result
-  (** [run ~max_bytes ~validate ~stat ~read] validates [stat] before asking
-      [read] for bytes and reads through end-of-file with one byte of lookahead
-      past [max_bytes]. The buffer offered to [read] starts at [stat]'s size
-      plus one byte and doubles toward [max_bytes + 1] only while the file keeps
-      answering, so a read costs the file and not the bound. A rejected or
-      partially read buffer, and each one outgrown, is overwritten before the
-      function returns or raises. The result is {!read_file}'s, for a caller
-      that opened the file another way; [read] answering [0] or raising
+  (** [run ~max_bytes ~validate ~stat ~read] is the bounded read of {!read_file}
+      over a file the caller has already opened. It opens nothing and refuses no
+      symbolic link: that check belongs to the open. It validates [stat] before
+      asking [read] for bytes and reads through end-of-file with one byte of
+      lookahead past [max_bytes]. The buffer offered to [read] starts at
+      [stat]'s size plus one byte and doubles toward [max_bytes + 1] only while
+      the file keeps answering, so a read costs the file and not the bound. A
+      rejected or partially read buffer, and each one outgrown, is overwritten
+      before the function returns or raises. The result is {!read_file}'s, for a
+      caller that opened the file another way; [read] answering [0] or raising
       [End_of_file] ends the file, and what [validate] or [read] raises
       otherwise is propagated.
 
@@ -240,12 +242,12 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
     filesystem and current directory. *)
 
 val run : ?cwd:string -> (stdenv -> 'a) -> 'a
-(** [run ~cwd fn] is [fn env], with [env] holding the root and the current
-    directory of a new in-memory filesystem; the current directory is the
-    absolute path [cwd] (defaults to ["/"]), made with its missing ancestors,
-    mode [0o755], before [fn] runs.
-
-    {b Note.} This does not install an effect handler; wrap the call in
-    something like [Eio_mock.Backend.run].
+(** [run ~cwd fn] calls [fn] with a new in-memory filesystem in place of the
+    host's. Unlike [Eio_main.run], it starts no event loop and installs no
+    effect handler: call it inside one, such as [Eio_main.run] or
+    [Eio_mock.Backend.run]. [env] holds the root and the current directory of
+    the new filesystem. The current directory is the absolute path [cwd]
+    (defaults to ["/"]), made with its missing ancestors, mode [0o755], before
+    [fn] runs.
 
     @raise Stdlib.Invalid_argument if [cwd] is not an absolute path. *)
