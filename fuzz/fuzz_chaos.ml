@@ -179,15 +179,14 @@ module Model = struct
   (* Shapes keyed by path; file contents keyed by a rename-stable id. *)
   type shape = File of int | Dir | Link of string
 
-  (* One directory operation: the path it names, whose parent's barrier
-     commits it, and each path it touched with what the live tree held at and
-     below that path just after it, [None] for a name it freed. *)
+  (* One directory operation: each path it touched, whose parent's barrier
+     commits it, with what the live tree held at and below that path just
+     after it, [None] for a name it freed. *)
   type entry = {
-    path : string;
     delta : (string * (string * shape) list option) list;
-    mutable barred : bool;
-        (* A barrier on its directory has run: it lands once that directory
-           is durable. *)
+    mutable barred : string list;
+        (* The directories, its own or a rename's destination's, a barrier
+           has reached: it lands once one of them is durable. *)
   }
 
   type t = {
@@ -224,8 +223,7 @@ module Model = struct
       (p, if SM.mem p below then Some (SM.bindings below) else None)
     in
     m.journal <-
-      { path; delta = List.map touched (path :: paths); barred = false }
-      :: m.journal
+      { delta = List.map touched (path :: paths); barred = [] } :: m.journal
 
   (* The metadata barrier: the durable world becomes the live one. *)
   let commit m =
@@ -250,7 +248,9 @@ module Model = struct
      oldest first, until none is left; the others stay pending. *)
   let commit_dir m dir =
     List.iter
-      (fun e -> if String.equal (parent e.path) dir then e.barred <- true)
+      (fun e ->
+        if List.exists (fun (p, _) -> String.equal (parent p) dir) e.delta then
+          e.barred <- dir :: e.barred)
       m.journal;
     let durable_dir d =
       String.equal d "" || SM.find_opt d m.durable = Some Dir
@@ -258,7 +258,7 @@ module Model = struct
     let rec settle () =
       let mine, others =
         List.partition
-          (fun e -> e.barred && durable_dir (parent e.path))
+          (fun e -> List.exists durable_dir e.barred)
           (List.rev m.journal)
       in
       if mine <> [] then begin
@@ -581,8 +581,8 @@ let test_crash_reference_model tape =
 (* {b Every change kept.} When the policy keeps every pending change, each
    write replayed where it landed and each directory operation in program
    order, the recovered tree is the live one. The tapes have no barrier on a
-   single directory: one commits a rename whole through its source's
-   directory, after which the surviving image need not be the live one. *)
+   single directory: one commits a rename whole through either directory,
+   after which the surviving image need not be the live one. *)
 let test_crash_keep_all_model tape =
   let m, actual =
     run_tape ~dir_barriers:false ~policy:(Crash.Survive (fun _ -> true)) tape

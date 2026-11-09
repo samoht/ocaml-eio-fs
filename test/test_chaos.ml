@@ -1913,6 +1913,21 @@ let test_crash_bottom_up_barriers () =
     "a/g, created after a's barrier" true
     (absent (post / "a" / "g"))
 
+(* A barrier on a rename's destination commits it. *)
+let test_crash_rename_destination_barrier () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.mkdir ~perm:0o755 (fs / "b");
+  Eio_fs_sync.sync_dir fs;
+  write_new ~sync:true (fs / "a" / "f") "data";
+  Eio_fs_sync.sync_dir (fs / "a");
+  Eio.Path.rename (fs / "a" / "f") (fs / "b" / "f");
+  Eio_fs_sync.sync_dir (fs / "b");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string) "b/f" "data" (Eio.Path.load (post / "b" / "f"));
+  Alcotest.(check bool) "a/f" true (absent (post / "a" / "f"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2230,6 +2245,8 @@ let suite =
         test_crash_sync_through_a_directory_handle;
       Alcotest.test_case "crash: bottom-up directory barriers" `Quick
         test_crash_bottom_up_barriers;
+      Alcotest.test_case "crash: a barrier on a rename's destination" `Quick
+        test_crash_rename_destination_barrier;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

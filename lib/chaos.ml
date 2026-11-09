@@ -1325,7 +1325,8 @@ module Crash = struct
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let tree = snapshot_at owner root_path in
     let delta = delta_of ~root:(path_segments root_path) ~tree resolved in
-    let dirs = match resolved with p :: _ -> [ parent_key p ] | [] -> [] in
+    (* A rename is committed by a barrier on either directory. *)
+    let dirs = List.map parent_key resolved in
     let locations = locations ctl in
     ctl.metadata <-
       { meta; dirs; barred = []; tree; delta; locations; recorded = locations }
@@ -1338,7 +1339,8 @@ module Crash = struct
     ctl.metadata <- []
 
   (* fsync(2) on a directory commits that directory's entries and nothing else:
-     the journal entries whose recorded path names a child of [dir]. A model
+     the journal entries whose recorded path, or a rename's destination, names
+     a child of [dir]. A model
      that commits the journal whole cannot tell the two apart.
 
      Those entries are not in general a journal prefix, so no snapshot can
