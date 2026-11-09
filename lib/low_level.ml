@@ -158,6 +158,9 @@ module File = struct
     | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
     | Buffer b -> Cstruct.blit b src_off dst dst_off len
 
+  (* The largest file, 4 GiB: the bytes live in memory, holes included. *)
+  let max_size = 1 lsl 32
+
   (* A buffer holding [f]'s bytes with room for [need], and every byte from
      [f]'s size to [need] zero: a truncation leaves stale bytes past the end. *)
   let reserve f need =
@@ -169,15 +172,12 @@ module File = struct
           let cap =
             match contents with Buffer b -> Cstruct.length b | Literal _ -> 0
           in
-          let b = Cstruct.create (max need (2 * cap)) in
+          let b = Cstruct.create (max need (min max_size (2 * cap))) in
           blit contents ~src_off:0 b ~dst_off:0 ~len:size;
           b
     in
     if need > size then Cstruct.memset (Cstruct.sub buf size (need - size)) 0;
     buf
-
-  (* The largest file, 4 GiB: the bytes live in memory, holes included. *)
-  let max_size = 1 lsl 32
 
   (* EFBIG past [max_size], checked without overflowing. *)
   let check_size ~off ~len =
@@ -194,9 +194,19 @@ module File = struct
     { stat = { f.stat with size }; contents = Buffer buf }
 
   (* [f] cut or zero-extended to [n] bytes. *)
+  (* A buffer cut below a quarter of its capacity is reallocated, so a file
+     emptied gives its memory back. *)
   let truncate f n =
     check_size ~off:n ~len:0;
-    let contents = if n <= size f then f.contents else Buffer (reserve f n) in
+    let contents =
+      match f.contents with
+      | Buffer b when n <= size f && n < Cstruct.length b / 4 ->
+          let small = Cstruct.create n in
+          Cstruct.blit b 0 small 0 n;
+          Buffer small
+      | contents when n <= size f -> contents
+      | _ -> Buffer (reserve f n)
+    in
     { stat = { f.stat with size = Optint.Int63.of_int n }; contents }
 end
 
