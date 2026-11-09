@@ -33,7 +33,7 @@
    The eio-fs.path library is lexical arithmetic on path strings. The
    eio-fs-crunch binary writes the module that embeds a tree, in the style of
    ocaml-crunch. The in-memory backend is adapted from Patrick Ferris's
-   eio_mem (https://tangled.org/patrick.sirref.org/eio_mem), itself derived
+   eio_mem (https://git.sirref.org/eio_mem), itself derived
    from the Eio filesystem interfaces.")
  (depends
   (hermetic (>= 0.1.0))
