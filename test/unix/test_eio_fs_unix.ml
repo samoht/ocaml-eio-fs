@@ -2715,9 +2715,17 @@ let test_name_of_a_member_of_an_opened_subtree () =
     (Eio_fs.Path.name (dir / "shadow"))
     name
 
+(* renameat2(2) and renameatx_np(2) exist only on Linux and Darwin; elsewhere
+   [exclusive_rename] answers ENOSYS. *)
+let renames f =
+  try f ()
+  with Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.ENOSYS, _, _)), _) ->
+    Alcotest.skip ()
+
 (* Linux renameat2(RENAME_NOREPLACE) and Darwin renameatx_np(RENAME_EXCL)
    require refusal when the destination already exists. The source survives. *)
 let test_exclusive_rename_refuses_existing_names () =
+  renames @@ fun () ->
   with_real_dir @@ fun dir ->
   let source = dir / "source" and target = dir / "target" in
   Eio.Path.save ~create:(`Exclusive 0o600) source "new";
@@ -2757,6 +2765,7 @@ let test_exclusive_rename_refuses_embedded_nul () =
     [ ("source\000suffix", "target"); ("source", "target\000suffix") ]
 
 let test_exclusive_publication_reaches_crash_model () =
+  renames @@ fun () ->
   with_real_dir @@ fun dir ->
   let ctl = Crash.v () in
   let fs = Crash.wrap ctl dir in
@@ -2786,6 +2795,7 @@ let test_publication_with_the_platform_barrier () =
     (Eio.Path.load (dir / "tree/f"))
 
 let test_concurrent_exclusive_publications_have_one_winner () =
+  renames @@ fun () ->
   with_real_dir @@ fun dir ->
   let config = Eio_fs_sync.config ~perm:0o600 ~max_bytes:3L () in
   let save text () =
@@ -2806,6 +2816,7 @@ let test_concurrent_exclusive_publications_have_one_winner () =
   | _ -> Alcotest.fail "exactly one exclusive publication must succeed"
 
 let test_exclusive_rename_keeps_open_parent () =
+  renames @@ fun () ->
   with_real_dir @@ fun dir ->
   Eio.Path.mkdir ~perm:0o700 (dir / "parent");
   Eio.Path.mkdir ~perm:0o700 (dir / "elsewhere");

@@ -590,7 +590,14 @@ let test_append_retries_a_failed_parent_barrier () =
 (* POSIX truncate leaves unwritten ranges zero. The independent operation
    trace pins the data extents, so filling those gaps with zero writes fails
    even if the published bytes still look right. *)
+(* [exclusive_rename] answers ENOSYS off Linux and Darwin. *)
+let renames f =
+  try f ()
+  with Eio.Io (Eio.Exn.X (Eio_unix.Unix_error (Unix.ENOSYS, _, _)), _) ->
+    Alcotest.skip ()
+
 let test_sparse_cost size =
+  renames @@ fun () ->
   Eio_main.run @@ fun env ->
   let fs = Eio.Stdenv.fs env in
   let dir =
