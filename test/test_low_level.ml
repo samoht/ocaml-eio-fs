@@ -401,6 +401,15 @@ let test_symlink_size () =
     "size" 5
     (Optint.Int63.to_int (Eio.Path.stat ~follow:false (env#fs / "l")).size)
 
+(* lseek(2) on a directory descriptor answers 0, as eio_posix does. *)
+let test_seek_directory_fd () =
+  with_env @@ fun env ->
+  Eio.Path.mkdir ~perm:0o755 (env#fs / "d");
+  Eio.Path.with_open_in (env#fs / "d") @@ fun f ->
+  Alcotest.(check int)
+    "offset" 0
+    (Optint.Int63.to_int (Eio.File.seek f Optint.Int63.zero `Set))
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -862,4 +871,6 @@ let suite =
       Alcotest.test_case "cwd follows its directory" `Quick
         test_cwd_follows_its_directory;
       Alcotest.test_case "symbolic link size" `Quick test_symlink_size;
+      Alcotest.test_case "seek a directory descriptor" `Quick
+        test_seek_directory_fd;
     ] )

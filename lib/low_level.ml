@@ -1000,6 +1000,8 @@ let seek_fd t off cmd =
       check_offset "seek" newpos;
       t.pos <- newpos;
       newpos
+  (* lseek(2) on a directory succeeds; its offset is no byte count. *)
+  | Resource.Dir _ -> Optint.Int63.zero
   | r -> not_a_file "seek" r
 
 let truncate_fd t len =
