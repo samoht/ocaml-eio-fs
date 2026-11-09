@@ -1,6 +1,13 @@
-(* Adapted from Patrick Ferris's POSIX-only modification of fpath, src/path.ml
-   in eio_mem (https://git.sirref.org/eio_mem).
-   Copyright (c) 2015 The fpath programmers, ISC; see LICENSE.md. *)
+(*---------------------------------------------------------------------------
+   Copyright (c) 2015 The fpath programmers. All rights reserved.
+   SPDX-License-Identifier: ISC
+
+   This is a modified Fpath to only be POSIX which complies with Eio's path
+   policies too.
+  ---------------------------------------------------------------------------*)
+
+(* Adapted from src/path.ml in eio_mem (https://git.sirref.org/eio_mem); see
+   LICENSE.md. *)
 
 open! Hermetic
 
