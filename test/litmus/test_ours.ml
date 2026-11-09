@@ -147,12 +147,6 @@ let mkdir_dir_barrier =
     ~extra:
       (unmarked [ [ ("d", Dir); ("d/f", File (zeros 1)) ] ]
       @ marked [ [ ("d", Absent); ("d/f", Absent) ] ])
-      (* CONFIRMED: the crash keeps the mkdir and drops the creation the
-         barrier on [d] covered. chaos.mli defers that barrier "until the
-         directory itself is durable", but the journal cut is drawn as a
-         plain prefix and never adds back an entry whose deferred barrier
-         the surviving image now satisfies. *)
-    ~impossible:(marked [ [ ("d", Dir); ("d/f", Absent) ] ])
 
 (* {1 unlink} *)
 

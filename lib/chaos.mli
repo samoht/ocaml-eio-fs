@@ -230,9 +230,11 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     [rmdir], [symlink] and [rename] enter a metadata journal in program order;
     {!Crash.sync_metadata} commits it whole, and a directory barrier (a sync of
     the directory, opened as a file or not) commits only the entries of that
-    directory. At a crash the policy decides how much of the uncommitted suffix
-    survives, always a prefix of program order, and a dropped operation is
-    rolled back whole. *)
+    directory. A barrier on a directory that is not itself durable yet holds
+    from the moment it is. At a crash the policy decides how much of the
+    uncommitted suffix survives, always a prefix of program order, and a dropped
+    operation is rolled back whole; an entry a deferred barrier covers survives
+    whenever its directory does. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =

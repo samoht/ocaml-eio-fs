@@ -1639,6 +1639,29 @@ module Crash = struct
             | None -> assert false)
       in
       let owner, root_path = root ctl in
+      (* A barrier deferred on a directory holds once the directory does: an
+         entry it covers survives whenever the image holds that directory,
+         wherever the cut fell. Program order replays a directory's creation
+         before the entries in it. *)
+      let tree, locs =
+        let root = path_segments root_path in
+        let holds tree d =
+          match tree_path ~root d with
+          | None -> false
+          | Some segs -> (
+              match tree_find tree segs with
+              | Some (Dir _) -> true
+              | Some (File _ | Link _) | None -> false)
+        in
+        List.filteri
+          (fun i _ -> i >= List.length metadata_survivors)
+          ordered_metadata
+        |> List.fold_left
+             (fun ((tree, _) as image) e ->
+               if List.exists (holds tree) e.barred then replay ~root image e
+               else image)
+             (tree, locs)
+      in
       restore_root owner root_path tree;
       List.iter
         (fun (fs, owner, rel) ->
