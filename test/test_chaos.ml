@@ -2705,6 +2705,27 @@ let test_crash_sync_metadata_commits_cleared_mode () =
     "without, then with sync_metadata" (0o2775, 0o775)
     (run ~commit:false, run ~commit:true)
 
+(* A chmod of a new directory, then a barrier on it: the chmod is listed as
+   unsynced until the directory is durable, and survives with it whatever a
+   predicate says. *)
+let test_crash_attrs_wait_for_their_node () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  let keep (u : Crash.unsynced) = u.kind = Mkdir in
+  let ctl = Crash.v ~policy:(Survive keep) () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.chmod ~follow:false ~perm:0o700 (fs / "a");
+  Eio_fs_sync.sync_dir (fs / "a");
+  let kinds =
+    List.map
+      (fun (u : Crash.unsynced) -> Fmt.str "%a" Crash.pp_unsynced u)
+      (Crash.unsynced ctl)
+  in
+  Alcotest.(check int) "mkdir and chmod unsynced" 2 (List.length kinds);
+  Alcotest.(check int)
+    "mode" 0o700 (Eio.Path.stat ~follow:false (Crash.post_crash ctl / "a")).perm
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3091,6 +3112,9 @@ let suite =
         test_crash_hole_lands_zeroed;
       Alcotest.test_case "crash: sync_metadata commits a write's setgid clear"
         `Quick test_crash_sync_metadata_commits_cleared_mode;
+      Alcotest.test_case
+        "crash: a reached chmod stays unsynced until its node is durable" `Quick
+        test_crash_attrs_wait_for_their_node;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

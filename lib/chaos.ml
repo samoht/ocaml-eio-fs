@@ -1129,8 +1129,8 @@ module Crash = struct
     delta : delta;
     mutable recorded : location list;
     attrs_ino : int64 option;
-        (* For a chmod or a chown, the node it changed: a sync of that file
-           commits it too. *)
+        (* For a chmod or a chown, the node it changed: it holds once that
+           node is durable, and a sync of that file commits it too. *)
     nodes : int64 list; (* the nodes it makes *)
     parents : int64 list; (* the directories whose entries it changes *)
     ancestors : int64 list;
@@ -1838,10 +1838,7 @@ module Crash = struct
                 Attrs
                   { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
               in
-              let file =
-                match st.kind with `Directory -> None | _ -> Some st.ino
-              in
-              ([ (segs, edit) ], [ up; st.ino ], file)
+              ([ (segs, edit) ], [ up; st.ino ], Some st.ino)
           | _ -> ([], [], None))
       | Rename _, [ src; dst ] -> (
           (* A rename moves the image's own node: nothing of what it holds

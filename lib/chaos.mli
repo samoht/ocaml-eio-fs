@@ -421,7 +421,14 @@ module Crash : sig
       @raise Eio.Io ("power lost") if [t] has crashed. *)
 
   val unsynced : t -> unsynced list
-  (** [unsynced t] are the changes not yet made durable, in program order. *)
+  (** [unsynced t] are the changes not yet made durable, in program order: every
+      write no sync made durable, and every journal entry not committed. That
+      includes an entry a sync or a barrier reached that does not hold yet: a
+      [chmod] or [chown] whose node is not durable, as one a file sync reached
+      while the file's creation is pending or one a barrier on a new directory
+      reached for that directory, and an entry whose directory is not durable.
+      Such an entry survives a crash whenever it would hold, whatever a
+      {!Survive} predicate says of it. *)
 
   val pp_unsynced : unsynced Fmt.t
   (** [pp_unsynced] formats an un-synced change for logs and test failures. *)
