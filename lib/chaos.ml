@@ -2423,7 +2423,8 @@ module Crash = struct
           ~stat:(fun () -> Eio.File.stat cf.cro)
           (fun () -> sync_base cf.cro)
 
-  (* A directory opened as a file syncs as that directory's barrier. *)
+  (* A directory opened as a file syncs as that directory's barrier, on the
+     inode it opened. *)
   let wrap_cfile_ro ?fs ?dir ctl base : Eio.File.ro_ty r =
     let cf =
       { ctl; cfs = None; cro = base; crw = None; cappend = false; cpos = ref 0 }
@@ -2432,7 +2433,7 @@ module Crash = struct
       match dir with
       | Some dir ->
           guard cf;
-          commit_dir ctl ~dir
+          commit_dir_ino ctl dir
       | None -> sync_ro cf fs
     in
     Eio.Resource.T
@@ -2664,8 +2665,8 @@ module Crash = struct
       let fs = Hashtbl.find_opt d.dctl.files (file_key d.dplace.proot rel) in
       let file = B.open_in bv ~sw ~follow path in
       let dir =
-        match (Eio.File.stat file).kind with
-        | `Directory -> Some rel
+        match Eio.File.stat file with
+        | { kind = `Directory; ino; _ } -> Some ino
         | _ -> None
       in
       wrap_cfile_ro ?fs ?dir d.dctl file

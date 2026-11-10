@@ -2492,6 +2492,30 @@ let test_crash_sync_commits_the_mode_alone () =
     ( Eio.Path.is_file (post / "x"),
       (Eio.Path.stat ~follow:false (post / "y")).perm )
 
+(* A directory opened, renamed, and another made at its old name: syncing
+   the handle commits the directory it opened, not the one at that name. *)
+let test_crash_dir_handle_barrier_by_inode () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  List.iter (fun d -> Eio.Path.mkdir ~perm:0o755 (raw / d)) [ "a"; "b"; "a/d" ];
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Switch.run @@ fun sw ->
+  let h = Eio.Path.open_in ~sw (fs / "a/d") in
+  Eio.Path.rename (fs / "a/d") (fs / "b/d");
+  Eio.Path.mkdir ~perm:0o755 (fs / "a/d");
+  Eio_fs_sync.sync_dir (fs / "a");
+  Eio_fs_sync.sync_dir (fs / "b");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "b/d/x") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "a/d/y") "y";
+  (match Eio_fs_sync.file_barrier h with
+  | Some barrier -> barrier ()
+  | None -> Alcotest.fail "no barrier");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check (pair bool bool))
+    "b/d/x kept, a/d/y lost" (true, false)
+    (Eio.Path.is_file (post / "b/d/x"), Eio.Path.is_file (post / "a/d/y"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2854,6 +2878,9 @@ let suite =
         test_crash_truncation_zeroes_old_blocks;
       Alcotest.test_case "crash: a file sync commits its mode alone" `Quick
         test_crash_sync_commits_the_mode_alone;
+      Alcotest.test_case
+        "crash: a directory handle's barrier is on the inode it opened" `Quick
+        test_crash_dir_handle_barrier_by_inode;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
