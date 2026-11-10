@@ -354,13 +354,20 @@ module Crash : sig
             reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
-            survivors keep program order. Writes are kept or dropped whole,
-            whatever block they share, so it can build a state no page cache
-            would. An uncommitted directory operation survives iff the predicate
-            holds for it {e and} every earlier uncommitted directory operation
-            survived (the prefix rule). It pins an exact scenario, for example
-            keeping a generation pointer but dropping the data block it
-            references. *)
+            survivors keep program order. A disk writes a 512-byte sector whole,
+            so where a surviving write overwrote bytes the file held, its sector
+            holds what the page cache held after it, the earlier overwrites of
+            that sector included. Otherwise writes are kept or dropped whole,
+            whatever block they share. An uncommitted directory operation
+            survives iff the predicate holds for it {e and} every earlier
+            uncommitted directory operation survived (the prefix rule). It pins
+            an exact scenario, for example keeping a generation pointer but
+            dropping the data block it references. *)
+    | Choose of (int -> int)
+        (** As {!Reorder_unsynced}, with each draw [f n], in [\[0, n)], made by
+            the function, so a caller can enumerate the states; and the bytes a
+            write adds past the end of the file may stop at any byte, not only
+            at a block boundary. *)
 
   (** The type for when a crash fires while the workload runs. *)
   type trigger =

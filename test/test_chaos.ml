@@ -3122,6 +3122,68 @@ let test_crash_cut_page_not_written () =
   let i = lost_images ~init:"pqrs" [ `W (2, "A"); `T 2; `F ] in
   Alcotest.(check (list string)) "images" [ "pq"; "pqrs" ] (List.sort compare i)
 
+(* Every image [Choose] draws for [steps] over a durable [init], enumerated
+   by walking the tree of its draws. *)
+let chosen_images ~init steps =
+  let seen = Hashtbl.create 8 in
+  let rec go prefix =
+    let trail = ref [] and pos = ref 0 in
+    let draw n =
+      let c = if !pos < Array.length prefix then prefix.(!pos) else 0 in
+      incr pos;
+      trail := (c, n) :: !trail;
+      c
+    in
+    let ctl = Crash.v ~policy:(Choose draw) ~block_size:512 () in
+    ( with_crash ctl @@ fun ~raw:_ ~fs ->
+      write_new ~sync:true (fs / "f") init;
+      Eio_fs_sync.sync_dir fs;
+      Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+          List.iter
+            (fun (o, d) ->
+              Eio.File.pwrite_all f ~file_offset:(i63 o) [ Cstruct.of_string d ])
+            steps);
+      Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) () );
+    let rec next = function
+      | [] -> None
+      | (c, n) :: rest when c + 1 < n ->
+          Some (Array.of_list (List.rev_map fst rest @ [ c + 1 ]))
+      | _ :: rest -> next rest
+    in
+    Option.iter go (next !trail)
+  in
+  go [||];
+  List.sort compare (List.of_seq (Hashtbl.to_seq_keys seen))
+
+(* Bytes that extend a file may stop at any byte; an overwrite of bytes the
+   file held lands whole within its sector. *)
+let test_crash_choose_tears_extensions () =
+  Alcotest.(check (list string))
+    "an append"
+    [ "pq"; "pq\000"; "pq\000\000"; "pqA"; "pqAB" ]
+    (chosen_images ~init:"pq" [ (2, "AB") ]);
+  Alcotest.(check (list string))
+    "an overwrite" [ "pXYs"; "pqrs" ]
+    (chosen_images ~init:"pqrs" [ (1, "XY") ])
+
+(* Two writes into one sector of bytes the file held: a sector is written
+   whole, so the second never lands without the first. *)
+let test_crash_survive_keeps_a_sector () =
+  let image keep =
+    let ctl = Crash.v ~policy:(Survive (fun u -> List.mem u.offset keep)) () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "hdr") (String.make 16 '.');
+    Eio_fs_sync.sync_dir fs;
+    Eio.Path.with_open_out ~create:`Never (fs / "hdr") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "MAGIC" ];
+        Eio.File.pwrite_all f ~file_offset:(i63 8) [ Cstruct.of_string "42" ]);
+    Eio.Path.load (Crash.post_crash ctl / "hdr")
+  in
+  Alcotest.(check (list string))
+    "the first, the second, both"
+    [ "MAGIC..........."; "MAGIC...42......"; "MAGIC...42......" ]
+    [ image [ 0 ]; image [ 8 ]; image [ 0; 8 ] ]
+
 (* Two failed writebacks of one block: either may have landed, the second
    also over the page re-read from disk once the first was evicted. *)
 let test_crash_each_failure_may_land () =
@@ -3613,6 +3675,10 @@ let suite =
         `Quick test_crash_over_chaos_over_user;
       Alcotest.test_case "crash: either failed writeback of a block may land"
         `Quick test_crash_each_failure_may_land;
+      Alcotest.test_case "crash: an extension tears at any byte" `Quick
+        test_crash_choose_tears_extensions;
+      Alcotest.test_case "crash: a sector's overwrites survive together" `Quick
+        test_crash_survive_keeps_a_sector;
       Alcotest.test_case "crash: a page cut before a failure is not written"
         `Quick test_crash_cut_page_not_written;
       Alcotest.test_case "crash: a lost page may be evicted before any sync"

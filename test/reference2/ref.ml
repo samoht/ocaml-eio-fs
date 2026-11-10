@@ -941,13 +941,62 @@ let keep_length ?cut durable chs =
       in
       List.rev kept
 
+(* A disk writes a 512-byte sector whole: where a kept write overwrote bytes
+   the file held, its sector holds the page cache after it, the earlier
+   overwrites of that sector included. *)
+let sectors_together f kept img =
+  let sector = 512 in
+  let _, over =
+    List.fold_left
+      (fun (size, acc) (seq, ch, _, cache) ->
+        match ch with
+        | W (o, d) ->
+            let hi = min size (o + String.length d) in
+            let ss =
+              if hi > o then
+                List.init
+                  (((hi - 1) / sector) - (o / sector) + 1)
+                  (fun i -> (o / sector) + i)
+              else []
+            in
+            (max size (o + String.length d), (seq, ss, cache) :: acc)
+        | T m -> ((if List.mem seq f.cached then size else m), acc))
+      (String.length f.base_cache, [])
+      f.pend
+  in
+  let over = List.rev over in
+  let b = Bytes.of_string img in
+  List.iteri
+    (fun k (seq, ss, cache) ->
+      if List.mem seq kept then
+        List.iter
+          (fun sc ->
+            let earlier_lost =
+              List.exists
+                (fun (seq', ss', _) ->
+                  (not (List.mem seq' kept)) && List.mem sc ss')
+                (List.filteri (fun j _ -> j < k) over)
+            in
+            if earlier_lost then
+              for x = sc * sector to ((sc + 1) * sector) - 1 do
+                if x < Bytes.length b && x < String.length cache then
+                  Bytes.set b x cache.[x]
+              done)
+          ss)
+    over;
+  Bytes.to_string b
+
 let content_survive ?cut t id subset =
   let f = fd t id in
+  let kept =
+    keep_length ?cut f.durable
+      (List.filter_map
+         (fun (s, ch, _, _) -> if IS.mem s subset then Some (s, ch) else None)
+         f.pend)
+  in
   merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache ~cached:f.cached
-    (keep_length ?cut f.durable
-       (List.filter_map
-          (fun (s, ch, _, _) -> if IS.mem s subset then Some (s, ch) else None)
-          f.pend))
+    kept
+  |> sectors_together f (List.map fst kept)
 
 let image_with t s content : image =
   let img = meta_image t s in
@@ -1049,9 +1098,10 @@ let survive_member ?cut t id s =
   let f = fd t id in
   let rec go kept = function
     | [] ->
+        let kept = keep_length ?cut f.durable (List.rev kept) in
         merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
-          ~cached:f.cached
-          (keep_length ?cut f.durable (List.rev kept))
+          ~cached:f.cached kept
+        |> sectors_together f (List.map fst kept)
         = s
     | (seq, ch, _, _) :: rest -> go kept rest || go ((seq, ch) :: kept) rest
   in

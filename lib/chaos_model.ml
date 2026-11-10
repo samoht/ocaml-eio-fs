@@ -1211,6 +1211,16 @@ module Crash = struct
     | Drop_unsynced
     | Reorder_unsynced of int
     | Survive of (unsynced -> bool)
+    | Choose of (int -> int)
+
+  (* The draws a crash state is built from: a seeded generator, or a function
+     that enumerates them. *)
+  type draw = { int : int -> int; bool : unit -> bool }
+
+  let draw_of_state rng =
+    { int = Random.State.int rng; bool = (fun () -> Random.State.bool rng) }
+
+  let draw_of_fun f = { int = f; bool = (fun () -> f 2 = 1) }
 
   type trigger =
     | Manual
@@ -2320,8 +2330,8 @@ module Crash = struct
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
-  let writeback ?(over = []) ?(len_upto = max_int) ~rng ~bs ~cache durable
-      changes =
+  let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ~rng ~bs
+      ~cache durable changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -2338,9 +2348,15 @@ module Crash = struct
           let size = max prev (offset + Cstruct.length data) in
           sizes.(k + 1) <- size;
           if k < len_upto then
-            for b = (prev / bs) + 1 to (size - 1) / bs do
-              boundaries := (b * bs) :: !boundaries
-            done
+            if bytes then
+              (* Bytes that extend the file may tear at any byte. *)
+              for x = prev + 1 to size - 1 do
+                boundaries := x :: !boundaries
+              done
+            else
+              for b = (prev / bs) + 1 to (size - 1) / bs do
+                boundaries := (b * bs) :: !boundaries
+              done
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
         if cached.(k) then (0, 0) else dirtied ~bs !cprev changes.(k)
@@ -2366,14 +2382,14 @@ module Crash = struct
     List.iter
       (fun b ->
         let vs = 0 :: List.rev (Hashtbl.find versions b) in
-        let v = List.nth vs (Random.State.int rng (List.length vs)) in
+        let v = List.nth vs (rng.int (List.length vs)) in
         if v > 0 then Hashtbl.replace chosen b v)
       blocks;
     let size =
       let boundaries = List.sort_uniq Int.compare !boundaries in
-      if Random.State.bool rng || boundaries = [] then
-        sizes.(Random.State.int rng (min n len_upto + 1))
-      else List.nth boundaries (Random.State.int rng (List.length boundaries))
+      if rng.bool () || boundaries = [] then
+        sizes.(rng.int (min n len_upto + 1))
+      else List.nth boundaries (rng.int (List.length boundaries))
     in
     (* Replay once, taking each chosen block as it stood after its change. *)
     let at = Hashtbl.create 16 in
@@ -2413,6 +2429,72 @@ module Crash = struct
       done;
     image
 
+  (* A disk writes a 512-byte sector whole, so the overwrites of one sector
+     land together: where a surviving write overwrote bytes the file held, its
+     sector holds what the page cache held after it, the earlier overwrites
+     of that sector included. *)
+  let sector = 512
+
+  let sectors_together ~cache durable mine kept image =
+    let base = Option.value ~default:durable cache in
+    let entries = Array.of_list mine in
+    (* The sectors each write overwrites, by its place in [mine]. *)
+    let _, over =
+      Array.fold_left
+        (fun (size, acc) (e : entry) ->
+          match e.change with
+          | Write { offset; data } ->
+              let hi = min size (offset + Cstruct.length data) in
+              let ss =
+                if hi > offset then
+                  List.init
+                    (((hi - 1) / sector) - (offset / sector) + 1)
+                    (fun i -> (offset / sector) + i)
+                else []
+              in
+              (max size (offset + Cstruct.length data), ss :: acc)
+          | Resize m -> ((if e.cached then size else m), [] :: acc))
+        (Cstruct.length base, [])
+        entries
+    in
+    let over = Array.of_list (List.rev over) in
+    let kept_at = Array.map (fun e -> List.memq e kept) entries in
+    let patch = Hashtbl.create 4 in
+    Array.iteri
+      (fun k ss ->
+        if kept_at.(k) then
+          List.iter
+            (fun s ->
+              let earlier_lost = ref false in
+              for j = 0 to k - 1 do
+                if (not kept_at.(j)) && List.mem s over.(j) then
+                  earlier_lost := true
+              done;
+              if !earlier_lost then Hashtbl.replace patch s k)
+            ss)
+      over;
+    if Hashtbl.length patch = 0 then image
+    else begin
+      let image = copy_cs image in
+      Hashtbl.iter
+        (fun s k ->
+          let live =
+            replay_changes base
+              (List.filteri (fun j _ -> j <= k) mine
+              |> List.filter_map (fun (e : entry) ->
+                  if e.cached then None else Some e.change))
+          in
+          let off = s * sector in
+          let n =
+            max 0
+              (min sector
+                 (min (Cstruct.length image) (Cstruct.length live) - off))
+          in
+          if n > 0 then Cstruct.blit live off image off n)
+        patch;
+      image
+    end
+
   let do_crash ctl =
     if not ctl.crashed then begin
       if Option.is_none ctl.base then
@@ -2420,9 +2502,12 @@ module Crash = struct
       ctl.crashed <- true;
       let data_rng =
         match ctl.policy with
-        | Reorder_unsynced seed -> Some (Random.State.make [| seed |])
+        | Reorder_unsynced seed ->
+            Some (draw_of_state (Random.State.make [| seed |]))
+        | Choose f -> Some (draw_of_fun f)
         | Drop_unsynced | Survive _ -> None
       in
+      let bytes = match ctl.policy with Choose _ -> true | _ -> false in
       let contents = Hashtbl.create 16 in
       (* The earliest setuid clear the crash dropped, by inode: a length a
          later change sets lands only with or after it, as ext4 journals both
@@ -2469,7 +2554,7 @@ module Crash = struct
             in
             let c =
               match (ctl.policy, data_rng) with
-              | Reorder_unsynced _, Some rng ->
+              | (Reorder_unsynced _ | Choose _), Some rng ->
                   let changes = List.map (fun e -> (e.change, e.cached)) mine in
                   (* A writeback that failed only partly wrote any of the
                      blocks it lost. *)
@@ -2485,7 +2570,7 @@ module Crash = struct
                               if b' = b then Some blk else None)
                             fs.partial
                         in
-                        match Random.State.int rng (List.length vs + 1) with
+                        match rng.int (List.length vs + 1) with
                         | 0 -> None
                         | i -> Some (b, List.nth vs (i - 1)))
                   in
@@ -2493,22 +2578,26 @@ module Crash = struct
                      it, whether a later sync ran or not. *)
                   if
                     (Option.is_some fs.cache || Option.is_some fs.evicted)
-                    && Random.State.bool rng
+                    && rng.bool ()
                   then
-                    writeback ~over ~len_upto ~rng ~bs:ctl.block_size
+                    writeback ~over ~len_upto ~bytes ~rng ~bs:ctl.block_size
                       ~cache:None
                       (Option.value ~default:(bytes_of fs.durable) fs.evicted)
                       (List.map (fun (c, _) -> (c, false)) changes)
                   else
-                    writeback ~over ~len_upto ~rng ~bs:ctl.block_size
+                    writeback ~over ~len_upto ~bytes ~rng ~bs:ctl.block_size
                       ~cache:fs.cache (bytes_of fs.durable) changes
               | Survive pred, _ ->
-                  List.filter (fun e -> pred (to_unsynced e)) mine
-                  |> keep_length
-                  |> List.map (fun e -> (e.change, e.cached))
+                  let kept =
+                    List.filter (fun e -> pred (to_unsynced e)) mine
+                    |> keep_length
+                  in
+                  List.map (fun e -> (e.change, e.cached)) kept
                   |> replay_cached ~bs:ctl.block_size ~cache:fs.cache
                        (bytes_of fs.durable)
                   |> fst
+                  |> sectors_together ~cache:fs.cache (bytes_of fs.durable) mine
+                       kept
               | _ -> copy_cs (bytes_of fs.durable)
             in
             Hashtbl.replace contents fs.id c;
@@ -2536,6 +2625,9 @@ module Crash = struct
             (* A uniform length: late crash points are as likely as early
                ones. *)
             let n = Random.State.int rng (List.length pending + 1) in
+            List.filteri (fun i _ -> i < n) pending
+        | Choose f ->
+            let n = f (List.length pending + 1) in
             List.filteri (fun i _ -> i < n) pending
       in
       let survives e = List.memq e survivors in
