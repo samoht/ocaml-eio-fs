@@ -232,14 +232,15 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     makes it durable. The page cache may still hold their bytes, and a later
     change that dirties one of those blocks then writes it whole, lost bytes
     included; or it may have evicted the page, and the later change lands over
-    the bytes on disk. {!Crash.Reorder_unsynced} draws either for each file; the
-    other policies keep the page cache's. Before the failure the lost writes are
-    pending like any write; after it, no crash shows them but through such a
-    block. This holds for a sync failure {!Chaos.wrap} injects above the model
-    and for one the base raises beneath it. The only safe recovery is to write
-    the data again from the application's own copy. A crash rewrites the base to
-    a post-crash image in which un-synced writes may be dropped or reordered,
-    which demonstrates the classic missing-{!Eio.File.sync} hazard.
+    the bytes on disk. {!Crash.Reorder_unsynced} draws either for each file,
+    whether a later sync ran or not; the other policies keep the page cache's.
+    Before the failure the lost writes are pending like any write; after it, no
+    crash shows them but through such a block. This holds for a sync failure
+    {!Chaos.wrap} injects above the model and for one the base raises beneath
+    it. The only safe recovery is to write the data again from the application's
+    own copy. A crash rewrites the base to a post-crash image in which un-synced
+    writes may be dropped or reordered, which demonstrates the classic
+    missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
     [rmdir], [symlink], [rename], [chmod] and [chown] enter a metadata journal

@@ -2398,7 +2398,7 @@ module Crash = struct
             let mine = List.rev fs.pending in
             let c =
               match (ctl.policy, data_rng) with
-              | Reorder_unsynced _, Some rng -> (
+              | Reorder_unsynced _, Some rng ->
                   let changes = List.map (fun e -> (e.change, e.cached)) mine in
                   (* A writeback that failed only partly wrote any of the
                      blocks it lost. *)
@@ -2419,14 +2419,17 @@ module Crash = struct
                         | i -> Some (b, List.nth vs (i - 1)))
                   in
                   (* The page cache kept what a failed sync lost, or evicted
-                     it. *)
-                  match fs.evicted with
-                  | Some e when Random.State.bool rng ->
-                      writeback ~over ~rng ~bs:ctl.block_size ~cache:None e
-                        (List.map (fun (c, _) -> (c, false)) changes)
-                  | Some _ | None ->
-                      writeback ~over ~rng ~bs:ctl.block_size ~cache:fs.cache
-                        (bytes_of fs.durable) changes)
+                     it, whether a later sync ran or not. *)
+                  if
+                    (Option.is_some fs.cache || Option.is_some fs.evicted)
+                    && Random.State.bool rng
+                  then
+                    writeback ~over ~rng ~bs:ctl.block_size ~cache:None
+                      (Option.value ~default:(bytes_of fs.durable) fs.evicted)
+                      (List.map (fun (c, _) -> (c, false)) changes)
+                  else
+                    writeback ~over ~rng ~bs:ctl.block_size ~cache:fs.cache
+                      (bytes_of fs.durable) changes
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> (e.change, e.cached))

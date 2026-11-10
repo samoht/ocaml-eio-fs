@@ -3083,6 +3083,15 @@ let test_crash_each_failure_may_land () =
     "first, second" [ true; true ]
     [ List.mem "Aqr" i; List.mem "ABr" i ]
 
+(* A lost page, then a write to it and a crash with no sync: the page
+   cache may have evicted the lost page, so the write lands over the bytes
+   on disk. *)
+let test_crash_evicted_before_sync () =
+  let i = lost_images [ `W (0, "A"); `F; `W (1, "B") ] in
+  Alcotest.(check (list bool))
+    "kept, evicted" [ true; true ]
+    [ List.mem "ABr" i; List.mem "pBr" i ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3493,6 +3502,8 @@ let suite =
         test_crash_stacked_wrappers_relay_failure;
       Alcotest.test_case "crash: either failed writeback of a block may land"
         `Quick test_crash_each_failure_may_land;
+      Alcotest.test_case "crash: a lost page may be evicted before any sync"
+        `Quick test_crash_evicted_before_sync;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
