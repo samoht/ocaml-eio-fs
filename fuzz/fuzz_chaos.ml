@@ -187,10 +187,12 @@ module Model = struct
      directory [parent] at [path], with what is below it, or a node taken
      out wherever it is. *)
   type half =
-    | Place of { parent : int; path : string; below : (string * shape) list }
+    | Place of { parent : int; path : string; node : shape }
+    | Move of { parent : int; path : string; id : int }
     | Remove of int
 
   type entry = {
+    seq : int;
     halves : half list;
     dirs : int list; (* the directories it changed *)
     mutable barred : int list; (* those a barrier has reached *)
@@ -204,6 +206,7 @@ module Model = struct
     mutable live_data : string IM.t;
     mutable durable_data : string IM.t;
     mutable next_id : int;
+    mutable seq : int;
   }
 
   let v () =
@@ -214,6 +217,7 @@ module Model = struct
       live_data = IM.empty;
       durable_data = IM.empty;
       next_id = 0;
+      seq = 0;
     }
 
   let under prefix p =
@@ -255,38 +259,63 @@ module Model = struct
 
   let remove_under p map = SM.filter (fun k _ -> not (at_or_under p k)) map
 
-  (* A half lands by identity: a node goes into its directory at the path it
-     had, or wherever that directory is now, and only once. *)
+  (* Where a node put at [path] in the directory [pid] goes in [map]. *)
+  let target map path pid =
+    let up = parent path in
+    if is_dir map up pid then Some (join up (base path))
+    else
+      match path_of map pid with
+      | Some p when is_dir map p pid -> Some (join p (base path))
+      | Some _ | None -> None
+
+  (* An entry lands whole or not at all: a node is put in its directory by
+     identity, a moved node is the world's own with what it holds there, and
+     an rmdir of a directory that still holds entries removes nothing. *)
+  let applies map e =
+    List.for_all
+      (function
+        | Place { parent = pid; path; _ } -> target map path pid <> None
+        | Move { parent = pid; path; id } -> (
+            match (path_of map id, target map path pid) with
+            | Some from, Some at -> not (under from at)
+            | _ -> false)
+        | Remove id -> (
+            match path_of map id with
+            | Some p -> not (SM.exists (fun k _ -> under p k) map)
+            | None -> true))
+      e.halves
+
   let land_half map = function
     | Remove id -> (
         match path_of map id with
         | Some p when not (String.equal p "") -> remove_under p map
         | Some _ | None -> map)
-    | Place { parent = pid; path; below } -> (
-        let up = parent path in
-        let target =
-          if is_dir map up pid then Some up
-          else
-            match path_of map pid with
-            | Some p when is_dir map p pid -> Some p
-            | Some _ | None -> None
-        in
-        match target with
+    | Place { parent = pid; path; node } -> (
+        match target map path pid with
         | None -> map
-        | Some up ->
-            let at = join up (base path) in
-            let id = id_of (List.assoc "" below) in
-            let map =
-              match path_of map id with
-              | Some old when not (String.equal old at) -> remove_under old map
-              | Some _ | None -> map
+        | Some at -> SM.add at node (remove_under at map))
+    | Move { parent = pid; path; id } -> (
+        match (path_of map id, target map path pid) with
+        | Some from, Some at when not (String.equal from at) ->
+            let below =
+              SM.fold
+                (fun k v acc ->
+                  if at_or_under from k then
+                    ( String.sub k (String.length from)
+                        (String.length k - String.length from),
+                      v )
+                    :: acc
+                  else acc)
+                map []
             in
-            let map = remove_under at map in
+            let map = remove_under at (remove_under from map) in
             List.fold_left
               (fun map (suffix, v) -> SM.add (at ^ suffix) v map)
-              map below)
+              map below
+        | _ -> map)
 
-  let replay map e = List.fold_left land_half map e.halves
+  let replay map e =
+    if applies map e then List.fold_left land_half map e.halves else map
 
   (* The durable world: the snapshot with every committed entry, in program
      order. *)
@@ -295,39 +324,48 @@ module Model = struct
       (fun map e -> if e.committed then replay map e else map)
       m.snapshot (List.rev m.journal)
 
-  (* Log the operation that touched [path] and [paths], with [gone] the id
-     a path held before an operation took it away. *)
-  let log ?(paths = []) ?gone m path =
-    let half p =
-      let pid = dir_id m.live (parent p) in
-      match gone with
-      | Some (q, id) when String.equal q p -> Some (pid, Remove id)
-      | _ -> (
-          match SM.find_opt p m.live with
-          | None -> None
-          | Some _ ->
-              let below =
-                SM.fold
-                  (fun k v acc ->
-                    if at_or_under p k then
-                      ( String.sub k (String.length p)
-                          (String.length k - String.length p),
-                        v )
-                      :: acc
-                    else acc)
-                  m.live []
-              in
-              Some (pid, Place { parent = pid; path = p; below }))
-    in
-    let halves = List.filter_map half (path :: paths) in
+  (* Log an operation: [halves] with the directories they change. *)
+  let log m halves =
+    m.seq <- m.seq + 1;
     m.journal <-
       {
+        seq = m.seq;
         halves = List.map snd halves;
         dirs = List.map fst halves;
         barred = [];
         committed = false;
       }
       :: m.journal
+
+  let place m path =
+    let pid = dir_id m.live (parent path) in
+    log m [ (pid, Place { parent = pid; path; node = SM.find path m.live }) ]
+
+  (* The ids an entry makes, and those it moves or removes. *)
+  let nodes e =
+    List.filter_map
+      (function
+        | Place { node; _ } -> Some (id_of node) | Move _ | Remove _ -> None)
+      e.halves
+
+  let named e =
+    List.filter_map
+      (function Move { id; _ } | Remove id -> Some id | Place _ -> None)
+      e.halves
+
+  (* The pending entries before [e] it needs: those that made a node it
+     names, and for an rmdir those that changed the directory. *)
+  let deps m e =
+    let names = e.dirs @ named e in
+    let removed =
+      List.filter_map (function Remove id -> Some id | _ -> None) e.halves
+    in
+    List.filter
+      (fun e' ->
+        (not e'.committed) && e'.seq < e.seq
+        && (List.exists (fun n -> List.mem n names) (nodes e')
+           || List.exists (fun d -> List.mem d removed) e'.dirs))
+      m.journal
 
   (* The metadata barrier: the durable world becomes the live one. *)
   let commit m =
@@ -353,7 +391,13 @@ module Model = struct
           m.journal
       in
       if ready <> [] then begin
-        List.iter (fun e -> e.committed <- true) ready;
+        let rec commit e =
+          if not e.committed then begin
+            e.committed <- true;
+            List.iter commit (deps m e)
+          end
+        in
+        List.iter commit ready;
         settle ()
       end
     in
@@ -385,7 +429,7 @@ module Model = struct
     m.live <- SM.add path (File id) m.live;
     m.live_data <- IM.add id "" m.live_data;
     m.durable_data <- IM.add id "" m.durable_data;
-    log m path
+    place m path
 
   let write m path s = m.live_data <- IM.add (file_id m path) s m.live_data
   let contents m path = IM.find (file_id m path) m.live_data
@@ -400,23 +444,34 @@ module Model = struct
   let remove m path =
     let id = id_of (SM.find path m.live) in
     m.live <- SM.remove path m.live;
-    log ~gone:(path, id) m path
+    log m [ (dir_id m.live (parent path), Remove id) ]
 
   let unlink = remove
   let rmdir = remove
 
   let mkdir m path =
     m.live <- SM.add path (Dir (fresh m)) m.live;
-    log m path
+    place m path
 
   let symlink m path target =
     m.live <- SM.add path (Link (target, fresh m)) m.live;
-    log m path
+    place m path
 
   let rename m ~src ~dst =
     let id = id_of (SM.find src m.live) in
+    let from = dir_id m.live (parent src) in
     m.live <- move ~src ~dst m.live;
-    log ~paths:[ dst ] ~gone:(src, id) m src
+    let up = dir_id m.live (parent dst) in
+    m.seq <- m.seq + 1;
+    m.journal <-
+      {
+        seq = m.seq;
+        halves = [ Move { parent = up; path = dst; id } ];
+        dirs = [ from; up ];
+        barred = [];
+        committed = false;
+      }
+      :: m.journal
 
   let image shapes data =
     SM.map

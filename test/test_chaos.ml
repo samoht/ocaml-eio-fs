@@ -2350,6 +2350,78 @@ let test_crash_inode_identity () =
   let mode p = (Eio.Path.stat ~follow:false (post / p)).perm in
   Alcotest.(check (pair int int)) "modes" (0o600, 0o600) (mode "f", mode "g")
 
+(* An entry takes effect whole, with the pending entries it needs, and a
+   rename moves the image's own node: synced bytes follow their file to a
+   renamed directory, a durable file survives a rename into a new directory
+   or out of one later removed, and nothing un-barriered rides along. *)
+let test_crash_entries_whole () =
+  let run setup ops =
+    let ctl = Crash.v () in
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    setup raw;
+    let fs = Crash.wrap ctl raw in
+    ops fs;
+    let post = Crash.post_crash ctl in
+    let rec walk p acc =
+      List.fold_left
+        (fun acc n ->
+          let q = Eio.Path.(post / p / n) in
+          let key = if p = "" then n else p ^ "/" ^ n in
+          match Eio.Path.kind ~follow:false q with
+          | `Directory -> walk key ((key ^ "/") :: acc)
+          | _ -> (key ^ "=" ^ Eio.Path.load q) :: acc)
+        acc
+        (List.sort String.compare (Eio.Path.read_dir Eio.Path.(post / p)))
+    in
+    List.rev (walk "" [])
+  in
+  let dirs raw l =
+    List.iter (fun d -> Eio.Path.mkdir ~perm:0o755 (raw / d)) l
+  in
+  let save raw p s = Eio.Path.save ~create:(`Exclusive 0o644) (raw / p) s in
+  let check what expected got =
+    Alcotest.(check (list string)) what expected got
+  in
+  check "synced bytes in a renamed directory" [ "D/"; "D/f=synced" ]
+    (run
+       (fun raw -> dirs raw [ "D" ])
+       (fun fs ->
+         Eio.Path.rename (fs / "D") (fs / "E");
+         write_new ~sync:true (fs / "E/f") "synced";
+         Eio_fs_sync.sync_dir (fs / "E")));
+  check "a move out of a directory then removed"
+    [ "P/"; "Q/"; "Q/C/"; "Q/C/x=durable" ]
+    (run
+       (fun raw ->
+         dirs raw [ "P"; "P/A"; "P/A/B"; "Q" ];
+         save raw "P/A/B/x" "durable")
+       (fun fs ->
+         Eio.Path.rename (fs / "P/A/B") (fs / "Q/C");
+         Eio.Path.rmdir (fs / "P/A");
+         Eio_fs_sync.sync_dir (fs / "P")));
+  check "a rename into a new directory"
+    [ "P/"; "Q/"; "Q/f=durable" ]
+    (run
+       (fun raw ->
+         dirs raw [ "P" ];
+         save raw "P/f" "durable")
+       (fun fs ->
+         Eio.Path.mkdir ~perm:0o755 (fs / "Q");
+         Eio.Path.rename (fs / "P/f") (fs / "Q/f");
+         Eio_fs_sync.sync_dir (fs / "P")));
+  check "a moved directory carries only what the image holds"
+    [ "A/"; "A/f=data"; "B/"; "B/e/" ]
+    (run
+       (fun raw ->
+         dirs raw [ "A"; "A/d"; "B" ];
+         save raw "A/f" "data")
+       (fun fs ->
+         Eio.Path.rename (fs / "A/f") (fs / "A/d/f");
+         write_new ~sync:true (fs / "A/d/new") "x";
+         Eio.Path.rename (fs / "A/d") (fs / "B/e");
+         Eio_fs_sync.sync_dir (fs / "B")))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2701,6 +2773,9 @@ let suite =
         test_crash_synced_mode_follows_the_file;
       Alcotest.test_case "crash: files and directories are known by inode"
         `Quick test_crash_inode_identity;
+      Alcotest.test_case
+        "crash: an entry lands whole, a rename moves the image's node" `Quick
+        test_crash_entries_whole;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

@@ -1098,8 +1098,6 @@ module Crash = struct
       (fun t (_, ls) -> List.fold_left (fun t (fs, _, _) -> unlocate fs t) t ls)
       t (under k t.at)
 
-  let all_locations t = Paths.fold (fun _ ls acc -> ls @ acc) t.at []
-
   (* An image of the tree: the tree, where each tracked file sits in it, and
      where each inode sits. *)
   type state = { tree : tree; locs : locs; inos : string list Inos.t }
@@ -1110,6 +1108,7 @@ module Crash = struct
      when the operation ran. *)
   type edit =
     | Place of { parent : int64; node : tree }
+    | Move of { parent : int64; ino : int64 }
     | Remove of int64
     | Attrs of { ino : int64; perm : int; uid : int64; gid : int64 }
 
@@ -1128,10 +1127,13 @@ module Crash = struct
         (* Those of [dirs] a barrier has reached since: the entry is durable
            once one of them is. *)
     delta : delta;
-    recorded : location list;
+    mutable recorded : location list;
     attrs_ino : int64 option;
         (* For a chmod or a chown, the node it changed: a sync of that file
            commits it too. *)
+    nodes : int64 list; (* the nodes it makes *)
+    named : int64 list; (* the nodes it moves or removes *)
+    parents : int64 list; (* the directories whose entries it changes *)
     mutable synced : bool; (* a sync of that file has run since *)
     mutable committed : bool;
   }
@@ -1183,9 +1185,16 @@ module Crash = struct
            log is compacted. *)
     mutable logged : int; (* the log's length *)
     mutable pending_changes : int; (* its entries still pending *)
-    mutable metadata : metadata_entry list;
-        (* Every entry since the last whole snapshot, committed or not, newest
-           first. *)
+    mutable journal : metadata_entry Ids.t;
+        (* Every entry since the last whole snapshot, committed or not, by
+           seq. *)
+    mutable pool : metadata_entry Ids.t;
+        (* The pending entries a barrier or a sync has reached. *)
+    by_dir : (int64, metadata_entry Ids.t) Hashtbl.t;
+        (* The pending entries by the directories whose barrier commits them. *)
+    by_node : (int64, metadata_entry Ids.t) Hashtbl.t;
+    by_parent : (int64, metadata_entry Ids.t) Hashtbl.t;
+    by_attrs : (int64, metadata_entry Ids.t) Hashtbl.t;
     mutable snapshot : state option; (* the last whole snapshot *)
     mutable durable : state option;
         (* The snapshot with the committed entries replayed over it, or
@@ -1200,6 +1209,10 @@ module Crash = struct
     mutable seq : int;
     mutable ops : int;
     mutable crashed : bool;
+    mutable image :
+      (string * int64 * [ `File of string | `Dir | `Link of string ]) list;
+        (* The image the crash rebuilt, by path below the root, with the
+           inode each entry had live, for this package's tests. *)
   }
 
   (* [owner] with root's rights when it is the wrapped base. *)
@@ -1245,9 +1258,9 @@ module Crash = struct
         ctl.log
     in
     let metadata =
-      List.filter_map
-        (fun e -> if e.committed then None else Some e.meta)
-        ctl.metadata
+      Ids.fold
+        (fun _ e acc -> if e.committed then acc else e.meta :: acc)
+        ctl.journal []
     in
     List.sort
       (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
@@ -1532,82 +1545,121 @@ module Crash = struct
     | _ :: p, _ :: s -> drop p s
     | _ :: _, [] -> []
 
-  (* Replay entry [e]'s delta onto an image. Each half finds its node by
-     inode: a node goes into the directory that held it when the operation
-     ran, at the path it had then or wherever that directory is now, and
-     only once; a node is taken out, or given attributes, wherever it is.
-     So a half whose directory the image does not hold, because the entry
-     that made it did not survive, lands nowhere, and nothing lands in
-     another directory of the same name. The files [e] recorded under a
-     node it puts somewhere sit there, at their path below it. *)
-  let replay ~root st e =
-    List.fold_left
-      (fun st (segs, edit) ->
+  (* Where the directory [parent], which held the entry at [segs] when the
+     operation ran, is in [st]: at that path if it is still there, or
+     wherever that inode is now. *)
+  let target_dir st segs parent =
+    let dir_at at =
+      match tree_find st.tree at with
+      | Some (Dir d) -> Int64.equal d.ino parent
+      | Some (File _ | Link _) | None -> false
+    in
+    match List.rev segs with
+    | [] -> None
+    | name :: up -> (
+        let up = List.rev up in
+        if dir_at up then Some (up @ [ name ])
+        else
+          match Inos.find_opt parent st.inos with
+          | Some at when dir_at at -> Some (at @ [ name ])
+          | Some _ | None -> None)
+
+  (* Whether every half of [e] lands in [st]: an entry takes effect whole or
+     not at all, so a rename whose destination directory the image does not
+     hold leaves its node where it was, and an rmdir of a directory that
+     still holds entries there removes nothing. *)
+  let applies st e =
+    List.for_all
+      (fun (segs, edit) ->
         match edit with
+        | Place { parent; _ } -> Option.is_some (target_dir st segs parent)
+        | Move { parent; ino } -> (
+            match (Inos.find_opt ino st.inos, target_dir st segs parent) with
+            | Some (_ :: _ as from), Some at ->
+                not (is_prefix from at && from <> at)
+            | _ -> false)
         | Remove ino -> (
             match Inos.find_opt ino st.inos with
-            | Some (_ :: _ as at) -> remove_path st at
-            | Some [] | None -> st)
-        | Attrs { ino; perm; uid; gid } -> (
-            match Inos.find_opt ino st.inos with
-            | None -> st
             | Some at -> (
                 match tree_find st.tree at with
-                | None -> st
-                | Some node -> (
-                    let node = with_attrs ~perm ~uid ~gid node in
-                    match at with
-                    | [] -> { st with tree = node }
-                    | _ ->
-                        { st with tree = tree_replace st.tree at (Some node) }))
-            )
-        | Place { parent; node } -> (
-            match List.rev segs with
-            | [] -> st
-            | name :: up -> (
-                let dir_at at =
+                | Some (Dir d) -> Paths.is_empty d.entries
+                | Some (File _ | Link _) | None -> true)
+            | None -> true)
+        | Attrs _ -> true)
+      e.delta
+
+  (* Replay entry [e]'s delta onto an image, whole or not at all. Each half
+     finds its node by inode: a new node goes into the directory that held it
+     when the operation ran, a moved node is the image's own, taken from
+     wherever it is with what it holds there, and a node is taken out, or
+     given attributes, wherever it is. *)
+  let replay ~root st e =
+    if not (applies st e) then st
+    else
+      List.fold_left
+        (fun st (segs, edit) ->
+          match edit with
+          | Remove ino -> (
+              match Inos.find_opt ino st.inos with
+              | Some (_ :: _ as at) -> remove_path st at
+              | Some [] | None -> st)
+          | Attrs { ino; perm; uid; gid } -> (
+              match Inos.find_opt ino st.inos with
+              | None -> st
+              | Some at -> (
                   match tree_find st.tree at with
-                  | Some (Dir d) -> Int64.equal d.ino parent
-                  | Some (File _ | Link _) | None -> false
-                in
-                let up = List.rev up in
-                let target =
-                  if dir_at up then Some up
-                  else
-                    match Inos.find_opt parent st.inos with
-                    | Some at when dir_at at -> Some at
-                    | Some _ | None -> None
-                in
-                match target with
-                | None -> st
-                | Some up ->
-                    let at = up @ [ name ] in
-                    let st =
-                      match Inos.find_opt (ino_of node) st.inos with
-                      | Some (_ :: _ as old) when old <> at ->
-                          remove_path st old
-                      | Some _ | None -> st
-                    in
-                    let st =
-                      {
-                        st with
-                        locs = unlocate_under (String.concat "/" at) st.locs;
-                      }
-                    in
-                    let st = set_node st at (Some node) in
-                    let locs =
-                      List.fold_left
-                        (fun locs ((_, _, rel) as l) ->
-                          match tree_path ~root rel with
-                          | Some s when is_prefix segs s ->
-                              locate_at
-                                (String.concat "/" (at @ drop segs s))
-                                l locs
-                          | Some _ | None -> locs)
-                        st.locs e.recorded
-                    in
-                    { st with locs })))
-      st e.delta
+                  | None -> st
+                  | Some node -> (
+                      let node = with_attrs ~perm ~uid ~gid node in
+                      match at with
+                      | [] -> { st with tree = node }
+                      | _ ->
+                          { st with tree = tree_replace st.tree at (Some node) }
+                      )))
+          | Move { parent; ino } -> (
+              match (Inos.find_opt ino st.inos, target_dir st segs parent) with
+              | Some from, Some at when from <> at -> (
+                  match tree_find st.tree from with
+                  | None -> st
+                  | Some node ->
+                      let moved = under (String.concat "/" from) st.locs.at in
+                      let st = remove_path st from in
+                      let st = remove_path st at in
+                      let st = set_node st at (Some node) in
+                      let n = List.length from in
+                      let locs =
+                        List.fold_left
+                          (fun locs (k, ls) ->
+                            let below =
+                              List.filteri (fun i _ -> i >= n) (path_segments k)
+                            in
+                            let key = String.concat "/" (at @ below) in
+                            List.fold_left
+                              (fun locs l -> locate_at key l locs)
+                              locs ls)
+                          st.locs moved
+                      in
+                      { st with locs })
+              | _ -> st)
+          | Place { parent; node } -> (
+              match target_dir st segs parent with
+              | None -> st
+              | Some at ->
+                  let st = remove_path st at in
+                  let st = set_node st at (Some node) in
+                  let locs =
+                    List.fold_left
+                      (fun locs ((_, _, rel) as l) ->
+                        match tree_path ~root rel with
+                        | Some s when is_prefix segs s ->
+                            locate_at
+                              (String.concat "/" (at @ drop segs s))
+                              l locs
+                        | Some _ | None -> locs)
+                      st.locs e.recorded
+                  in
+                  { st with locs }))
+        st e.delta
 
   (* The path of [p]'s directory, spelt as [p] is. *)
   let parent_path p =
@@ -1621,30 +1673,7 @@ module Crash = struct
     | st -> Some st.ino
     | exception Eio.Io _ -> None
 
-  (* What one directory operation did at the paths it touched, resolved: its
-     own, and for a rename the destination as well. A path in [gone] names
-     the node it held before the operation, which went; any other names the
-     node it holds now, and only that subtree is read. Each half also gives
-     the inode of the directory it changed. *)
-  let delta_of ~root owner ~gone paths =
-    List.filter_map
-      (fun p ->
-        match tree_path ~root p with
-        | None -> None
-        | Some segs -> (
-            match ino_at owner (parent_path p) with
-            | None -> None
-            | Some parent -> (
-                match List.assoc_opt p gone with
-                | Some ino -> Some (parent, (segs, Remove ino))
-                | None -> (
-                    match snapshot_at owner p with
-                    | node -> Some (parent, (segs, Place { parent; node }))
-                    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
-                        None))))
-      paths
-
-  (* Whether [loc] lies at or under a node [delta] puts somewhere. *)
+  (* Whether [loc] lies at or under a node [delta] makes. *)
   let covers ~root delta (_, _, rel) =
     match tree_path ~root rel with
     | None -> false
@@ -1653,7 +1682,7 @@ module Crash = struct
           (fun (segs, edit) ->
             match edit with
             | Place _ -> is_prefix segs s
-            | Remove _ | Attrs _ -> false)
+            | Move _ | Remove _ | Attrs _ -> false)
           delta
 
   (* [locs] in an image keyed below [root]. *)
@@ -1673,6 +1702,82 @@ module Crash = struct
     | Some (_, root_path) -> path_segments root_path
     | None -> []
 
+  (* {2 The journal and its indexes} *)
+
+  let add_to tbl key e =
+    let m = Option.value ~default:Ids.empty (Hashtbl.find_opt tbl key) in
+    Hashtbl.replace tbl key (Ids.add e.meta.seq e m)
+
+  let remove_from tbl key e =
+    match Hashtbl.find_opt tbl key with
+    | None -> ()
+    | Some m ->
+        let m = Ids.remove e.meta.seq m in
+        if Ids.is_empty m then Hashtbl.remove tbl key
+        else Hashtbl.replace tbl key m
+
+  let candidate e =
+    (not e.committed)
+    && (e.barred <> [] || (e.synced && Option.is_some e.attrs_ino))
+
+  let refresh ctl e =
+    ctl.pool <-
+      (if candidate e then Ids.add e.meta.seq e ctl.pool
+       else Ids.remove e.meta.seq ctl.pool)
+
+  let index_entry ctl e =
+    ctl.journal <- Ids.add e.meta.seq e ctl.journal;
+    List.iter (fun d -> add_to ctl.by_dir d e) e.dirs;
+    List.iter (fun n -> add_to ctl.by_node n e) e.nodes;
+    List.iter (fun p -> add_to ctl.by_parent p e) e.parents;
+    Option.iter (fun a -> add_to ctl.by_attrs a e) e.attrs_ino
+
+  (* A committed entry leaves the indexes of pending ones. *)
+  let mark_committed ctl e =
+    e.committed <- true;
+    List.iter (fun d -> remove_from ctl.by_dir d e) e.dirs;
+    List.iter (fun n -> remove_from ctl.by_node n e) e.nodes;
+    List.iter (fun p -> remove_from ctl.by_parent p e) e.parents;
+    Option.iter (fun a -> remove_from ctl.by_attrs a e) e.attrs_ino;
+    ctl.pool <- Ids.remove e.meta.seq ctl.pool
+
+  (* The pending entries before [e] it depends on: those that made a node [e]
+     names, and for an rmdir, those that changed the directory it removes. A
+     directory renamed before [e] changed it is no dependency: its inode is
+     durable under one name or the other. A change of attributes waits for
+     its node and pulls nothing in. *)
+  let deps ctl e =
+    match e.attrs_ino with
+    | Some _ -> []
+    | None ->
+        let earlier tbl key =
+          match Hashtbl.find_opt tbl key with
+          | None -> []
+          | Some m ->
+              Ids.fold
+                (fun s e' acc -> if s < e.meta.seq then e' :: acc else acc)
+                m []
+        in
+        List.concat_map (earlier ctl.by_node) (e.parents @ e.named)
+        @ List.concat_map
+            (fun (_, edit) ->
+              match edit with
+              | Remove ino -> earlier ctl.by_parent ino
+              | Place _ | Move _ | Attrs _ -> [])
+            e.delta
+
+  (* [e] and, transitively, the pending entries it depends on. *)
+  let closure ctl e =
+    let seen = Hashtbl.create 8 in
+    let rec go acc e =
+      if Hashtbl.mem seen e.meta.seq then acc
+      else begin
+        Hashtbl.replace seen e.meta.seq ();
+        List.fold_left go (e :: acc) (deps ctl e)
+      end
+    in
+    go [] e
+
   (* [path] and [kind] as the caller spelled them, [resolved] the paths the
      operation touched, resolved: its own first. [gone] gives the inode a
      path held before an operation that took it away. *)
@@ -1681,6 +1786,7 @@ module Crash = struct
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let root = path_segments root_path in
+    let parent p = ino_at owner (parent_path p) in
     let delta, dirs, attrs_ino =
       match (kind, resolved) with
       | (Chmod _ | Chown _), [ p ] -> (
@@ -1688,8 +1794,8 @@ module Crash = struct
              directory or on the node itself, and for a file by its sync. *)
           let (Base_dir ((module B), bv)) = owner in
           let st = B.stat bv ~follow:false p in
-          match (tree_path ~root p, ino_at owner (parent_path p)) with
-          | Some segs, Some parent ->
+          match (tree_path ~root p, parent p) with
+          | Some segs, Some up ->
               let edit =
                 Attrs
                   { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
@@ -1697,11 +1803,37 @@ module Crash = struct
               let file =
                 match st.kind with `Directory -> None | _ -> Some st.ino
               in
-              ([ (segs, edit) ], [ parent; st.ino ], file)
+              ([ (segs, edit) ], [ up; st.ino ], file)
+          | _ -> ([], [], None))
+      | Rename _, [ src; dst ] -> (
+          (* A rename moves the image's own node: nothing of what it holds
+             live comes with it. It is committed by a barrier on either
+             directory. *)
+          match
+            ( List.assoc_opt src gone,
+              tree_path ~root dst,
+              parent src,
+              parent dst )
+          with
+          | Some ino, Some segs, Some from, Some up ->
+              ([ (segs, Move { parent = up; ino }) ], [ from; up ], None)
           | _ -> ([], [], None))
       | _ ->
-          (* A rename is committed by a barrier on either directory. *)
-          let halves = delta_of ~root owner ~gone resolved in
+          let halves =
+            List.filter_map
+              (fun p ->
+                match (tree_path ~root p, parent p) with
+                | None, _ | _, None -> None
+                | Some segs, Some up -> (
+                    match List.assoc_opt p gone with
+                    | Some ino -> Some (up, (segs, Remove ino))
+                    | None -> (
+                        match snapshot_at owner p with
+                        | node -> Some (up, (segs, Place { parent = up; node }))
+                        | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+                            None)))
+              resolved
+          in
           (List.map snd halves, List.map fst halves, None)
     in
     let recorded =
@@ -1710,7 +1842,28 @@ module Crash = struct
       |> List.map (fun fs -> (fs, fs.owner, fs.rel))
       |> List.filter (covers ~root delta)
     in
-    ctl.metadata <-
+    let nodes =
+      List.filter_map
+        (fun (_, edit) ->
+          match edit with
+          | Place { node; _ } -> Some (ino_of node)
+          | Move _ | Remove _ | Attrs _ -> None)
+        delta
+    in
+    let named =
+      List.filter_map
+        (fun (_, edit) ->
+          match edit with
+          | Move { ino; _ } | Remove ino -> Some ino
+          | Place _ | Attrs _ -> None)
+        delta
+    in
+    let parents =
+      match attrs_ino with
+      | Some _ -> []
+      | None -> List.sort_uniq Int64.compare dirs
+    in
+    index_entry ctl
       {
         meta;
         dirs;
@@ -1718,10 +1871,20 @@ module Crash = struct
         delta;
         recorded;
         attrs_ino;
+        nodes;
+        named;
+        parents;
         synced = false;
         committed = false;
       }
-      :: ctl.metadata
+
+  let reset_journal ctl =
+    ctl.journal <- Ids.empty;
+    ctl.pool <- Ids.empty;
+    Hashtbl.reset ctl.by_dir;
+    Hashtbl.reset ctl.by_node;
+    Hashtbl.reset ctl.by_parent;
+    Hashtbl.reset ctl.by_attrs
 
   let commit_metadata ctl =
     let owner, root_path = root ctl in
@@ -1733,7 +1896,7 @@ module Crash = struct
     ctl.snapshot <- Some st;
     ctl.durable <- Some st;
     ctl.committed_upto <- ctl.seq;
-    ctl.metadata <- []
+    reset_journal ctl
 
   (* The durable image, built again from the snapshot when a commit came out
      of program order. *)
@@ -1744,9 +1907,9 @@ module Crash = struct
     | None, Some snapshot ->
         let root = root_segs ctl in
         let st =
-          List.fold_left
-            (fun st e -> if e.committed then replay ~root st e else st)
-            snapshot (List.rev ctl.metadata)
+          Ids.fold
+            (fun _ e st -> if e.committed then replay ~root st e else st)
+            ctl.journal snapshot
         in
         ctl.durable <- Some st;
         st
@@ -1758,13 +1921,14 @@ module Crash = struct
     | None -> ()
     | Some snapshot ->
         let root = root_segs ctl in
-        let rec go st = function
-          | e :: rest when e.committed -> go (replay ~root st e) rest
-          | rest -> (st, rest)
+        let rec go st =
+          match Ids.min_binding_opt ctl.journal with
+          | Some (s, e) when e.committed ->
+              ctl.journal <- Ids.remove s ctl.journal;
+              go (replay ~root st e)
+          | Some _ | None -> st
         in
-        let st, rest = go snapshot (List.rev ctl.metadata) in
-        ctl.snapshot <- Some st;
-        ctl.metadata <- List.rev rest
+        ctl.snapshot <- Some (go snapshot)
 
   (* fsync(2) on a directory commits that directory's entries and nothing
      else: the journal entries that changed it, keyed by its inode, so a
@@ -1772,7 +1936,9 @@ module Crash = struct
      another of the same name. An entry of a directory whose own entry is not
      durable cannot be durable yet: after the power cut there is no directory
      to hold it. The barrier is remembered on the entry, which becomes
-     durable as soon as its directory does.
+     durable as soon as its directory does, with the pending entries before
+     it that it needs: the one that made its destination, or that emptied
+     the directory it removes.
 
      The entries a barrier commits are not in general a journal prefix: the
      durable image replays every committed entry in program order, so an
@@ -1785,10 +1951,16 @@ module Crash = struct
       && (match e.attrs_ino with Some ino -> held ino | None -> true)
       && (List.exists held e.barred || (e.synced && Option.is_some e.attrs_ino))
     in
-    match List.filter ready (List.rev ctl.metadata) with
+    match
+      Ids.fold (fun _ e acc -> if ready e then e :: acc else acc) ctl.pool []
+    with
     | [] -> fold_committed ctl
-    | newly ->
-        List.iter (fun e -> e.committed <- true) newly;
+    | ready ->
+        let newly =
+          List.concat_map (closure ctl) ready
+          |> List.sort_uniq (fun a b -> Int.compare a.meta.seq b.meta.seq)
+        in
+        List.iter (mark_committed ctl) newly;
         let last = List.fold_left (fun m e -> max m e.meta.seq) 0 newly in
         if List.for_all (fun e -> e.meta.seq > ctl.committed_upto) newly then
           ctl.durable <-
@@ -1800,11 +1972,16 @@ module Crash = struct
   (* Hold a barrier on the directory [ino] for the entries that changed it,
      then commit what it can. *)
   let commit_dir_ino ctl ino =
-    List.iter
-      (fun e ->
-        if (not e.committed) && List.exists (Int64.equal ino) e.dirs then
-          e.barred <- ino :: e.barred)
-      ctl.metadata;
+    (match Hashtbl.find_opt ctl.by_dir ino with
+    | None -> ()
+    | Some m ->
+        Ids.iter
+          (fun _ e ->
+            if not (List.exists (Int64.equal ino) e.barred) then begin
+              e.barred <- ino :: e.barred;
+              refresh ctl e
+            end)
+          m);
     settle ctl
 
   let commit_dir ctl ~dir =
@@ -1816,13 +1993,16 @@ module Crash = struct
   (* fsync(2) of a file commits its inode, attributes included: they hold
      once the image holds the file. *)
   let commit_attrs ctl ~ino =
-    if List.exists (fun e -> Option.is_some e.attrs_ino) ctl.metadata then begin
+    if Hashtbl.length ctl.by_attrs > 0 then begin
       let ino = ino () in
-      List.iter
-        (fun e ->
-          if Option.equal Int64.equal e.attrs_ino (Some ino) then
-            e.synced <- true)
-        ctl.metadata;
+      (match Hashtbl.find_opt ctl.by_attrs ino with
+      | None -> ()
+      | Some m ->
+          Ids.iter
+            (fun _ e ->
+              e.synced <- true;
+              refresh ctl e)
+            m);
       settle ctl
     end
 
@@ -1856,15 +2036,12 @@ module Crash = struct
                   match tree_find node (drop s segs) with
                   | Some (File f) -> Int64.equal f.ino ino
                   | Some (Dir _ | Link _) | None -> false)
-              | Place _ | Remove _ | Attrs _ -> false)
+              | Place _ | Move _ | Remove _ | Attrs _ -> false)
             e.delta
         in
-        ctl.metadata <-
-          List.map
-            (fun e ->
-              if in_delta e then { e with recorded = location :: e.recorded }
-              else e)
-            ctl.metadata
+        Ids.iter
+          (fun _ e -> if in_delta e then e.recorded <- location :: e.recorded)
+          ctl.journal
 
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
@@ -1989,7 +2166,9 @@ module Crash = struct
             Hashtbl.replace contents fs.id c;
             c
       in
-      let journal = List.rev ctl.metadata in
+      let journal =
+        List.rev (Ids.fold (fun _ e acc -> e :: acc) ctl.journal [])
+      in
       let pending = List.filter (fun e -> not e.committed) journal in
       let rec take_prefix pred = function
         | x :: xs when pred x -> x :: take_prefix pred xs
@@ -2022,30 +2201,68 @@ module Crash = struct
         let snapshot =
           match ctl.snapshot with Some st -> st | None -> assert false
         in
+        let included = Hashtbl.create 16 in
         List.fold_left
           (fun st e ->
             let held ino = Inos.mem ino st.inos in
-            let barred =
+            let barred () =
               (match e.attrs_ino with Some ino -> held ino | None -> true)
               && (List.exists held e.barred
                  || (e.synced && Option.is_some e.attrs_ino))
+              && List.for_all
+                   (fun d -> Hashtbl.mem included d.meta.seq)
+                   (deps ctl e)
             in
-            if e.committed || survives e || barred then replay ~root st e
+            if e.committed || survives e || barred () then begin
+              Hashtbl.replace included e.meta.seq ();
+              replay ~root st e
+            end
             else st)
           snapshot journal
       in
       restore_root owner root_path tree;
-      List.iter
-        (fun (fs, owner, rel) ->
-          let content = content fs in
-          let (Base_dir ((module B), bv)) = as_admin ctl owner in
-          match B.stat bv ~follow:false rel with
-          | { kind = `Regular_file; _ } ->
-              fs.owner <- owner;
-              fs.rel <- rel;
-              rewrite ctl fs content
-          | _ | (exception Eio.Io _) -> ())
-        (all_locations locs)
+      (* Each tracked file is rewritten where the image holds it, which a
+         rename may have made another name than the one it was met at. *)
+      let rel_of key =
+        if String.equal root_path "" then key
+        else if String.ends_with ~suffix:"/" root_path then root_path ^ key
+        else root_path ^ "/" ^ key
+      in
+      let proot = Option.get ctl.root_box in
+      Paths.iter
+        (fun key ls ->
+          let rel = rel_of key in
+          List.iter
+            (fun (fs, _, _) ->
+              let content = content fs in
+              let (Base_dir ((module B), bv)) = owner in
+              match B.stat bv ~follow:false rel with
+              | { kind = `Regular_file; _ } ->
+                  fs.owner <- proot;
+                  fs.rel <- rel;
+                  rewrite ctl fs content
+              | _ | (exception Eio.Io _) -> ())
+            ls)
+        locs.at;
+      ctl.image <-
+        fold_nodes
+          (fun segs node acc ->
+            match segs with
+            | [] -> acc
+            | _ ->
+                let key = String.concat "/" segs in
+                let kind =
+                  match node with
+                  | Dir _ -> `Dir
+                  | Link l -> `Link l.target
+                  | File f -> (
+                      match Paths.find_opt key locs.at with
+                      | Some ((fs, _, _) :: _) ->
+                          `File (Cstruct.to_string (content fs))
+                      | Some [] | None -> `File (Cstruct.to_string f.data))
+                in
+                (key, ino_of node, kind) :: acc)
+          [] tree []
     end
 
   (* Advance the durability op counter and fire the configured auto-trigger. *)
@@ -2107,13 +2324,13 @@ module Crash = struct
   (* A barrier makes the file's pending changes durable, replayed over its
      durable bytes: a change lost to a failed barrier, or made around the
      wrapper, never becomes durable. *)
-  let barrier ctl fs ~ino sync =
+  let barrier ctl fs ~stat sync =
     match sync () with
     | () ->
         let pending = List.rev fs.pending in
         List.iter (fun e -> apply fs.durable e.change) pending;
         lose ctl fs;
-        commit_attrs ctl ~ino;
+        commit_attrs ctl ~ino:(fun () -> (stat ()).Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
         lose ctl fs;
@@ -2153,7 +2370,9 @@ module Crash = struct
     match fs with
     | None -> commit_attrs cf.ctl ~ino:(file_ino cf)
     | Some fs ->
-        barrier cf.ctl fs ~ino:(file_ino cf) (fun () -> sync_base cf.cro)
+        barrier cf.ctl fs
+          ~stat:(fun () -> Eio.File.stat cf.cro)
+          (fun () -> sync_base cf.cro)
 
   (* A directory opened as a file syncs as that directory's barrier. *)
   let wrap_cfile_ro ?fs ?dir ctl base : Eio.File.ro_ty r =
@@ -2228,8 +2447,9 @@ module Crash = struct
     let sync cf =
       guard cf;
       let fs = fstate_of cf in
-      barrier cf.ctl fs ~ino:(file_ino cf) (fun () ->
-          Eio.File.sync (writable cf))
+      barrier cf.ctl fs
+        ~stat:(fun () -> Eio.File.stat cf.cro)
+        (fun () -> Eio.File.sync (writable cf))
 
     let truncate cf len =
       guard cf;
@@ -2656,7 +2876,12 @@ module Crash = struct
       base = None;
       files = Hashtbl.create 8;
       log = [];
-      metadata = [];
+      journal = Ids.empty;
+      pool = Ids.empty;
+      by_dir = Hashtbl.create 16;
+      by_node = Hashtbl.create 16;
+      by_parent = Hashtbl.create 16;
+      by_attrs = Hashtbl.create 16;
       snapshot = None;
       durable = None;
       committed_upto = 0;
@@ -2669,6 +2894,7 @@ module Crash = struct
       pending_changes = 0;
       ops = 0;
       crashed = false;
+      image = [];
     }
 
   let wrap ctl (base, path) =
@@ -2719,4 +2945,5 @@ end
 module Private = struct
   let next = Schedule.next
   let replay_copied () = Atomic.get Crash.copied
+  let crash_image (ctl : Crash.t) = List.rev ctl.image
 end

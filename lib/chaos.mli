@@ -235,9 +235,15 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     from the moment it is. The model knows files and directories by inode, as
     ext4 does: a barrier holds for its directory under whatever name it has
     later, and never for another directory of the same name. Committed entries
-    take effect in program order, whatever order their barriers ran in. At a
-    crash the policy decides how much of the uncommitted suffix survives, always
-    a prefix of program order, and a dropped operation is rolled back whole; an
+    take effect in program order, whatever order their barriers ran in, and a
+    barrier also commits the pending entries an entry it commits needs: the one
+    that made a directory it puts a node in, or the ones that emptied a
+    directory it removes. A rename moves the node the image holds, with what the
+    image holds below it. An entry takes effect whole or not at all: one whose
+    directory the image does not hold, or an rmdir of a directory the image
+    still fills, changes nothing, so no durable node is lost to it. At a crash
+    the policy decides how much of the uncommitted suffix survives, always a
+    prefix of program order, and a dropped operation is rolled back whole; an
     entry a deferred barrier covers survives whenever its directory does. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
@@ -401,6 +407,12 @@ end
 module Private : sig
   val next : Schedule.t -> Op.t -> Fault.t option
   (** [next t op] advances [t] by one operation and is the fault to inject. *)
+
+  val crash_image :
+    Crash.t ->
+    (string * int64 * [ `File of string | `Dir | `Link of string ]) list
+  (** [crash_image t] is the image [t]'s crash rebuilt: each entry's path below
+      the wrapped root, the inode it had before the crash, and what it holds. *)
 
   val replay_copied : unit -> int
   (** [replay_copied ()] is how many bytes {!Crash} has copied into the images
