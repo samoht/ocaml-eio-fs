@@ -464,7 +464,7 @@ let file_sync t id ~ok =
         (fun b ->
           let off = b * t.bs in
           let n = max 0 (min t.bs (String.length f.cache - off)) in
-          (b, String.sub f.cache off n))
+          (b, if n = 0 then "" else String.sub f.cache off n))
         written
       @ List.filter (fun (b, _) -> not (List.mem b written)) f.partial;
     f.pend <- [];
