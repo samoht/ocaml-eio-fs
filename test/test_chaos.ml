@@ -2954,6 +2954,52 @@ let test_crash_second_failure () =
     "f" "x\000\000e"
     (Eio.Path.load (Crash.post_crash ctl / "f"))
 
+(* A page a failed sync lost, then a truncation that cuts it away, made
+   durable by a sync: the page never comes back, even when the cut falls on
+   a block boundary. *)
+let test_crash_durable_cut_frees_lost_pages () =
+  let images init steps =
+    let seen = Hashtbl.create 8 in
+    for seed = 0 to 399 do
+      let ctl = Crash.v ~policy:(Reorder_unsynced seed) ~block_size:2 () in
+      with_crash ctl @@ fun ~raw:_ ~fs ->
+      write_new ~sync:true (fs / "f") init;
+      Eio_fs_sync.sync_dir fs;
+      let sched =
+        Schedule.scripted
+          [
+            {
+              trigger = Op_on_path { kind = `Sync; path = "f" };
+              fault = Sync_error `Eio;
+            };
+          ]
+      in
+      let cfs = Chaos.wrap sched fs in
+      Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+          List.iter
+            (function
+              | `W (o, s) ->
+                  Eio.File.pwrite_all f ~file_offset:(i63 o)
+                    [ Cstruct.of_string s ]
+              | `T n -> Eio.File.truncate f (i63 n)
+              | `S -> Eio.File.sync f
+              | `F -> (
+                  try
+                    Eio.Path.with_open_out ~create:`Never (cfs / "f")
+                      Eio.File.sync
+                  with Eio.Io _ -> ()))
+            steps);
+      Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
+    done;
+    List.of_seq (Hashtbl.to_seq_keys seen)
+  in
+  let a = images "" [ `W (0, "A"); `F; `T 0; `S; `T 1 ] in
+  Alcotest.(check bool) "no A" false (List.mem "A" a);
+  let b = images "pqr" [ `W (3, "A"); `F; `T 1; `S; `W (1, "BB") ] in
+  Alcotest.(check bool)
+    "no r at 2" false
+    (List.exists (fun s -> String.length s > 2 && s.[2] = 'r') b)
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3358,6 +3404,8 @@ let suite =
         `Quick test_crash_partial_writeback;
       Alcotest.test_case "crash: a second failed sync keeps the page cache"
         `Quick test_crash_second_failure;
+      Alcotest.test_case "crash: a durable cut frees the pages a failure lost"
+        `Quick test_crash_durable_cut_frees_lost_pages;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

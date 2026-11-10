@@ -974,9 +974,10 @@ module Crash = struct
     mutable evicted : Cstruct.t option;
         (* The durable bytes had the pages a failed sync lost been evicted
            before a later write to them, where they differ. *)
-    mutable partial : (int * Cstruct.t) list;
-        (* The blocks a failed sync lost, as they stood then: a writeback
-           that failed only partly may have written any of them. *)
+    mutable partial : (int * int * Cstruct.t) list;
+        (* The blocks a failed sync lost, with the seq it failed at and as
+           they stood then: a writeback that failed only partly may have
+           written any of them. *)
   }
 
   and entry = {
@@ -2394,7 +2395,10 @@ module Crash = struct
                   (* A writeback that failed only partly wrote any of the
                      blocks it lost. *)
                   let over =
-                    List.filter (fun _ -> Random.State.bool rng) fs.partial
+                    List.filter_map
+                      (fun (b, _, blk) ->
+                        if Random.State.bool rng then Some (b, blk) else None)
+                      fs.partial
                   in
                   match fs.evicted with
                   | Some e when Random.State.bool rng ->
@@ -2623,9 +2627,10 @@ module Crash = struct
           let n = min bs (Cstruct.length live - off) in
           (* A page cut away by then is written no more; the tail of the
              last one past the end is zero. *)
-          if n <= 0 then None else Some (b, copy_cs (Cstruct.sub live off n)))
+          if n <= 0 then None
+          else Some (b, ctl.seq, copy_cs (Cstruct.sub live off n)))
         written
-      @ List.filter (fun (b, _) -> not (List.mem b written)) fs.partial;
+      @ List.filter (fun (b, _, _) -> not (List.mem b written)) fs.partial;
     lose ctl fs;
     (* A truncation is metadata, journaled apart from the data: the failure
        does not lose it, and it stays pending in program order. *)
@@ -2661,8 +2666,26 @@ module Crash = struct
                    (fun (c, cached) -> if cached then None else Some c)
                    pending)
             in
+            (* A shrink made durable now frees the blocks past it that a
+               failure captured before it, even on a block boundary, where
+               it dirties nothing. *)
+            let shrinks =
+              List.filter_map
+                (fun e ->
+                  match e.change with
+                  | Resize m -> Some (e.seq, m)
+                  | Write _ -> None)
+                fs.pending
+            in
             fs.partial <-
-              List.filter (fun (b, _) -> not (List.mem b written)) partial);
+              List.filter
+                (fun (b, at, _) ->
+                  (not (List.mem b written))
+                  && not
+                       (List.exists
+                          (fun (seq, m) -> seq > at && b * ctl.block_size >= m)
+                          shrinks))
+                partial);
         (match (fs.cache, fs.evicted) with
         | None, None -> List.iter (fun (c, _) -> apply fs.durable c) pending
         | cache, evicted ->
