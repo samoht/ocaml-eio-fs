@@ -116,8 +116,9 @@ type fdata = {
       (* the durable bytes had the pages a failed sync lost been evicted
          before a later write to them *)
   mutable partial : (int * string) list;
-      (* blocks a failed sync lost, as they stood: a writeback that failed
-         only partly may have written any of them *)
+      (* blocks failed syncs lost, as they stood, or as they stood over the
+         pages reloaded from disk: a writeback that failed only partly may
+         have written any of them, the one of any failure *)
   mutable cached : int list;
       (* truncations a failed sync left pending, which the page cache holds *)
   mutable pend : (int * change * string * string) list;
@@ -457,14 +458,21 @@ let file_sync t id ~ok =
         (f.base_cache, []) f.pend
     in
     let written = List.sort_uniq compare written in
+    let reloaded =
+      List.fold_left (fun c (_, ch, _, _) -> apply_change c ch) f.evicted f.pend
+    in
+    let version src b =
+      let off = b * t.bs in
+      let n = min t.bs (String.length src - off) in
+      if n <= 0 then None else Some (b, String.sub src off n)
+    in
     f.partial <-
-      List.filter_map
+      List.concat_map
         (fun b ->
-          let off = b * t.bs in
-          let n = min t.bs (String.length f.cache - off) in
-          if n <= 0 then None else Some (b, String.sub f.cache off n))
+          List.sort_uniq compare
+            (List.filter_map (fun src -> version src b) [ f.cache; reloaded ]))
         written
-      @ List.filter (fun (b, _) -> not (List.mem b written)) f.partial;
+      @ f.partial;
     f.pend <- [];
     f.shadow <- f.durable;
     f.base_cache <- f.cache;
@@ -975,10 +983,11 @@ let reorder_cands ?(evicted = false) ?cut t ~bs id =
   let blocks : (int, string list) Hashtbl.t = Hashtbl.create 8 in
   let base i =
     block_bytes ~bs durable i
-    ::
-    (match List.assoc_opt i f.partial with
-    | Some p -> [ p ^ String.make (bs - String.length p) '\000' ]
-    | None -> [])
+    :: List.filter_map
+         (fun (b, p) ->
+           if b = i then Some (p ^ String.make (bs - String.length p) '\000')
+           else None)
+         f.partial
   in
   let add_block i v =
     let cur = Option.value ~default:(base i) (Hashtbl.find_opt blocks i) in

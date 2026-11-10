@@ -871,6 +871,15 @@ let cases : (string * user * init list * op list) list =
       [
         Write ("f", 0, "BB"); Fsync_fail "f"; Write ("f", 6000, "CC"); Fsync "f";
       ] );
+    ( "failed-sync-twice",
+      root_user,
+      [ I_file ("f", "ABCDEFGHIJ") ],
+      [
+        Write ("f", 1, "bbbbb");
+        Fsync_fail "f";
+        Write ("f", 7, "ccccc");
+        Fsync_fail "f";
+      ] );
     ( "failed-sync-cut-page",
       root_user,
       [ I_file ("f", "AAAAAAAA") ],
