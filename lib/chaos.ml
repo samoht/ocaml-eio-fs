@@ -1191,7 +1191,6 @@ module Crash = struct
     mutable durable : state option;
         (* The snapshot with the committed entries replayed over it, or
            [None] until it is built again. *)
-    mutable committed_upto : int; (* the latest seq the durable image holds *)
     mutable root_box : boxed option; (* the base given to [wrap] *)
     mutable admin : boxed option;
         (* The base with root's rights, which the model reads and rebuilds
@@ -1928,7 +1927,6 @@ module Crash = struct
     in
     ctl.snapshot <- Some st;
     ctl.durable <- Some st;
-    ctl.committed_upto <- ctl.seq;
     reset_journal ctl
 
   (* How the entry that made [ino] put it: where, as what, and the files it
@@ -1948,8 +1946,7 @@ module Crash = struct
   let replay_in ctl st e =
     replay ~root:(root_segs ctl) ~made:(made_node ctl) st e
 
-  (* The durable image, built again from the snapshot when a commit came out
-     of program order. *)
+  (* The durable image, built from the snapshot when it is not kept. *)
   let durable ctl =
     match (ctl.durable, ctl.snapshot) with
     | Some st, _ -> st
@@ -2002,13 +1999,13 @@ module Crash = struct
      another of the same name. An entry of a directory whose own entry is not
      durable cannot be durable yet: after the power cut there is no directory
      to hold it. The barrier is remembered on the entry, which becomes
-     durable as soon as its directory does, with the pending entries before
-     it that it needs: the one that made its destination, or that emptied
-     the directory it removes.
+     durable as soon as a directory it changes is, with the pending entries
+     before it that it needs.
 
-     The entries a barrier commits are not in general a journal prefix: the
-     durable image replays every committed entry in program order, so an
-     entry committed late still lands before the later ones it precedes. *)
+     The entries a barrier commits are not in general a journal prefix, and
+     one committed late is replayed over the durable image as it stands: it
+     changes no directory a later committed entry changes, as that entry
+     would have pulled it in, so it lands as it would in program order. *)
   let rec settle ctl =
     let st = durable ctl in
     let ready e = (not e.committed) && reached st e in
@@ -2022,11 +2019,7 @@ module Crash = struct
           |> List.sort_uniq (fun a b -> Int.compare a.meta.seq b.meta.seq)
         in
         List.iter (mark_committed ctl) newly;
-        let last = List.fold_left (fun m e -> max m e.meta.seq) 0 newly in
-        if List.for_all (fun e -> e.meta.seq > ctl.committed_upto) newly then
-          ctl.durable <- Some (List.fold_left (replay_in ctl) st newly)
-        else ctl.durable <- None;
-        ctl.committed_upto <- max ctl.committed_upto last;
+        ctl.durable <- Some (List.fold_left (replay_in ctl) st newly);
         settle ctl
 
   (* Hold a barrier on the directory [ino] for the entries that changed it,
@@ -2108,8 +2101,7 @@ module Crash = struct
               }
             in
             ctl.journal <- Ids.add e.meta.seq e ctl.journal;
-            ctl.durable <- Some (replay_in ctl dur e);
-            ctl.committed_upto <- ctl.seq
+            ctl.durable <- Some (replay_in ctl dur e)
         | Some _ | None -> ())
 
   (* A file the wrapper first meets on an open that finds it on disk was made
@@ -3030,7 +3022,6 @@ module Crash = struct
       by_attrs = Hashtbl.create 16;
       snapshot = None;
       durable = None;
-      committed_upto = 0;
       by_rel = Paths.empty;
       root_box = None;
       admin = None;

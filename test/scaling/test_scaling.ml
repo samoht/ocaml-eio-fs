@@ -115,6 +115,35 @@ let test_crash_barriers_beside_a_pinned_entry () =
   in
   at_most "words per round, beside a pinned entry" ~bound:50_000. (w /. 8000.)
 
+(* 2000 rounds of creates and unlinks in two directories whose barriers
+   alternate, beside a pinned entry: a barrier then commits an entry older
+   than the latest committed one, and a commit out of program order that
+   rebuilt the durable image from the snapshot replayed the whole journal. *)
+let test_crash_alternating_barriers () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o755 (raw / "D");
+  Eio.Path.mkdir ~perm:0o755 (raw / "X");
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "pin") "p";
+  let w =
+    words (fun () ->
+        for i = 1 to 2000 do
+          let x = fs / "X" / Printf.sprintf "x%d" (i mod 64) in
+          let d = fs / "D" / Printf.sprintf "d%d" (i mod 64) in
+          Eio.Path.save ~create:(`Or_truncate 0o644) x "abc";
+          Eio.Path.save ~create:(`Or_truncate 0o644) d "abc";
+          Eio_fs_sync.sync_dir (fs / "D");
+          Eio_fs_sync.sync_dir (fs / "X");
+          Eio.Path.unlink x;
+          Eio.Path.unlink d;
+          Eio_fs_sync.sync_dir (fs / "D");
+          Eio_fs_sync.sync_dir (fs / "X")
+        done)
+  in
+  at_most "words per round, alternating barriers" ~bound:50_000. (w /. 2000.)
+
 let suite =
   ( "scaling",
     [
@@ -124,4 +153,6 @@ let suite =
         test_crash_syncs_beside_pending_writes;
       Alcotest.test_case "crash: barriers beside a pinned entry" `Quick
         test_crash_barriers_beside_a_pinned_entry;
+      Alcotest.test_case "crash: alternating barriers" `Quick
+        test_crash_alternating_barriers;
     ] )
