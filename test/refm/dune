@@ -1,0 +1,6 @@
+; A block-level reference for one file's data under failed syncs, shared by
+; the tests.
+
+(library
+ (name refm)
+ (libraries fmt))
