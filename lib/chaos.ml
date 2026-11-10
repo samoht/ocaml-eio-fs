@@ -979,6 +979,7 @@ module Crash = struct
     mutable mode : int;
         (* The file's mode as last seen, to tell when a write clears setuid
            or setgid. *)
+    mutable fino : int64; (* its inode, once a write cleared its mode *)
     mutable evicted : Cstruct.t option;
         (* The durable bytes had the pages a failed sync lost been evicted
            before a later write to them, where they differ. *)
@@ -1011,6 +1012,7 @@ module Crash = struct
       gen = 0;
       cache = None;
       mode = 0;
+      fino = -1L;
       evicted = None;
       partial = [];
     }
@@ -2124,6 +2126,7 @@ module Crash = struct
      change of attributes, committed by the file's sync and by any later
      commit. *)
   let record_clear ctl fs (st : Eio.File.Stat.t) =
+    fs.fino <- st.ino;
     ctl.seq <- ctl.seq + 1;
     let segs =
       Option.value ~default:[] (tree_path ~root:(root_segs ctl) fs.rel)
@@ -2289,7 +2292,8 @@ module Crash = struct
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
-  let writeback ?(over = []) ~rng ~bs ~cache durable changes =
+  let writeback ?(over = []) ?(len_upto = max_int) ~rng ~bs ~cache durable
+      changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -2305,9 +2309,10 @@ module Crash = struct
       | Write { offset; data } ->
           let size = max prev (offset + Cstruct.length data) in
           sizes.(k + 1) <- size;
-          for b = (prev / bs) + 1 to (size - 1) / bs do
-            boundaries := (b * bs) :: !boundaries
-          done
+          if k < len_upto then
+            for b = (prev / bs) + 1 to (size - 1) / bs do
+              boundaries := (b * bs) :: !boundaries
+            done
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
         if cached.(k) then (0, 0) else dirtied ~bs !cprev changes.(k)
@@ -2339,7 +2344,7 @@ module Crash = struct
     let size =
       let boundaries = List.sort_uniq Int.compare !boundaries in
       if Random.State.bool rng || boundaries = [] then
-        sizes.(Random.State.int rng (n + 1))
+        sizes.(Random.State.int rng (min n len_upto + 1))
       else List.nth boundaries (Random.State.int rng (List.length boundaries))
     in
     (* Replay once, taking each chosen block as it stood after its change. *)
@@ -2391,11 +2396,49 @@ module Crash = struct
         | Drop_unsynced | Survive _ -> None
       in
       let contents = Hashtbl.create 16 in
+      (* The earliest setuid clear the crash dropped, by inode: a length a
+         later change sets lands only with or after it, as ext4 journals both
+         in program order. An overwrite within the length may land without
+         it. *)
+      let clear_cut = Hashtbl.create 4 in
       let content fs =
         match Hashtbl.find_opt contents fs.id with
         | Some c -> c
         | None ->
             let mine = List.rev fs.pending in
+            let cut = Hashtbl.find_opt clear_cut fs.fino in
+            let len_upto =
+              match cut with
+              | None -> max_int
+              | Some c ->
+                  let rec count k = function
+                    | (e : entry) :: rest when e.seq < c -> count (k + 1) rest
+                    | _ -> k
+                  in
+                  count 0 mine
+            in
+            (* Under a scripted policy, a change past the cut that would set
+               the length does not survive. *)
+            let keep_length survivors =
+              match cut with
+              | None -> survivors
+              | Some c ->
+                  let _, kept =
+                    List.fold_left
+                      (fun (len, acc) (e : entry) ->
+                        let len' =
+                          match e.change with
+                          | Write { offset; data } ->
+                              max len (offset + Cstruct.length data)
+                          | Resize m -> m
+                        in
+                        if e.seq >= c && len' <> len then (len, acc)
+                        else (len', e :: acc))
+                      (Cstruct.length (bytes_of fs.durable), [])
+                      survivors
+                  in
+                  List.rev kept
+            in
             let c =
               match (ctl.policy, data_rng) with
               | Reorder_unsynced _, Some rng ->
@@ -2424,14 +2467,16 @@ module Crash = struct
                     (Option.is_some fs.cache || Option.is_some fs.evicted)
                     && Random.State.bool rng
                   then
-                    writeback ~over ~rng ~bs:ctl.block_size ~cache:None
+                    writeback ~over ~len_upto ~rng ~bs:ctl.block_size
+                      ~cache:None
                       (Option.value ~default:(bytes_of fs.durable) fs.evicted)
                       (List.map (fun (c, _) -> (c, false)) changes)
                   else
-                    writeback ~over ~rng ~bs:ctl.block_size ~cache:fs.cache
-                      (bytes_of fs.durable) changes
+                    writeback ~over ~len_upto ~rng ~bs:ctl.block_size
+                      ~cache:fs.cache (bytes_of fs.durable) changes
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
+                  |> keep_length
                   |> List.map (fun e -> (e.change, e.cached))
                   |> replay_cached ~bs:ctl.block_size ~cache:fs.cache
                        (bytes_of fs.durable)
@@ -2473,11 +2518,11 @@ module Crash = struct
          deferred barrier holds once its directory does, wherever the cut
          fell. An entry pulled in that way may come before entries already
          replayed, so the replay starts again with it. *)
+      let included = Hashtbl.create 16 in
       let { tree; locs; _ } =
         let snapshot =
           match ctl.snapshot with Some st -> st | None -> assert false
         in
-        let included = Hashtbl.create 16 in
         List.iter
           (fun e ->
             if e.committed || survives e then
@@ -2512,6 +2557,17 @@ module Crash = struct
         in
         build ()
       in
+      List.iter
+        (fun e ->
+          match e.attrs_ino with
+          | Some ino when e.clear && not (Hashtbl.mem included e.meta.seq) -> (
+              (* The write that cleared it was logged just before it. *)
+              let at = e.meta.seq - 1 in
+              match Hashtbl.find_opt clear_cut ino with
+              | Some s when s <= at -> ()
+              | Some _ | None -> Hashtbl.replace clear_cut ino at)
+          | Some _ | None -> ())
+        journal;
       let tree =
         match tree with
         | Dir d ->

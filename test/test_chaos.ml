@@ -3092,6 +3092,46 @@ let test_crash_evicted_before_sync () =
     "kept, evicted" [ true; true ]
     [ List.mem "ABr" i; List.mem "pBr" i ]
 
+(* A user's write that grows a setuid file, or a truncation of it: the new
+   length lands only with the setuid clear before it, as ext4 journals both
+   in program order. An overwrite within the length may land without it. *)
+let test_crash_length_after_clear () =
+  let run op policy =
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "WW";
+    Eio.Path.chmod ~follow:false ~perm:0o4777 (raw / "f");
+    let ctl = Crash.v ~policy ~block_size:2 () in
+    let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice raw) in
+    Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+        match op with
+        | `Grow ->
+            Eio.File.pwrite_all f ~file_offset:(i63 0)
+              [ Cstruct.of_string "aaaa" ]
+        | `Cut -> Eio.File.truncate f (i63 1)
+        | `Over ->
+            Eio.File.pwrite_all f ~file_offset:(i63 0)
+              [ Cstruct.of_string "aa" ]);
+    let post = Crash.post_crash ctl in
+    (Eio.Path.load (post / "f"), (Eio.Path.stat ~follow:false (post / "f")).perm)
+  in
+  let policies =
+    Crash.Survive (fun u -> u.kind = Data || u.kind = Truncate)
+    :: List.init 100 (fun s -> Crash.Reorder_unsynced s)
+  in
+  List.iter
+    (fun op ->
+      List.iter
+        (fun policy ->
+          let data, perm = run op policy in
+          if String.length data <> 2 && perm <> 0o777 then
+            Alcotest.failf "%S with mode %o" data perm)
+        policies)
+    [ `Grow; `Cut ];
+  Alcotest.(check bool)
+    "an overwrite without its clear" true
+    (List.exists (fun p -> run `Over p = ("aa", 0o4777)) policies)
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3504,6 +3544,8 @@ let suite =
         `Quick test_crash_each_failure_may_land;
       Alcotest.test_case "crash: a lost page may be evicted before any sync"
         `Quick test_crash_evicted_before_sync;
+      Alcotest.test_case "crash: a length lands with the setuid clear before it"
+        `Quick test_crash_length_after_clear;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

@@ -324,11 +324,12 @@ let classify t (obs : image) ~data =
       let bad =
         List.concat_map
           (fun k ->
-            let _, _, _, vis = List.nth choices k in
+            let _, s, _, vis = List.nth choices k in
             List.filter_map
               (fun (p, d) ->
                 match d with
-                | F (_, _, _, c) when not (data (List.assoc p vis) c) -> Some p
+                | F (_, _, _, c) when not (data s (List.assoc p vis) c) ->
+                    Some p
                 | _ -> None)
               obs)
           ks
@@ -381,7 +382,7 @@ let check ?(seeds = 40) ?(survive_cap = 64) ~user ~init ~ops () =
     if probe.image <> exp then
       add
         ("drop:"
-        ^ classify t probe.image ~data:(fun id c ->
+        ^ classify t probe.image ~data:(fun _ id c ->
             c = content_survive t id IS.empty))
         "Drop"
         (Fmt.str "eio:@.%a@.ref:@.%a" pp_image probe.image pp_image exp);
@@ -405,7 +406,8 @@ let check ?(seeds = 40) ?(survive_cap = 64) ~user ~init ~ops () =
             if r.image <> exp then
               add
                 ("survive:"
-                ^ classify t r.image ~data:(fun id c -> survive_member t id c))
+                ^ classify t r.image ~data:(fun s id c ->
+                    survive_member ?cut:(clear_cut t s id) t id c))
                 (Fmt.str "%a" pp_policy (P_survive (k, im)))
                 (Fmt.str "eio:@.%a@.ref:@.%a" pp_image r.image pp_image exp))
           (subsets_cap rs (List.length md) survive_cap)
@@ -422,7 +424,7 @@ let check ?(seeds = 40) ?(survive_cap = 64) ~user ~init ~ops () =
                 ()
             in
             observed := r.image :: !observed;
-            let data id c = survive_member t id c in
+            let data s id c = survive_member ?cut:(clear_cut t s id) t id c in
             if not (member t ~data r.image) then
               add
                 ("survive-u:" ^ classify t r.image ~data)
@@ -440,7 +442,7 @@ let check ?(seeds = 40) ?(survive_cap = 64) ~user ~init ~ops () =
         for seed = 0 to seeds - 1 do
           let r = run_eio ~user ~init ~ops ~policy:(P_reorder (bs, seed)) () in
           observed := r.image :: !observed;
-          let data id c = reorder_member t ~bs id c in
+          let data s id c = reorder_member ?cut:(clear_cut t s id) t ~bs id c in
           if not (member t ~data r.image) then
             add
               ("reorder:" ^ classify t r.image ~data)

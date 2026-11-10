@@ -899,12 +899,47 @@ let pending_data t =
     t.fdata []
   |> List.sort compare
 
-let content_survive t id subset =
+(* The write before the earliest setuid clear of [id] the committed set [s]
+   leaves out: a length a change from there on sets lands only with the
+   clear, as ext4 journals both in program order. *)
+let clear_cut t s id =
+  List.fold_left
+    (fun acc e ->
+      match e.ek with
+      | Suid_clear { node } when node = id && not (IS.mem e.seq s) -> (
+          match acc with
+          | Some c when c <= e.seq - 1 -> acc
+          | _ -> Some (e.seq - 1))
+      | _ -> acc)
+    None t.journal
+
+(* [chs] without the changes from [cut] on that would set the length. *)
+let keep_length ?cut durable chs =
+  match cut with
+  | None -> chs
+  | Some c ->
+      let _, kept =
+        List.fold_left
+          (fun (len, acc) (seq, ch) ->
+            let len' =
+              match ch with
+              | W (o, d) -> max len (o + String.length d)
+              | T m -> m
+            in
+            if seq >= c && len' <> len then (len, acc)
+            else (len', (seq, ch) :: acc))
+          (String.length durable, [])
+          chs
+      in
+      List.rev kept
+
+let content_survive ?cut t id subset =
   let f = fd t id in
   merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache ~cached:f.cached
-    (List.filter_map
-       (fun (s, ch, _, _) -> if IS.mem s subset then Some (s, ch) else None)
-       f.pend)
+    (keep_length ?cut f.durable
+       (List.filter_map
+          (fun (s, ch, _, _) -> if IS.mem s subset then Some (s, ch) else None)
+          f.pend))
 
 let image_with t s content : image =
   let img = meta_image t s in
@@ -920,7 +955,8 @@ let image_with t s content : image =
 (* Exact state for a Survive choice: [k] uncommitted entries kept, data
    changes in [subset] kept. *)
 let survive_state t ~k ~subset =
-  image_with t (survivors t k) (fun id -> content_survive t id subset)
+  let s = survivors t k in
+  image_with t s (fun id -> content_survive ?cut:(clear_cut t s id) t id subset)
 
 (* {2 Reorder_unsynced at block size [bs]} *)
 
@@ -932,7 +968,7 @@ let block_bytes ~bs c i =
 (* Length candidates and per-block version candidates: as the page cache
    kept what a failed sync lost, or, [evicted], as it reloaded those pages
    from disk. *)
-let reorder_cands ?(evicted = false) t ~bs id =
+let reorder_cands ?(evicted = false) ?cut t ~bs id =
   let f = fd t id in
   let durable = if evicted then f.evicted else f.durable in
   let lens = ref [ String.length durable ] in
@@ -955,9 +991,10 @@ let reorder_cands ?(evicted = false) t ~bs id =
       let after = apply_change !prev ch in
       let cache = if evicted then after else cache in
       let ol = String.length !prev and nl = String.length after in
-      lens := nl :: !lens;
+      let past = match cut with Some c -> seq >= c | None -> false in
+      if not past then lens := nl :: !lens;
       (match ch with
-      | W _ when nl > ol ->
+      | W _ when nl > ol && not past ->
           let b = ref (((ol / bs) + 1) * bs) in
           while !b < nl do
             lens := !b :: !lens;
@@ -975,8 +1012,8 @@ let reorder_cands ?(evicted = false) t ~bs id =
   ( List.sort_uniq compare !lens,
     fun i -> Option.value ~default:(base i) (Hashtbl.find_opt blocks i) )
 
-let reorder_member_in ~evicted t ~bs id s =
-  let lens, cands = reorder_cands ~evicted t ~bs id in
+let reorder_member_in ~evicted ?cut t ~bs id s =
+  let lens, cands = reorder_cands ~evicted ?cut t ~bs id in
   let len = String.length s in
   List.mem len lens
   &&
@@ -994,17 +1031,18 @@ let reorder_member_in ~evicted t ~bs id s =
   done;
   !ok
 
-let reorder_member t ~bs id s =
-  reorder_member_in ~evicted:false t ~bs id s
-  || reorder_member_in ~evicted:true t ~bs id s
+let reorder_member ?cut t ~bs id s =
+  reorder_member_in ~evicted:false ?cut t ~bs id s
+  || reorder_member_in ~evicted:true ?cut t ~bs id s
 
 (* Survive membership: some subset of pending changes yields [s]. *)
-let survive_member t id s =
+let survive_member ?cut t id s =
   let f = fd t id in
   let rec go kept = function
     | [] ->
         merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
-          ~cached:f.cached (List.rev kept)
+          ~cached:f.cached
+          (keep_length ?cut f.durable (List.rev kept))
         = s
     | (seq, ch, _, _) :: rest -> go kept rest || go ((seq, ch) :: kept) rest
   in
@@ -1044,12 +1082,12 @@ let obs_skeleton (i : image) =
 let member t ~data (obs : image) =
   let sk = obs_skeleton obs in
   List.exists
-    (fun (_, _, img, vis) ->
+    (fun (_, s, img, vis) ->
       skeleton t img vis = sk
       && List.for_all
            (fun (p, d) ->
              match d with
-             | F (_, _, _, c) -> data (List.assoc p vis) c
+             | F (_, _, _, c) -> data s (List.assoc p vis) c
              | _ -> true)
            obs)
     (meta_choices t)

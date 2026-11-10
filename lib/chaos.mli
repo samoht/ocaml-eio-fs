@@ -256,7 +256,10 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     at once, at its place in program order, as ext4 journals the change in the
     running transaction: a sync of the file commits it, as does
     {!Crash.sync_metadata} and any barrier that commits a later entry, and at a
-    crash it survives with the prefix it is part of. A barrier on a directory
+    crash it survives with the prefix it is part of. A length the write, or a
+    later write or truncation of the file, sets lands only with or after the
+    clear, as ext4 journals both in program order; data that overwrites within
+    the length may land without it, as ext4 allows. A barrier on a directory
     that is not itself durable yet holds from the moment it is, or from the
     moment another directory the entry changes is: with [d/f] durable,
     [mkdir e; rename d/f e/f; fsync_dir e] makes the rename durable when the
