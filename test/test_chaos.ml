@@ -3132,6 +3132,25 @@ let test_crash_length_after_clear () =
     "an overwrite without its clear" true
     (List.exists (fun p -> run `Over p = ("aa", 0o4777)) policies)
 
+(* A fault wrapper between the controller and a user's view: the crash still
+   rebuilds the tree with root's rights. *)
+let test_crash_over_chaos_over_user () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o755 (raw / "d");
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "d" / "f") "x";
+  Eio.Path.mkdir ~perm:0o755 (raw / "u");
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "u");
+  let ctl = Crash.v () in
+  let fs =
+    Crash.wrap ctl (Chaos.wrap Schedule.empty (Eio_fs.Fs.as_user alice raw))
+  in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "u" / "g") "y";
+  let post = Crash.post_crash ctl in
+  Alcotest.(check (pair string bool))
+    "d/f kept, u/g dropped" ("x", false)
+    (Eio.Path.load (post / "d" / "f"), Eio.Path.is_file (post / "u" / "g"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3540,6 +3559,8 @@ let suite =
         `Quick test_crash_durable_cut_frees_lost_pages;
       Alcotest.test_case "crash: stacked wrappers relay a failed sync" `Quick
         test_crash_stacked_wrappers_relay_failure;
+      Alcotest.test_case "crash: rebuilds as root beneath a fault wrapper"
+        `Quick test_crash_over_chaos_over_user;
       Alcotest.test_case "crash: either failed writeback of a block may land"
         `Quick test_crash_each_failure_may_land;
       Alcotest.test_case "crash: a lost page may be evicted before any sync"

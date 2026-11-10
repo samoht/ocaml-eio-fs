@@ -798,8 +798,8 @@ end
 (* The wrapper is its own value, bound to its own interfaces: a handler
    rebuilt from its bindings reaches nothing of the base's, so no directory
    operation steps around the schedule. The base stays reachable through
-   [Eio_fs_internal.Base_dir] alone, which no library outside this package can
-   name. A backend's own interfaces, such as the native directory a child
+   [Eio_fs_internal.Base_dir] and [Eio_fs_internal.Admin] alone, which no
+   library outside this package can name. A backend's own interfaces, such as the native directory a child
    process is started in, are not carried over. *)
 let dir_handler =
   Eio.Resource.handler
@@ -807,6 +807,14 @@ let dir_handler =
       Eio.Resource.H (Eio.Fs.Pi.Dir, (module Dir_impl));
       Eio.Resource.H (Eio.Resource.Close, fun t -> close_resource t.base);
       Eio.Resource.H (Eio_fs_internal.Base_dir, fun t -> t.base);
+      (* The base's root rights, under the same schedule. *)
+      Eio.Resource.H
+        ( Eio_fs_internal.Admin,
+          fun t ->
+            let base =
+              Option.value ~default:t.base (Eio_fs_internal.admin t.base)
+            in
+            (!wrap_dir_hook ~base ~sched:t.sched :> Eio.Fs.dir_ty r) );
       Eio.Resource.H (Eio_fs_sync.Rename.Exclusive, Dir_impl.rename_exclusive);
       Eio.Resource.H
         (Eio_fs_sync.Process_local, fun t -> Eio_fs_sync.is_process_local t.base);
