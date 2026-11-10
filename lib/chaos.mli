@@ -112,7 +112,8 @@ module Op : sig
     path : string;
         (** The path the operation names, as given to the wrapped directory it
             went through; for a file operation, the path the file was opened by.
-        *)
+            A scripted rule matches it exactly as spelt: through the root
+            {!Fs.v} returns, whose path is ["/"], a file is ["/f"]. *)
     file_offset : int;
         (** The byte offset of a read or a write, and [0] otherwise. *)
     length : int;
@@ -216,9 +217,10 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 (** A power-loss durability model over a base directory capability.
 
     Every write is tracked as un-synced until a successful {!Eio.File.sync}
-    makes that file's prior writes durable. A file is known by its path with
-    symbolic links, [.] and [..] resolved, so a sync through any name of it, a
-    read-only handle included, is a sync of that file.
+    makes that file's prior writes durable. A file is known by its inode, not
+    its path: a sync through any name of it, through a symbolic link, [.] or
+    [..], or through a read-only handle, is a sync of that file, and its pending
+    writes follow it through a rename of itself or of a directory above it.
 
     {b A failed sync loses the file's pending writes.} Linux marks their pages
     clean without writing them, so a later sync that succeeds does not make them
@@ -236,9 +238,11 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     [rmdir], [symlink], [rename], [chmod] and [chown] enter a metadata journal
     in program order; {!Crash.sync_metadata} commits it whole, and a directory
     barrier (a sync of the directory, opened as a file or not) commits only the
-    entries of that directory, a [chmod] or [chown] of one of them included. A
-    sync of a file also commits a [chmod] or [chown] of it. A write or a
-    truncation that clears setuid or setgid enters the journal only at the
+    entries of that directory, a [chmod] or [chown] of the directory itself or
+    of one of its entries included; a [chmod] or [chown] is covered by a barrier
+    on the directory that held its node when it ran, not on one the node moved
+    to since. A sync of a file also commits a [chmod] or [chown] of it. A write
+    or a truncation that clears setuid or setgid enters the journal only at the
     file's next sync that succeeds, or at {!Crash.sync_metadata}, which commits
     it; a failed sync leaves it pending, and a crash before keeps the old mode.
     A barrier on a directory that is not itself durable yet holds from the
@@ -255,17 +259,18 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     ones that emptied a directory it removes or a rename replaces, and, for a
     rename, the renames that moved a directory above where it lands, so a
     directory never lands inside itself. The entry that made a directory is not
-    among them: only a barrier on its parent makes a new directory durable, and
-    a node made in a directory the image lacks is put where a committed rename
-    took it. A rename moves the node the image holds, with what the image holds
-    below it; moved into a directory the image does not hold, the node leaves
-    the image until a later committed rename brings it back. Another entry takes
-    effect whole or not at all: one whose directory the image does not hold, or
-    an rmdir of a directory the image still fills, changes nothing. At a crash
-    the policy decides how much of the uncommitted suffix survives, always a
-    prefix of program order, and a dropped operation is rolled back whole; an
-    entry a deferred barrier covers survives, with the entries it needs,
-    whenever it would hold. *)
+    among them: only a barrier on its parent makes a new directory durable. Each
+    entry takes effect whole or not at all: a creation whose directory the image
+    does not hold makes nothing, and an rmdir of a directory the image still
+    fills, or a rename over one, changes nothing. A rename moves the node the
+    image holds, with what the image holds below it; a node made by a creation
+    that made nothing still exists for a committed rename of it, which puts it
+    where it moved, as its inode exists on disk; moved into a directory the
+    image does not hold, a node leaves the image until a later committed rename
+    brings it back. At a crash the policy decides how much of the uncommitted
+    suffix survives, always a prefix of program order, and a dropped operation
+    is rolled back whole; an entry a deferred barrier covers survives, with the
+    entries it needs, whenever it would hold. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =
