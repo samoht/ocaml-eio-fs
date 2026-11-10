@@ -716,6 +716,26 @@ let test_sync_dir_checks () =
       denied what (fun () -> Eio_fs_sync.sync_dir (dir / "x")))
     [ ("in memory", a); ("through the crash model", crash) ]
 
+(* A file a user creates in a setgid directory of a group the user is not
+   in loses setgid, as Linux strips it at create; a member keeps it. *)
+let test_perm_setgid_stripped_outside_group () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o777 (fs / "g");
+  Eio.Path.chown ~follow:false ~uid:0L ~gid:2000L (fs / "g");
+  Eio.Path.chmod ~follow:false ~perm:0o2777 (fs / "g");
+  let make user name =
+    let d = Eio_fs.Fs.as_user user fs in
+    Eio.Path.with_open_out ~create:(`Exclusive 0o2755) (d / "g" / name) ignore;
+    let st = Eio.Path.stat ~follow:false (fs / "g" / name) in
+    (st.perm, st.gid)
+  in
+  let member = { alice with groups = [ 2000 ] } in
+  Alcotest.(check (pair (pair int int64) (pair int int64)))
+    "outsider, member"
+    ((0o755, 2000L), (0o2755, 2000L))
+    (make { alice with umask = 0 } "a", make { member with umask = 0 } "b")
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1199,6 +1219,8 @@ let suite =
         test_perm_chmod_chown;
       Alcotest.test_case "permissions: root and a user differ" `Quick
         test_perm_root_and_user_differ;
+      Alcotest.test_case "permissions: setgid stripped outside its group" `Quick
+        test_perm_setgid_stripped_outside_group;
       Alcotest.test_case "permissions: load keeps modes" `Quick
         test_perm_load_keeps_modes;
       Alcotest.test_case "chmod masks the mode" `Quick test_chmod_masks_the_mode;

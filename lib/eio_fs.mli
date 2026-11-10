@@ -171,14 +171,15 @@ val root : user
     on a directory to list it; read, or read and write, on a file to open it. A
     new file or directory loses the user's umask bits and belongs to the user's
     uid and gid, or to the group of a setgid directory it is made in; a new
-    directory there also takes the setgid bit. Only a file's owner changes its
-    mode, and a user outside the file's group cannot set its setgid bit. Only
-    root gives a file away; its owner may move it to one of their own groups. A
-    chown of a regular file, or a write to one by a user other than root, clears
-    its setuid bit, and its setgid bit when its group may execute it. Root needs
-    no bit to read, write or search, as on Linux, so a test that runs as
-    {!root}, the default, misses the bugs a user meets: a directory it cannot
-    create in, a file it cannot open. *)
+    directory there also takes the setgid bit. A file made there by a user
+    outside that group loses setgid, as Linux strips it at create. Only a file's
+    owner changes its mode, and a user outside the file's group cannot set its
+    setgid bit. Only root gives a file away; its owner may move it to one of
+    their own groups. A chown of a regular file, or a write to one by a user
+    other than root, clears its setuid bit, and its setgid bit when its group
+    may execute it. Root needs no bit to read, write or search, as on Linux, so
+    a test that runs as {!root}, the default, misses the bugs a user meets: a
+    directory it cannot create in, a file it cannot open. *)
 module Fs : sig
   val v : ?user:user -> unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ~user ()] is the root of a fresh, empty in-memory filesystem whose

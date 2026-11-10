@@ -355,7 +355,9 @@ let default_stat =
     }
 
 (* A new entry is owned by the user who makes it, in the group of a setgid
-   [parent], from which a new directory also takes the setgid bit. *)
+   [parent], from which a new directory also takes the setgid bit. A new
+   file in a group its maker is not in loses setgid, as Linux strips it at
+   create (mode_strip_sgid). *)
 let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
   fs.last_ino <- Int64.succ fs.last_ino;
   let kind = Option.value ~default:default_stat.kind kind in
@@ -365,6 +367,15 @@ let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
     | Some (p : Eio.File.Stat.t) when p.perm land 0o2000 <> 0 ->
         (p.gid, if kind = `Directory then perm lor 0o2000 else perm)
     | Some _ | None -> (User.id user.gid, perm)
+  in
+  let perm =
+    if
+      kind <> `Directory
+      && perm land 0o2000 <> 0
+      && user.uid <> 0
+      && not (User.in_group user gid)
+    then perm land lnot 0o2000
+    else perm
   in
   {
     default_stat with
