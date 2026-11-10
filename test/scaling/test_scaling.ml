@@ -91,6 +91,30 @@ let test_crash_many_files () =
   at_most "words per file, for 20k files and a crash" ~bound:50_000.
     (w /. 20_000.)
 
+(* 8000 rounds of a create, a sync, a barrier, an unlink and a barrier in
+   one directory, while one create elsewhere is never barriered: a barrier
+   that scanned the whole journal, which that entry keeps from folding,
+   allocated words in proportion to it on every round. *)
+let test_crash_barriers_beside_a_pinned_entry () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o755 (raw / "D");
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "pin") "p";
+  let w =
+    words (fun () ->
+        for i = 1 to 8000 do
+          let f = fs / "D" / Printf.sprintf "f%d" (i mod 64) in
+          Eio.Path.save ~create:(`Or_truncate 0o644) f "abc";
+          Eio.Path.with_open_out ~create:`Never f Eio.File.sync;
+          Eio_fs_sync.sync_dir (fs / "D");
+          Eio.Path.unlink f;
+          Eio_fs_sync.sync_dir (fs / "D")
+        done)
+  in
+  at_most "words per round, beside a pinned entry" ~bound:50_000. (w /. 8000.)
+
 let suite =
   ( "scaling",
     [
@@ -98,4 +122,6 @@ let suite =
       Alcotest.test_case "crash: many files" `Quick test_crash_many_files;
       Alcotest.test_case "crash: syncs beside pending writes" `Quick
         test_crash_syncs_beside_pending_writes;
+      Alcotest.test_case "crash: barriers beside a pinned entry" `Quick
+        test_crash_barriers_beside_a_pinned_entry;
     ] )
