@@ -1804,8 +1804,9 @@ module Crash = struct
 
   (* [path] and [kind] as the caller spelled them, [resolved] the paths the
      operation touched, resolved: its own first. [gone] gives the inode a
-     path held before an operation that took it away. *)
-  let record_metadata ?(gone = []) ctl ~path ~kind ~resolved =
+     path held before an operation that took it away, and [victim] the node
+     a rename replaced. *)
+  let record_metadata ?(gone = []) ?victim ctl ~path ~kind ~resolved =
     ctl.seq <- ctl.seq + 1;
     let owner, root_path = root ctl in
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
@@ -1853,7 +1854,17 @@ module Crash = struct
               parent dst )
           with
           | Some ino, Some segs, Some from, Some up ->
-              ([ (segs, Move { parent = up; ino }) ], [ from; up ], None)
+              (* The node it replaces goes first: a directory the image
+                 still fills stops the rename, and the entries that emptied
+                 it come with it. *)
+              let replaced =
+                match victim with
+                | Some v when not (Int64.equal v ino) -> [ (segs, Remove v) ]
+                | Some _ | None -> []
+              in
+              ( replaced @ [ (segs, Move { parent = up; ino }) ],
+                [ from; up ],
+                None )
           | _ -> ([], [], None))
       | _ ->
           let halves =
@@ -2886,6 +2897,8 @@ module Crash = struct
             (cd.dplace.proot, dest, resolve ~follow_last:false cd dest)
         | None -> (box_dir target, new_path, new_path)
       in
+      (* The node the rename replaces, if any. *)
+      let victim = ino_at (as_admin d.dctl owner) rel in
       (match exclusive with
       | None -> B.rename bv old_path target new_path
       | Some backend ->
@@ -2899,7 +2912,7 @@ module Crash = struct
         move_state d.dctl ~old_owner:d.dplace.proot ~old_rel ~new_owner:owner
           ~new_rel:rel;
         let kind = Rename { dest } in
-        record_metadata d.dctl ~gone ~path:spelt ~kind
+        record_metadata d.dctl ~gone ?victim ~path:spelt ~kind
           ~resolved:[ old_rel; rel ];
         bump_metadata d.dctl ~path:spelt ~kind
       end

@@ -483,6 +483,11 @@ module Model = struct
 
   let rename m ~src ~dst =
     let id = id_of (SM.find src m.live) in
+    let replaced =
+      match SM.find_opt dst m.live with
+      | Some v when id_of v <> id -> [ Remove (id_of v) ]
+      | Some _ | None -> []
+    in
     let from = dir_id m.live (parent src) in
     m.live <- move ~src ~dst m.live;
     let up = dir_id m.live (parent dst) in
@@ -495,7 +500,7 @@ module Model = struct
     m.journal <-
       {
         seq = m.seq;
-        halves = [ Move { parent = up; path = dst; id } ];
+        halves = replaced @ [ Move { parent = up; path = dst; id } ];
         dirs = [ from; up ];
         ancestors;
         barred = [];

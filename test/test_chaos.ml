@@ -2626,6 +2626,23 @@ let test_crash_preexisting_found_by_inode () =
       run ~dir:false keep_data;
     ]
 
+(* A file moved out of a directory, then another directory renamed over it:
+   the barrier that commits the rename commits the move that emptied the
+   directory it replaces, so the file is not lost with it. *)
+let test_crash_rename_over_filled_dir () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  List.iter (fun d -> Eio.Path.mkdir ~perm:0o755 (raw / d)) [ "a"; "b" ];
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "b/g") "G";
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.rename (fs / "b/g") (fs / "a/g");
+  Eio.Path.rename (fs / "a") (fs / "b");
+  Eio_fs_sync.sync_dir fs;
+  Alcotest.(check string)
+    "b/g" "G"
+    (Eio.Path.load (Crash.post_crash ctl / "b/g"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3002,6 +3019,9 @@ let suite =
       Alcotest.test_case
         "crash: a file met after a rename of it is found by inode" `Quick
         test_crash_preexisting_found_by_inode;
+      Alcotest.test_case
+        "crash: a rename over a directory needs what emptied it" `Quick
+        test_crash_rename_over_filled_dir;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
