@@ -353,8 +353,9 @@ module Model = struct
       (function Move { id; _ } | Remove id -> Some id | Place _ -> None)
       e.halves
 
-  (* The pending entries before [e] it needs: those that made a node it
-     names, and for an rmdir those that changed the directory. *)
+  (* The pending entries before [e] it needs: those that changed a
+     directory it changes, those that made a node it names, and for an rmdir
+     those that changed the directory. *)
   let deps m e =
     let names = e.dirs @ named e in
     let removed =
@@ -363,7 +364,8 @@ module Model = struct
     List.filter
       (fun e' ->
         (not e'.committed) && e'.seq < e.seq
-        && (List.exists (fun n -> List.mem n names) (nodes e')
+        && (List.exists (fun d -> List.mem d e.dirs) e'.dirs
+           || List.exists (fun n -> List.mem n names) (nodes e')
            || List.exists (fun d -> List.mem d removed) e'.dirs))
       m.journal
 

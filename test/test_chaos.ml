@@ -2353,7 +2353,8 @@ let test_crash_inode_identity () =
 (* An entry takes effect whole, with the pending entries it needs, and a
    rename moves the image's own node: synced bytes follow their file to a
    renamed directory, a durable file survives a rename into a new directory
-   or out of one later removed, and nothing un-barriered rides along. *)
+   or out of one later removed, and a moved directory carries only what
+   the image holds, with an earlier rename in the same source directory. *)
 let test_crash_entries_whole () =
   let run setup ops =
     let ctl = Crash.v () in
@@ -2411,7 +2412,7 @@ let test_crash_entries_whole () =
          Eio.Path.rename (fs / "P/f") (fs / "Q/f");
          Eio_fs_sync.sync_dir (fs / "P")));
   check "a moved directory carries only what the image holds"
-    [ "A/"; "A/f=data"; "B/"; "B/e/" ]
+    [ "A/"; "B/"; "B/e/"; "B/e/f=data" ]
     (run
        (fun raw ->
          dirs raw [ "A"; "A/d"; "B" ];

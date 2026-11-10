@@ -1729,11 +1729,12 @@ module Crash = struct
     Option.iter (fun a -> remove_from ctl.by_attrs a e) e.attrs_ino;
     ctl.pool <- Ids.remove e.meta.seq ctl.pool
 
-  (* The pending entries before [e] it depends on: those that made a node [e]
-     names, and for an rmdir, those that changed the directory it removes. A
-     directory renamed before [e] changed it is no dependency: its inode is
-     durable under one name or the other. A change of attributes waits for
-     its node and pulls nothing in. *)
+  (* The pending entries before [e] it depends on: those that changed a
+     directory [e] changes, as one directory's entries stay in order; those
+     that made a node [e] names; and for an rmdir, those that changed the
+     directory it removes. A directory renamed before [e] changed it is no
+     dependency: its inode is durable under one name or the other. A change
+     of attributes waits for its node and pulls nothing in. *)
   let deps ctl e =
     match e.attrs_ino with
     | Some _ -> []
@@ -1746,7 +1747,8 @@ module Crash = struct
                 (fun s e' acc -> if s < e.meta.seq then e' :: acc else acc)
                 m []
         in
-        List.concat_map (earlier ctl.by_node) (e.parents @ e.named)
+        List.concat_map (earlier ctl.by_parent) e.parents
+        @ List.concat_map (earlier ctl.by_node) (e.parents @ e.named)
         @ List.concat_map
             (fun (_, edit) ->
               match edit with
@@ -1847,9 +1849,9 @@ module Crash = struct
         delta
     in
     let parents =
-      match attrs_ino with
-      | Some _ -> []
-      | None -> List.sort_uniq Int64.compare dirs
+      match kind with
+      | Chmod _ | Chown _ -> []
+      | _ -> List.sort_uniq Int64.compare dirs
     in
     index_entry ctl
       {

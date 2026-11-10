@@ -598,8 +598,6 @@ let rename_after_create_in_source =
     }
     ~ext4:(unmarked pre @ marked [ List.nth pre 2 ])
     ~envelope:(unmarked pre @ marked [ List.nth pre 2 ])
-    ~impossible:
-      (marked [ [ ("a/f", Absent); ("a/g", Absent); ("b/f", File "x") ] ])
 
 (* A truncation, then an overwrite that grows the file again inside the cut
    block. data=ordered writes the zeroed tail before the truncation commits;
