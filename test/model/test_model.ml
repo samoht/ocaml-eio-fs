@@ -929,34 +929,61 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
             let l = max 0 (min bs (String.length s - off)) in
             if l = 0 then "" else String.sub s off l
           in
+          (* A crash keeps one length, the one version [i] left, and each
+             block as some version [v] left it; a shrink between [v] and [i]
+             has landed, so the block reads zeros past it. *)
           let file_ok id content =
-            let vs = versions id in
-            let sizes = List.map String.length vs in
-            let lo = List.fold_left min max_int sizes
-            and hi = List.fold_left max 0 sizes in
+            let vs = Array.of_list (versions id) in
+            let sizes = Array.map String.length vs in
+            let lo = Array.fold_left min max_int sizes
+            and hi = Array.fold_left max 0 sizes in
             let n = String.length content in
-            let size_ok =
-              List.mem n sizes || (n mod bs = 0 && n > lo && n < hi)
+            let shrinks =
+              List.filter_map
+                (fun k ->
+                  if sizes.(k) < sizes.(k - 1) then Some (k, sizes.(k))
+                  else None)
+                (List.init (Array.length vs - 1) (fun k -> k + 1))
             in
-            let blocks_ok =
-              let nb = if n = 0 then 0 else ((n - 1) / bs) + 1 in
-              List.for_all
-                (fun b ->
-                  let got = block content b in
-                  List.exists
-                    (fun v ->
-                      let vb = block v b in
-                      let vb =
-                        vb
-                        ^ String.make
-                            (max 0 (String.length got - String.length vb))
-                            '\000'
-                      in
-                      String.sub vb 0 (String.length got) = got)
-                    vs)
-                (List.init nb Fun.id)
+            let lengths =
+              List.filter
+                (fun i ->
+                  sizes.(i) = n
+                  || n mod bs = 0
+                     && i > 0
+                     && sizes.(i - 1) < n
+                     && n < sizes.(i))
+                (List.init (Array.length vs) Fun.id)
             in
-            size_ok && blocks_ok
+            let size_ok = lengths <> [] || (n mod bs = 0 && n > lo && n < hi) in
+            let nb = if n = 0 then 0 else ((n - 1) / bs) + 1 in
+            let block_ok i b =
+              let got = block content b in
+              Array.to_list (Array.mapi (fun v s -> (v, s)) vs)
+              |> List.exists (fun (v, s) ->
+                  let vb = block s b in
+                  let vb =
+                    Bytes.of_string
+                      (vb
+                      ^ String.make
+                          (max 0 (String.length got - String.length vb))
+                          '\000')
+                  in
+                  List.iter
+                    (fun (k, m) ->
+                      if v < k && k <= i then
+                        for o = max 0 (m - (b * bs)) to Bytes.length vb - 1 do
+                          Bytes.set vb o '\000'
+                        done)
+                    shrinks;
+                  Bytes.sub_string vb 0 (String.length got) = got)
+            in
+            let blocks_ok i = List.for_all (block_ok i) (List.init nb Fun.id) in
+            let indexes =
+              if lengths = [] then List.init (Array.length vs) Fun.id
+              else lengths
+            in
+            size_ok && List.exists blocks_ok indexes
           in
           (* parse got into path -> line *)
           let ok_state1 (tree, perms) =

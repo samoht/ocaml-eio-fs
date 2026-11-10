@@ -2459,6 +2459,21 @@ let test_crash_sync_records_the_mode () =
     ( (Eio.Path.stat ~follow:false (post / "suid")).perm,
       Eio.Path.load (post / "suid") )
 
+(* A file truncated and rewritten, unsynced: once the new length lands, the
+   block kept from before the truncation reads zeros, not the old bytes. *)
+let test_crash_truncation_zeroes_old_blocks () =
+  for seed = 0 to 199 do
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "dgjutfwss";
+    let ctl = Crash.v ~policy:(Reorder_unsynced seed) () in
+    let fs = Crash.wrap ctl raw in
+    Eio.Path.save ~create:(`Or_truncate 0o644) (fs / "f") "wtw";
+    let got = Eio.Path.load (Crash.post_crash ctl / "f") in
+    if String.length got < 9 && not (List.mem got [ ""; "wtw"; "\000\000\000" ])
+    then Alcotest.failf "seed %d: %S" seed got
+  done
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2817,6 +2832,8 @@ let suite =
         test_crash_keeps_privilege_bits;
       Alcotest.test_case "crash: a sync makes a cleared setuid durable" `Quick
         test_crash_sync_records_the_mode;
+      Alcotest.test_case "crash: a truncation zeroes the blocks it cut" `Quick
+        test_crash_truncation_zeroes_old_blocks;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

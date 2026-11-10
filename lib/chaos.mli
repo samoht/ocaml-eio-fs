@@ -290,12 +290,13 @@ module Crash : sig
             durable or as it stood after any one of those changes, drawn
             independently of the other blocks. The length is one a change left,
             or a block boundary a write grew the file across; a truncation
-            changes it in one step. So a multi-block write may keep any subset
-            of its blocks, while a block is never torn and never holds a later
-            write without the earlier ones. Uncommitted directory operations
-            survive as a prefix of program order whose length is drawn
-            uniformly: metadata never reorders. The [int] is the seed; the same
-            seed and workload reproduce the same image. *)
+            changes it in one step, and once it has landed a block kept from
+            before it reads zeros past it. So a multi-block write may keep any
+            subset of its blocks, while a block is never torn and never holds a
+            later write without the earlier ones. Uncommitted directory
+            operations survive as a prefix of program order whose length is
+            drawn uniformly: metadata never reorders. The [int] is the seed; the
+            same seed and workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
             survivors keep program order. Writes are kept or dropped whole,
