@@ -2732,6 +2732,43 @@ let test_crash_attrs_wait_for_their_node () =
   Alcotest.(check int)
     "mode" 0o700 (Eio.Path.stat ~follow:false (Crash.post_crash ctl / "a")).perm
 
+(* A truncation is metadata: a failed sync does not lose it, and a later
+   sync makes it durable, with the bytes the page cache then holds. *)
+let test_crash_failed_sync_keeps_truncation () =
+  let run init work =
+    let ctl = Crash.v ~policy:Drop_unsynced () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") init;
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+        Eio.File.truncate f (i63 0);
+        (try Eio.File.sync f with Eio.Io _ -> ());
+        work f;
+        Eio.File.sync f);
+    Eio.Path.load (Crash.post_crash ctl / "f")
+  in
+  let big = String.make 8192 'A' in
+  Alcotest.(check (list string))
+    "sync again, regrow, write past the cut"
+    [ ""; "\000"; String.make 4096 '\000' ^ "c" ]
+    [
+      run "AB" ignore;
+      run "AB" (fun f -> Eio.File.truncate f (i63 1));
+      run big (fun f ->
+          Eio.File.pwrite_all f ~file_offset:(i63 4096)
+            [ Cstruct.of_string "c" ]);
+    ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3121,6 +3158,8 @@ let suite =
       Alcotest.test_case
         "crash: a reached chmod stays unsynced until its node is durable" `Quick
         test_crash_attrs_wait_for_their_node;
+      Alcotest.test_case "crash: a failed sync keeps a truncation" `Quick
+        test_crash_failed_sync_keeps_truncation;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

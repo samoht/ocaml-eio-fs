@@ -970,7 +970,15 @@ module Crash = struct
            sync lost. *)
   }
 
-  and entry = { efs : fstate; change : change; seq : int; egen : int }
+  and entry = {
+    efs : fstate;
+    change : change;
+    seq : int;
+    egen : int;
+    cached : bool;
+        (* A truncation a failed sync kept pending, which the page cache
+           already holds. *)
+  }
 
   let next_id = Atomic.make 0
 
@@ -1217,7 +1225,9 @@ module Crash = struct
 
   let clog_change ctl fs change =
     ctl.seq <- ctl.seq + 1;
-    let e = { efs = fs; change; seq = ctl.seq; egen = fs.gen } in
+    let e =
+      { efs = fs; change; seq = ctl.seq; egen = fs.gen; cached = false }
+    in
     ctl.log <- e :: ctl.log;
     fs.pending <- e :: fs.pending;
     ctl.logged <- ctl.logged + 1;
@@ -2173,33 +2183,43 @@ module Crash = struct
     | Resize m when m < prev -> (m, if m mod bs = 0 then m else m + 1)
     | Resize m -> (prev, m)
 
-  (* [durable] with [changes] replayed over it, where a block they dirty is
-     written whole from the page cache, [cache] with the same changes, which
-     still holds the bytes a failed sync lost; and the page cache after
-     them. *)
+  (* [durable] with [changes] replayed over it, where a block they dirty in
+     the page cache, [cache] with the same changes, is written whole from
+     it: the page cache still holds the bytes a failed sync lost. And the page
+     cache after them. *)
   let replay_cached ~bs durable ~cache changes =
     match cache with
     | None ->
-        let c = replay_changes durable changes in
+        let c = replay_changes durable (List.map fst changes) in
         (c, c)
     | Some cache ->
-        let plain = copy_cs (replay_changes durable changes) in
-        let live = replay_changes cache changes in
+        let plain = copy_cs (replay_changes durable (List.map fst changes)) in
+        let live =
+          replay_changes cache
+            (List.filter_map
+               (fun (c, cached) -> if cached then None else Some c)
+               changes)
+        in
         let len = Cstruct.length plain and live_len = Cstruct.length live in
+        let size prev = function
+          | Write { offset; data } -> max prev (offset + Cstruct.length data)
+          | Resize m -> m
+        in
         let _ =
           List.fold_left
-            (fun prev change ->
-              let lo, hi = dirtied ~bs prev change in
+            (fun (pprev, cprev) (change, cached) ->
+              let lo, hi =
+                dirtied ~bs (if cached then pprev else cprev) change
+              in
               if hi > lo then
                 for b = lo / bs to (hi - 1) / bs do
                   let off = b * bs in
                   let n = max 0 (min bs (min len live_len - off)) in
                   if n > 0 then Cstruct.blit live off plain off n
                 done;
-              match change with
-              | Write { offset; data } -> max prev (offset + Cstruct.length data)
-              | Resize m -> m)
-            (Cstruct.length durable) changes
+              (size pprev change, if cached then cprev else size cprev change))
+            (Cstruct.length durable, Cstruct.length cache)
+            changes
         in
         (plain, live)
 
@@ -2213,8 +2233,12 @@ module Crash = struct
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
   let writeback ~rng ~bs ~cache durable changes =
-    let changes = Array.of_list changes in
+    let cached = Array.of_list (List.map snd changes) in
+    let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
+    (* Dirt is counted in the page cache, which a failed sync may have left
+       apart from the durable bytes. *)
+    let cprev = ref (Cstruct.length (Option.value ~default:durable cache)) in
     let sizes = Array.make (n + 1) (Cstruct.length durable) in
     let versions = Hashtbl.create 16 in
     let boundaries = ref [] in
@@ -2228,7 +2252,14 @@ module Crash = struct
             boundaries := (b * bs) :: !boundaries
           done
       | Resize m -> sizes.(k + 1) <- m);
-      let lo, hi = dirtied ~bs prev changes.(k) in
+      let lo, hi =
+        dirtied ~bs (if cached.(k) then prev else !cprev) changes.(k)
+      in
+      (if not cached.(k) then
+         cprev :=
+           match changes.(k) with
+           | Write { offset; data } -> max !cprev (offset + Cstruct.length data)
+           | Resize m -> m);
       if hi > lo then
         for b = lo / bs to (hi - 1) / bs do
           let vs = Option.value ~default:[] (Hashtbl.find_opt versions b) in
@@ -2271,7 +2302,7 @@ module Crash = struct
     let live = image_of (Option.value ~default:durable cache) in
     Array.iteri
       (fun k change ->
-        apply live change;
+        if not cached.(k) then apply live change;
         List.iter
           (fun b -> Hashtbl.replace taken b (block_of (bytes_of live) b))
           (Option.value ~default:[] (Hashtbl.find_opt at (k + 1))))
@@ -2310,10 +2341,10 @@ module Crash = struct
               | Reorder_unsynced _, Some rng ->
                   writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
                     (bytes_of fs.durable)
-                    (List.map (fun e -> e.change) mine)
+                    (List.map (fun e -> (e.change, e.cached)) mine)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
-                  |> List.map (fun e -> e.change)
+                  |> List.map (fun e -> (e.change, e.cached))
                   |> replay_cached ~bs:ctl.block_size ~cache:fs.cache
                        (bytes_of fs.durable)
                   |> fst
@@ -2500,13 +2531,27 @@ module Crash = struct
       ctl.logged <- ctl.pending_changes
     end
 
-  (* A failed barrier loses the pending changes, which the page cache keeps:
+  (* A failed barrier loses the pending writes, which the page cache keeps:
      a later change that dirties one of their blocks writes it whole. *)
   let fail_sync ctl fs =
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
+    let pending = List.rev fs.pending in
     fs.cache <-
-      Some (replay_changes cache (List.rev_map (fun e -> e.change) fs.pending));
-    lose ctl fs
+      Some (replay_changes cache (List.map (fun e -> e.change) pending));
+    lose ctl fs;
+    (* A truncation is metadata, journaled apart from the data: the failure
+       does not lose it, and it stays pending in program order. *)
+    List.iter
+      (fun e ->
+        match e.change with
+        | Resize _ ->
+            let e = { e with egen = fs.gen; cached = true } in
+            ctl.log <- e :: ctl.log;
+            fs.pending <- e :: fs.pending;
+            ctl.logged <- ctl.logged + 1;
+            ctl.pending_changes <- ctl.pending_changes + 1
+        | Write _ -> ())
+      pending
 
   (* A barrier makes the file's pending changes durable, replayed over its
      durable bytes, with the lost bytes in the blocks they dirty: a change
@@ -2515,9 +2560,9 @@ module Crash = struct
   let barrier ctl fs ~stat sync =
     match sync () with
     | () ->
-        let pending = List.rev_map (fun e -> e.change) fs.pending in
+        let pending = List.rev_map (fun e -> (e.change, e.cached)) fs.pending in
         (match fs.cache with
-        | None -> List.iter (apply fs.durable) pending
+        | None -> List.iter (fun (c, _) -> apply fs.durable c) pending
         | cache ->
             let c, live =
               replay_cached ~bs:ctl.block_size ~cache (bytes_of fs.durable)

@@ -112,6 +112,8 @@ type fdata = {
   mutable cache : string;
       (* the page cache: what reads see, lost writes included *)
   mutable base_cache : string; (* the page cache at the last sync *)
+  mutable cached : int list;
+      (* truncations a failed sync left pending, which the page cache holds *)
   mutable pend : (int * change * string * string) list;
       (* seq, change, shadow after, page cache after *)
   mutable pending_clear : int option; (* seq of the write that cleared setuid *)
@@ -242,6 +244,7 @@ let fd t id =
           shadow = "";
           cache = "";
           base_cache = "";
+          cached = [];
           pend = [];
           pending_clear = None;
         }
@@ -342,15 +345,17 @@ let blocks_dirtied ~bs before ch =
   else List.init ((hi / bs) - (lo / bs) + 1) (fun i -> (lo / bs) + i)
 
 (* [durable] with the pending changes [chs] (seq, change) replayed, where a
-   block they dirty is written whole from the page cache, [base_cache] with
-   the same changes: it still holds what a failed sync lost. *)
-let merged ~bs ~durable ~base_cache chs =
+   block they dirty in the page cache, [base_cache] with the same changes,
+   is written whole from it: it still holds what a failed sync lost. A
+   truncation in [cached] is one the page cache already holds. *)
+let merged ~bs ~durable ~base_cache ~cached chs =
   let plain, cache, dirty =
     List.fold_left
-      (fun (plain, cache, dirty) ch ->
+      (fun (plain, cache, dirty) (seq, ch) ->
+        let c = List.mem seq cached in
         ( apply_change plain ch,
-          apply_change cache ch,
-          blocks_dirtied ~bs plain ch @ dirty ))
+          (if c then cache else apply_change cache ch),
+          blocks_dirtied ~bs (if c then plain else cache) ch @ dirty ))
       (durable, base_cache, []) chs
   in
   let b = Bytes.of_string plain in
@@ -397,9 +402,11 @@ let file_sync t id ~ok =
   if ok then begin
     f.durable <-
       merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
-        (List.map (fun (_, c, _, _) -> c) f.pend);
+        ~cached:f.cached
+        (List.map (fun (s, c, _, _) -> (s, c)) f.pend);
     f.shadow <- f.durable;
     f.base_cache <- f.cache;
+    f.cached <- [];
     f.pend <- [];
     (* the write's setuid clear enters the journal now, committed *)
     (match f.pending_clear with
@@ -419,9 +426,20 @@ let file_sync t id ~ok =
       t.journal
   end
   else begin
+    (* A failed sync loses the data writes; a truncation is metadata, and
+       stays pending. *)
+    let kept =
+      List.filter (function _, T _, _, _ -> true | _ -> false) f.pend
+    in
     f.pend <- [];
     f.shadow <- f.durable;
-    f.base_cache <- f.cache
+    f.base_cache <- f.cache;
+    List.iter
+      (fun (seq, ch, _, _) ->
+        f.shadow <- apply_change f.shadow ch;
+        f.pend <- f.pend @ [ (seq, ch, f.shadow, f.cache) ];
+        f.cached <- seq :: f.cached)
+      kept
   end
 
 (* A barrier on directory [d]: covers its entries and a chmod/chown of one of
@@ -849,9 +867,9 @@ let pending_data t =
 
 let content_survive t id subset =
   let f = fd t id in
-  merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
+  merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache ~cached:f.cached
     (List.filter_map
-       (fun (s, ch, _, _) -> if IS.mem s subset then Some ch else None)
+       (fun (s, ch, _, _) -> if IS.mem s subset then Some (s, ch) else None)
        f.pend)
 
 let image_with t s content : image =
@@ -890,9 +908,9 @@ let reorder_cands t ~bs id =
     in
     if not (List.mem v cur) then Hashtbl.replace blocks i (cur @ [ v ])
   in
-  let prev = ref f.durable in
+  let prev = ref f.durable and cprev = ref f.base_cache in
   List.iter
-    (fun (_, ch, after, cache) ->
+    (fun (seq, ch, after, cache) ->
       let ol = String.length !prev and nl = String.length after in
       lens := nl :: !lens;
       (match ch with
@@ -903,10 +921,13 @@ let reorder_cands t ~bs id =
             b := !b + bs
           done
       | _ -> ());
+      (* Dirt is counted in the page cache. *)
+      let c = List.mem seq f.cached in
       List.iter
         (fun i -> add_block i (block_bytes ~bs cache i))
-        (blocks_dirtied ~bs !prev ch);
-      prev := after)
+        (blocks_dirtied ~bs (if c then !prev else !cprev) ch);
+      prev := after;
+      cprev := cache)
     f.pend;
   ( List.sort_uniq compare !lens,
     fun i ->
@@ -939,9 +960,9 @@ let survive_member t id s =
   let rec go kept = function
     | [] ->
         merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
-          (List.rev kept)
+          ~cached:f.cached (List.rev kept)
         = s
-    | (_, ch, _, _) :: rest -> go kept rest || go (ch :: kept) rest
+    | (seq, ch, _, _) :: rest -> go kept rest || go ((seq, ch) :: kept) rest
   in
   go [] f.pend
 
