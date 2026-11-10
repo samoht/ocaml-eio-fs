@@ -2685,6 +2685,26 @@ let test_crash_hole_lands_zeroed () =
     "zeroed hole, stale bytes" (true, true)
     (Hashtbl.mem seen "\000\000x", Hashtbl.mem seen "ABx")
 
+(* A user's write clears setgid: a crash keeps the old mode, unless
+   sync_metadata committed the journal since. *)
+let test_crash_sync_metadata_commits_cleared_mode () =
+  let run ~commit =
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "g") "KLM";
+    Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "g");
+    Eio.Path.chmod ~follow:false ~perm:0o2775 (raw / "g");
+    let ctl = Crash.v () in
+    let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice raw) in
+    Eio.Path.with_open_out ~create:`Never (fs / "g") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "x" ]);
+    if commit then Crash.sync_metadata ctl;
+    (Eio.Path.stat ~follow:false (Crash.post_crash ctl / "g")).perm
+  in
+  Alcotest.(check (pair int int))
+    "without, then with sync_metadata" (0o2775, 0o775)
+    (run ~commit:false, run ~commit:true)
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3069,6 +3089,8 @@ let suite =
       Alcotest.test_case
         "crash: the hole a write past the end leaves can land zeroed" `Quick
         test_crash_hole_lands_zeroed;
+      Alcotest.test_case "crash: sync_metadata commits a write's setgid clear"
+        `Quick test_crash_sync_metadata_commits_cleared_mode;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
