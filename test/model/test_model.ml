@@ -604,11 +604,26 @@ let fail_with trace msg =
        (Fmt.str "%s@.trace:@.%a" msg Fmt.string
           (String.concat "\n" (List.rev trace))))
 
+(* The files of a model tree, with their paths. *)
+let model_files root =
+  let rec go pre d acc =
+    SM.fold
+      (fun n e acc ->
+        let p = if pre = "" then n else pre ^ "/" ^ n in
+        match e with F id -> (p, id) :: acc | D d -> go p d acc | L _ -> acc)
+      d.ents acc
+  in
+  go "" root []
+
 let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
   let rng = Random.State.make [| seed |] in
   let crash = mode <> `Nocrash in
   let users = mode = `Nocrash || alice in
-  let dirsync = mode = `Full in
+  let dirsync =
+    match mode with
+    | `Full | `Barriers_drop | `Barriers_reorder _ -> true
+    | `Nocrash | `Drop | `Reorder _ -> false
+  in
   (match env with None -> Eio_mock.Backend.run | Some _ -> fun f -> f ())
   @@ fun () ->
   let admin =
@@ -625,6 +640,9 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
     | `Reorder (s, bs) ->
         Some (Crash.v ~policy:(Crash.Reorder_unsynced s) ~block_size:bs ())
     | `Full -> Some (Crash.v ~policy:(Crash.Survive (fun _ -> true)) ())
+    | `Barriers_drop -> Some (Crash.v ())
+    | `Barriers_reorder s ->
+        Some (Crash.v ~policy:(Crash.Reorder_unsynced s) ())
   in
   let m = new_model () in
   if users then begin
@@ -638,7 +656,7 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
   (* As a user, the crash model wraps that user's view of the tree. *)
   let dir, alice_dir =
     match ctl with
-    | None -> (admin, as_alice)
+    | None -> if alice then (as_alice, as_alice) else (admin, as_alice)
     | Some c when alice ->
         let w = (Crash.wrap c as_alice :> Eio.Fs.dir_ty Eio.Path.t) in
         (w, w)
@@ -646,6 +664,16 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
   in
   let handles = Array.make 3 None in
   let trace = ref [] in
+  (* The inode of each file the model knows, which a rename keeps. *)
+  let ino_of_id = Hashtbl.create 16 in
+  let note_inos () =
+    List.iter
+      (fun (p, id) ->
+        match Eio.Path.stat ~follow:false (admin // p) with
+        | st -> Hashtbl.replace ino_of_id id st.ino
+        | exception Eio.Io _ -> ())
+      (model_files m.root)
+  in
   Eio.Switch.run @@ fun sw ->
   for _ = 1 to len do
     let who, op = gen_op ~crash ~users ~alice ~dirsync m rng in
@@ -790,7 +818,8 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
         let got = render_real admin in
         if exp <> got then
           fail_with !trace
-            (Fmt.str "live tree differs@.expected:@.%s@.got:@.%s" exp got)
+            (Fmt.str "live tree differs@.expected:@.%s@.got:@.%s" exp got);
+        note_inos ()
       end
       else restore ()
     end
@@ -802,6 +831,51 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
       (* Read the image as root: a user may not read all of it. *)
       let pc = Eio_fs.Fs.as_user Eio_fs.root (Crash.post_crash ctl) in
       let got = render_real pc in
+      (* Invariants on the image, by inode. *)
+      let image = Eio_fs.Chaos.Private.crash_image ctl in
+      let inos = List.map (fun (_, ino, _) -> ino) image in
+      (match
+         List.find_opt
+           (fun i -> List.length (List.filter (Int64.equal i) inos) > 1)
+           inos
+       with
+      | Some i ->
+          fail_with !trace (Fmt.str "inode %Ld is twice in the image@.%s" i got)
+      | None -> ());
+      let id_at ino =
+        Hashtbl.fold
+          (fun id i acc -> if Int64.equal i ino then Some id else acc)
+          ino_of_id None
+      in
+      (* A file durable at the last snapshot and still live is in the image,
+         under some name: nothing that survived removed it. *)
+      let live_ids = List.map snd (model_files m.root) in
+      List.iter
+        (fun (_, id) ->
+          if List.mem id live_ids then
+            match Hashtbl.find_opt ino_of_id id with
+            | Some ino when not (List.mem ino inos) ->
+                fail_with !trace
+                  (Fmt.str "durable file %d (inode %Ld) is lost@.%s" id ino got)
+            | Some _ | None -> ())
+        (model_files (fst m.committed));
+      (* Under Drop_unsynced, a file holds its durable bytes under whatever
+         name the image gives it. *)
+      (match mode with
+      | `Drop | `Barriers_drop ->
+          List.iter
+            (fun (p, ino, kind) ->
+              match (kind, id_at ino) with
+              | `File _, Some id ->
+                  let bytes = Eio.Path.load (pc // p) in
+                  let durable = Hashtbl.find m.durable id in
+                  if bytes <> durable then
+                    fail_with !trace
+                      (Fmt.str "%s (file %d) holds %S, not its durable %S@.%s" p
+                         id bytes durable got)
+              | _ -> ())
+            image
+      | `Nocrash | `Reorder _ | `Full | `Barriers_reorder _ -> ());
       let perm_of perms id =
         try List.assoc id perms with Not_found -> 0o7777
       in
@@ -932,7 +1006,7 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
                  (render_model (fst m.committed)
                     (fun id -> Hashtbl.find m.durable id)
                     (fun _ -> (0, 0))))
-      | `Nocrash -> ())
+      | `Nocrash | `Barriers_drop | `Barriers_reorder _ -> ())
 
 let modes =
   [
@@ -950,6 +1024,14 @@ let modes =
     ( "every change survives, with directory barriers, as a user",
       true,
       fun _ -> `Full );
+    ("no crash, a user alone", true, fun _ -> `Nocrash);
+    ("Drop_unsynced, with directory barriers", false, fun _ -> `Barriers_drop);
+    ( "Drop_unsynced, with directory barriers, as a user",
+      true,
+      fun _ -> `Barriers_drop );
+    ( "Reorder_unsynced, with directory barriers",
+      false,
+      fun seed -> `Barriers_reorder seed );
   ]
 
 (* Each mode runs 1000 seeds of 40 operations. *)
