@@ -32,10 +32,12 @@ adapted from Patrick Ferris's eio_mem (https://git.sirref.org/eio_mem).")
   fmt
   cstruct
   optint
+  mtime
+  psq
+  domain-local-await
   (cmdliner (>= 1.1.0))
   eio_main
   (conf-linux-libc-dev (= :os linux))
   (mdx (and :with-test (>= 2.3.0)))
   (alcotest (and :with-test (>= 1.7.0)))
-  (alcobar :with-test)
-  (mtime :with-test)))
+  (alcobar :with-test)))

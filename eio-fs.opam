@@ -25,13 +25,15 @@ depends: [
   "fmt"
   "cstruct"
   "optint"
+  "mtime"
+  "psq"
+  "domain-local-await"
   "cmdliner" {>= "1.1.0"}
   "eio_main"
   "conf-linux-libc-dev" {os = "linux"}
   "mdx" {with-test & >= "2.3.0"}
   "alcotest" {with-test & >= "1.7.0"}
   "alcobar" {with-test}
-  "mtime" {with-test}
   "odoc" {with-doc}
 ]
 build: [

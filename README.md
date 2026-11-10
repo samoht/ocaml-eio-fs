@@ -5,8 +5,8 @@ with fault injection for crash-consistency tests.
 
 Code written against `Eio.Path` runs the same on a disk or in memory. eio-fs
 provides the in-memory side, for tests and for unikernels that have no disk.
-Each filesystem it creates is separate from the others. It can also wrap any
-directory to inject faults or simulate a power cut.
+Each filesystem it creates is separate from the others. Its chaos tests run
+a workload under filesystem errors and power cuts.
 
 ## Installation
 
@@ -31,42 +31,110 @@ assert (Eio.Path.load Eio.Path.(fs / "hello") = "world")
 `Eio_fs.Fs.load dir` returns a new in-memory filesystem holding a copy of the
 tree at `dir`. `Eio_fs.Path.pp_tree` prints a tree on any backend.
 
-## Testing crash consistency
+## Chaos tests
 
-`Eio_fs.Chaos.wrap` injects faults into a directory, such as torn writes,
-failed syncs or a read-only filesystem. A torn write stores part of its bytes
-and then fails.
+`Eio_fs.Chaos.check` runs a workload many times on fresh in-memory
+filesystems, each time with a different fault: an open, a write or a sync
+fails, a write moves one byte or is torn, the filesystem turns read-only or
+full. It chooses the faults from what the workload does.
 
-`Eio_fs.Chaos.Crash` simulates a power cut. A write stays unsynced until
-`Eio.File.sync` runs on its file. Directory operations go into a journal in the
-order they ran. At the crash, each block an unsynced write dirtied may be
-lost. A directory sync commits the operations on that directory; of the rest,
-only a prefix survives.
-
-One crash can end in many states. The default policy, `Drop_unsynced`, builds
-only one of them: the state at the last barriers. `Reorder_unsynced seed` draws
-a different state for each seed, so a test loops over seeds.
-
-In this test, a file saved with `Eio_fs_sync.save` survives every crash,
-because that call syncs the file and its directory. A file written with no sync
-is lost in some of them. The test also links `eio-fs.sync`.
+Here a cache must keep working whatever the filesystem does: any error only
+costs a recomputation. An entry ends with `$`, so a torn one is not trusted.
 
 ```ocaml
-Eio_main.run @@ fun _env ->
-let module Crash = Eio_fs.Chaos.Crash in
-let lost = ref 0 in
-for seed = 0 to 99 do
-  let ctl = Crash.v ~policy:(Crash.Reorder_unsynced seed) () in
-  let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
-  Eio_fs_sync.save Eio.Path.(fs / "state") "committed";
-  Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(fs / "draft") "unsynced";
-  let after = Crash.post_crash ctl in
-  assert (Eio.Path.load Eio.Path.(after / "state") = "committed");
-  if Eio.Path.kind ~follow:false Eio.Path.(after / "draft") = `Not_found then
-    incr lost
-done;
-assert (!lost > 0)
+# let get dir key ~compute =
+    let path = Eio.Path.(dir / key) in
+    let soft f = try Some (f ()) with Eio.Io _ -> None in
+    match soft (fun () -> Eio.Path.load path) with
+    | Some v when String.ends_with ~suffix:"$" v ->
+        String.sub v 0 (String.length v - 1)
+    | _ ->
+        let v = compute key in
+        let tmp = Eio.Path.(dir / (key ^ ".tmp")) in
+        ignore
+          (soft (fun () ->
+               Eio.Path.save ~create:(`Or_truncate 0o644) tmp (v ^ "$");
+               Eio.Path.rename tmp path));
+        v;;
+val get :
+  [> Eio.Fs.dir_ty ] Eio.Path.t ->
+  string -> compute:(string -> string) -> string = <fun>
+# Eio_fs.Chaos.check (fun env ->
+    for _ = 1 to 2 do
+      let v = get env#fs "k" ~compute:String.uppercase_ascii in
+      if v <> "K" then Fmt.failwith "got %S" v
+    done);;
+- : unit = ()
 ```
+
+`Eio_fs.Chaos.Crash.check` cuts the power during a workload, and during its
+recovery. The workload calls `ack v` once its program has promised that `v` is
+durable. After each cut, `recover ~acked` runs as a fresh process would, on
+the directory as the disk holds it, and checks what survived. Here a config
+is saved with a temporary file, a sync, a rename and a sync of the directory:
+
+```ocaml
+# let save ~sync_dir dir v =
+    let tmp = Eio.Path.(dir / "config.tmp") in
+    Eio.Path.with_open_out ~create:(`Or_truncate 0o644) tmp (fun f ->
+        Eio.Flow.copy_string v f;
+        Eio.File.sync f);
+    Eio.Path.rename tmp Eio.Path.(dir / "config");
+    if sync_dir then Eio_fs_sync.sync_dir dir;;
+val save : sync_dir:bool -> [> Eio.Fs.dir_ty ] Eio.Path.t -> string -> unit =
+  <fun>
+# let test ~sync_dir () =
+    Eio_fs.Chaos.Crash.check
+      ~setup:(fun env -> save ~sync_dir:true env#fs "old")
+      (fun ~ack env ->
+        match save ~sync_dir env#fs "new" with
+        | () -> ack ()
+        | exception Eio.Io _ -> ())
+      ~recover:(fun ~acked env ->
+        match (Eio.Path.load Eio.Path.(env#fs / "config"), acked) with
+        | "new", _ | "old", [] -> ()
+        | v, _ -> Fmt.failwith "config is %S" v);;
+val test : sync_dir:bool -> unit -> unit = <fun>
+# test ~sync_dir:true ();;
+- : unit = ()
+```
+
+Without the sync of the directory, the rename may be lost after the program
+said the config was saved:
+
+```ocaml
+# let cut f =
+    match f () with
+    | () -> "passed"
+    | exception Failure m -> List.nth (String.split_on_char '\n' m) 1;;
+val cut : (unit -> unit) -> string = <fun>
+# cut (test ~sync_dir:false);;
+- : string = "  cut:      at the end, every unsynced change lost"
+```
+
+The failure also gives the tier that found it, the operations of the failing
+run, and a `~replay:"..."` argument that runs that scenario alone.
+
+The tests follow a few rules:
+
+- At most two faults reach a run. A program that tries three times may be
+  asked to succeed.
+- A lasting condition, such as a read-only filesystem, reaches every
+  operation from where it starts, the retries included. A program that
+  retries at once with no time passing fails as a hang.
+- `recover` stands for a fresh process: it reads what the disk holds and
+  what the workload acknowledged, never state the workload left in memory.
+- A cut cancels the workload, as `Eio.Cancel` cancels a fiber: it must not
+  catch `Eio.Cancel.Cancelled`. Any other exception that escapes the workload
+  fails the check, an injected `Eio.Io` included, so the workload catches the
+  errors its program may raise and checks the results itself.
+- A check blocks the event loop it is called from until it ends. Each run has
+  its own event loop, whose clock moves only when every fiber waits, so a
+  timeout of an hour takes no time.
+
+A check is deterministic, reads no environment variable and prints nothing.
+For a scenario it does not try, `Eio_fs.Chaos.wrap f dir` asks `f` about each
+operation, and `Eio_fs.Chaos.Crash.v` builds a power cut by hand.
 
 ## Testing as a user
 

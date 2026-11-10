@@ -1,7 +1,7 @@
 (library
  (name eio_fs)
  (public_name eio-fs)
- (private_modules low_level memfs)
+ (private_modules low_level memfs quiet_mock chaos_plan)
  (libraries
   hermetic
   eio
@@ -11,4 +11,7 @@
   eio_fs_internal
   fmt
   cstruct
-  optint))
+  optint
+  mtime
+  psq
+  domain-local-await))
