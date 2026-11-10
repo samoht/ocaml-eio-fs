@@ -558,10 +558,15 @@ let sync_ro t =
       raise_io c t.path
   | _ -> sync_base t.ro
 
+(* A failure a wrapper above injected is told on to the file beneath, so
+   stacked wrappers reach the power-loss model at the bottom. *)
 let ro_handler =
   Eio.Resource.handler
     (Eio.Resource.bindings (Eio.File.Pi.ro (module Ro_impl))
-    @ [ Eio.Resource.H (Eio_fs_sync.File_sync, sync_ro) ])
+    @ [
+        Eio.Resource.H (Eio_fs_sync.File_sync, sync_ro);
+        Eio.Resource.H (Sync_failed, fun t -> sync_failed t.ro);
+      ])
 
 let wrap_ro sched ~path base : Eio.File.ro_ty r =
   Eio.Resource.T
@@ -601,7 +606,10 @@ let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =
       rw = Some base;
     }
   in
-  rw_boxed (module Rw_impl) state ~base
+  rw_boxed
+    ~extra:[ Eio.Resource.H (Sync_failed, fun t -> sync_failed t.ro) ]
+    (module Rw_impl)
+    state ~base
 
 (* {2 Directory wrapper} *)
 

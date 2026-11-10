@@ -3000,6 +3000,53 @@ let test_crash_durable_cut_frees_lost_pages () =
     "no r at 2" false
     (List.exists (fun s -> String.length s > 2 && s.[2] = 'r') b)
 
+(* A failed sync injected two wrappers above the model reaches it, through
+   a read-write and a read-only handle: the next sync does not make the
+   lost write durable. *)
+let test_crash_stacked_wrappers_relay_failure () =
+  let run ~ro =
+    let ctl = Crash.v ~policy:Drop_unsynced () in
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "pqr";
+    let mid = Chaos.wrap Schedule.empty (Crash.wrap ctl raw) in
+    let rule =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "/f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    Eio.Switch.run (fun sw ->
+        let h = Eio.Path.open_out ~sw ~create:`Never (mid / "f") in
+        Eio.File.pwrite_all h ~file_offset:(i63 0) [ Cstruct.of_string "A" ];
+        (if ro then
+           Eio.Path.with_open_in
+             (Chaos.wrap rule mid / "f")
+             (fun g ->
+               match Eio_fs_sync.file_barrier g with
+               | Some b -> (
+                   match b () with
+                   | () -> Alcotest.fail "no failure"
+                   | exception Eio.Io _ -> ())
+               | None -> Alcotest.fail "no barrier")
+         else
+           match
+             Eio.Path.with_open_out ~create:`Never
+               (Chaos.wrap rule mid / "f")
+               Eio.File.sync
+           with
+           | () -> Alcotest.fail "no failure"
+           | exception Eio.Io _ -> ());
+        Eio.File.sync h);
+    Eio.Path.load (Crash.post_crash ctl / "f")
+  in
+  Alcotest.(check (pair string string))
+    "read-write, read-only" ("pqr", "pqr")
+    (run ~ro:false, run ~ro:true)
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3406,6 +3453,8 @@ let suite =
         `Quick test_crash_second_failure;
       Alcotest.test_case "crash: a durable cut frees the pages a failure lost"
         `Quick test_crash_durable_cut_frees_lost_pages;
+      Alcotest.test_case "crash: stacked wrappers relay a failed sync" `Quick
+        test_crash_stacked_wrappers_relay_failure;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
