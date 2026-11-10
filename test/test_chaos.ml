@@ -2893,6 +2893,40 @@ let test_crash_wrap_once () =
   | _ -> Alcotest.fail "a second wrap was accepted"
   | exception Invalid_argument _ -> ()
 
+(* A writeback that fails only in part writes the pages that succeeded:
+   Reorder_unsynced keeps any subset of the blocks a failed sync lost, and
+   Drop_unsynced none. *)
+let test_crash_partial_writeback () =
+  let run policy =
+    let ctl = Crash.v ~policy ~block_size:2 () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "aaaa";
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "BBCC" ];
+        try Eio.File.sync f with Eio.Io _ -> ());
+    Eio.Path.load (Crash.post_crash ctl / "f")
+  in
+  let seen = Hashtbl.create 4 in
+  for seed = 0 to 199 do
+    Hashtbl.replace seen (run (Reorder_unsynced seed)) ()
+  done;
+  Alcotest.(check string) "drop" "aaaa" (run Drop_unsynced);
+  Alcotest.(check (list string))
+    "reorder"
+    [ "BBCC"; "BBaa"; "aaCC"; "aaaa" ]
+    (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3293,6 +3327,8 @@ let suite =
         `Quick test_crash_kept_truncation_length_only;
       Alcotest.test_case "crash: a controller is wrapped once" `Quick
         test_crash_wrap_once;
+      Alcotest.test_case "crash: a failed sync may have written some blocks"
+        `Quick test_crash_partial_writeback;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

@@ -974,6 +974,9 @@ module Crash = struct
     mutable evicted : Cstruct.t option;
         (* The durable bytes had the pages a failed sync lost been evicted
            before a later write to them, where they differ. *)
+    mutable partial : (int * Cstruct.t) list;
+        (* The blocks a failed sync lost, as they stood then: a writeback
+           that failed only partly may have written any of them. *)
   }
 
   and entry = {
@@ -1000,6 +1003,7 @@ module Crash = struct
       cache = None;
       mode = 0;
       evicted = None;
+      partial = [];
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -2241,6 +2245,32 @@ module Crash = struct
         in
         (plain, live)
 
+  (* The blocks the writes among [changes] dirty, replayed from a file of
+     [len] bytes. *)
+  let written_blocks ~bs len changes =
+    let _, acc =
+      List.fold_left
+        (fun (prev, acc) change ->
+          let acc =
+            match change with
+            | Write _ ->
+                let lo, hi = dirtied ~bs prev change in
+                if hi > lo then
+                  List.init
+                    (((hi - 1) / bs) - (lo / bs) + 1)
+                    (fun i -> (lo / bs) + i)
+                  @ acc
+                else acc
+            | Resize _ -> acc
+          in
+          ( (match change with
+            | Write { offset; data } -> max prev (offset + Cstruct.length data)
+            | Resize m -> m),
+            acc ))
+        (len, []) changes
+    in
+    List.sort_uniq Int.compare acc
+
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
@@ -2358,15 +2388,38 @@ module Crash = struct
               match (ctl.policy, data_rng) with
               | Reorder_unsynced _, Some rng -> (
                   let changes = List.map (fun e -> (e.change, e.cached)) mine in
+                  (* A writeback that failed only partly wrote any of the
+                     blocks it lost. *)
+                  let with_partial durable =
+                    match fs.partial with
+                    | [] -> durable
+                    | partial ->
+                        let d = copy_cs durable in
+                        List.iter
+                          (fun (b, blk) ->
+                            if Random.State.bool rng then begin
+                              let off = b * ctl.block_size in
+                              let n =
+                                max 0
+                                  (min (Cstruct.length blk)
+                                     (Cstruct.length d - off))
+                              in
+                              if n > 0 then Cstruct.blit blk 0 d off n
+                            end)
+                          partial;
+                        d
+                  in
                   (* The page cache kept what a failed sync lost, or evicted
                      it. *)
                   match fs.evicted with
                   | Some e when Random.State.bool rng ->
-                      writeback ~rng ~bs:ctl.block_size ~cache:None e
+                      writeback ~rng ~bs:ctl.block_size ~cache:None
+                        (with_partial e)
                         (List.map (fun (c, _) -> (c, false)) changes)
                   | Some _ | None ->
                       writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
-                        (bytes_of fs.durable) changes)
+                        (with_partial (bytes_of fs.durable))
+                        changes)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> (e.change, e.cached))
@@ -2566,8 +2619,21 @@ module Crash = struct
   let fail_sync ctl fs =
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
     let pending = List.rev fs.pending in
-    fs.cache <-
-      Some (replay_changes cache (List.map (fun e -> e.change) pending));
+    let changes = List.map (fun e -> e.change) pending in
+    let live = replay_changes cache changes in
+    fs.cache <- Some live;
+    (* The pages that failed are clean and unwritten; those that did not
+       may be on disk, as they stood. *)
+    let bs = ctl.block_size in
+    let written = written_blocks ~bs (Cstruct.length cache) changes in
+    fs.partial <-
+      List.map
+        (fun b ->
+          let off = b * bs in
+          let n = max 0 (min bs (Cstruct.length live - off)) in
+          (b, if n = 0 then Cstruct.empty else copy_cs (Cstruct.sub live off n)))
+        written
+      @ List.filter (fun (b, _) -> not (List.mem b written)) fs.partial;
     lose ctl fs;
     (* A truncation is metadata, journaled apart from the data: the failure
        does not lose it, and it stays pending in program order. *)
@@ -2591,6 +2657,20 @@ module Crash = struct
     match sync () with
     | () ->
         let pending = List.rev_map (fun e -> (e.change, e.cached)) fs.pending in
+        (* A block written now is no longer one a failed sync may have
+           left. *)
+        (match fs.partial with
+        | [] -> ()
+        | partial ->
+            let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
+            let written =
+              written_blocks ~bs:ctl.block_size (Cstruct.length cache)
+                (List.filter_map
+                   (fun (c, cached) -> if cached then None else Some c)
+                   pending)
+            in
+            fs.partial <-
+              List.filter (fun (b, _) -> not (List.mem b written)) partial);
         (match (fs.cache, fs.evicted) with
         | None, None -> List.iter (fun (c, _) -> apply fs.durable c) pending
         | cache, evicted ->

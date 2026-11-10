@@ -115,6 +115,9 @@ type fdata = {
   mutable evicted : string;
       (* the durable bytes had the pages a failed sync lost been evicted
          before a later write to them *)
+  mutable partial : (int * string) list;
+      (* blocks a failed sync lost, as they stood: a writeback that failed
+         only partly may have written any of them *)
   mutable cached : int list;
       (* truncations a failed sync left pending, which the page cache holds *)
   mutable pend : (int * change * string * string) list;
@@ -247,6 +250,7 @@ let fd t id =
           cache = "";
           base_cache = "";
           cached = [];
+          partial = [];
           evicted = "";
           pend = [];
         }
@@ -412,6 +416,17 @@ let file_sync t id ~ok =
   let n = node t id in
   (match n.k with File _ -> () | _ -> ());
   if ok then begin
+    (let _, written =
+       List.fold_left
+         (fun (prev, acc) (seq, ch, _, cache) ->
+           ( cache,
+             match ch with
+             | W _ when not (List.mem seq f.cached) ->
+                 blocks_dirtied ~bs:t.bs prev ch @ acc
+             | _ -> acc ))
+         (f.base_cache, []) f.pend
+     in
+     f.partial <- List.filter (fun (b, _) -> not (List.mem b written)) f.partial);
     f.evicted <-
       List.fold_left (fun c (_, ch, _, _) -> apply_change c ch) f.evicted f.pend;
     f.durable <-
@@ -433,6 +448,25 @@ let file_sync t id ~ok =
     let kept =
       List.filter (function _, T _, _, _ -> true | _ -> false) f.pend
     in
+    let _, written =
+      List.fold_left
+        (fun (prev, acc) (seq, ch, _, cache) ->
+          ( cache,
+            match ch with
+            | W _ when not (List.mem seq f.cached) ->
+                blocks_dirtied ~bs:t.bs prev ch @ acc
+            | _ -> acc ))
+        (f.base_cache, []) f.pend
+    in
+    let written = List.sort_uniq compare written in
+    f.partial <-
+      List.map
+        (fun b ->
+          let off = b * t.bs in
+          let n = max 0 (min t.bs (String.length f.cache - off)) in
+          (b, String.sub f.cache off n))
+        written
+      @ List.filter (fun (b, _) -> not (List.mem b written)) f.partial;
     f.pend <- [];
     f.shadow <- f.durable;
     f.base_cache <- f.cache;
@@ -905,12 +939,17 @@ let reorder_cands ?(evicted = false) t ~bs id =
   let durable = if evicted then f.evicted else f.durable in
   let lens = ref [ String.length durable ] in
   let blocks : (int, string list) Hashtbl.t = Hashtbl.create 8 in
+  let base i =
+    block_bytes ~bs durable i
+    ::
+    (match List.assoc_opt i f.partial with
+    | Some p ->
+        let d = block_bytes ~bs durable i in
+        [ p ^ String.sub d (String.length p) (bs - String.length p) ]
+    | None -> [])
+  in
   let add_block i v =
-    let cur =
-      Option.value
-        ~default:[ block_bytes ~bs durable i ]
-        (Hashtbl.find_opt blocks i)
-    in
+    let cur = Option.value ~default:(base i) (Hashtbl.find_opt blocks i) in
     if not (List.mem v cur) then Hashtbl.replace blocks i (cur @ [ v ])
   in
   let prev = ref durable
@@ -938,10 +977,7 @@ let reorder_cands ?(evicted = false) t ~bs id =
       cprev := cache)
     f.pend;
   ( List.sort_uniq compare !lens,
-    fun i ->
-      Option.value
-        ~default:[ block_bytes ~bs durable i ]
-        (Hashtbl.find_opt blocks i) )
+    fun i -> Option.value ~default:(base i) (Hashtbl.find_opt blocks i) )
 
 let reorder_member_in ~evicted t ~bs id s =
   let lens, cands = reorder_cands ~evicted t ~bs id in

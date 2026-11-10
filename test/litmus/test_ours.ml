@@ -516,10 +516,10 @@ let rename_then_barrier =
 
 (* {1 fsync after a failed fsync} *)
 
-(* The failed fsync loses the write; the next one succeeds and writes
-   nothing (fsyncgate). *)
+(* The failed fsync loses the write, unless its writeback failed only in
+   part and wrote this page before failing; the next one succeeds and
+   writes nothing (fsyncgate). *)
 let fsync_after_failure =
-  let states = unmarked [ [ ("f", File "old") ]; [ ("f", File "new") ] ] in
   case
     {
       name = "fsync after a failed fsync";
@@ -527,8 +527,8 @@ let fsync_after_failure =
       body = [ Pwrite ("f", 0, "new"); Fsync_fails "f"; Fsync "f"; Mark ];
       observe = [ "f" ];
     }
-    ~ext4:(states @ marked [ [ ("f", File "old") ] ])
-    ~envelope:(states @ marked [ [ ("f", File "old") ] ])
+    ~ext4:(both [ [ ("f", File "old") ]; [ ("f", File "new") ] ])
+    ~envelope:(both [ [ ("f", File "old") ]; [ ("f", File "new") ] ])
 
 (* Writing the data again from the application's copy is the only recovery. *)
 let fsync_after_rewrite =

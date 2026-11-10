@@ -222,20 +222,23 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     [..], or through a read-only handle, is a sync of that file, and its pending
     writes follow it through a rename of itself or of a directory above it.
 
-    {b A failed sync loses the file's pending writes.} Linux marks their pages
-    clean without writing them, so a later sync that succeeds does not make them
-    durable. A truncation is not lost: ext4 journals it as metadata, so it stays
-    pending and a later sync makes it durable. The page cache may still hold
-    their bytes, and a later change that dirties one of those blocks then writes
-    it whole, lost bytes included; or it may have evicted the page, and the
-    later change lands over the bytes on disk. {!Crash.Reorder_unsynced} draws
-    either for each file; the other policies keep the page cache's. Before the
-    failure the lost writes are pending like any write; after it, no crash shows
-    them but through such a block. This holds for a sync failure {!Chaos.wrap}
-    injects above the model and for one the base raises beneath it. The only
-    safe recovery is to write the data again from the application's own copy. A
-    crash rewrites the base to a post-crash image in which un-synced writes may
-    be dropped or reordered, which demonstrates the classic
+    {b A failed sync loses the file's pending writes.} Linux marks the pages
+    whose writeback failed clean without writing them, so a later sync that
+    succeeds does not make them durable. A writeback may fail only in part, and
+    the pages that succeeded are on disk: {!Crash.Reorder_unsynced} keeps any
+    subset of the blocks the failed sync lost, as they stood then, and the other
+    policies keep none. A truncation is not lost: ext4 journals it as metadata,
+    so it stays pending and a later sync makes it durable. The page cache may
+    still hold their bytes, and a later change that dirties one of those blocks
+    then writes it whole, lost bytes included; or it may have evicted the page,
+    and the later change lands over the bytes on disk. {!Crash.Reorder_unsynced}
+    draws either for each file; the other policies keep the page cache's. Before
+    the failure the lost writes are pending like any write; after it, no crash
+    shows them but through such a block. This holds for a sync failure
+    {!Chaos.wrap} injects above the model and for one the base raises beneath
+    it. The only safe recovery is to write the data again from the application's
+    own copy. A crash rewrites the base to a post-crash image in which un-synced
+    writes may be dropped or reordered, which demonstrates the classic
     missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
