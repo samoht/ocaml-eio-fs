@@ -1138,32 +1138,19 @@ module Crash = struct
     mutable committed : bool;
   }
 
+  (* Documented in chaos.mli. *)
+
   (** How the post-crash image reconstructs from the un-synced writes. *)
   type policy =
     | Drop_unsynced
-        (** The state at the last barriers: every un-synced write is lost. *)
     | Reorder_unsynced of int
-        (** Seeded: each un-synced write survives on an even coin and the
-            survivors are applied in a seeded-shuffled order, so a later write
-            may land while an earlier one is lost. The [int] is the seed; the
-            same seed and workload reproduce the same image. *)
     | Survive of (unsynced -> bool)
-        (** Scripted: an un-synced write survives iff the predicate holds;
-            survivors keep program order. Pins an exact scenario -- for example
-            keep the generation pointer but drop the data block it references.
-        *)
 
-  (** When a crash fires while the workload runs. *)
   type trigger =
-    | Manual  (** Only an explicit {!crash} (or {!post_crash}) fires it. *)
+    | Manual
     | After_write of { path : string; file_offset : int }
-        (** Crash right after the write covering [file_offset] on [path]
-            commits, before any following sync. *)
     | Nth_op of int
-        (** Crash on the [n]th durability op (writes and syncs, 1-based). *)
     | After_dir_op of { kind : op_kind; path : string }
-        (** Crash once that directory operation has entered the metadata
-            journal, before any following operation can commit it. *)
 
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The backing store handed back after a crash. *)

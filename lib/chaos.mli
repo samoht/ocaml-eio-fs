@@ -95,7 +95,9 @@ module Op : sig
       (** A directory listing, by either enumeration entry point. It accepts
           {!Fault.t.Read_error}, never a byte-oriented short read. *)
     | `Write  (** A write of a file's bytes, streaming or positioned. *)
-    | `Sync  (** A file's sync. *)
+    | `Sync
+      (** A sync: a file's, or a directory's through [Eio_fs_sync.sync_dir],
+          whose path is the directory. *)
     | `Open
       (** An open of a file or a subdirectory, which may create the file. *)
     | `Stat  (** A stat, of a path or of an open file. *)
@@ -314,8 +316,10 @@ module Crash : sig
         (** Crash right after the write covering that offset in that file
             commits, before any following sync. *)
     | Nth_op of int
-        (** Crash on the [n]th durability op (writes, syncs and directory
-            operations, 1-based). *)
+        (** Crash on the [n]th durability op (1-based): a write or a truncation,
+            a file's sync, or a directory operation, a change of mode or owner
+            included. A directory barrier and {!sync_metadata} are not counted.
+        *)
     | After_dir_op of { kind : op_kind; path : string }
         (** Crash once the directory operation of that {!type-op_kind} on that
             path has entered the metadata journal, and before any following
