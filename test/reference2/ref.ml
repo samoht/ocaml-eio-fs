@@ -112,6 +112,9 @@ type fdata = {
   mutable cache : string;
       (* the page cache: what reads see, lost writes included *)
   mutable base_cache : string; (* the page cache at the last sync *)
+  mutable evicted : string;
+      (* the durable bytes had the pages a failed sync lost been evicted
+         before a later write to them *)
   mutable cached : int list;
       (* truncations a failed sync left pending, which the page cache holds *)
   mutable pend : (int * change * string * string) list;
@@ -245,6 +248,7 @@ let fd t id =
           cache = "";
           base_cache = "";
           cached = [];
+          evicted = "";
           pend = [];
           pending_clear = None;
         }
@@ -315,7 +319,8 @@ let v ?(bs = 4096) ~user init =
           f.durable <- data;
           f.shadow <- data;
           f.cache <- data;
-          f.base_cache <- data
+          f.base_cache <- data;
+          f.evicted <- data
       | _ -> ())
     init;
   Hashtbl.iter
@@ -400,6 +405,8 @@ let file_sync t id ~ok =
   let n = node t id in
   (match n.k with File _ -> () | _ -> ());
   if ok then begin
+    f.evicted <-
+      List.fold_left (fun c (_, ch, _, _) -> apply_change c ch) f.evicted f.pend;
     f.durable <-
       merged ~bs:t.bs ~durable:f.durable ~base_cache:f.base_cache
         ~cached:f.cached
@@ -895,22 +902,28 @@ let block_bytes ~bs c i =
       let x = (i * bs) + j in
       if x < String.length c then c.[x] else '\000')
 
-(* Length candidates and per-block version candidates. *)
-let reorder_cands t ~bs id =
+(* Length candidates and per-block version candidates: as the page cache
+   kept what a failed sync lost, or, [evicted], as it reloaded those pages
+   from disk. *)
+let reorder_cands ?(evicted = false) t ~bs id =
   let f = fd t id in
-  let lens = ref [ String.length f.durable ] in
+  let durable = if evicted then f.evicted else f.durable in
+  let lens = ref [ String.length durable ] in
   let blocks : (int, string list) Hashtbl.t = Hashtbl.create 8 in
   let add_block i v =
     let cur =
       Option.value
-        ~default:[ block_bytes ~bs f.durable i ]
+        ~default:[ block_bytes ~bs durable i ]
         (Hashtbl.find_opt blocks i)
     in
     if not (List.mem v cur) then Hashtbl.replace blocks i (cur @ [ v ])
   in
-  let prev = ref f.durable and cprev = ref f.base_cache in
+  let prev = ref durable
+  and cprev = ref (if evicted then durable else f.base_cache) in
   List.iter
-    (fun (seq, ch, after, cache) ->
+    (fun (seq, ch, _, cache) ->
+      let after = apply_change !prev ch in
+      let cache = if evicted then after else cache in
       let ol = String.length !prev and nl = String.length after in
       lens := nl :: !lens;
       (match ch with
@@ -922,7 +935,7 @@ let reorder_cands t ~bs id =
           done
       | _ -> ());
       (* Dirt is counted in the page cache. *)
-      let c = List.mem seq f.cached in
+      let c = (not evicted) && List.mem seq f.cached in
       List.iter
         (fun i -> add_block i (block_bytes ~bs cache i))
         (blocks_dirtied ~bs (if c then !prev else !cprev) ch);
@@ -932,11 +945,11 @@ let reorder_cands t ~bs id =
   ( List.sort_uniq compare !lens,
     fun i ->
       Option.value
-        ~default:[ block_bytes ~bs f.durable i ]
+        ~default:[ block_bytes ~bs durable i ]
         (Hashtbl.find_opt blocks i) )
 
-let reorder_member t ~bs id s =
-  let lens, cands = reorder_cands t ~bs id in
+let reorder_member_in ~evicted t ~bs id s =
+  let lens, cands = reorder_cands ~evicted t ~bs id in
   let len = String.length s in
   List.mem len lens
   &&
@@ -953,6 +966,10 @@ let reorder_member t ~bs id s =
     then ok := false
   done;
   !ok
+
+let reorder_member t ~bs id s =
+  reorder_member_in ~evicted:false t ~bs id s
+  || reorder_member_in ~evicted:true t ~bs id s
 
 (* Survive membership: some subset of pending changes yields [s]. *)
 let survive_member t id s =

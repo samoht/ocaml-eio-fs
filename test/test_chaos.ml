@@ -2769,6 +2769,38 @@ let test_crash_failed_sync_keeps_truncation () =
             [ Cstruct.of_string "c" ]);
     ]
 
+(* A record lost to a failed sync, then another in the same page and a sync
+   that succeeds: the page cache may have kept the lost record, which lands
+   with the new one, or evicted it, so the new one lands over the old bytes. *)
+let test_crash_lost_page_kept_or_evicted () =
+  let seen = Hashtbl.create 4 in
+  for seed = 0 to 199 do
+    let ctl = Crash.v ~policy:(Reorder_unsynced seed) () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "";
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "rec1" ];
+        (try Eio.File.sync f with Eio.Io _ -> ());
+        Eio.File.pwrite_all f ~file_offset:(i63 4) [ Cstruct.of_string "rec2" ];
+        Eio.File.sync f);
+    Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
+  done;
+  Alcotest.(check (list string))
+    "outcomes"
+    [ "\000\000\000\000rec2"; "rec1rec2" ]
+    (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3160,6 +3192,8 @@ let suite =
         test_crash_attrs_wait_for_their_node;
       Alcotest.test_case "crash: a failed sync keeps a truncation" `Quick
         test_crash_failed_sync_keeps_truncation;
+      Alcotest.test_case "crash: a lost page is kept or evicted" `Quick
+        test_crash_lost_page_kept_or_evicted;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

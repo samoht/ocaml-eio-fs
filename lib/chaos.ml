@@ -968,6 +968,9 @@ module Crash = struct
         (* The page cache's bytes as of the last sync, where a failed sync
            left them apart from the durable ones: it still holds what that
            sync lost. *)
+    mutable evicted : Cstruct.t option;
+        (* The durable bytes had the pages a failed sync lost been evicted
+           before a later write to them, where they differ. *)
   }
 
   and entry = {
@@ -992,6 +995,7 @@ module Crash = struct
       pending = [];
       gen = 0;
       cache = None;
+      evicted = None;
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -2338,10 +2342,17 @@ module Crash = struct
             let mine = List.rev fs.pending in
             let c =
               match (ctl.policy, data_rng) with
-              | Reorder_unsynced _, Some rng ->
-                  writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
-                    (bytes_of fs.durable)
-                    (List.map (fun e -> (e.change, e.cached)) mine)
+              | Reorder_unsynced _, Some rng -> (
+                  let changes = List.map (fun e -> (e.change, e.cached)) mine in
+                  (* The page cache kept what a failed sync lost, or evicted
+                     it. *)
+                  match fs.evicted with
+                  | Some e when Random.State.bool rng ->
+                      writeback ~rng ~bs:ctl.block_size ~cache:None e
+                        (List.map (fun (c, _) -> (c, false)) changes)
+                  | Some _ | None ->
+                      writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
+                        (bytes_of fs.durable) changes)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> (e.change, e.cached))
@@ -2561,16 +2572,24 @@ module Crash = struct
     match sync () with
     | () ->
         let pending = List.rev_map (fun e -> (e.change, e.cached)) fs.pending in
-        (match fs.cache with
-        | None -> List.iter (fun (c, _) -> apply fs.durable c) pending
-        | cache ->
+        (match (fs.cache, fs.evicted) with
+        | None, None -> List.iter (fun (c, _) -> apply fs.durable c) pending
+        | cache, evicted ->
             let c, live =
               replay_cached ~bs:ctl.block_size ~cache (bytes_of fs.durable)
                 pending
             in
+            (* Had the lost pages been evicted, a later write lands over the
+               bytes on disk. *)
+            let e =
+              replay_changes
+                (Option.value ~default:(bytes_of fs.durable) evicted)
+                (List.map fst pending)
+            in
             fs.durable.buf <- c;
             fs.durable.len <- Cstruct.length c;
-            fs.cache <- (if Cstruct.equal c live then None else Some live));
+            fs.cache <- (if Cstruct.equal c live then None else Some live);
+            fs.evicted <- (if Cstruct.equal c e then None else Some e));
         lose ctl fs;
         let st = stat () in
         record_mode ctl st;
