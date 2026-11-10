@@ -2,7 +2,9 @@
    Drop_unsynced, every Survive cut of the metadata times every subset of
    the data, and Reorder_unsynced at blocks of 2 bytes until 100 seeds in a
    row bring no new image. Each image must keep the invariants of
-   oracle.ml. *)
+   oracle.ml. Chaos.Crash runs over a fault wrapper, which fails a sync
+   beneath it; a sync also fails above it, alone or through a second
+   wrapper. *)
 
 open Core
 
@@ -137,7 +139,8 @@ let scopes =
         ];
     };
     (* one file at blocks of 2 bytes: boundaries, holes, append, truncations
-       that cut a block mid-way, failed syncs *)
+       that cut a block mid-way, syncs failed above Chaos.Crash, through a
+       second wrapper or beneath it *)
     {
       name = "blocks";
       depth = 3;
@@ -153,9 +156,12 @@ let scopes =
           Trunc (Root, "f", 4);
           Fsync "f";
           Fsync_fail "f";
+          Fsync_fail_s "f";
+          Fsync_fail_b "f";
         ];
     };
-    (* failed syncs with a second file, rename over, handles *)
+    (* failed syncs with a second file, one beneath Chaos.Crash, rename over,
+       handles *)
     {
       name = "failed syncs";
       depth = 3;
@@ -170,7 +176,7 @@ let scopes =
           Fsync "f";
           Fsync_fail "f";
           Fsync "g";
-          Fsync_fail "g";
+          Fsync_fail_b "g";
           Rename ("g", "f");
           Sync_dir ".";
           Trunc (Root, "f", 1);
@@ -206,6 +212,22 @@ let scopes =
           Chmod (Root, "d", 0o700);
           Write (Root, "d/g", 0, 1);
           Sync_dir "d";
+        ];
+    };
+    (* a user's files in a setgid directory of a group the user is not in *)
+    {
+      name = "setgid";
+      depth = 3;
+      init = [ IDir_g ("s", 0o2777, 2000) ];
+      ops =
+        [
+          Create (User, "s/f", 0o2755);
+          Write (User, "s/g", 0, 2);
+          Chmod (User, "s/f", 0o2755);
+          Write (User, "s/f", 0, 1);
+          Fsync "s/f";
+          Sync_dir "s";
+          Sync_meta;
         ];
     };
     (* a link to a file in a directory renamed over an empty one, handles
@@ -284,8 +306,8 @@ let oracle_run ~init ops =
       ops
   in
   let evs = Oracle.events !root snaps ops (ref None) (ref None) (ref None) in
-  let blocks = Oracle.blocks !root snaps ops in
-  ({ Oracle.root = !root; snaps; evs; blocks }, !unsynced, img)
+  let blocks, clears = Oracle.blocks !root snaps ops in
+  ({ Oracle.root = !root; snaps; evs; blocks; clears }, !unsynced, img)
 
 let max_seeds = 3000
 let quiet_seeds = 100
@@ -330,7 +352,14 @@ let check_workload ~init ops =
         (run ~init ~policy:(C.Survive pred) ops)
     done
   done;
-  if uns <> [] || List.exists (function Fsync_fail _ -> true | _ -> false) ops
+  if
+    uns <> []
+    || List.exists
+         (function
+           | Fsync_fail _ | Fsync_fail_u _ | Fsync_fail_s _ | Fsync_fail_b _ ->
+               true
+           | _ -> false)
+         ops
   then begin
     let images = Hashtbl.create 16 in
     let rec go seed quiet =

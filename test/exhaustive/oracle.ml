@@ -4,8 +4,11 @@
    every entry and byte is one the live tree had or a write made; (f) a
    removal a barrier covered is gone; (g) every mode and owner one the node
    had, (g2) and the last one once synced; (h) a link holds a target it had;
-   (j) a write a failed sync lost shows only through a block a later change
-   dirtied, or under Reorder_unsynced as the block stood at the failure. *)
+   (g3) a file that keeps a setuid or setgid bit a write cleared has a
+   length from before that write; (g4) a user's file never keeps setgid for
+   a group the user is not in; (h) a link holds a target it had; (j) a write
+   a failed sync lost shows only through a block a later change dirtied, or
+   under Reorder_unsynced through a block test/refm allows. *)
 open Core
 
 type ev =
@@ -24,6 +27,9 @@ type hist = {
   blocks : (int64, Refm.t) Hashtbl.t;
       (* each file's data under Reorder_unsynced, by the block-level
          reference *)
+  clears : (int64 * int * Refm.t) list;
+      (* a write at op [i] cleared the file's setuid or setgid bit; its data
+         before that op *)
 }
 
 let lookup s p = List.assoc_opt p s.paths
@@ -107,7 +113,7 @@ let events root (snaps : snap array) ops (hino : int64 option ref)
           match fres p with
           | Some ino -> evs.(i) <- [ Fsync_ev (ino, true) ]
           | None -> ())
-      | Fsync_fail p | Fsync_fail_u p -> (
+      | Fsync_fail p | Fsync_fail_u p | Fsync_fail_s p | Fsync_fail_b p -> (
           match fres p with
           | Some ino -> evs.(i) <- [ Fsync_ev (ino, false) ]
           | None -> ())
@@ -165,14 +171,31 @@ let blocks root (snaps : snap array) ops =
         Hashtbl.replace refs ino r;
         r
   in
-  let hino = ref None in
+  let hino = ref None and clears = ref [] in
+  let suid s ino =
+    match IM.find_opt ino s.nodes with
+    | Some nd -> Some (nd.perm land 0o6000)
+    | None -> None
+  in
   List.iteri
     (fun j op ->
       let i = j + 1 in
       let s1 = snaps.(i) in
       let data len = String.make len (Char.chr (Char.code 'a' + i - 1)) in
       let fres p = resolve root s1 p 0 in
-      let with_file p f = match fres p with Some ino -> f ino | None -> () in
+      let note_clear ino =
+        match (suid snaps.(i - 1) ino, suid s1 ino) with
+        | Some m0, Some m1 when m0 <> 0 && m1 <> m0 ->
+            clears := (ino, i, Refm.copy (get ino)) :: !clears
+        | _ -> ()
+      in
+      let with_file p f =
+        match fres p with
+        | Some ino ->
+            note_clear ino;
+            f ino
+        | None -> ()
+      in
       match op with
       | Write (_, p, off, len) ->
           with_file p (fun ino -> Refm.write (get ino) off (data len))
@@ -182,19 +205,21 @@ let blocks root (snaps : snap array) ops =
               Refm.write r r.Refm.clen (data len))
       | Write_h (off, len) -> (
           match !hino with
-          | Some ino -> Refm.write (get ino) off (data len)
+          | Some ino ->
+              note_clear ino;
+              Refm.write (get ino) off (data len)
           | None -> ())
       | Trunc (_, p, k) -> with_file p (fun ino -> Refm.resize (get ino) k)
       | Fsync p | Fsync_u p | Fake_fsync p ->
           with_file p (fun ino -> Refm.sync_ok (get ino))
-      | Fsync_fail p | Fsync_fail_u p ->
+      | Fsync_fail p | Fsync_fail_u p | Fsync_fail_s p | Fsync_fail_b p ->
           with_file p (fun ino -> Refm.sync_fail ~reorder:true (get ino))
       | Sync_h -> (
           match !hino with Some ino -> Refm.sync_ok (get ino) | None -> ())
       | Open_h p -> hino := fres p
       | _ -> ())
     ops;
-  refs
+  (refs, List.rev !clears)
 
 (* ---------- guarantees ---------- *)
 
@@ -515,6 +540,67 @@ let check ?(reorder = false) h (img : image) =
             | Some why -> add "j:blocks" (Fmt.str "%s = %S: %s" path s why))
         | _ -> ())
       img;
+  (* (g3) a setuid or setgid bit kept against a write that cleared it: the
+     length is one the file had before that write, or any length while the
+     mode lasted uncleared *)
+  List.iter
+    (fun (path, x, c, perm, _, _) ->
+      match c with
+      | `File s when perm land 0o6000 <> 0 ->
+          let l = String.length s in
+          let has j =
+            match IM.find_opt x h.snaps.(j).nodes with
+            | Some nd -> nd.perm = perm
+            | None -> false
+          in
+          let lengths (r : Refm.t) =
+            List.fold_left
+              (fun acc -> function
+                | Refm.CW (o, d) -> Refm.IS.add (o + String.length d) acc
+                | CR m -> Refm.IS.add m acc)
+              (Refm.lengths ~policy:Refm.Reorder r)
+              r.pend
+          in
+          let ok j =
+            let k = ref (j + 1) in
+            while !k <= n && has !k do
+              incr k
+            done;
+            !k > n
+            ||
+            match List.find_opt (fun (y, i, _) -> y = x && i = !k) h.clears with
+            | None -> true
+            | Some (_, _, r) -> Refm.IS.mem l (lengths r)
+          in
+          let rec any j = j <= n && ((has j && ok j) || any (j + 1)) in
+          if
+            List.exists (fun j -> has j) (List.init (n + 1) Fun.id)
+            && not (any 0)
+          then
+            add "g3:length-without-clear"
+              (Fmt.str "%s %o has length %d" path perm l)
+      | _ -> ())
+    img;
+  (* (g4) setgid outside the user's groups, image or live *)
+  let g4 where (perm, uid, gid) path =
+    if
+      perm land 0o2000 <> 0
+      && uid = Int64.of_int user.uid
+      && gid <> Int64.of_int user.gid
+    then
+      add "g4:setgid-outside-group"
+        (Fmt.str "%s %s %o gid %Ld" where path perm gid)
+  in
+  List.iter
+    (fun (path, _, c, perm, uid, gid) ->
+      match c with `File _ -> g4 "image" (perm, uid, gid) path | _ -> ())
+    img;
+  IM.iter
+    (fun x nd ->
+      match nd.kind with
+      | F _ -> g4 "live" (nd.perm, nd.uid, nd.gid) (Int64.to_string x)
+      | _ -> ())
+    fin.nodes;
   (* (g2) mode durability *)
   IM.iter
     (fun x nd ->

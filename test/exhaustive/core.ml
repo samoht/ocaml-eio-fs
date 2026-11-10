@@ -38,6 +38,9 @@ type op =
   | Fsync_fail_u of string
   | Fsync_u of string
   | Fake_fsync of string
+  | Fsync_fail_s of string (* through a second, faultless wrapper *)
+  | Fsync_fail_b of string (* failing beneath Chaos.Crash *)
+  | Create of who * string * int
 
 let who = function Root -> "" | User -> "u:"
 
@@ -67,11 +70,15 @@ let pp_op ppf = function
   | Fsync_fail_u p -> Fmt.pf ppf "u:fsync! %s" p
   | Fsync_u p -> Fmt.pf ppf "u:fsync %s" p
   | Fake_fsync p -> Fmt.pf ppf "FAKE-fsync %s" p
+  | Fsync_fail_s p -> Fmt.pf ppf "fsync!s %s" p
+  | Fsync_fail_b p -> Fmt.pf ppf "fsync!b %s" p
+  | Create (w, p, m) -> Fmt.pf ppf "%screate %s %o" (who w) p m
 
 let pp_wl = Fmt.(list ~sep:(any "; ") pp_op)
 
 type init =
   | IDir of string * int
+  | IDir_g of string * int * int (* path, perm, gid; owned by root *)
   | IFile of string * string * int * int (* path, contents, perm, uid *)
   | ILink of string * string
 
@@ -125,6 +132,10 @@ let setup base init =
       | IDir (p, perm) ->
           P.mkdir ~perm P.(base / p);
           P.chmod ~follow:false ~perm P.(base / p)
+      | IDir_g (p, perm, gid) ->
+          P.mkdir ~perm P.(base / p);
+          P.chown ~follow:false ~uid:0L ~gid:(Int64.of_int gid) P.(base / p);
+          P.chmod ~follow:false ~perm P.(base / p)
       | IFile (p, s, perm, uid) ->
           P.save ~create:(`Exclusive perm) P.(base / p) s;
           P.chmod ~follow:false ~perm P.(base / p);
@@ -147,7 +158,12 @@ type handles = {
 let fail_sched () =
   Ch.Schedule.seeded ~probability:1.0 ~kinds:[ `Sync_error ] ~seed:0 ()
 
-let exec ~sw ~w ~wu hs i op =
+let must_fail f =
+  match f () with
+  | () -> raise (Anomaly "failing sync did not fail")
+  | exception Eio.Io _ -> ()
+
+let exec ~sw ~w ~wu ~dry hs i op =
   let ch = Char.chr (Char.code 'a' + i) in
   let buf n = [ Cstruct.of_string (String.make n ch) ] in
   let d = function Root -> w | User -> wu in
@@ -165,17 +181,24 @@ let exec ~sw ~w ~wu hs i op =
         P.(d u / p)
         (fun h -> Eio.File.truncate h (I63.of_int n))
   | Fsync p -> P.with_open_out ~create:`Never P.(w / p) Eio.File.sync
-  | Fsync_fail p -> (
+  | Fsync_fail p ->
       let wf = Ch.wrap (fail_sched ()) w in
-      match P.with_open_out ~create:`Never P.(wf / p) Eio.File.sync with
-      | () -> raise (Anomaly "failing sync did not fail")
-      | exception Eio.Io _ -> ())
+      must_fail (fun () ->
+          P.with_open_out ~create:`Never P.(wf / p) Eio.File.sync)
+  | Fsync_fail_s p ->
+      let wf = Ch.wrap (fail_sched ()) (Ch.wrap Ch.Schedule.empty w) in
+      must_fail (fun () ->
+          P.with_open_out ~create:`Never P.(wf / p) Eio.File.sync)
+  | Fsync_fail_b p ->
+      let sync () = P.with_open_out ~create:`Never P.(w / p) Eio.File.sync in
+      if dry then sync () else must_fail sync
   | Fsync_u p -> P.with_open_out ~create:`Never P.(wu / p) Eio.File.sync
-  | Fsync_fail_u p -> (
+  | Fsync_fail_u p ->
       let wf = Ch.wrap (fail_sched ()) wu in
-      match P.with_open_out ~create:`Never P.(wf / p) Eio.File.sync with
-      | () -> raise (Anomaly "failing sync did not fail")
-      | exception Eio.Io _ -> ())
+      must_fail (fun () ->
+          P.with_open_out ~create:`Never P.(wf / p) Eio.File.sync)
+  | Create (u, p, perm) ->
+      P.with_open_out ~create:(`Exclusive perm) P.(d u / p) ignore
   | Mkdir p -> P.mkdir ~perm:0o755 P.(w / p)
   | Rmdir p -> P.rmdir P.(w / p)
   | Unlink p -> P.unlink P.(w / p)
@@ -216,10 +239,10 @@ let exec ~sw ~w ~wu hs i op =
           | Some b -> b ()
           | None -> raise (Anomaly "no file barrier on dir handle")))
 
-(* One run: fresh fs, durable init, ops, crash by [policy]. [observe] is
-   called with the raw base after each op (oracle run only). *)
-let run ?(observe = fun _ _ -> ()) ?(before_crash = fun _ -> ()) ~init ~policy
-    ops =
+(* Fresh fs, durable init, ops through Chaos.Crash over a Chaos wrapper with
+   [sched]. [observe] is called with the raw base after each op, [at] with
+   the index of the op about to run. *)
+let exec_all ~sched ~dry ~observe ~at ~init ~policy ops k =
   Eio.Switch.run @@ fun sw ->
   let base = Eio_fs.Fs.v () in
   setup base init;
@@ -233,22 +256,70 @@ let run ?(observe = fun _ _ -> ()) ?(before_crash = fun _ -> ()) ~init ~policy
         | Write (User, _, _, _)
         | Trunc (User, _, _)
         | Chmod (User, _, _)
+        | Create (User, _, _)
         | Fsync_u _ | Fsync_fail_u _ ->
             true
         | _ -> false)
       ops
   in
-  let w = C.wrap t (if has_user then Eio_fs.Fs.as_user user base else base) in
+  let inner = if has_user then Eio_fs.Fs.as_user user base else base in
+  let w = C.wrap t (Ch.wrap sched inner) in
   let wu = w in
   let hs = { fh = None; dh = None; dfh = None } in
   List.iteri
     (fun i op ->
-      (try exec ~sw ~w ~wu hs i op with
+      at i;
+      (try exec ~sw ~w ~wu ~dry hs i op with
       | Anomaly _ as e -> raise e
       | e -> raise (Invalid (i, Printexc.to_string e)));
       if op = Sync_meta then C.sync_metadata t;
       observe (i + 1) base)
     ops;
+  k t base
+
+(* The rules that fail each [Fsync_fail_b] beneath Chaos.Crash: the first
+   sync it sends down, by its rank among the syncs on its path, found by a
+   run that lets it succeed. *)
+let beneath_rules ~init ops =
+  if not (List.exists (function Fsync_fail_b _ -> true | _ -> false) ops) then
+    []
+  else begin
+    let cur = ref (-1) and counts = Hashtbl.create 4 and rules = ref [] in
+    let failing i =
+      match List.nth ops i with Fsync_fail_b _ -> true | _ -> false
+    in
+    let f (op : Ch.Op.t) =
+      if op.kind = `Sync then begin
+        let n = 1 + Option.value ~default:0 (Hashtbl.find_opt counts op.path) in
+        Hashtbl.replace counts op.path n;
+        if failing !cur && not (List.mem_assoc !cur !rules) then
+          rules :=
+            ( !cur,
+              {
+                Ch.Schedule.trigger =
+                  Nth_op_on_path { n; kind = `Sync; path = op.path };
+                fault = Sync_error `Eio;
+              } )
+            :: !rules
+      end
+    in
+    exec_all
+      ~sched:(Ch.Schedule.observing f Ch.Schedule.empty)
+      ~dry:true
+      ~observe:(fun _ _ -> ())
+      ~at:(fun i -> cur := i)
+      ~init ~policy:C.Drop_unsynced ops
+      (fun _ _ -> ());
+    List.rev_map snd !rules
+  end
+
+(* One run: fresh fs, durable init, ops, crash by [policy]. [observe] is
+   called with the raw base after each op (oracle run only). *)
+let run ?(observe = fun _ _ -> ()) ?(before_crash = fun _ -> ()) ~init ~policy
+    ops =
+  let sched = Ch.Schedule.scripted (beneath_rules ~init ops) in
+  exec_all ~sched ~dry:false ~observe ~at:ignore ~init ~policy ops
+  @@ fun t base ->
   before_crash t;
   let _pc = C.post_crash t in
   let pc = base in
