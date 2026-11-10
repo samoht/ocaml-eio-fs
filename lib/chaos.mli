@@ -232,30 +232,32 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     [rmdir], [symlink], [rename], [chmod] and [chown] enter a metadata journal
     in program order; {!Crash.sync_metadata} commits it whole, and a directory
     barrier (a sync of the directory, opened as a file or not) commits only the
-    entries of that directory. A sync of a file also commits a [chmod] or
-    [chown] of it. A barrier on a directory that is not itself durable yet holds
-    from the moment it is, or from the moment another directory the entry
-    changes is: a rename out of a durable directory into a new one is durable
-    once the new one's barrier returns. The model knows files and directories by
-    inode, as ext4 does: a barrier holds for its directory under whatever name
-    it has later, and never for another directory of the same name. Committed
-    entries take effect in program order, whatever order their barriers ran in,
-    and a barrier also commits the pending entries an entry it commits needs:
-    the earlier ones in a directory it changes, as one directory's entries stay
-    in order, the ones that emptied a directory it removes, and, for a rename,
-    the renames that moved a directory above where it lands, so a directory
-    never lands inside itself. The entry that made a directory is not among
-    them: only a barrier on its parent makes a new directory durable, and a node
-    made in a directory the image lacks is put where a committed rename took it.
-    A rename moves the node the image holds, with what the image holds below it;
-    moved into a directory the image does not hold, the node leaves the image
-    until a later committed rename brings it back. Another entry takes effect
-    whole or not at all: one whose directory the image does not hold, or an
-    rmdir of a directory the image still fills, changes nothing. At a crash the
-    policy decides how much of the uncommitted suffix survives, always a prefix
-    of program order, and a dropped operation is rolled back whole; an entry a
-    deferred barrier covers survives, with the entries it needs, whenever it
-    would hold. *)
+    entries of that directory, a [chmod] or [chown] of one of them included. A
+    sync of a file also commits a [chmod] or [chown] of it. A write that clears
+    setuid or setgid enters the journal only at the file's next sync, which
+    commits it: a crash before that keeps the old mode. A barrier on a directory
+    that is not itself durable yet holds from the moment it is, or from the
+    moment another directory the entry changes is: a rename out of a durable
+    directory into a new one is durable once the new one's barrier returns. The
+    model knows files and directories by inode, as ext4 does: a barrier holds
+    for its directory under whatever name it has later, and never for another
+    directory of the same name. Committed entries take effect in program order,
+    whatever order their barriers ran in, and a barrier also commits the pending
+    entries an entry it commits needs: the earlier ones in a directory it
+    changes, as one directory's entries stay in order, the ones that emptied a
+    directory it removes, and, for a rename, the renames that moved a directory
+    above where it lands, so a directory never lands inside itself. The entry
+    that made a directory is not among them: only a barrier on its parent makes
+    a new directory durable, and a node made in a directory the image lacks is
+    put where a committed rename took it. A rename moves the node the image
+    holds, with what the image holds below it; moved into a directory the image
+    does not hold, the node leaves the image until a later committed rename
+    brings it back. Another entry takes effect whole or not at all: one whose
+    directory the image does not hold, or an rmdir of a directory the image
+    still fills, changes nothing. At a crash the policy decides how much of the
+    uncommitted suffix survives, always a prefix of program order, and a dropped
+    operation is rolled back whole; an entry a deferred barrier covers survives,
+    with the entries it needs, whenever it would hold. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =

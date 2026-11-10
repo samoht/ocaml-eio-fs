@@ -1141,8 +1141,6 @@ module Crash = struct
   }
 
   (* Documented in chaos.mli. *)
-
-  (** How the post-crash image reconstructs from the un-synced writes. *)
   type policy =
     | Drop_unsynced
     | Reorder_unsynced of int
