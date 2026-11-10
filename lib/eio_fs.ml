@@ -325,8 +325,14 @@ module Fs = struct
     let with_dir_entries t path fn =
       fn (Low_level.read_dir_entries (fd t) path |> List.to_seq)
 
-    (* Volatile storage: the strongest barrier it has is nothing. *)
-    let sync_dir t _ = ignore (fd t)
+    (* Volatile storage: the strongest barrier it has is nothing, once the
+       directory opens read-only, as fsync(2) on Linux needs it to. *)
+    let sync_dir t path =
+      Eio.Switch.run @@ fun sw ->
+      let fd =
+        Low_level.openat ~sw ~mode:0 (fd t) path Low_level.Open_flags.o_rdonly
+      in
+      Low_level.close fd
 
     let rename t old_path (new_dir : [> Eio.Fs.dir_ty ] Eio.Std.r) new_path =
       match as_memfs_dir new_dir with

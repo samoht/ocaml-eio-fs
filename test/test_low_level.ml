@@ -700,6 +700,22 @@ let test_perm_setgid_and_privileges () =
   Eio.Path.chmod ~follow:false ~perm:0o2755 (a / "sg");
   check "chmod outside the group drops setgid" "1000:60 755" "sg"
 
+(* A directory barrier opens the directory read-only first, as fsync(2) on
+   Linux needs: a missing one is Not_found, an unreadable one
+   Permission_denied, through the crash model too. *)
+let test_sync_dir_checks () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o311 (fs / "x");
+  let a = Eio_fs.Fs.as_user alice fs in
+  let crash = Eio_fs.Chaos.Crash.wrap (Eio_fs.Chaos.Crash.v ()) a in
+  List.iter
+    (fun (what, dir) ->
+      expect_io_error "not found" (fun () ->
+          Eio_fs_sync.sync_dir (dir / "missing"));
+      denied what (fun () -> Eio_fs_sync.sync_dir (dir / "x")))
+    [ ("in memory", a); ("through the crash model", crash) ]
+
 (* {2 The file offset belongs to the open file description}
 
    open(2) makes a new open file description, with its own offset and its own
@@ -1193,4 +1209,6 @@ let suite =
         test_perm_open_directory;
       Alcotest.test_case "permissions: setgid directories and privilege bits"
         `Quick test_perm_setgid_and_privileges;
+      Alcotest.test_case "a directory barrier opens its directory" `Quick
+        test_sync_dir_checks;
     ] )

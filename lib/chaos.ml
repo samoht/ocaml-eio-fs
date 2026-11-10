@@ -2598,6 +2598,9 @@ module Crash = struct
        operation. *)
     let sync_dir d path =
       if d.dctl.crashed then raise_power_lost ();
+      (* The base's barrier first: it refuses a directory that is missing or
+         that the caller cannot read. *)
+      Eio_fs_sync.sync_dir (d.dbase, path);
       commit_dir d.dctl ~dir:(resolve d (at d.dplace.prefix path))
 
     let native d path =
