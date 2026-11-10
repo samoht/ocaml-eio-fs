@@ -191,16 +191,13 @@ let gen ~as_alice rng len =
    - [Parent_mode]: it differs from one eio-fs leaves only in the modes of
      nodes whose chmod a later barrier on their directory committed, as a
      directory barrier commits its entries' modes;
-   - [Clear_mode]: it differs only in the modes of files a write cleared
-     setuid or setgid from, as that clear waits for a sync;
    - [Other]: nothing documented explains it. *)
-type class_ = Prefix | Ancestors | Parent_mode | Clear_mode | Other
+type class_ = Prefix | Ancestors | Parent_mode | Other
 
 let class_name = function
   | Prefix -> "prefix"
   | Ancestors -> "ancestors"
   | Parent_mode -> "parent-mode"
-  | Clear_mode -> "clear-mode"
   | Other -> "other"
 
 type report = {
@@ -275,8 +272,7 @@ let differential workloads =
               es)
           per_op
       in
-      let parent_modes = mode_nodes ~chmod:true
-      and clear_modes = mode_nodes ~chmod:false in
+      let parent_modes = mode_nodes ~chmod:true in
       (* A barrier on a directory commits the chmod of an entry it held. *)
       let covered = Hashtbl.create 8 in
       let _ =
@@ -310,9 +306,9 @@ let differential workloads =
             base + List.length es)
           0 per_op
       in
-      let covers i j = Hashtbl.mem covered (i, j) in
-      (* A write's setuid clear is no journal entry until a sync. *)
-      let unjournaled =
+      (* A write's setuid clear is journaled at once, and any later
+         journal event carries it. *)
+      let clear_idx =
         let clears = Hashtbl.create 4 in
         ignore
           (List.fold_left
@@ -330,7 +326,16 @@ let differential workloads =
              0 per_op);
         Hashtbl.mem clears
       in
-      let r = states ~covers ~unjournaled ~root ~init ~base evs in
+      let evs_a = Array.of_list evs in
+      let covers i j =
+        Hashtbl.mem covered (i, j)
+        || clear_idx i
+           &&
+           match evs_a.(j) with
+           | Meta _ | Init _ | Attrs _ -> true
+           | _ -> false
+      in
+      let r = states ~covers ~root ~init ~base evs in
       let ref_meta = States.map without_data r.all in
       (* A state eio-fs leaves is a prefix one under its rules: the
          barriers' closure, with the renames above where one lands and the
@@ -405,7 +410,6 @@ let differential workloads =
             else if not (States.mem s ancestors) then Ancestors
             else if not (States.mem s shaped) then Parent_mode
             else if modes_of parent_modes s then Parent_mode
-            else if modes_of (parent_modes @ clear_modes) s then Clear_mode
             else Other
           in
           Hashtbl.replace missing c
@@ -415,7 +419,7 @@ let differential workloads =
         (States.diff ref_meta eio)
     done
   done;
-  let classes = [ Prefix; Ancestors; Parent_mode; Clear_mode; Other ] in
+  let classes = [ Prefix; Ancestors; Parent_mode; Other ] in
   {
     states = !n_states;
     unsound = List.rev !unsound;
@@ -438,13 +442,7 @@ let expected_unsound = 0
 (* What eio-fs never produces over [workloads] workloads, by class. A count
    that moves is a change of the crash model: say why. *)
 let expected_missing =
-  [
-    (Prefix, 7526);
-    (Ancestors, 0);
-    (Parent_mode, 179);
-    (Clear_mode, 6);
-    (Other, 0);
-  ]
+  [ (Prefix, 7530); (Ancestors, 0); (Parent_mode, 179); (Other, 0) ]
 
 let pp_missing =
   Fmt.(list ~sep:(any ", ") (fun ppf (c, n) -> pf ppf "%s %d" (class_name c) n))

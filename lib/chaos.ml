@@ -968,6 +968,9 @@ module Crash = struct
         (* The page cache's bytes as of the last sync, where a failed sync
            left them apart from the durable ones: it still holds what that
            sync lost. *)
+    mutable mode : int;
+        (* The file's mode as last seen, to tell when a write clears setuid
+           or setgid. *)
     mutable evicted : Cstruct.t option;
         (* The durable bytes had the pages a failed sync lost been evicted
            before a later write to them, where they differ. *)
@@ -995,6 +998,7 @@ module Crash = struct
       pending = [];
       gen = 0;
       cache = None;
+      mode = 0;
       evicted = None;
     }
 
@@ -1154,6 +1158,8 @@ module Crash = struct
         (* For a rename, the directories from the root down to where it
            lands. *)
     mutable synced : bool; (* a sync of that file has run since *)
+    clear : bool;
+        (* A write's setuid or setgid clear: any later commit carries it. *)
     mutable committed : bool;
   }
 
@@ -1201,6 +1207,7 @@ module Crash = struct
            snapshot holds the node. *)
     by_parent : (int64, metadata_entry Ids.t) Hashtbl.t;
     by_moved : (int64, metadata_entry Ids.t) Hashtbl.t;
+    mutable clears : metadata_entry Ids.t; (* the pending setuid clears *)
     by_attrs : (int64, metadata_entry Ids.t) Hashtbl.t;
     mutable snapshot : state option; (* the last whole snapshot *)
     mutable durable : state option;
@@ -1779,6 +1786,7 @@ module Crash = struct
     List.iter (fun p -> remove_from ctl.by_parent p e) e.parents;
     List.iter (fun n -> remove_from ctl.by_moved n e) (moved e);
     Option.iter (fun a -> remove_from ctl.by_attrs a e) e.attrs_ino;
+    if e.clear then ctl.clears <- Ids.remove e.meta.seq ctl.clears;
     ctl.pool <- Ids.remove e.meta.seq ctl.pool
 
   (* The pending entries before [e] it depends on: those that changed a
@@ -1931,6 +1939,7 @@ module Crash = struct
         parents;
         ancestors;
         synced = false;
+        clear = false;
         committed = false;
       }
 
@@ -1941,6 +1950,7 @@ module Crash = struct
     Hashtbl.reset ctl.made;
     Hashtbl.reset ctl.by_parent;
     Hashtbl.reset ctl.by_moved;
+    ctl.clears <- Ids.empty;
     Hashtbl.reset ctl.by_attrs
 
   let commit_metadata ctl =
@@ -2039,9 +2049,19 @@ module Crash = struct
     with
     | [] -> fold_committed ctl
     | ready ->
+        let newly = List.concat_map (closure ctl) ready in
+        (* A commit carries the setuid clears before it, which ext4
+           journals in the running transaction. *)
+        let last = List.fold_left (fun m e -> max m e.meta.seq) 0 newly in
+        let clears =
+          Ids.fold
+            (fun s e acc -> if s < last then e :: acc else acc)
+            ctl.clears []
+        in
         let newly =
-          List.concat_map (closure ctl) ready
-          |> List.sort_uniq (fun a b -> Int.compare a.meta.seq b.meta.seq)
+          List.sort_uniq
+            (fun a b -> Int.compare a.meta.seq b.meta.seq)
+            (clears @ newly)
         in
         List.iter (mark_committed ctl) newly;
         ctl.durable <- Some (List.fold_left (replay_in ctl) st newly);
@@ -2084,50 +2104,41 @@ module Crash = struct
       settle ctl
     end
 
-  (* A sync that finds the file's mode changed since the durable image's,
-     as a user's write clears setuid, makes the new mode durable. *)
-  let record_mode ctl (st : Eio.File.Stat.t) =
-    let dur = durable ctl in
-    match Inos.find_opt st.ino dur.inos with
-    | None -> ()
-    | Some at -> (
-        match tree_find dur.tree at with
-        | Some (File f)
-          when f.perm <> st.perm
-               || (not (Int64.equal f.uid st.uid))
-               || not (Int64.equal f.gid st.gid) ->
-            ctl.seq <- ctl.seq + 1;
-            let e =
-              {
-                meta =
-                  metadata_unsynced ~path:""
-                    ~kind:(Chmod { perm = st.perm })
-                    ~seq:ctl.seq;
-                dirs = [];
-                barred = [];
-                delta =
-                  [
-                    ( at,
-                      Attrs
-                        {
-                          ino = st.ino;
-                          perm = st.perm;
-                          uid = st.uid;
-                          gid = st.gid;
-                        } );
-                  ];
-                recorded = [];
-                attrs_ino = Some st.ino;
-                nodes = [];
-                parents = [];
-                ancestors = [];
-                synced = true;
-                committed = true;
-              }
-            in
-            ctl.journal <- Ids.add e.meta.seq e ctl.journal;
-            ctl.durable <- Some (replay_in ctl dur e)
-        | Some _ | None -> ())
+  (* A write or a truncation that cleared setuid or setgid changed the
+     file's mode, which ext4 journals at once, in program order: a pending
+     change of attributes, committed by the file's sync and by any later
+     commit. *)
+  let record_clear ctl fs (st : Eio.File.Stat.t) =
+    ctl.seq <- ctl.seq + 1;
+    let segs =
+      Option.value ~default:[] (tree_path ~root:(root_segs ctl) fs.rel)
+    in
+    let e =
+      {
+        meta =
+          metadata_unsynced ~path:fs.rel
+            ~kind:(Chmod { perm = st.perm })
+            ~seq:ctl.seq;
+        dirs = [];
+        barred = [];
+        delta =
+          [
+            ( segs,
+              Attrs { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
+            );
+          ];
+        recorded = [];
+        attrs_ino = Some st.ino;
+        nodes = [];
+        parents = [];
+        ancestors = [];
+        synced = false;
+        clear = true;
+        committed = false;
+      }
+    in
+    index_entry ctl e;
+    ctl.clears <- Ids.add e.meta.seq e ctl.clears
 
   (* A file the wrapper first meets on an open that finds it on disk was made
      by nothing the model recorded. It is the file an image holds at its
@@ -2414,13 +2425,18 @@ module Crash = struct
                 if !again then st
                 else if Hashtbl.mem included e.meta.seq then replay_in ctl st e
                 else if reached st e then begin
+                  let clears =
+                    Ids.fold
+                      (fun s c acc -> if s < e.meta.seq then c :: acc else acc)
+                      ctl.clears []
+                  in
                   List.iter
                     (fun d ->
                       if not (Hashtbl.mem included d.meta.seq) then begin
                         Hashtbl.replace included d.meta.seq ();
                         if d != e then again := true
                       end)
-                    (closure ctl e);
+                    (clears @ closure ctl e);
                   replay_in ctl st e
                 end
                 else st)
@@ -2592,7 +2608,6 @@ module Crash = struct
             fs.evicted <- (if Cstruct.equal c e then None else Some e));
         lose ctl fs;
         let st = stat () in
-        record_mode ctl st;
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
@@ -2679,12 +2694,23 @@ module Crash = struct
     let seek cf off cmd = do_seek ~pos:cf.cpos cf.cro off cmd
     let close cf = close_resource cf.cro
 
+    (* A write that cleared setuid or setgid, as a user's does. *)
+    let note_clear cf fs =
+      if fs.mode land 0o6000 <> 0 then begin
+        let st = Eio.File.stat cf.cro in
+        if st.perm <> fs.mode then begin
+          fs.mode <- st.perm;
+          record_clear cf.ctl fs st
+        end
+      end
+
     let single_write cf bufs =
       guard cf;
       let fs = fstate_of cf in
       let off = write_offset ~append:cf.cappend ~pos:cf.cpos cf.cro in
       let got = Eio.Flow.single_write (writable cf) bufs in
       clog_write cf.ctl fs ~offset:off (capture bufs got);
+      note_clear cf fs;
       cf.cpos := off + got;
       bump cf.ctl fs ~kind:`Write ~offset:off ~len:got;
       got
@@ -2700,6 +2726,7 @@ module Crash = struct
       in
       let got = Eio.File.pwrite_single (writable cf) ~file_offset bufs in
       clog_write cf.ctl fs ~offset:off (capture bufs got);
+      note_clear cf fs;
       bump cf.ctl fs ~kind:`Write ~offset:off ~len:got;
       got
 
@@ -2720,6 +2747,7 @@ module Crash = struct
       let fs = fstate_of cf in
       Eio.File.truncate (writable cf) len;
       clog_change cf.ctl fs (Resize (Optint.Int63.to_int len));
+      note_clear cf fs;
       bump cf.ctl fs ~kind:`Write ~offset:0 ~len:0
   end
 
@@ -2930,6 +2958,8 @@ module Crash = struct
               found;
             fs
       in
+      fs.mode <-
+        (match found with Some st -> st.perm | None -> create_perm create);
       (* An unsynced truncation of pre-existing durable data is itself a change
          that a crash may lose. *)
       if is_trunc create && had_bytes then clog_change d.dctl fs (Resize 0);
@@ -3071,6 +3101,14 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       B.chmod bv ~follow ~perm path;
+      (* A tracked file's mode, to tell when a write clears setuid. *)
+      (match
+         Hashtbl.find_opt d.dctl.files
+           (file_key d.dplace.proot
+              (resolve ~follow_last:follow d (at d.dplace.prefix path)))
+       with
+      | Some fs -> fs.mode <- (B.stat bv ~follow path).perm
+      | None -> ());
       attrs d ~follow path (Chmod { perm = perm land 0o7777 })
 
     let chown ~follow ?uid ?gid d path =
@@ -3161,6 +3199,7 @@ module Crash = struct
       made = Hashtbl.create 16;
       by_parent = Hashtbl.create 16;
       by_moved = Hashtbl.create 16;
+      clears = Ids.empty;
       by_attrs = Hashtbl.create 16;
       snapshot = None;
       durable = None;

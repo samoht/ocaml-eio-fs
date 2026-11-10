@@ -119,7 +119,6 @@ type fdata = {
       (* truncations a failed sync left pending, which the page cache holds *)
   mutable pend : (int * change * string * string) list;
       (* seq, change, shadow after, page cache after *)
-  mutable pending_clear : int option; (* seq of the write that cleared setuid *)
 }
 
 type barrier = { bdir : int; covered : int list (* seqs *) }
@@ -250,7 +249,6 @@ let fd t id =
           cached = [];
           evicted = "";
           pend = [];
-          pending_clear = None;
         }
       in
       Hashtbl.replace t.fdata id f;
@@ -383,6 +381,15 @@ let record_data t id ch =
   t.data_log <- (seq, id, ch, path_of t id) :: t.data_log;
   seq
 
+(* ext4 journals a write's setuid or setgid clear at once, in program
+   order, in the running transaction. *)
+let journal_clear t id =
+  ignore
+    (journal t ~attr_node:id
+       ~owner:(Option.value ~default:0 (parent_of t id))
+       ~dirs:[] ~tag:"suidclear"
+       (Suid_clear { node = id }))
+
 let do_write t id ch =
   let n = node t id in
   (match n.k with
@@ -395,8 +402,8 @@ let do_write t id ch =
       let clr = if n.mode land 0o010 <> 0 then 0o6000 else 0o4000 in
       if n.mode land clr <> 0 then begin
         n.mode <- n.mode land lnot clr;
-        let f = fd t id in
-        if f.pending_clear = None then f.pending_clear <- Some seq
+        ignore seq;
+        journal_clear t id
       end
   | _ -> ()
 
@@ -415,18 +422,6 @@ let file_sync t id ~ok =
     f.base_cache <- f.cache;
     f.cached <- [];
     f.pend <- [];
-    (* the write's setuid clear enters the journal now, committed *)
-    (match f.pending_clear with
-    | Some wseq ->
-        let s =
-          journal t ~at:wseq ~attr_node:id
-            ~owner:(Option.value ~default:0 (parent_of t id))
-            ~dirs:[] ~tag:"suidclear"
-            (Suid_clear { node = id })
-        in
-        t.forced <- s :: t.forced;
-        f.pending_clear <- None
-    | None -> ());
     (* A sync of a file commits a chmod or chown of it. *)
     List.iter
       (fun e -> if e.attr_node = Some id then t.forced <- e.seq :: t.forced)
@@ -453,6 +448,7 @@ let file_sync t id ~ok =
    them. [self_attr]: also a chmod/chown of [d] itself (POSIX fsync of the
    directory's inode). *)
 let self_attr = ref true
+let is_clear e = match e.ek with Suid_clear _ -> true | _ -> false
 
 let dir_barrier t d =
   let covered =
@@ -460,7 +456,7 @@ let dir_barrier t d =
       (fun e ->
         if
           List.mem d e.dirs
-          || (e.owner = Some d && e.attr_node <> None)
+          || (e.owner = Some d && e.attr_node <> None && not (is_clear e))
           || (!self_attr && e.attr_node = Some d)
         then Some e.seq
         else None)
@@ -616,8 +612,8 @@ let run_op t op =
         let clr = if nd.mode land 0o010 <> 0 then 0o6000 else 0o4000 in
         if nd.mode land clr <> 0 then begin
           nd.mode <- nd.mode land lnot clr;
-          let f = fd t id in
-          if f.pending_clear = None then f.pending_clear <- Some seq
+          ignore seq;
+          journal_clear t id
         end
       end
   | Fsync p ->
@@ -636,22 +632,7 @@ let run_op t op =
       let id = resolve t p in
       if not (is_dir t id) then fail "ENOTDIR";
       dir_barrier t id
-  | Sync_meta ->
-      (* A journal commit carries the inodes writes dirtied: their setuid
-         clears. *)
-      Hashtbl.iter
-        (fun id f ->
-          match f.pending_clear with
-          | Some wseq ->
-              ignore
-                (journal t ~at:wseq ~attr_node:id
-                   ~owner:(Option.value ~default:0 (parent_of t id))
-                   ~dirs:[] ~tag:"suidclear"
-                   (Suid_clear { node = id }));
-              f.pending_clear <- None
-          | None -> ())
-        t.fdata;
-      List.iter (fun e -> t.forced <- e.seq :: t.forced) t.journal
+  | Sync_meta -> List.iter (fun e -> t.forced <- e.seq :: t.forced) t.journal
   | Hopen (h, p) ->
       let id = resolve t p in
       if is_dir t id then fail "EISDIR";
@@ -745,9 +726,26 @@ let committed_with t kept =
         t.barriers
   in
   let s = ref (close t (IS.union (IS.of_list forced) kept)) in
+  let clears =
+    List.filter_map
+      (fun e -> match e.ek with Suid_clear _ -> Some e | _ -> None)
+      (entries t)
+  in
   let changed = ref true in
   while !changed do
     changed := false;
+    (* A commit carries the setuid clears before it. *)
+    List.iter
+      (fun e ->
+        if
+          (not (IS.mem e.seq !s))
+          && IS.exists (fun x -> x > e.seq) !s
+          && holds t !s ~bdir:None e
+        then begin
+          s := IS.add e.seq !s;
+          changed := true
+        end)
+      clears;
     List.iter
       (fun (bdir, x) ->
         if (not (IS.mem x !s)) && holds t !s ~bdir (find_ent t x) then begin

@@ -2801,6 +2801,36 @@ let test_crash_lost_page_kept_or_evicted () =
     [ "\000\000\000\000rec2"; "rec1rec2" ]
     (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
 
+(* A user's write clears setuid, which ext4 journals at once: a crash with
+   no sync may keep it, and a later barrier that commits anything after it
+   carries it. *)
+let test_crash_clear_journaled_at_write () =
+  let run ~barrier policy =
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "X";
+    Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "f");
+    Eio.Path.chmod ~follow:false ~perm:0o4755 (raw / "f");
+    Eio.Path.chmod ~follow:false ~perm:0o777 raw;
+    let ctl = Crash.v ~policy () in
+    let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice raw) in
+    Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "Y" ]);
+    if barrier then begin
+      Eio.Path.mkdir ~perm:0o755 (fs / "n");
+      Eio_fs_sync.sync_dir fs
+    end;
+    (Eio.Path.stat ~follow:false (Crash.post_crash ctl / "f")).perm
+  in
+  let keep_all = Crash.Survive (fun _ -> true) in
+  Alcotest.(check (list int))
+    "no sync, kept; no sync, dropped; a later barrier" [ 0o755; 0o4755; 0o755 ]
+    [
+      run ~barrier:false keep_all;
+      run ~barrier:false Drop_unsynced;
+      run ~barrier:true Drop_unsynced;
+    ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3194,6 +3224,9 @@ let suite =
         test_crash_failed_sync_keeps_truncation;
       Alcotest.test_case "crash: a lost page is kept or evicted" `Quick
         test_crash_lost_page_kept_or_evicted;
+      Alcotest.test_case
+        "crash: a write's setuid clear is journaled at the write" `Quick
+        test_crash_clear_journaled_at_write;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
