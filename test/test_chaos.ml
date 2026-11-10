@@ -2422,6 +2422,25 @@ let test_crash_entries_whole () =
          Eio.Path.rename (fs / "A/d") (fs / "B/e");
          Eio_fs_sync.sync_dir (fs / "B")))
 
+(* A crash gives each entry its owner before its mode: a chown clears
+   setuid and setgid, which the mode then sets back. *)
+let test_crash_keeps_privilege_bits () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "suid") "x";
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "suid");
+  Eio.Path.chmod ~follow:false ~perm:0o6755 (raw / "suid");
+  Eio.Path.mkdir ~perm:0o755 (raw / "sg");
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "sg");
+  Eio.Path.chmod ~follow:false ~perm:0o2775 (raw / "sg");
+  let ctl = Crash.v () in
+  ignore (Crash.wrap ctl raw);
+  let post = Crash.post_crash ctl in
+  let mode p = (Eio.Path.stat ~follow:false (post / p)).perm in
+  Alcotest.(check (pair int int))
+    "modes" (0o6755, 0o2775)
+    (mode "suid", mode "sg")
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2776,6 +2795,8 @@ let suite =
       Alcotest.test_case
         "crash: an entry lands whole, a rename moves the image's node" `Quick
         test_crash_entries_whole;
+      Alcotest.test_case "crash: a crash keeps setuid and setgid" `Quick
+        test_crash_keeps_privilege_bits;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

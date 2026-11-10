@@ -1335,9 +1335,10 @@ module Crash = struct
               ~create:(`Or_truncate perm) path
           in
           if Cstruct.length data > 0 then
-            Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ];
-          B.chmod bv ~follow:true ~perm path );
-        restore_owner owner path ~uid ~gid
+            Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ] );
+        (* The owner first: a chown clears setuid and setgid. *)
+        restore_owner owner path ~uid ~gid;
+        B.chmod bv ~follow:true ~perm path
     | Link { target; uid; gid; _ } ->
         B.symlink ~link_to:target bv path;
         restore_owner owner path ~uid ~gid
@@ -1352,8 +1353,8 @@ module Crash = struct
             restore_at owner child_path child)
           entries;
         if not (String.equal path "") then begin
-          B.chmod bv ~follow:false ~perm path;
-          restore_owner owner path ~uid ~gid
+          restore_owner owner path ~uid ~gid;
+          B.chmod bv ~follow:false ~perm path
         end
 
   let restore_root (Base_dir ((module B), bv) as owner) path = function
@@ -1363,8 +1364,8 @@ module Crash = struct
             let child = Eio_fs_path.append path name in
             remove_at owner child);
         if not (String.equal path "") then begin
-          B.chmod bv ~follow:true ~perm path;
-          restore_owner owner path ~uid ~gid
+          restore_owner owner path ~uid ~gid;
+          B.chmod bv ~follow:true ~perm path
         end;
         Paths.iter
           (fun name child ->
