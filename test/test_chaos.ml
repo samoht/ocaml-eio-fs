@@ -2460,9 +2460,11 @@ let test_crash_sync_records_the_mode () =
     ( (Eio.Path.stat ~follow:false (post / "suid")).perm,
       Eio.Path.load (post / "suid") )
 
-(* A file truncated and rewritten, unsynced: once the new length lands, the
-   block kept from before the truncation reads zeros, not the old bytes. *)
-let test_crash_truncation_zeroes_old_blocks () =
+(* A file truncated and rewritten, unsynced: writeback may land the new
+   length over the block from before the truncation, so the bytes it cut
+   come back, and every outcome is one of those. *)
+let test_crash_truncation_follows_writeback () =
+  let seen = Hashtbl.create 8 in
   for seed = 0 to 199 do
     Eio_mock.Backend.run @@ fun () ->
     let raw = Eio_fs.Fs.v () in
@@ -2470,10 +2472,13 @@ let test_crash_truncation_zeroes_old_blocks () =
     let ctl = Crash.v ~policy:(Reorder_unsynced seed) () in
     let fs = Crash.wrap ctl raw in
     Eio.Path.save ~create:(`Or_truncate 0o644) (fs / "f") "wtw";
-    let got = Eio.Path.load (Crash.post_crash ctl / "f") in
-    if String.length got < 9 && not (List.mem got [ ""; "wtw"; "\000\000\000" ])
-    then Alcotest.failf "seed %d: %S" seed got
-  done
+    Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
+  done;
+  Alcotest.(check (list string))
+    "outcomes"
+    (List.sort String.compare
+       [ ""; "dgj"; "dgjutfwss"; "wtw"; "wtw\000\000\000\000\000\000" ])
+    (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
 
 (* A file's sync commits the file's mode, not an earlier directory operation
    on another name. *)
@@ -2945,8 +2950,8 @@ let suite =
         test_crash_keeps_privilege_bits;
       Alcotest.test_case "crash: a sync makes a cleared setuid durable" `Quick
         test_crash_sync_records_the_mode;
-      Alcotest.test_case "crash: a truncation zeroes the blocks it cut" `Quick
-        test_crash_truncation_zeroes_old_blocks;
+      Alcotest.test_case "crash: a truncation follows writeback" `Quick
+        test_crash_truncation_follows_writeback;
       Alcotest.test_case "crash: a file sync commits its mode alone" `Quick
         test_crash_sync_commits_the_mode_alone;
       Alcotest.test_case

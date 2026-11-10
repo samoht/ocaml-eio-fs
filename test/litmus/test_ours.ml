@@ -616,7 +616,7 @@ let truncate_then_regrow =
     }
     ~ext4:(both ordered)
     ~envelope:(both (ordered @ [ [ ("f", File "AB") ] ]))
-    ~not_produced:(both [ [ ("f", File "AB") ] ])
+    ~extra:(both [ [ ("f", File "AB") ] ])
 
 let cases =
   [

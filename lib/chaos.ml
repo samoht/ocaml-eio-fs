@@ -2146,16 +2146,15 @@ module Crash = struct
      any one of those changes, drawn from [rng]; the length is one a change
      left, or a block boundary a write grew the file across, as writeback
      lands a long append block by block. A truncation changes the length in
-     one step, and once it has landed a block kept from before it reads zeros
-     past it. A block is never torn, and a later change never lands in a
-     block without the earlier ones. *)
+     one step and dirties only the block it cuts, so a block kept from before
+     it keeps its old bytes. A block is never torn, and a later change never
+     lands in a block without the earlier ones. *)
   let writeback ~rng ~bs durable changes =
     let changes = Array.of_list changes in
     let n = Array.length changes in
     let sizes = Array.make (n + 1) (Cstruct.length durable) in
     let versions = Hashtbl.create 16 in
     let boundaries = ref [] in
-    let shrinks = ref [] in
     for k = 0 to n - 1 do
       let prev = sizes.(k) in
       let lo, hi =
@@ -2165,14 +2164,13 @@ module Crash = struct
             let size = max prev (offset + len) in
             sizes.(k + 1) <- size;
             for b = (prev / bs) + 1 to (size - 1) / bs do
-              boundaries := (b * bs, k + 1) :: !boundaries
+              boundaries := (b * bs) :: !boundaries
             done;
             (offset, offset + len)
         | Resize m when m < prev ->
             (* A shrink rewrites only the block cut at its new end; the blocks
                past it keep their bytes until the new length lands. *)
             sizes.(k + 1) <- m;
-            shrinks := (k + 1, m) :: !shrinks;
             (m, if m mod bs = 0 then m else m + 1)
         | Resize m ->
             sizes.(k + 1) <- m;
@@ -2197,12 +2195,10 @@ module Crash = struct
         let v = List.nth vs (Random.State.int rng (List.length vs)) in
         if v > 0 then Hashtbl.replace chosen b v)
       blocks;
-    (* The length is the one change [last] left. *)
-    let size, last =
-      let boundaries = List.sort_uniq compare !boundaries in
+    let size =
+      let boundaries = List.sort_uniq Int.compare !boundaries in
       if Random.State.bool rng || boundaries = [] then
-        let i = Random.State.int rng (n + 1) in
-        (sizes.(i), i)
+        sizes.(Random.State.int rng (n + 1))
       else List.nth boundaries (Random.State.int rng (List.length boundaries))
     in
     (* Replay once, taking each chosen block as it stood after its change. *)
@@ -2235,15 +2231,7 @@ module Crash = struct
           | None -> block_of durable b
         in
         let len = min (Cstruct.length src) (size - (b * bs)) in
-        if len > 0 then Cstruct.blit src 0 image (b * bs) len;
-        let v = Option.value ~default:0 (Hashtbl.find_opt chosen b) in
-        let cut =
-          List.fold_left
-            (fun cut (k, m) -> if v < k && k <= last then min cut m else cut)
-            max_int !shrinks
-        in
-        let lo = max cut (b * bs) and hi = min size ((b + 1) * bs) in
-        if lo < hi then Cstruct.memset (Cstruct.sub image lo (hi - lo)) 0
+        if len > 0 then Cstruct.blit src 0 image (b * bs) len
       done;
     image
 
