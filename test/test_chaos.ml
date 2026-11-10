@@ -2474,6 +2474,24 @@ let test_crash_truncation_zeroes_old_blocks () =
     then Alcotest.failf "seed %d: %S" seed got
   done
 
+(* A file's sync commits the file's mode, not an earlier directory operation
+   on another name. *)
+let test_crash_sync_commits_the_mode_alone () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "x") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "y") "y";
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.unlink (fs / "x");
+  Eio.Path.chmod ~follow:false ~perm:0o755 (fs / "y");
+  Eio.Path.with_open_out ~create:`Never (fs / "y") Eio.File.sync;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check (pair bool int))
+    "x kept, y's mode" (true, 0o755)
+    ( Eio.Path.is_file (post / "x"),
+      (Eio.Path.stat ~follow:false (post / "y")).perm )
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2834,6 +2852,8 @@ let suite =
         test_crash_sync_records_the_mode;
       Alcotest.test_case "crash: a truncation zeroes the blocks it cut" `Quick
         test_crash_truncation_zeroes_old_blocks;
+      Alcotest.test_case "crash: a file sync commits its mode alone" `Quick
+        test_crash_sync_commits_the_mode_alone;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

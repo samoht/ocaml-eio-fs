@@ -41,8 +41,9 @@ type m = {
   (* metadata states: (tree, perms of files) at last commit, then after each op *)
   mutable committed : dnode * (int * int) list;
   mutable meta_states : (dnode * (int * int) list) list;
-  fsynced : (int, int) Hashtbl.t;
-      (* the mode a sync since the last commit made durable, by file *)
+  fsynced : (int, int * int) Hashtbl.t;
+      (* the mode a sync since the last commit made durable, by file, and the
+         number of metadata states before that sync *)
       (* newest first, since commit *)
 }
 
@@ -180,7 +181,7 @@ let m_trunc m id n =
 
 let m_sync m id =
   Hashtbl.replace m.durable id (finfo m id).data;
-  Hashtbl.replace m.fsynced id (finfo m id).fperm;
+  Hashtbl.replace m.fsynced id ((finfo m id).fperm, List.length m.meta_states);
   Hashtbl.remove m.pending id
 
 let lookup m who p =
@@ -879,11 +880,14 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
       let perm_of perms id =
         try List.assoc id perms with Not_found -> 0o7777
       in
-      (* A sync made a file's mode durable before its name. *)
-      let synced perms =
+      (* A sync made a file's mode durable before its name: it overrides the
+         mode of a state from before it. *)
+      let synced ?(state = 0) perms =
         List.map
           (fun (id, p) ->
-            (id, Option.value ~default:p (Hashtbl.find_opt m.fsynced id)))
+            match Hashtbl.find_opt m.fsynced id with
+            | Some (q, at) when at >= state -> (id, q)
+            | Some _ | None -> (id, p))
           perms
       in
       match mode with
@@ -1021,10 +1025,15 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
                 file_ok id content)
               (files "" tree [])
           in
-          let ok_state (tree, perms) =
-            ok_state1 (tree, perms) || ok_state1 (tree, synced perms)
+          let ok_state state (tree, perms) =
+            ok_state1 (tree, synced ~state perms)
           in
-          if not (List.exists ok_state states) then
+          if
+            not
+              (List.exists
+                 (fun (i, st) -> ok_state i st)
+                 (List.mapi (fun i st -> (i, st)) states))
+          then
             fail_with !trace
               (Fmt.str
                  "Reorder image matches no prefix \
