@@ -2007,6 +2007,52 @@ module Crash = struct
       settle ctl
     end
 
+  (* A sync that finds the file's mode changed since the durable image's,
+     as a user's write clears setuid, makes the new mode durable. *)
+  let record_mode ctl (st : Eio.File.Stat.t) =
+    let dur = durable ctl in
+    match Inos.find_opt st.ino dur.inos with
+    | None -> ()
+    | Some at -> (
+        match tree_find dur.tree at with
+        | Some (File f)
+          when f.perm <> st.perm
+               || (not (Int64.equal f.uid st.uid))
+               || not (Int64.equal f.gid st.gid) ->
+            ctl.seq <- ctl.seq + 1;
+            let e =
+              {
+                meta =
+                  metadata_unsynced ~path:""
+                    ~kind:(Chmod { perm = st.perm })
+                    ~seq:ctl.seq;
+                dirs = [];
+                barred = [];
+                delta =
+                  [
+                    ( at,
+                      Attrs
+                        {
+                          ino = st.ino;
+                          perm = st.perm;
+                          uid = st.uid;
+                          gid = st.gid;
+                        } );
+                  ];
+                recorded = [];
+                attrs_ino = Some st.ino;
+                nodes = [];
+                named = [];
+                parents = [];
+                synced = true;
+                committed = true;
+              }
+            in
+            ctl.journal <- Ids.add e.meta.seq e ctl.journal;
+            ctl.durable <- Some (replay ~root:(root_segs ctl) dur e);
+            ctl.committed_upto <- ctl.seq
+        | Some _ | None -> ())
+
   (* A file the wrapper first meets on an open that finds it on disk was made
      by nothing the model recorded. It is the file an image holds at its
      path only if that node is its inode: the snapshot and the durable image,
@@ -2331,7 +2377,9 @@ module Crash = struct
         let pending = List.rev fs.pending in
         List.iter (fun e -> apply fs.durable e.change) pending;
         lose ctl fs;
-        commit_attrs ctl ~ino:(fun () -> (stat ()).Eio.File.Stat.ino);
+        let st = stat () in
+        record_mode ctl st;
+        commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
         lose ctl fs;

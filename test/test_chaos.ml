@@ -2441,6 +2441,24 @@ let test_crash_keeps_privilege_bits () =
     "modes" (0o6755, 0o2775)
     (mode "suid", mode "sg")
 
+(* A user's write clears setuid; the sync after it makes that mode durable. *)
+let test_crash_sync_records_the_mode () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "suid") "x";
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (raw / "suid");
+  Eio.Path.chmod ~follow:false ~perm:0o4755 (raw / "suid");
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl (Eio_fs.Fs.as_user alice raw) in
+  Eio.Path.with_open_out ~create:`Never (fs / "suid") (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "y" ];
+      Eio.File.sync f);
+  let post = Crash.post_crash ctl in
+  Alcotest.(check (pair int string))
+    "mode and bytes" (0o755, "y")
+    ( (Eio.Path.stat ~follow:false (post / "suid")).perm,
+      Eio.Path.load (post / "suid") )
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2797,6 +2815,8 @@ let suite =
         test_crash_entries_whole;
       Alcotest.test_case "crash: a crash keeps setuid and setgid" `Quick
         test_crash_keeps_privilege_bits;
+      Alcotest.test_case "crash: a sync makes a cleared setuid durable" `Quick
+        test_crash_sync_records_the_mode;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
