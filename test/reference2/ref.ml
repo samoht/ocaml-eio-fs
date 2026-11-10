@@ -444,21 +444,18 @@ let file_sync t id ~ok =
       kept
   end
 
-(* A barrier on directory [d]: covers its entries and a chmod/chown of one of
-   them. [self_attr]: also a chmod/chown of [d] itself (POSIX fsync of the
-   directory's inode). *)
+(* A barrier on directory [d]: covers its entries and a chmod/chown of [d]
+   itself (POSIX fsync of the directory's inode), not one of an entry: ext4's
+   fsync of a directory completes only that directory's own last
+   transaction. [self_attr] turns the second off. *)
 let self_attr = ref true
-let is_clear e = match e.ek with Suid_clear _ -> true | _ -> false
 
 let dir_barrier t d =
   let covered =
     List.filter_map
       (fun e ->
-        if
-          List.mem d e.dirs
-          || (e.owner = Some d && e.attr_node <> None && not (is_clear e))
-          || (!self_attr && e.attr_node = Some d)
-        then Some e.seq
+        if List.mem d e.dirs || (!self_attr && e.attr_node = Some d) then
+          Some e.seq
         else None)
       t.journal
   in

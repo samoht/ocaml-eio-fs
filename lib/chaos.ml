@@ -1855,18 +1855,20 @@ module Crash = struct
     let delta, dirs, attrs_ino =
       match (kind, resolved) with
       | (Chmod _ | Chown _), [ p ] -> (
-          (* New attributes on the node: committed by a barrier on its
-             directory or on the node itself, and for a file by its sync. *)
+          (* New attributes on the node: committed by a barrier on the node
+             itself, for a directory, or by its sync, for a file. A barrier on
+             its parent does not: ext4's fsync of a directory completes only
+             that directory's own last transaction. *)
           let (Base_dir ((module B), bv)) = owner in
           let st = B.stat bv ~follow:false p in
-          match (tree_path ~root p, parent p) with
-          | Some segs, Some up ->
+          match tree_path ~root p with
+          | Some segs ->
               let edit =
                 Attrs
                   { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
               in
-              ([ (segs, edit) ], [ up; st.ino ], Some st.ino)
-          | _ -> ([], [], None))
+              ([ (segs, edit) ], [ st.ino ], Some st.ino)
+          | None -> ([], [], None))
       | Rename _, [ src; dst ] -> (
           (* A rename moves the image's own node: nothing of what it holds
              live comes with it. It is committed by a barrier on either

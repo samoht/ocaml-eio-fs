@@ -2241,8 +2241,10 @@ let test_crash_deferred_barrier_identity () =
   Alcotest.(check (list string)) "after rename, the new d" [] renamed;
   Alcotest.(check (list string)) "the root" [ "d"; "x" ] top
 
-(* A change of mode or owner is metadata: lost unless a sync of the file or a
-   barrier on its directory commits it. *)
+(* A change of mode or owner is metadata: lost unless a sync of the file, or
+   a barrier on the directory itself, commits it. A barrier on the parent
+   does not: ext4's fsync of a directory completes only its own last
+   transaction. *)
 let test_crash_chmod_journaled () =
   let mode ~sync =
     let ctl = Crash.v () in
@@ -2265,8 +2267,10 @@ let test_crash_chmod_journaled () =
   check "a sync of the file" (0o600, 1000L, 0o755)
     (mode ~sync:(fun _ fs ->
          Eio.Path.with_open_out ~create:`Never (fs / "f") Eio.File.sync));
-  check "a barrier on the directory" (0o600, 1000L, 0o700)
-    (mode ~sync:(fun _ fs -> Eio_fs_sync.sync_dir fs))
+  check "a barrier on the parent" (0o644, 0L, 0o755)
+    (mode ~sync:(fun _ fs -> Eio_fs_sync.sync_dir fs));
+  check "a barrier on the directory itself" (0o644, 0L, 0o700)
+    (mode ~sync:(fun _ fs -> Eio_fs_sync.sync_dir (fs / "d")))
 
 (* A sync makes a new file's mode durable before its name: whenever a crash
    keeps the name, the file has that mode. *)

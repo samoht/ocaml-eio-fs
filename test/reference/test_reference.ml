@@ -188,16 +188,14 @@ let gen ~as_alice rng len =
      ("metadata never reorders", chaos.mli);
    - [Ancestors]: a rename waits for the renames that moved a directory
      above where it lands;
-   - [Parent_mode]: it differs from one eio-fs leaves only in the modes of
-     nodes whose chmod a later barrier on their directory committed, as a
-     directory barrier commits its entries' modes;
+   - [Clear]: a commit carries the setuid clears before it;
    - [Other]: nothing documented explains it. *)
-type class_ = Prefix | Ancestors | Parent_mode | Other
+type class_ = Prefix | Ancestors | Clear | Other
 
 let class_name = function
   | Prefix -> "prefix"
   | Ancestors -> "ancestors"
-  | Parent_mode -> "parent-mode"
+  | Clear -> "clear"
   | Other -> "other"
 
 type report = {
@@ -244,68 +242,6 @@ let differential workloads =
     for k = 0 to List.length ops do
       let evs = List.concat (take k evs_by_op) in
       let per_op = List.mapi (fun p e -> (p, e)) (take k evs_by_op) in
-      let parent_at p i =
-        let _, nodes = List.nth trees (p + 1) in
-        IM.fold
-          (fun d n acc ->
-            if SM.exists (fun _ c -> c = i) n.ents then Some d else acc)
-          nodes None
-      in
-      let mode_nodes ~chmod =
-        List.concat_map
-          (fun (p, es) ->
-            let is_chmod =
-              match List.nth ops p with Chmod _ -> true | _ -> false
-            in
-            List.filter_map
-              (function
-                | Attrs (i, _) when chmod && is_chmod -> (
-                    match parent_at p i with
-                    | Some d
-                      when List.exists
-                             (fun (q, es) -> q >= p && List.mem (Bdir d) es)
-                             per_op ->
-                        Some i
-                    | _ -> None)
-                | Attrs (i, _) when (not chmod) && not is_chmod -> Some i
-                | _ -> None)
-              es)
-          per_op
-      in
-      let parent_modes = mode_nodes ~chmod:true in
-      (* A barrier on a directory commits the chmod of an entry it held. *)
-      let covered = Hashtbl.create 8 in
-      let _ =
-        List.fold_left
-          (fun base (p, es) ->
-            (match List.nth ops p with
-            | Chmod _ ->
-                List.iteri
-                  (fun a e ->
-                    match e with
-                    | Attrs (i, _) -> (
-                        match parent_at p i with
-                        | None -> ()
-                        | Some d ->
-                            ignore
-                              (List.fold_left
-                                 (fun qbase (q, es') ->
-                                   if q > p then
-                                     List.iteri
-                                       (fun b e' ->
-                                         if e' = Bdir d then
-                                           Hashtbl.replace covered
-                                             (base + a, qbase + b)
-                                             ())
-                                       es';
-                                   qbase + List.length es')
-                                 0 per_op))
-                    | _ -> ())
-                  es
-            | _ -> ());
-            base + List.length es)
-          0 per_op
-      in
       (* A write's setuid clear is journaled at once, and any later
          journal event carries it. *)
       let clear_idx =
@@ -328,18 +264,14 @@ let differential workloads =
       in
       let evs_a = Array.of_list evs in
       let covers i j =
-        Hashtbl.mem covered (i, j)
-        || clear_idx i
-           &&
-           match evs_a.(j) with
-           | Meta _ | Init _ | Attrs _ -> true
-           | _ -> false
+        clear_idx i
+        && match evs_a.(j) with Meta _ | Init _ | Attrs _ -> true | _ -> false
       in
       let r = states ~covers ~root ~init ~base evs in
       let ref_meta = States.map without_data r.all in
       (* A state eio-fs leaves is a prefix one under its rules: the
          barriers' closure, with the renames above where one lands and the
-         modes a directory barrier commits, and a prefix of the rest. *)
+         setuid clears a later commit carries, and a prefix of the rest. *)
       let shaped = States.map without_data r.eio in
       (* A file made since the setup starts empty. *)
       let versions id =
@@ -390,26 +322,12 @@ let differential workloads =
       in
       let prefix = States.map without_data r.prefix
       and ancestors = States.map without_data r.ancestors in
-      let eio_list = States.elements eio in
-      (* Whether [s] is a state eio-fs leaves but for the modes of [nodes]. *)
-      let modes_of nodes s =
-        List.exists
-          (fun e ->
-            List.length e = List.length s
-            && List.for_all2
-                 (fun a b ->
-                   { a with perm = 0 } = { b with perm = 0 }
-                   && (a.perm = b.perm || List.mem a.id nodes))
-                 e s)
-          eio_list
-      in
       States.iter
         (fun s ->
           let c =
             if not (States.mem s prefix) then Prefix
             else if not (States.mem s ancestors) then Ancestors
-            else if not (States.mem s shaped) then Parent_mode
-            else if modes_of parent_modes s then Parent_mode
+            else if not (States.mem s shaped) then Clear
             else Other
           in
           Hashtbl.replace missing c
@@ -419,7 +337,7 @@ let differential workloads =
         (States.diff ref_meta eio)
     done
   done;
-  let classes = [ Prefix; Ancestors; Parent_mode; Other ] in
+  let classes = [ Prefix; Ancestors; Clear; Other ] in
   {
     states = !n_states;
     unsound = List.rev !unsound;
@@ -442,7 +360,7 @@ let expected_unsound = 0
 (* What eio-fs never produces over [workloads] workloads, by class. A count
    that moves is a change of the crash model: say why. *)
 let expected_missing =
-  [ (Prefix, 7530); (Ancestors, 0); (Parent_mode, 179); (Other, 0) ]
+  [ (Prefix, 7556); (Ancestors, 0); (Clear, 6); (Other, 0) ]
 
 let pp_missing =
   Fmt.(list ~sep:(any ", ") (fun ppf (c, n) -> pf ppf "%s %d" (class_name c) n))
