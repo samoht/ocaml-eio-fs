@@ -40,7 +40,8 @@ and then fails.
 `Eio_fs.Chaos.Crash` simulates a power cut. A write stays unsynced until
 `Eio.File.sync` runs on its file. Directory operations go into a journal in the
 order they ran. At the crash, each block an unsynced write dirtied may be
-lost, and only a prefix of the uncommitted directory operations survives.
+lost. A directory sync commits the operations on that directory; of the rest,
+only a prefix survives.
 
 One crash can end in many states. The default policy, `Drop_unsynced`, builds
 only one of them: the state at the last barriers. `Reorder_unsynced seed` draws
