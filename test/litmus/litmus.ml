@@ -271,7 +271,7 @@ let seeds () =
 
 let report = Option.is_some (Sys.getenv_opt "LITMUS_REPORT")
 
-let check ~name ~eio ~envelope ~ext4 ~extra ~missing ~impossible =
+let check ~name ~eio ~envelope ~ext4 ~extra ~missing ~impossible ~not_produced =
   let set = Set.of_list in
   let outside = Set.diff eio envelope in
   let weaker = Set.diff (Set.diff eio ext4) outside in
@@ -283,10 +283,15 @@ let check ~name ~eio ~envelope ~ext4 ~extra ~missing ~impossible =
        weaker than ext4:@,\
       \  %a@,\
        missing:@,\
+      \  %a@,\
+       not produced:@,\
       \  %a@]@."
-      name pp_set outside pp_set weaker pp_set (Set.diff ext4 eio);
+      name pp_set outside pp_set weaker pp_set (Set.diff ext4 eio) pp_set
+      (Set.diff envelope eio);
   Alcotest.check testable "impossible outcomes (eio-fs outside its envelope)"
     (set impossible) outside;
   Alcotest.check testable "deliberately weaker than ext4" (set extra) weaker;
   Alcotest.check testable "ext4 outcomes eio-fs misses" (set missing)
-    (Set.diff ext4 eio)
+    (Set.diff ext4 eio);
+  Alcotest.check testable "envelope outcomes eio-fs never produces"
+    (set not_produced) (Set.diff envelope eio)

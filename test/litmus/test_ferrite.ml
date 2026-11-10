@@ -153,11 +153,12 @@ type case = {
   extra : outcome list;
   missing : outcome list;
   impossible : outcome list;
+  not_produced : outcome list;
 }
 
-let case ?(paper = []) ?(extra = []) ?(missing = []) ?(impossible = []) test
-    surprising =
-  { test; surprising; paper; extra; missing; impossible }
+let case ?(paper = []) ?(extra = []) ?(missing = []) ?(impossible = [])
+    ?(not_produced = []) test surprising =
+  { test; surprising; paper; extra; missing; impossible; not_produced }
 
 let zeros n = String.make n '\000'
 let ones n = String.make n '1'
@@ -318,7 +319,8 @@ let run_case c () =
       Fmt.(list ~sep:(any " ") (pair ~sep:(any ":") string bool))
       c.paper;
   check ~name:t.name ~eio:r.outcomes ~envelope:env_set ~ext4:ext4_set
-    ~extra:c.extra ~missing:c.missing ~impossible:c.impossible;
+    ~extra:c.extra ~missing:c.missing ~impossible:c.impossible
+    ~not_produced:c.not_produced;
   Alcotest.check testable "sequential states are reachable" Set.empty
     (Set.diff seqfs r.outcomes);
   Alcotest.check testable "advfs states are reachable" Set.empty

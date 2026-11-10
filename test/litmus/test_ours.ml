@@ -20,7 +20,12 @@
    truncation is one change of length that does not rewrite the bytes it
    keeps or cuts, and a failed fsync leaves the bytes it failed to write
    unwritten (Linux since 4.13 marks those pages clean, so a later fsync
-   does not retry them). *)
+   does not retry them).
+
+   Each case then lists how eio-fs differs: [impossible], outside the
+   envelope (known unsound); [extra], inside it but weaker than ext4;
+   [missing], what ext4 leaves and eio-fs never does; and [not_produced],
+   what the envelope allows and eio-fs never does (deliberately stronger). *)
 
 open Litmus
 
@@ -41,6 +46,7 @@ type case = {
   extra : outcome list;
   missing : outcome list;
   impossible : outcome list;
+  not_produced : outcome list;
 }
 
 let run_case c () =
@@ -56,10 +62,11 @@ let run_case c () =
   Alcotest.check testable "ext4 stays inside the envelope" Set.empty
     (Set.diff ext4 envelope);
   check ~name:c.test.name ~eio:r.outcomes ~envelope ~ext4 ~extra:c.extra
-    ~missing:c.missing ~impossible:c.impossible
+    ~missing:c.missing ~impossible:c.impossible ~not_produced:c.not_produced
 
-let case ?(extra = []) ?(missing = []) ?(impossible = []) test ~ext4 ~envelope =
-  { test; ext4; envelope; extra; missing; impossible }
+let case ?(extra = []) ?(missing = []) ?(impossible = []) ?(not_produced = [])
+    test ~ext4 ~envelope =
+  { test; ext4; envelope; extra; missing; impossible; not_produced }
 
 (* {1 mkdir} *)
 
@@ -543,6 +550,77 @@ let fsync_after_rewrite =
     ~ext4:(states @ marked [ [ ("f", File "new") ] ])
     ~envelope:(states @ marked [ [ ("f", File "new") ] ])
 
+(* {1 A rename into a new directory, a rename after a create, a regrown
+   truncation} *)
+
+(* A file moved into a new directory, then a barrier on that directory
+   alone. The rename changes both directories in one step, so once the
+   barrier returns it is durable: [a/f] is gone. [b/d] may still be lost
+   with it (the envelope) or not (ext4). *)
+let rename_into_new_dir =
+  let pre =
+    [
+      [ ("a/f", File "x"); ("b/d", Absent); ("b/d/f", Absent) ];
+      [ ("a/f", File "x"); ("b/d", Dir); ("b/d/f", Absent) ];
+      [ ("a/f", Absent); ("b/d", Dir); ("b/d/f", File "x") ];
+    ]
+  in
+  let lost = [ ("a/f", Absent); ("b/d", Absent); ("b/d/f", Absent) ] in
+  case
+    {
+      name = "rename into a new directory, barrier on it alone";
+      setup = [ Mkdir "a"; Mkdir "b"; Creat "a/f"; Write ("a/f", "x") ];
+      body = [ Mkdir "b/d"; Rename ("a/f", "b/d/f"); Fsync_dir "b/d"; Mark ];
+      observe = [ "a/f"; "b/d"; "b/d/f" ];
+    }
+    ~ext4:(unmarked pre @ marked [ List.nth pre 2 ])
+    ~envelope:(unmarked (pre @ [ lost ]) @ marked [ List.nth pre 2; lost ])
+    ~impossible:(marked [ List.nth pre 0 ])
+    ~not_produced:(both [ lost ])
+
+(* A file made in [a], then another moved from [a] to [b], then a barrier
+   on [b]. Both change [a], so they stay in order (Ferrite's same-directory
+   rule): the barrier that makes the rename durable makes [a/g] durable. *)
+let rename_after_create_in_source =
+  let pre =
+    [
+      [ ("a/f", File "x"); ("a/g", Absent); ("b/f", Absent) ];
+      [ ("a/f", File "x"); ("a/g", File ""); ("b/f", Absent) ];
+      [ ("a/f", Absent); ("a/g", File ""); ("b/f", File "x") ];
+    ]
+  in
+  case
+    {
+      name = "rename after a create in its source, barrier on the target";
+      setup = [ Mkdir "a"; Mkdir "b"; Creat "a/f"; Write ("a/f", "x") ];
+      body = [ Creat "a/g"; Rename ("a/f", "b/f"); Fsync_dir "b"; Mark ];
+      observe = [ "a/f"; "a/g"; "b/f" ];
+    }
+    ~ext4:(unmarked pre @ marked [ List.nth pre 2 ])
+    ~envelope:(unmarked pre @ marked [ List.nth pre 2 ])
+    ~impossible:
+      (marked [ [ ("a/f", Absent); ("a/g", Absent); ("b/f", File "x") ] ])
+
+(* A truncation, then an overwrite that grows the file again inside the cut
+   block. data=ordered writes the zeroed tail before the truncation commits;
+   data=writeback may commit the new length over the old block, so the
+   file's own cut byte "B" comes back. *)
+let truncate_then_regrow =
+  let ordered =
+    [ "ABC"; "A"; "A\000"; "AZ"; "A\000\000"; "AZ\000" ]
+    |> List.map (fun c -> [ ("f", File c) ])
+  in
+  case
+    {
+      name = "truncate, then regrow inside the cut block";
+      setup = [ Creat "f"; Write ("f", "ABC") ];
+      body = [ Truncate ("f", 1); Pwrite ("f", 1, "Z"); Mark ];
+      observe = [ "f" ];
+    }
+    ~ext4:(both ordered)
+    ~envelope:(both (ordered @ [ [ ("f", File "AB") ] ]))
+    ~not_produced:(both [ [ ("f", File "AB") ] ])
+
 let cases =
   [
     mkdir_file_sync;
@@ -561,6 +639,9 @@ let cases =
     rename_then_barrier;
     fsync_after_failure;
     fsync_after_rewrite;
+    rename_into_new_dir;
+    rename_after_create_in_source;
+    truncate_then_regrow;
   ]
 
 let suite =

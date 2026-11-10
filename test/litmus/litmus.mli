@@ -97,8 +97,11 @@ val check :
   extra:outcome list ->
   missing:outcome list ->
   impossible:outcome list ->
+  not_produced:outcome list ->
   unit
 (** [check] asserts that the eio-fs outcomes outside [envelope] are exactly
     [impossible] (known unsoundness), that those outside [ext4] but inside
-    [envelope] are exactly [extra] (deliberately weaker), and that the [ext4]
-    outcomes eio-fs cannot produce are exactly [missing]. *)
+    [envelope] are exactly [extra] (deliberately weaker), that the [ext4]
+    outcomes eio-fs cannot produce are exactly [missing], and that the
+    [envelope] outcomes it never produces are exactly [not_produced]
+    (deliberately stronger). *)
