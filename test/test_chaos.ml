@@ -2592,6 +2592,40 @@ let test_crash_new_dir_needs_parent_barrier () =
     "without, then with the parent's barrier" (false, true)
     (run ~parent:false, run ~parent:true)
 
+(* A file durable before the wrapper, first opened after an uncommitted
+   rename of itself or of a directory above it: what it syncs lands in the
+   file the image holds under its old name. *)
+let test_crash_preexisting_found_by_inode () =
+  let run ~dir policy =
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.mkdir ~perm:0o755 (raw / "d");
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "d/f") "OLD";
+    let ctl = Crash.v ~policy () in
+    let fs = Crash.wrap ctl raw in
+    let now =
+      if dir then (
+        Eio.Path.rename (fs / "d") (fs / "e");
+        "e/f")
+      else (
+        Eio.Path.rename (fs / "d/f") (fs / "d/g");
+        "d/g")
+    in
+    Eio.Path.with_open_out ~create:`Never (fs / now) (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "NEW" ];
+        if policy = Crash.Drop_unsynced then Eio.File.sync f);
+    Eio.Path.load (Crash.post_crash ctl / "d/f")
+  in
+  let keep_data = Crash.Survive (fun u -> u.kind = Data) in
+  Alcotest.(check (list string))
+    "renamed file, renamed directory, then a surviving write"
+    [ "NEW"; "NEW"; "NEW" ]
+    [
+      run ~dir:false Drop_unsynced;
+      run ~dir:true Drop_unsynced;
+      run ~dir:false keep_data;
+    ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2965,6 +2999,9 @@ let suite =
       Alcotest.test_case
         "crash: a new directory is durable only by its parent's barrier" `Quick
         test_crash_new_dir_needs_parent_barrier;
+      Alcotest.test_case
+        "crash: a file met after a rename of it is found by inode" `Quick
+        test_crash_preexisting_found_by_inode;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

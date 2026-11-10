@@ -2104,9 +2104,9 @@ module Crash = struct
 
   (* A file the wrapper first meets on an open that finds it on disk was made
      by nothing the model recorded. It is the file an image holds at its
-     path only if that node is its inode: the snapshot and the durable image,
-     and the nodes pending entries put. Locating it there lets a crash
-     rewrite it with what it synced. *)
+     path if that node is its inode, or wherever the image holds that inode:
+     the snapshot and the durable image, and the nodes pending entries put.
+     Locating it there lets a crash rewrite it with what it synced. *)
   let locate_preexisting ctl ((_, _, rel) as location) ~ino =
     let root = root_segs ctl in
     match tree_path ~root rel with
@@ -2118,9 +2118,21 @@ module Crash = struct
           | Some (File f) -> Int64.equal f.ino ino
           | Some (Dir _ | Link _) | None -> false
         in
+        (* By inode: an uncommitted rename of the file, or of a directory
+           above it, leaves it under its old name in the image. *)
         let locate st =
           if mine st.tree then { st with locs = locate_at key location st.locs }
-          else st
+          else
+            match Inos.find_opt ino st.inos with
+            | Some (_ :: _ as at) -> (
+                match tree_find st.tree at with
+                | Some (File f) when Int64.equal f.ino ino ->
+                    {
+                      st with
+                      locs = locate_at (String.concat "/" at) location st.locs;
+                    }
+                | Some _ | None -> st)
+            | Some [] | None -> st
         in
         ctl.snapshot <- Option.map locate ctl.snapshot;
         ctl.durable <- Option.map locate ctl.durable;
