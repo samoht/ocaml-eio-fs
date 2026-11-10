@@ -21,6 +21,9 @@ type hist = {
   root : int64;
   snaps : snap array; (* 0 = initial; i = after op i *)
   evs : ev list array; (* index i = op i (1-based), 0 unused *)
+  blocks : (int64, Refm.t) Hashtbl.t;
+      (* each file's data under Reorder_unsynced, by the block-level
+         reference *)
 }
 
 let lookup s p = List.assoc_opt p s.paths
@@ -143,6 +146,55 @@ let events root (snaps : snap array) ops (hino : int64 option ref)
       | _ -> ())
     ops;
   evs
+
+(* Each file's data under Reorder_unsynced, by the block-level reference: its
+   writes (op [i] writes letter [i]), truncations and syncs. A file not in
+   the initial snapshot starts empty. *)
+let blocks root (snaps : snap array) ops =
+  let refs = Hashtbl.create 4 in
+  let get ino =
+    match Hashtbl.find_opt refs ino with
+    | Some r -> r
+    | None ->
+        let init =
+          match IM.find_opt ino snaps.(0).nodes with
+          | Some { kind = F c; _ } -> c
+          | _ -> ""
+        in
+        let r = Refm.v init in
+        Hashtbl.replace refs ino r;
+        r
+  in
+  let hino = ref None in
+  List.iteri
+    (fun j op ->
+      let i = j + 1 in
+      let s1 = snaps.(i) in
+      let data len = String.make len (Char.chr (Char.code 'a' + i - 1)) in
+      let fres p = resolve root s1 p 0 in
+      let with_file p f = match fres p with Some ino -> f ino | None -> () in
+      match op with
+      | Write (_, p, off, len) ->
+          with_file p (fun ino -> Refm.write (get ino) off (data len))
+      | Append (p, len) ->
+          with_file p (fun ino ->
+              let r = get ino in
+              Refm.write r r.Refm.clen (data len))
+      | Write_h (off, len) -> (
+          match !hino with
+          | Some ino -> Refm.write (get ino) off (data len)
+          | None -> ())
+      | Trunc (_, p, k) -> with_file p (fun ino -> Refm.resize (get ino) k)
+      | Fsync p | Fsync_u p | Fake_fsync p ->
+          with_file p (fun ino -> Refm.sync_ok (get ino))
+      | Fsync_fail p | Fsync_fail_u p ->
+          with_file p (fun ino -> Refm.sync_fail ~reorder:true (get ino))
+      | Sync_h -> (
+          match !hino with Some ino -> Refm.sync_ok (get ino) | None -> ())
+      | Open_h p -> hino := fres p
+      | _ -> ())
+    ops;
+  refs
 
 (* ---------- guarantees ---------- *)
 
@@ -440,17 +492,9 @@ let check ?(reorder = false) h (img : image) =
                               k' > j && lo' < b0 + 2 && hi' > b0)
                             !datas
                         in
-                        (* A writeback that failed only in part may have
-                           written the block as it stood at the failure. *)
-                        let partial =
-                          reorder
-                          &&
-                          match IM.find_opt x h.snaps.(j - 1).nodes with
-                          | Some { kind = F s0; _ } ->
-                              i < String.length s0 && s0.[i] = ch
-                          | _ -> false
-                        in
-                        if not (redirtied || partial) then
+                        (* Under Reorder_unsynced the block-level reference
+                           judges the whole file, below. *)
+                        if not (redirtied || reorder) then
                           add "j:lost-write-visible"
                             (Fmt.str "%s[%d]=%C from op %d lost at op %d" path i
                                ch k j)
@@ -459,6 +503,18 @@ let check ?(reorder = false) h (img : image) =
             s
       | _ -> ())
     img;
+  (* (j) under Reorder_unsynced: each block one the block-level reference
+     allows, a partly failed writeback or an evicted page included *)
+  if reorder then
+    List.iter
+      (fun (path, x, c, _, _, _) ->
+        match (c, Hashtbl.find_opt h.blocks x) with
+        | `File s, Some r -> (
+            match Refm.check ~policy:Refm.Reorder r s with
+            | None -> ()
+            | Some why -> add "j:blocks" (Fmt.str "%s = %S: %s" path s why))
+        | _ -> ())
+      img;
   (* (g2) mode durability *)
   IM.iter
     (fun x nd ->

@@ -284,7 +284,8 @@ let oracle_run ~init ops =
       ops
   in
   let evs = Oracle.events !root snaps ops (ref None) (ref None) (ref None) in
-  ({ Oracle.root = !root; snaps; evs }, !unsynced, img)
+  let blocks = Oracle.blocks !root snaps ops in
+  ({ Oracle.root = !root; snaps; evs; blocks }, !unsynced, img)
 
 let max_seeds = 3000
 let quiet_seeds = 100
