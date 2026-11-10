@@ -279,7 +279,7 @@ let test_open_error () =
     Schedule.scripted
       [
         {
-          trigger = Op_on_path { kind = `Open; path = "secret" };
+          trigger = Op_on_path { kind = `Open_read; path = "secret" };
           fault = Open_error `Enoent;
         };
       ]
@@ -287,6 +287,44 @@ let test_open_error () =
   with_chaos sched @@ fun ~raw ~chaos ->
   Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "secret") "x";
   expect_io "open" (fun () -> ignore (Eio.Path.load (chaos / "secret")))
+
+(* A chmod and a chown change an entry: a fault on [`Change] fails them
+   before they are made. *)
+let test_change_error_on_chmod_chown () =
+  let sched =
+    Schedule.hook (fun (op : Op.t) ->
+        if op.kind = `Change then Some (Fault.Change_error `Eperm) else None)
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "x";
+  expect_io "chmod" (fun () ->
+      Eio.Path.chmod ~follow:false ~perm:0o600 (chaos / "f"));
+  expect_io "chown" (fun () ->
+      Eio.Path.chown ~follow:false ~uid:1L ~gid:1L (chaos / "f"));
+  let st = Eio.Path.stat ~follow:false (raw / "f") in
+  Alcotest.(check (pair int int64))
+    "mode and owner" (0o644, 0L) (st.perm, st.uid)
+
+(* An open for reading and one that may write are told apart. *)
+let test_open_kinds () =
+  let seen = ref [] in
+  let sched =
+    Schedule.hook (fun (op : Op.t) ->
+        (match op.kind with
+        | (`Open_read | `Open_write) as k -> seen := (k, op.path) :: !seen
+        | _ -> ());
+        None)
+  in
+  with_chaos sched @@ fun ~raw ~chaos ->
+  Eio.Path.mkdir ~perm:0o755 (raw / "d");
+  Eio.Path.save ~create:(`Exclusive 0o644) (chaos / "f") "x";
+  ignore (Eio.Path.load (chaos / "f"));
+  Eio.Path.with_open_dir (chaos / "d") ignore;
+  let name = function `Open_read -> "read" | `Open_write -> "write" in
+  Alcotest.(check (list (pair string string)))
+    "opens"
+    [ ("write", "f"); ("read", "f"); ("read", "d") ]
+    (List.rev_map (fun (k, p) -> (name k, p)) !seen)
 
 let test_descriptor_stat_error writable () =
   let observed = ref [] in
@@ -473,7 +511,7 @@ let test_swap_symlink_on_open_in () =
     Schedule.scripted
       [
         {
-          trigger = Op_on_path { kind = `Open; path = "current" };
+          trigger = Op_on_path { kind = `Open_read; path = "current" };
           fault = Swap_symlink "decoy";
         };
       ]
@@ -501,7 +539,7 @@ let test_swap_symlink_on_open_out () =
     Schedule.scripted
       [
         {
-          trigger = Op_on_path { kind = `Open; path = "current" };
+          trigger = Op_on_path { kind = `Open_write; path = "current" };
           fault = Swap_symlink "decoy";
         };
       ]
@@ -532,7 +570,7 @@ let test_swap_symlink_on_open_subtree () =
     Schedule.scripted
       [
         {
-          trigger = Op_on_path { kind = `Open; path = "current" };
+          trigger = Op_on_path { kind = `Open_read; path = "current" };
           fault = Swap_symlink "other";
         };
       ]
@@ -605,7 +643,7 @@ let swap_on_open path target =
   Schedule.scripted
     [
       {
-        trigger = Op_on_path { kind = `Open; path };
+        trigger = Op_on_path { kind = `Open_read; path };
         fault = Swap_symlink target;
       };
     ]
@@ -707,7 +745,7 @@ let test_nth_op_on_path () =
     Schedule.scripted
       [
         {
-          trigger = Nth_op_on_path { n = 3; kind = `Open; path = "f" };
+          trigger = Nth_op_on_path { n = 3; kind = `Open_read; path = "f" };
           fault = Open_error `Enoent;
         };
       ]
@@ -717,13 +755,13 @@ let test_nth_op_on_path () =
     List.map
       (fun o -> Option.is_some (Chaos.Internal.next sched o))
       [
-        op `Open "f";
-        op `Open "g";
+        op `Open_read "f";
+        op `Open_read "g";
         op `Read "f";
-        op `Open "f";
+        op `Open_read "f";
         op `Read "f";
-        op `Open "f";
-        op `Open "f";
+        op `Open_read "f";
+        op `Open_read "f";
       ]
   in
   Alcotest.(check (list bool))
@@ -738,13 +776,13 @@ let ops_fixture =
     { kind; path; file_offset; length }
   in
   [
-    mk `Open "a" 0 0;
+    mk `Open_write "a" 0 0;
     mk `Write "a" 0 4096;
     mk `Write "a" 4096 4096;
     mk `Sync "a" 0 0;
     mk `Read "a" 0 8192;
     mk `Stat "b" 0 0;
-    mk `Open "b" 0 0;
+    mk `Open_write "b" 0 0;
     mk `Write "b" 0 512;
     mk `Read "b" 0 512;
     mk `Sync "b" 0 0;
@@ -817,7 +855,7 @@ let test_change_error () =
            trigger = Nth_op_on_path { n = 2; kind = `Change; path = "f" };
            fault = Change_error `Eacces;
          };
-         rule `Open "conf" (Open_error `Erofs);
+         rule `Open_write "conf" (Open_error `Erofs);
        ])
   @@ fun ~raw ~chaos ->
   Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "x";
@@ -3424,6 +3462,9 @@ let suite =
       Alcotest.test_case "read-only file sync" `Quick test_read_only_file_sync;
       Alcotest.test_case "fault compare" `Quick test_fault_compare;
       Alcotest.test_case "open error" `Quick test_open_error;
+      Alcotest.test_case "chmod and chown are changes" `Quick
+        test_change_error_on_chmod_chown;
+      Alcotest.test_case "opens for reading and writing" `Quick test_open_kinds;
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "real child cwd" `Quick test_real_child_cwd;
       Alcotest.test_case "directory error" `Quick (test_directory_error false);

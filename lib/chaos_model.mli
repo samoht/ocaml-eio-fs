@@ -66,8 +66,9 @@ module Fault : sig
     | Stat_error of code  (** Fail a stat with {!type-code}. *)
     | Change_error of code
         (** Fail a change to a directory's entries (a [mkdir], [symlink],
-            [unlink], [rmdir] or [rename]) with {!type-code}, before it is made.
-            A seeded schedule draws [`Eacces], [`Eperm] or [`Erofs]. *)
+            [unlink], [rmdir] or [rename]) or to an entry's mode or owner (a
+            [chmod] or [chown]) with {!type-code}, before it is made. A seeded
+            schedule draws [`Eacces], [`Eperm] or [`Erofs]. *)
     | Swap_symlink of string
         (** Perform an open or a stat, then replace its path with a symbolic
             link to the given target: the check-to-use window a TOCTOU exploits.
@@ -98,13 +99,14 @@ module Op : sig
     | `Sync
       (** A sync: a file's, or a directory's through [Eio_fs_sync.sync_dir],
           whose path is the directory. *)
-    | `Open
-      (** An open of a file or a subdirectory, which may create the file. *)
+    | `Open_read  (** An open for reading, of a file or a subdirectory. *)
+    | `Open_write  (** An open that may write or create the file. *)
     | `Stat  (** A stat, of a path or of an open file. *)
     | `Change
-      (** A change to a directory's entries: a [mkdir], [symlink], [unlink],
-          [rmdir] or [rename]. Its path is the entry made or removed, a rename's
-          source. *) ]
+      (** A change to a directory's entries ([mkdir], [symlink], [unlink],
+          [rmdir], [rename]) or to an entry's mode or owner ([chmod], [chown]).
+          Its path is the entry made, removed or changed, a rename's source. *)
+    ]
   (** The type for operation kinds. *)
 
   type t = {
@@ -178,6 +180,9 @@ module Schedule : sig
       rather than in seconds: how many reads a scan issues over a file is a
       property of the code, where the time it takes to issue them is a property
       of the machine it ran on. *)
+
+  val hook : (Op.t -> Fault.t option) -> t
+  (** [hook f] injects the fault [f] answers for each operation. *)
 
   val seeded :
     ?probability:float -> ?kinds:Fault.kind list -> seed:int -> unit -> t

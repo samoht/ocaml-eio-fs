@@ -101,7 +101,7 @@ module Fixture :
       let observed_leaf = identity (root / "observed/leaf") in
       let swapped = ref false in
       let schedule = Eio_fs.Chaos.Private.Schedule.observing (fun (op : Eio_fs.Chaos.Private.Op.t) ->
-        if op.kind = `Open && op.path = "observed" && not !swapped then begin
+        if (op.kind = `Open_read || op.kind = `Open_write) && op.path = "observed" && not !swapped then begin
           swapped := true;
           Eio.Path.rename (root / "observed") (root / "observed-original");
           Eio.Path.mkdir ~perm:0o700 (root / "observed");
@@ -162,7 +162,7 @@ and create no destination. This is a real in-memory backend, not an OS-fd fake.
     let before = Eio.Path.stat ~follow:false Eio.Path.(root / "source") in
     let empty_open = ref false in
     let schedule = Eio_fs.Chaos.Private.Schedule.observing (fun (op : Eio_fs.Chaos.Private.Op.t) ->
-      if op.kind = `Open && op.path = "" then empty_open := true)
+      if (op.kind = `Open_read || op.kind = `Open_write) && op.path = "" then empty_open := true)
       Eio_fs.Chaos.Private.Schedule.empty in
     let wrapped = Eio_fs.Chaos.Private.wrap schedule root in
     Eio.Switch.run (fun sw ->

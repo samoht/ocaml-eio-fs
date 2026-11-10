@@ -1507,7 +1507,7 @@ let test_probe_of_a_lock_file_that_goes () =
     Chaos.Schedule.observing
       (fun (operation : Chaos.Op.t) ->
         match operation.kind with
-        | `Open -> opened := true
+        | `Open_read | `Open_write -> opened := true
         | `Stat when !opened && not !gone ->
             Unix.unlink native;
             gone := true
@@ -1538,7 +1538,7 @@ let test_probe_of_a_lock_file_replaced () =
     Chaos.Schedule.observing
       (fun (operation : Chaos.Op.t) ->
         match operation.kind with
-        | `Open -> opened := true
+        | `Open_read | `Open_write -> opened := true
         | `Stat when !opened && not !replaced ->
             Unix.unlink native;
             Out_channel.with_open_gen [ Open_wronly; Open_creat; Open_excl ]

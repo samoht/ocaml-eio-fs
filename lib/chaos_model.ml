@@ -140,7 +140,15 @@ module Fault = struct
 end
 
 module Op = struct
-  type kind = [ `Read | `Read_dir | `Write | `Sync | `Open | `Stat | `Change ]
+  type kind =
+    [ `Read
+    | `Read_dir
+    | `Write
+    | `Sync
+    | `Open_read
+    | `Open_write
+    | `Stat
+    | `Change ]
 
   let equal_kind (a : kind) (b : kind) = a = b
 
@@ -156,7 +164,8 @@ module Op = struct
     | `Read_dir -> Fmt.string ppf "read-dir"
     | `Write -> Fmt.string ppf "write"
     | `Sync -> Fmt.string ppf "sync"
-    | `Open -> Fmt.string ppf "open"
+    | `Open_read -> Fmt.string ppf "open"
+    | `Open_write -> Fmt.string ppf "open-write"
     | `Stat -> Fmt.string ppf "stat"
     | `Change -> Fmt.string ppf "change"
 
@@ -171,7 +180,11 @@ module Op = struct
 
   let read_dir path = { kind = `Read_dir; path; file_offset = 0; length = 0 }
   let sync path = { kind = `Sync; path; file_offset = 0; length = 0 }
-  let open_ path = { kind = `Open; path; file_offset = 0; length = 0 }
+  let open_read path = { kind = `Open_read; path; file_offset = 0; length = 0 }
+
+  let open_write path =
+    { kind = `Open_write; path; file_offset = 0; length = 0 }
+
   let stat path = { kind = `Stat; path; file_offset = 0; length = 0 }
   let change path = { kind = `Change; path; file_offset = 0; length = 0 }
 end
@@ -206,10 +219,12 @@ module Schedule = struct
         mutable n : int;
       }
     | Observed of { f : Op.t -> unit; inner : t }
+    | Hook of (Op.t -> Fault.t option)
 
   let empty = Empty
   let scripted rules = Scripted { rules; n = 0; seen = Hashtbl.create 8 }
   let observing f t = Observed { f; inner = t }
+  let hook f = Hook f
 
   let all_kinds =
     [
@@ -251,7 +266,7 @@ module Schedule = struct
     | `Read_dir, `Read_error -> true
     | `Write, (`Short_write | `Torn_write | `Write_error) -> true
     | `Sync, `Sync_error -> true
-    | `Open, `Open_error -> true
+    | (`Open_read | `Open_write), `Open_error -> true
     | `Stat, `Stat_error -> true
     | `Change, `Change_error -> true
     | _ -> false
@@ -290,6 +305,7 @@ module Schedule = struct
     | Observed { f; inner } ->
         f op;
         next inner op
+    | Hook f -> f op
     | Scripted s ->
         s.n <- s.n + 1;
         let key = (op.kind, op.path) in
@@ -365,6 +381,7 @@ module Schedule = struct
           | kinds -> "[ " ^ String.concat "; " (List.map kind_name kinds) ^ " ]")
           pp_int s.seed
     | Observed { inner; _ } -> Fmt.pf ppf "observed(%a)" pp inner
+    | Hook _ -> Fmt.string ppf "hook"
 end
 
 (* Take at most [n] bytes from the front of [bufs], sharing the underlying
@@ -667,7 +684,7 @@ module Dir_impl = struct
   type t = dir
 
   let open_in t ~sw ~follow path =
-    let fault = Schedule.next t.sched (Op.open_ path) in
+    let fault = Schedule.next t.sched (Op.open_read path) in
     (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
@@ -677,7 +694,7 @@ module Dir_impl = struct
     wrap_ro t.sched ~path file
 
   let open_out t ~sw ~follow ~append ~create path =
-    let fault = Schedule.next t.sched (Op.open_ path) in
+    let fault = Schedule.next t.sched (Op.open_write path) in
     (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
@@ -687,7 +704,7 @@ module Dir_impl = struct
     wrap_rw t.sched ~path ~append file
 
   let open_subtree t ~sw path =
-    let fault = Schedule.next t.sched (Op.open_ path) in
+    let fault = Schedule.next t.sched (Op.open_read path) in
     (match fault with
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
@@ -769,10 +786,12 @@ module Dir_impl = struct
     B.symlink ~link_to bv path
 
   let chmod t ~follow ~perm path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.chmod bv ~follow ~perm path
 
   let chown ~follow ?uid ?gid t path =
+    change t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.chown ~follow ?uid ?gid bv path
 

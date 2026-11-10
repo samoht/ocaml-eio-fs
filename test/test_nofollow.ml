@@ -116,7 +116,7 @@ let test_read_nofollow_is_one_open_through_its_wrapper () =
   | Ok bytes -> Cstruct.memset bytes 0);
   let opens =
     List.filter
-      (fun (operation : Chaos.Op.t) -> operation.kind = `Open)
+      (fun (operation : Chaos.Op.t) -> operation.kind = `Open_read)
       !observed
   in
   Alcotest.(check int)
