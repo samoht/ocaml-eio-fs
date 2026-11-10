@@ -1998,33 +1998,39 @@ let test_crash_rename_destination_barrier () =
   Alcotest.(check bool) "a/f" true (absent (post / "a" / "f"))
 
 (* fsyncgate: Linux marks the pages of a failed fsync clean, so a retry that
-   succeeds does not write them. *)
+   succeeds does not write them; the page cache still holds their bytes,
+   so a later write to the same page writes them with it, and one to
+   another page does not. *)
 let test_crash_sync_retry_after_failure () =
-  let ctl = Crash.v ~policy:Drop_unsynced () in
-  with_crash ctl @@ fun ~raw:_ ~fs ->
-  write_new ~sync:true (fs / "f") "";
-  Eio_fs_sync.sync_dir fs;
-  let sched =
-    Schedule.scripted
-      [
-        {
-          trigger = Op_on_path { kind = `Sync; path = "f" };
-          fault = Sync_error `Eio;
-        };
-      ]
+  let run off =
+    let ctl = Crash.v ~policy:Drop_unsynced () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") (String.make 12288 'a');
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+        Eio.File.pwrite_all f ~file_offset:(i63 0)
+          [ Cstruct.of_string "record" ];
+        (try Eio.File.sync f with Eio.Io _ -> ());
+        Eio.File.sync f;
+        Eio.File.pwrite_all f ~file_offset:(i63 off)
+          [ Cstruct.of_string "next" ];
+        Eio.File.sync f);
+    let got = Eio.Path.load (Crash.post_crash ctl / "f") in
+    String.sub got 0 6
   in
-  let cfs = Chaos.wrap sched fs in
-  Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
-      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "record" ];
-      (try Eio.File.sync f with Eio.Io _ -> ());
-      Eio.File.sync f;
-      Eio.File.pwrite_all f ~file_offset:(i63 6) [ Cstruct.of_string "next" ];
-      Eio.File.sync f);
-  let post = Crash.post_crash ctl in
-  Alcotest.(check string)
-    "the failed write is lost, the later one kept"
-    "\000\000\000\000\000\000next"
-    (Eio.Path.load (post / "f"))
+  Alcotest.(check (pair string string))
+    "the same page, then another" ("record", "aaaaaa")
+    (run 6, run 8192)
 
 (* The same with the failure beneath the model. *)
 let test_crash_sync_failure_beneath () =

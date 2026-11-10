@@ -964,6 +964,10 @@ module Crash = struct
     mutable gen : int;
         (* Bumped when the pending changes go, durable or lost: an entry of an
            older generation in the controller's log is stale. *)
+    mutable cache : Cstruct.t option;
+        (* The page cache's bytes as of the last sync, where a failed sync
+           left them apart from the durable ones: it still holds what that
+           sync lost. *)
   }
 
   and entry = { efs : fstate; change : change; seq : int; egen : int }
@@ -979,6 +983,7 @@ module Crash = struct
       durable = image_of durable;
       pending = [];
       gen = 0;
+      cache = None;
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -2159,6 +2164,45 @@ module Crash = struct
           (fun _ e -> if in_delta e then e.recorded <- location :: e.recorded)
           ctl.journal
 
+  (* The bytes [change] dirties in a file of [prev] bytes: a write those it
+     covers and, past the end, the hole it leaves; a shrink only the byte
+     where it cuts, so only a block it cuts mid-way; a growth the bytes it
+     adds. *)
+  let dirtied ~bs prev = function
+    | Write { offset; data } -> (min prev offset, offset + Cstruct.length data)
+    | Resize m when m < prev -> (m, if m mod bs = 0 then m else m + 1)
+    | Resize m -> (prev, m)
+
+  (* [durable] with [changes] replayed over it, where a block they dirty is
+     written whole from the page cache, [cache] with the same changes, which
+     still holds the bytes a failed sync lost; and the page cache after
+     them. *)
+  let replay_cached ~bs durable ~cache changes =
+    match cache with
+    | None ->
+        let c = replay_changes durable changes in
+        (c, c)
+    | Some cache ->
+        let plain = copy_cs (replay_changes durable changes) in
+        let live = replay_changes cache changes in
+        let len = Cstruct.length plain and live_len = Cstruct.length live in
+        let _ =
+          List.fold_left
+            (fun prev change ->
+              let lo, hi = dirtied ~bs prev change in
+              if hi > lo then
+                for b = lo / bs to (hi - 1) / bs do
+                  let off = b * bs in
+                  let n = max 0 (min bs (min len live_len - off)) in
+                  if n > 0 then Cstruct.blit live off plain off n
+                done;
+              match change with
+              | Write { offset; data } -> max prev (offset + Cstruct.length data)
+              | Resize m -> m)
+            (Cstruct.length durable) changes
+        in
+        (plain, live)
+
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
@@ -2168,7 +2212,7 @@ module Crash = struct
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
-  let writeback ~rng ~bs durable changes =
+  let writeback ~rng ~bs ~cache durable changes =
     let changes = Array.of_list changes in
     let n = Array.length changes in
     let sizes = Array.make (n + 1) (Cstruct.length durable) in
@@ -2176,26 +2220,15 @@ module Crash = struct
     let boundaries = ref [] in
     for k = 0 to n - 1 do
       let prev = sizes.(k) in
-      let lo, hi =
-        match changes.(k) with
-        | Write { offset; data } ->
-            let len = Cstruct.length data in
-            let size = max prev (offset + len) in
-            sizes.(k + 1) <- size;
-            for b = (prev / bs) + 1 to (size - 1) / bs do
-              boundaries := (b * bs) :: !boundaries
-            done;
-            (* Past the end of the file, the zeroed hole it leaves too. *)
-            (min prev offset, offset + len)
-        | Resize m when m < prev ->
-            (* A shrink rewrites only the block cut at its new end; the blocks
-               past it keep their bytes until the new length lands. *)
-            sizes.(k + 1) <- m;
-            (m, if m mod bs = 0 then m else m + 1)
-        | Resize m ->
-            sizes.(k + 1) <- m;
-            (prev, m)
-      in
+      (match changes.(k) with
+      | Write { offset; data } ->
+          let size = max prev (offset + Cstruct.length data) in
+          sizes.(k + 1) <- size;
+          for b = (prev / bs) + 1 to (size - 1) / bs do
+            boundaries := (b * bs) :: !boundaries
+          done
+      | Resize m -> sizes.(k + 1) <- m);
+      let lo, hi = dirtied ~bs prev changes.(k) in
       if hi > lo then
         for b = lo / bs to (hi - 1) / bs do
           let vs = Option.value ~default:[] (Hashtbl.find_opt versions b) in
@@ -2234,7 +2267,8 @@ module Crash = struct
       let len = max 0 (min bs (Cstruct.length buf - off)) in
       if len = 0 then Cstruct.empty else copy_cs (Cstruct.sub buf off len)
     in
-    let live = image_of durable in
+    (* The page cache: what a failed sync lost is still there. *)
+    let live = image_of (Option.value ~default:durable cache) in
     Array.iteri
       (fun k change ->
         apply live change;
@@ -2274,12 +2308,15 @@ module Crash = struct
             let c =
               match (ctl.policy, data_rng) with
               | Reorder_unsynced _, Some rng ->
-                  writeback ~rng ~bs:ctl.block_size (bytes_of fs.durable)
+                  writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
+                    (bytes_of fs.durable)
                     (List.map (fun e -> e.change) mine)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> e.change)
-                  |> replay_changes (bytes_of fs.durable)
+                  |> replay_cached ~bs:ctl.block_size ~cache:fs.cache
+                       (bytes_of fs.durable)
+                  |> fst
               | _ -> copy_cs (bytes_of fs.durable)
             in
             Hashtbl.replace contents fs.id c;
@@ -2463,21 +2500,39 @@ module Crash = struct
       ctl.logged <- ctl.pending_changes
     end
 
+  (* A failed barrier loses the pending changes, which the page cache keeps:
+     a later change that dirties one of their blocks writes it whole. *)
+  let fail_sync ctl fs =
+    let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
+    fs.cache <-
+      Some (replay_changes cache (List.rev_map (fun e -> e.change) fs.pending));
+    lose ctl fs
+
   (* A barrier makes the file's pending changes durable, replayed over its
-     durable bytes: a change lost to a failed barrier, or made around the
-     wrapper, never becomes durable. *)
+     durable bytes, with the lost bytes in the blocks they dirty: a change
+     lost to a failed barrier, or made around the wrapper, never becomes
+     durable by itself. *)
   let barrier ctl fs ~stat sync =
     match sync () with
     | () ->
-        let pending = List.rev fs.pending in
-        List.iter (fun e -> apply fs.durable e.change) pending;
+        let pending = List.rev_map (fun e -> e.change) fs.pending in
+        (match fs.cache with
+        | None -> List.iter (apply fs.durable) pending
+        | cache ->
+            let c, live =
+              replay_cached ~bs:ctl.block_size ~cache (bytes_of fs.durable)
+                pending
+            in
+            fs.durable.buf <- c;
+            fs.durable.len <- Cstruct.length c;
+            fs.cache <- (if Cstruct.equal c live then None else Some live));
         lose ctl fs;
         let st = stat () in
         record_mode ctl st;
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
-        lose ctl fs;
+        fail_sync ctl fs;
         raise e
 
   let fstate_of cf = match cf.cfs with Some fs -> fs | None -> assert false
@@ -2538,7 +2593,7 @@ module Crash = struct
           @ [
               Eio.Resource.H (Eio_fs_sync.File_sync, sync);
               Eio.Resource.H
-                (Sync_failed, fun cf -> Option.iter (lose cf.ctl) fs);
+                (Sync_failed, fun cf -> Option.iter (fail_sync cf.ctl) fs);
             ]) )
 
   module Crw_impl = struct
@@ -2616,7 +2671,7 @@ module Crash = struct
       }
     in
     rw_boxed
-      ~extra:[ Eio.Resource.H (Sync_failed, fun cf -> lose cf.ctl fs) ]
+      ~extra:[ Eio.Resource.H (Sync_failed, fun cf -> fail_sync cf.ctl fs) ]
       (module Crw_impl)
       state ~base
 

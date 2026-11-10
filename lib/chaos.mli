@@ -222,11 +222,15 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
 
     {b A failed sync loses the file's pending writes.} Linux marks their pages
     clean without writing them, so a later sync that succeeds does not make them
-    durable. This holds for a sync failure {!Chaos.wrap} injects above the model
-    and for one the base raises beneath it. The only safe recovery is to write
-    the data again from the application's own copy. A crash rewrites the base to
-    a post-crash image in which un-synced writes may be dropped or reordered,
-    which demonstrates the classic missing-{!Eio.File.sync} hazard.
+    durable. The page cache still holds their bytes: a later change that dirties
+    one of those blocks writes the block whole, lost bytes included, when it is
+    synced or written back. Before the failure they are pending like any write;
+    after it, no crash shows them but through such a block. This holds for a
+    sync failure {!Chaos.wrap} injects above the model and for one the base
+    raises beneath it. The only safe recovery is to write the data again from
+    the application's own copy. A crash rewrites the base to a post-crash image
+    in which un-synced writes may be dropped or reordered, which demonstrates
+    the classic missing-{!Eio.File.sync} hazard.
 
     {b Directory operations are journaled.} Creation, [mkdir], [unlink],
     [rmdir], [symlink], [rename], [chmod] and [chown] enter a metadata journal
