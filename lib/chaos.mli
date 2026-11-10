@@ -241,7 +241,9 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     directory into a new one is durable once the new one's barrier returns. The
     model knows files and directories by inode, as ext4 does: a barrier holds
     for its directory under whatever name it has later, and never for another
-    directory of the same name. Committed entries take effect in program order,
+    directory of the same name. A barrier through a directory opened before it
+    was removed or replaced commits that directory's own entries, and nothing of
+    the one now at its name. Committed entries take effect in program order,
     whatever order their barriers ran in, and a barrier also commits the pending
     entries an entry it commits needs: the earlier ones in a directory it
     changes, as one directory's entries stay in order, the ones that emptied a

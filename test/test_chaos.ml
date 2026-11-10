@@ -2643,6 +2643,28 @@ let test_crash_rename_over_filled_dir () =
     "b/g" "G"
     (Eio.Path.load (Crash.post_crash ctl / "b/g"))
 
+(* A directory opened, emptied, removed and made again: a barrier through
+   the opened directory commits the removed one's own entries, not the new
+   one's. *)
+let test_crash_subtree_barrier_by_inode () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o755 (raw / "a");
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "a/old") "O";
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Switch.run @@ fun sw ->
+  let d = Eio.Path.open_dir ~sw (fs / "a") in
+  Eio.Path.unlink (fs / "a/old");
+  Eio.Path.rmdir (fs / "a");
+  Eio.Path.mkdir ~perm:0o755 (fs / "a");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "a/g") "G";
+  Eio_fs_sync.sync_dir d;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check (pair bool bool))
+    "a/old and a/g" (false, false)
+    (Eio.Path.is_file (post / "a/old"), Eio.Path.is_file (post / "a/g"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3022,6 +3044,8 @@ let suite =
       Alcotest.test_case
         "crash: a rename over a directory needs what emptied it" `Quick
         test_crash_rename_over_filled_dir;
+      Alcotest.test_case "crash: an opened directory's barrier is on its inode"
+        `Quick test_crash_subtree_barrier_by_inode;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

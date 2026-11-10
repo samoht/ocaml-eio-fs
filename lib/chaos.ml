@@ -2631,6 +2631,7 @@ module Crash = struct
     dbase : Eio.Fs.dir_ty r;
     dboxed : boxed;
     dplace : place;
+    dino : int64 option; (* the inode a subtree opened *)
   }
 
   (* Expose the whole crash directory so a rename whose target is itself a
@@ -2641,12 +2642,13 @@ module Crash = struct
 
   let crash_dir_hook :
       (t ->
+      ino:int64 option ->
       root:boxed ->
       prefix:string ->
       base:Eio.Fs.dir_ty r ->
       [ `Close | Eio.Fs.dir_ty ] r)
       ref =
-    ref (fun _ ~root:_ ~prefix:_ ~base:_ -> assert false)
+    ref (fun _ ~ino:_ ~root:_ ~prefix:_ ~base:_ -> assert false)
 
   let is_trunc = function
     | `Or_truncate _ | `Exclusive _ -> true
@@ -2823,7 +2825,8 @@ module Crash = struct
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
       let sub = B.open_subtree bv ~sw path in
-      !crash_dir_hook d.dctl ~root:d.dplace.proot
+      let ino = (B.stat bv ~follow:true path).ino in
+      !crash_dir_hook d.dctl ~ino:(Some ino) ~root:d.dplace.proot
         ~prefix:(resolve d (at d.dplace.prefix path))
         ~base:(sub :> Eio.Fs.dir_ty r)
 
@@ -2962,14 +2965,18 @@ module Crash = struct
     (* A directory barrier commits the entries of the directory it names,
        exactly as the platform's directory fsync would, and the journal is
        asked root-relative so a barrier issued through a staging subtree still
-       names the same directory. After the power cut it fails like every other
+       names the same directory. Through an opened subtree, a barrier on the
+       subtree itself is on the inode it opened, even once removed or
+       replaced: it commits that directory's own entries. After the power cut it fails like every other
        operation. *)
     let sync_dir d path =
       if d.dctl.crashed then raise_power_lost ();
       (* The base's barrier first: it refuses a directory that is missing or
          that the caller cannot read. *)
       Eio_fs_sync.sync_dir (d.dbase, path);
-      commit_dir d.dctl ~dir:(resolve d (at d.dplace.prefix path))
+      match (d.dino, path_segments path) with
+      | Some ino, [] -> commit_dir_ino d.dctl ino
+      | _ -> commit_dir d.dctl ~dir:(resolve d (at d.dplace.prefix path))
 
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -3003,17 +3010,23 @@ module Crash = struct
         H (Eio_fs_sync.Dir_sync, fun d ~path -> Cdir_impl.sync_dir d path);
       ]
 
-  let wrap_cdir ctl ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
+  let wrap_cdir ctl ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
     let place = { proot = root; prefix } in
     ctl.subtrees <- place :: ctl.subtrees;
     (Eio.Resource.T
-       ( { dctl = ctl; dbase = base; dboxed = box_dir base; dplace = place },
+       ( {
+           dctl = ctl;
+           dbase = base;
+           dboxed = box_dir base;
+           dplace = place;
+           dino = ino;
+         },
          cdir_handler )
       :> [ `Close | Eio.Fs.dir_ty ] r)
 
   let () =
     crash_dir_hook :=
-      fun ctl ~root ~prefix ~base -> wrap_cdir ctl ~root ~prefix ~base
+      fun ctl ~ino ~root ~prefix ~base -> wrap_cdir ctl ~ino ~root ~prefix ~base
 
   let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(block_size = 4096) () =
     if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
@@ -3059,7 +3072,7 @@ module Crash = struct
     let st = state_of (snapshot_at admin path) no_locs in
     ctl.snapshot <- Some st;
     ctl.durable <- Some st;
-    (wrap_cdir ctl ~root:proot ~prefix:"" ~base, path)
+    (wrap_cdir ctl ~ino:None ~root:proot ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
   let is_crashed ctl = ctl.crashed
