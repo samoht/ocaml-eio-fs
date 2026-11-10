@@ -3155,9 +3155,14 @@ let chosen_images ~init steps =
   go [||];
   List.sort compare (List.of_seq (Hashtbl.to_seq_keys seen))
 
-(* Bytes that extend a file may stop at any byte; an overwrite of bytes the
-   file held lands whole within its sector. *)
+(* Bytes a write puts in a sector the disk held nothing of may land in any
+   order and stop anywhere; a sector that held bytes is written whole, so an
+   append to it or an overwrite lands whole within it. *)
 let test_crash_choose_tears_extensions () =
+  Alcotest.(check (list string))
+    "a write to an empty file"
+    [ ""; "\000"; "\000\000"; "\000B"; "A"; "A\000"; "AB" ]
+    (chosen_images ~init:"" [ (0, "AB") ]);
   Alcotest.(check (list string))
     "an append"
     [ "pq"; "pq\000"; "pq\000\000"; "pqA"; "pqAB" ]

@@ -2330,6 +2330,13 @@ module Crash = struct
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
+  (* The points that cut [\[a, b)] in quarters, [a] included. *)
+  let quarters a b =
+    if b <= a then []
+    else
+      let step = max 1 ((b - a + 3) / 4) in
+      List.init (((b - a - 1) / step) + 1) (fun i -> a + (i * step))
+
   let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ~rng ~bs
       ~cache durable changes =
     let cached = Array.of_list (List.map snd changes) in
@@ -2349,10 +2356,11 @@ module Crash = struct
           sizes.(k + 1) <- size;
           if k < len_upto then
             if bytes then
-              (* Bytes that extend the file may tear at any byte. *)
-              for x = prev + 1 to size - 1 do
-                boundaries := x :: !boundaries
-              done
+              (* Bytes that extend the file may stop at any byte: at the
+                 quarters of what the write adds. *)
+              List.iter
+                (fun x -> if x > prev then boundaries := x :: !boundaries)
+                (quarters prev size)
             else
               for b = (prev / bs) + 1 to (size - 1) / bs do
                 boundaries := (b * bs) :: !boundaries
@@ -2427,6 +2435,37 @@ module Crash = struct
         let len = min (Cstruct.length src) (size - (b * bs)) in
         if len > 0 then Cstruct.blit src 0 image (b * bs) len
       done;
+    if bytes then begin
+      (* A sector the disk held nothing of may hold any of the bytes the
+         writes put there: each quarter of what a write put there reads back
+         as written or as zeros. A sector that held bytes is written whole. *)
+      let lo = (Cstruct.length durable + 511) / 512 * 512 in
+      let points = ref [ lo; size ] in
+      Array.iteri
+        (fun k change ->
+          match change with
+          | Write { offset; data } when not cached.(k) ->
+              List.iter
+                (fun x -> if x > lo && x < size then points := x :: !points)
+                (quarters offset (offset + Cstruct.length data))
+          | _ -> ())
+        changes;
+      let points = List.sort_uniq Int.compare !points in
+      let rec pieces = function
+        | a :: (b :: _ as rest) ->
+            if b > a then begin
+              let piece = Cstruct.sub image a (b - a) in
+              let landed = ref false in
+              for i = 0 to b - a - 1 do
+                if Cstruct.get_uint8 piece i <> 0 then landed := true
+              done;
+              if !landed && not (rng.bool ()) then Cstruct.memset piece 0
+            end;
+            pieces rest
+        | _ -> ()
+      in
+      if size > lo then pieces points
+    end;
     image
 
   (* A disk writes a 512-byte sector whole, so the overwrites of one sector
