@@ -983,9 +983,9 @@ module Crash = struct
         (* The durable bytes had the pages a failed sync lost been evicted
            before a later write to them, where they differ. *)
     mutable partial : (int * int * Cstruct.t) list;
-        (* The blocks a failed sync lost, with the seq it failed at and as
+        (* The blocks failed syncs lost, with the seq each failed at and as
            they stood then: a writeback that failed only partly may have
-           written any of them. *)
+           written any of them, the one of any failure. *)
   }
 
   and entry = {
@@ -2403,11 +2403,23 @@ module Crash = struct
                   (* A writeback that failed only partly wrote any of the
                      blocks it lost. *)
                   let over =
-                    List.filter_map
-                      (fun (b, _, blk) ->
-                        if Random.State.bool rng then Some (b, blk) else None)
-                      fs.partial
+                    List.sort_uniq Int.compare
+                      (List.map (fun (b, _, _) -> b) fs.partial)
+                    |> List.filter_map (fun b ->
+                        (* Any failed writeback's version of the block, or
+                           none. *)
+                        let vs =
+                          List.filter_map
+                            (fun (b', _, blk) ->
+                              if b' = b then Some blk else None)
+                            fs.partial
+                        in
+                        match Random.State.int rng (List.length vs + 1) with
+                        | 0 -> None
+                        | i -> Some (b, List.nth vs (i - 1)))
                   in
+                  (* The page cache kept what a failed sync lost, or evicted
+                     it. *)
                   match fs.evicted with
                   | Some e when Random.State.bool rng ->
                       writeback ~over ~rng ~bs:ctl.block_size ~cache:None e
@@ -2638,7 +2650,7 @@ module Crash = struct
           if n <= 0 then None
           else Some (b, ctl.seq, copy_cs (Cstruct.sub live off n)))
         written
-      @ List.filter (fun (b, _, _) -> not (List.mem b written)) fs.partial;
+      @ fs.partial;
     lose ctl fs;
     (* A truncation is metadata, journaled apart from the data: the failure
        does not lose it, and it stays pending in program order. *)

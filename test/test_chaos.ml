@@ -3047,6 +3047,42 @@ let test_crash_stacked_wrappers_relay_failure () =
     "read-write, read-only" ("pqr", "pqr")
     (run ~ro:false, run ~ro:true)
 
+(* The images seeds 0 to 399 leave of "pqr" after [steps], at blocks of 2
+   bytes, a failed sync injected above the model. *)
+let lost_images steps =
+  let seen = Hashtbl.create 8 in
+  for seed = 0 to 399 do
+    let ctl = Crash.v ~policy:(Reorder_unsynced seed) ~block_size:2 () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "pqr";
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.seeded ~probability:1.0 ~kinds:[ `Sync_error ] ~seed:0 ()
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+        List.iter
+          (function
+            | `W (o, s) ->
+                Eio.File.pwrite_all f ~file_offset:(i63 o)
+                  [ Cstruct.of_string s ]
+            | `F -> (
+                try
+                  Eio.Path.with_open_out ~create:`Never (cfs / "f")
+                    Eio.File.sync
+                with Eio.Io _ -> ()))
+          steps);
+    Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
+  done;
+  List.of_seq (Hashtbl.to_seq_keys seen)
+
+(* Two failed writebacks of one block: either may have landed. *)
+let test_crash_each_failure_may_land () =
+  let i = lost_images [ `W (0, "A"); `F; `W (1, "B"); `F ] in
+  Alcotest.(check (list bool))
+    "first, second" [ true; true ]
+    [ List.mem "Aqr" i; List.mem "ABr" i ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3455,6 +3491,8 @@ let suite =
         `Quick test_crash_durable_cut_frees_lost_pages;
       Alcotest.test_case "crash: stacked wrappers relay a failed sync" `Quick
         test_crash_stacked_wrappers_relay_failure;
+      Alcotest.test_case "crash: either failed writeback of a block may land"
+        `Quick test_crash_each_failure_may_land;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
