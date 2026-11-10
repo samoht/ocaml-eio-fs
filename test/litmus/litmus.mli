@@ -1,4 +1,4 @@
-(** Crash-consistency litmus tests over {!Eio_fs.Chaos.Crash}.
+(** Crash-consistency litmus tests over {!Eio_fs.Chaos.Private.Crash}.
 
     A litmus test is a setup, which runs on the bare in-memory tree and is
     durable before the body starts, and a body, which runs under the crash model
@@ -27,7 +27,7 @@ type op =
   | Fsync_dir of string  (** A barrier on a directory, [""] for the root. *)
   | Fsync_fails of string
       (** A barrier on the descriptor that fails with [EIO], injected by
-          {!Eio_fs.Chaos.wrap} above the crash model. *)
+          {!Eio_fs.Chaos.Private.wrap} above the crash model. *)
 
 type t = {
   name : string;

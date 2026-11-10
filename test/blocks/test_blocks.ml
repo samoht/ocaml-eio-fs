@@ -6,7 +6,7 @@
    no new image comes; each image must be one the reference allows. Directed
    cases check that states the reference allows are drawn. *)
 
-open Eio_fs.Chaos
+open Eio_fs.Chaos.Private
 
 let ( / ) = Eio.Path.( / )
 let i63 = Optint.Int63.of_int

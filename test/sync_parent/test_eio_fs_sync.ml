@@ -11,7 +11,7 @@
    file is there after the power cut is exactly whether the parent's barrier
    ran, and [Crash.unsynced] shows the journal between the two. *)
 
-module Crash = Eio_fs.Chaos.Crash
+module Crash = Eio_fs.Chaos.Private.Crash
 
 let ( / ) = Eio.Path.( / )
 let i63 = Optint.Int63.of_int

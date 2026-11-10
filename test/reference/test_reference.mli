@@ -1,5 +1,5 @@
-(** A differential of {!Eio_fs.Chaos.Crash} against an independent reference
-    crash model. *)
+(** A differential of {!Eio_fs.Chaos.Private.Crash} against an independent
+    reference crash model. *)
 
 val suite : string * unit Alcotest.test_case list
 (** [suite] checks that every crash state eio-fs produces is one the reference

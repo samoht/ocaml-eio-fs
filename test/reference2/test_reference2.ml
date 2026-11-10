@@ -6,8 +6,8 @@
    only names and modes. *)
 
 open Ref
-module Crash = Eio_fs.Chaos.Crash
-module Chaos = Eio_fs.Chaos
+module Crash = Eio_fs.Chaos.Private.Crash
+module Chaos = Eio_fs.Chaos.Private
 
 let ( / ) = Eio.Path.( / )
 let i63 = Optint.Int63.of_int

@@ -8,7 +8,7 @@
    [After_write] keys on a byte range an unlink never writes, and [Nth_op] is a
    magic number a refactor of the commit path moves silently. *)
 
-module Crash = Eio_fs.Chaos.Crash
+module Crash = Eio_fs.Chaos.Private.Crash
 
 let ( / ) = Eio.Path.( / )
 let i63 = Optint.Int63.of_int

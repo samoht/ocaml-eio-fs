@@ -3,7 +3,7 @@
    the validation hold before a byte is returned, and a failed read wipes its
    buffer. *)
 
-module Chaos = Eio_fs.Chaos
+module Chaos = Eio_fs.Chaos.Private
 
 let ( / ) = Eio.Path.( / )
 

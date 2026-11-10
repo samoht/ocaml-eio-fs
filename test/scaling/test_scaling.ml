@@ -5,7 +5,7 @@
 
 let ( / ) = Eio.Path.( / )
 
-module Crash = Eio_fs.Chaos.Crash
+module Crash = Eio_fs.Chaos.Private.Crash
 
 let i63 = Optint.Int63.of_int
 
@@ -25,7 +25,7 @@ let test_crash_appends () =
   let ctl = Crash.v ~policy:(Crash.Reorder_unsynced 1) () in
   let fs = Crash.wrap ctl (Eio_fs.Fs.v ()) in
   let line = String.make 100 'x' in
-  let before = Eio_fs.Chaos.Private.replay_copied () in
+  let before = Eio_fs.Chaos.Private.Internal.replay_copied () in
   Eio.Switch.run (fun sw ->
       let f =
         Eio.Path.open_out ~sw ~append:true ~create:(`Exclusive 0o644)
@@ -39,7 +39,7 @@ let test_crash_appends () =
         Eio.Flow.copy_string line f
       done);
   Crash.crash ctl;
-  let copied = Eio_fs.Chaos.Private.replay_copied () - before in
+  let copied = Eio_fs.Chaos.Private.Internal.replay_copied () - before in
   at_most "bytes copied, for 6.4 MB of appends" ~bound:(8. *. 6.4e6)
     (float copied)
 

@@ -1,8 +1,8 @@
-(** Fault-injection tests for {!Eio_fs.Chaos}: each fault kind is pinned with a
-    scripted schedule and asserted to occur exactly, and a seeded schedule is
-    shown to reproduce deterministically. *)
+(** Fault-injection tests for {!Eio_fs.Chaos.Private}: each fault kind is pinned
+    with a scripted schedule and asserted to occur exactly, and a seeded
+    schedule is shown to reproduce deterministically. *)
 
-module Chaos = Eio_fs.Chaos
+module Chaos = Eio_fs.Chaos.Private
 module Schedule = Chaos.Schedule
 module Fault = Chaos.Fault
 module Op = Chaos.Op
@@ -400,7 +400,7 @@ let test_directory_short_read_inapplicable () =
   in
   Alcotest.(check bool)
     "no byte fault selected for directory" true
-    (Chaos.Private.next sched op = None);
+    (Chaos.Internal.next sched op = None);
   with_chaos sched @@ fun ~raw ~chaos ->
   Eio.Path.mkdir ~perm:0o755 (raw / "tree");
   Alcotest.(check (list string))
@@ -414,7 +414,7 @@ let test_seeded_short_read_long_op () =
   in
   let length = (1 lsl 30) + 1 in
   let op : Op.t = { kind = `Read; path = "f"; file_offset = 0; length } in
-  match Chaos.Private.next sched op with
+  match Chaos.Internal.next sched op with
   | Some (Short_read n) ->
       Alcotest.(check bool)
         "split inside the operation" true
@@ -690,7 +690,7 @@ let test_scripted_fires_once () =
   let check name expected =
     Alcotest.(check bool)
       name true
-      (match (Chaos.Private.next sched op, expected) with
+      (match (Chaos.Internal.next sched op, expected) with
       | None, None -> true
       | Some a, Some b -> Fault.equal a b
       | _ -> false)
@@ -715,7 +715,7 @@ let test_nth_op_on_path () =
   let op kind path = { Op.kind; path; file_offset = 0; length = 0 } in
   let faults =
     List.map
-      (fun o -> Option.is_some (Chaos.Private.next sched o))
+      (fun o -> Option.is_some (Chaos.Internal.next sched o))
       [
         op `Open "f";
         op `Open "g";
@@ -752,7 +752,7 @@ let ops_fixture =
 
 let run_schedule seed =
   let s = Schedule.seeded ~seed ~probability:0.7 () in
-  List.map (Chaos.Private.next s) ops_fixture
+  List.map (Chaos.Internal.next s) ops_fixture
 
 let test_seed_determinism () =
   let a = run_schedule 1234 and b = run_schedule 1234 in
@@ -838,8 +838,8 @@ let test_seeded_change_error () =
   let s = Schedule.seeded ~probability:1. ~kinds:[ `Change_error ] ~seed:3 () in
   Alcotest.(check string)
     "printed"
-    "Eio_fs.Chaos.Schedule.seeded ~probability:1. ~kinds:[ `Change_error ] \
-     ~seed:3 ()"
+    "Eio_fs.Chaos.Private.Schedule.seeded ~probability:1. ~kinds:[ \
+     `Change_error ] ~seed:3 ()"
     (Fmt.str "%a" Schedule.pp s);
   with_chaos s @@ fun ~raw ~chaos ->
   expect_io "a seeded mkdir" (fun () ->
@@ -855,15 +855,15 @@ let test_seeded_pp_rebuilds () =
   in
   Alcotest.(check string)
     "printed"
-    "Eio_fs.Chaos.Schedule.seeded ~probability:0.25 ~kinds:[ `Torn_write; \
-     `Sync_error ] ~seed:42 ()"
+    "Eio_fs.Chaos.Private.Schedule.seeded ~probability:0.25 ~kinds:[ \
+     `Torn_write; `Sync_error ] ~seed:42 ()"
     (Fmt.str "%a" Schedule.pp s);
   let rebuilt =
-    Eio_fs.Chaos.Schedule.seeded ~probability:0.25
+    Eio_fs.Chaos.Private.Schedule.seeded ~probability:0.25
       ~kinds:[ `Torn_write; `Sync_error ]
       ~seed:42 ()
   in
-  let faults s = List.map (Chaos.Private.next s) ops_fixture in
+  let faults s = List.map (Chaos.Internal.next s) ops_fixture in
   Alcotest.(check bool)
     "same faults" true
     (List.equal (Option.equal Fault.equal) (faults s) (faults rebuilt))
@@ -878,7 +878,7 @@ let test_seeded_pp_floats () =
   let expect p lit =
     Alcotest.(check string)
       lit
-      ("Eio_fs.Chaos.Schedule.seeded ~probability:" ^ lit
+      ("Eio_fs.Chaos.Private.Schedule.seeded ~probability:" ^ lit
      ^ " ~kinds:[] ~seed:1 ()")
       (printed p)
   in
@@ -2574,7 +2574,7 @@ let test_crash_move_needs_ancestor_moves () =
         | `Dir -> p ^ "/"
         | `File s -> p ^ "=" ^ s
         | `Link t -> p ^ "->" ^ t)
-      (Eio_fs.Chaos.Private.crash_image
+      (Eio_fs.Chaos.Private.Internal.crash_image
          (Crash.crash ctl;
           ctl))
     |> List.sort String.compare

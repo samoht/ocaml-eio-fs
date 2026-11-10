@@ -12,7 +12,7 @@
    and reads the post-crash tree back through the pointer: it is the whole old
    generation or the whole new one. *)
 
-module Crash = Eio_fs.Chaos.Crash
+module Crash = Eio_fs.Chaos.Private.Crash
 
 let ( / ) = Eio.Path.( / )
 
@@ -319,7 +319,9 @@ let test_posix_readonly_failed_populate () =
    durable publication through it syncs each file all the same. *)
 let test_durable_through_a_fault_wrapper () =
   with_empty @@ fun fs ->
-  let wrapped = Eio_fs.Chaos.wrap Eio_fs.Chaos.Schedule.empty fs in
+  let wrapped =
+    Eio_fs.Chaos.Private.wrap Eio_fs.Chaos.Private.Schedule.empty fs
+  in
   publish ~durable:true wrapped new_tree;
   Alcotest.check tree "published" (Some new_tree) (read_back (fs / "out"))
 

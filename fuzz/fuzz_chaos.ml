@@ -1,12 +1,12 @@
-(** Fuzz tests for {!Eio_fs.Chaos}: crash-safety (only [Eio.Io] or [End_of_file]
-    ever escapes), determinism (a seeded schedule replays the same outcome and
-    bytes), the [Drop_unsynced] barrier invariant (the post-crash image is the
-    synced prefix and keeps its mode), and a reference model (an arbitrary
-    operation tape drives a crash-wrapped tree in lockstep with a pure model of
-    the journal, byte for byte). *)
+(** Fuzz tests for {!Eio_fs.Chaos.Private}: crash-safety (only [Eio.Io] or
+    [End_of_file] ever escapes), determinism (a seeded schedule replays the same
+    outcome and bytes), the [Drop_unsynced] barrier invariant (the post-crash
+    image is the synced prefix and keeps its mode), and a reference model (an
+    arbitrary operation tape drives a crash-wrapped tree in lockstep with a pure
+    model of the journal, byte for byte). *)
 
 open Alcobar
-module Chaos = Eio_fs.Chaos
+module Chaos = Eio_fs.Chaos.Private
 
 let ( / ) = Eio.Path.( / )
 let i63 = Optint.Int63.of_int
@@ -808,7 +808,7 @@ let test_publish_is_atomic old_body new_body =
   let old_body = cap old_body and new_body = cap new_body in
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
-  let module Crash = Eio_fs.Chaos.Crash in
+  let module Crash = Eio_fs.Chaos.Private.Crash in
   let ctl = Crash.v ~policy:Crash.Drop_unsynced () in
   let fs = Crash.wrap ctl env#fs in
   publish_string Eio.Path.(fs / "f") old_body;
@@ -840,11 +840,11 @@ let test_failed_save_preserves_old seed old_body new_body =
   (* Write the original through a clean view, then fault the replacement. *)
   publish_string Eio.Path.(env#fs / "f") old_body;
   let sched =
-    Eio_fs.Chaos.Schedule.seeded ~probability:1.0
+    Eio_fs.Chaos.Private.Schedule.seeded ~probability:1.0
       ~kinds:[ `Write_error; `Sync_error ]
       ~seed ()
   in
-  let hostile = Eio_fs.Chaos.wrap sched env#fs in
+  let hostile = Eio_fs.Chaos.Private.wrap sched env#fs in
   (try publish_string Eio.Path.(hostile / "f") new_body
    with Eio.Io _ | Sys_error _ -> ());
   match Eio.Path.kind ~follow:false Eio.Path.(env#fs / "f") with

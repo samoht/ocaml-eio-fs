@@ -100,14 +100,14 @@ module Fixture :
       Eio.Path.save ~create:(`Exclusive 0o600) (root / "observed/leaf") "observed";
       let observed_leaf = identity (root / "observed/leaf") in
       let swapped = ref false in
-      let schedule = Eio_fs.Chaos.Schedule.observing (fun (op : Eio_fs.Chaos.Op.t) ->
+      let schedule = Eio_fs.Chaos.Private.Schedule.observing (fun (op : Eio_fs.Chaos.Private.Op.t) ->
         if op.kind = `Open && op.path = "observed" && not !swapped then begin
           swapped := true;
           Eio.Path.rename (root / "observed") (root / "observed-original");
           Eio.Path.mkdir ~perm:0o700 (root / "observed");
           Eio.Path.save ~create:(`Exclusive 0o600) (root / "observed/leaf") "replacement"
-        end) Eio_fs.Chaos.Schedule.empty in
-      let wrapped = Eio_fs.Chaos.wrap schedule root in
+        end) Eio_fs.Chaos.Private.Schedule.empty in
+      let wrapped = Eio_fs.Chaos.Private.wrap schedule root in
       called := false;
       require "observed/open identity mismatch denied" (denied (fun () ->
         P.with_parent (wrapped / "observed/leaf") (fun _ -> called := true)));
@@ -161,10 +161,10 @@ and create no destination. This is a real in-memory backend, not an OS-fd fake.
     Eio.Path.save ~create:(`Exclusive 0o600) Eio.Path.(root / "source") "source";
     let before = Eio.Path.stat ~follow:false Eio.Path.(root / "source") in
     let empty_open = ref false in
-    let schedule = Eio_fs.Chaos.Schedule.observing (fun (op : Eio_fs.Chaos.Op.t) ->
+    let schedule = Eio_fs.Chaos.Private.Schedule.observing (fun (op : Eio_fs.Chaos.Private.Op.t) ->
       if op.kind = `Open && op.path = "" then empty_open := true)
-      Eio_fs.Chaos.Schedule.empty in
-    let wrapped = Eio_fs.Chaos.wrap schedule root in
+      Eio_fs.Chaos.Private.Schedule.empty in
+    let wrapped = Eio_fs.Chaos.Private.wrap schedule root in
     Eio.Switch.run (fun sw ->
       let batch = Eio_fs_unix.Batch.v ~sw wrapped in
       assert (match Eio_fs_unix.Batch.run batch

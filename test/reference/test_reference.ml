@@ -3,7 +3,7 @@
    never produces fall in the classes its documented rules explain. *)
 
 open Reference
-module Crash = Eio_fs.Chaos.Crash
+module Crash = Eio_fs.Chaos.Private.Crash
 
 let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 }
 let setup = [ Mkdir "a"; Mkdir "b"; Creat ("a/f", '0') ]
@@ -83,7 +83,7 @@ let crash ?block_size ~as_alice ops k policy =
         | `File content -> { path; k = `F; id; perm; content }
         | `Dir -> { path; k = `D; id; perm; content = "" }
         | `Link _ -> failwith "unexpected link")
-      (Eio_fs.Chaos.Private.crash_image ctl)
+      (Eio_fs.Chaos.Private.Internal.crash_image ctl)
   in
   (List.sort compare image, pending)
 

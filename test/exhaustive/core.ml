@@ -2,8 +2,8 @@
    Chaos.Crash. The fake barrier and the fake sync do nothing: they let a
    test check that the invariants catch a barrier that was never issued. *)
 
-module C = Eio_fs.Chaos.Crash
-module Ch = Eio_fs.Chaos
+module C = Eio_fs.Chaos.Private.Crash
+module Ch = Eio_fs.Chaos.Private
 module P = Eio.Path
 module I63 = Optint.Int63
 module IM = Map.Make (Int64)
@@ -323,7 +323,7 @@ let run ?(observe = fun _ _ -> ()) ?(before_crash = fun _ -> ()) ~init ~policy
   before_crash t;
   let _pc = C.post_crash t in
   let pc = base in
-  let img = Ch.Private.crash_image t in
+  let img = Ch.Internal.crash_image t in
   let img =
     List.map
       (fun (p, ino, c) ->
