@@ -2882,6 +2882,17 @@ let test_crash_kept_truncation_length_only () =
           trunc f 4);
     ]
 
+(* A second wrap would reset the durable image and split the files' state
+   between two wrappers: it is refused. *)
+let test_crash_wrap_once () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  let ctl = Crash.v () in
+  ignore (Crash.wrap ctl raw);
+  match Crash.wrap ctl raw with
+  | _ -> Alcotest.fail "a second wrap was accepted"
+  | exception Invalid_argument _ -> ()
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3280,6 +3291,8 @@ let suite =
         test_crash_clear_journaled_at_write;
       Alcotest.test_case "crash: a kept truncation brings no lost write back"
         `Quick test_crash_kept_truncation_length_only;
+      Alcotest.test_case "crash: a controller is wrapped once" `Quick
+        test_crash_wrap_once;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

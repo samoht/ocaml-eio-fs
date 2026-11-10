@@ -401,9 +401,13 @@ module Crash : sig
       model only the rights of the process, which must be able to read and write
       every entry of the tree, as its owner or root can.
 
+      A controller has one wrapper, and its operations run as the user of
+      [base]. {!Eio_fs.Fs.as_user} refuses a wrapper, so a test cannot drive one
+      controller as several users: it runs each user on a controller of its own.
+
       @raise Stdlib.Invalid_argument
-        if the tree under [base] holds an entry that is neither a regular file,
-        a directory nor a symbolic link. *)
+        if [t] is already wrapped, or if the tree under [base] holds an entry
+        that is neither a regular file, a directory nor a symbolic link. *)
 
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per

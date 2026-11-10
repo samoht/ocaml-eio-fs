@@ -3219,6 +3219,10 @@ module Crash = struct
     }
 
   let wrap ctl (base, path) =
+    (* One controller, one wrapper: a second would reset the durable image
+       and split the files' state between the two. *)
+    if Option.is_some ctl.base then
+      invalid_arg "Chaos.Crash.wrap: controller already wrapped";
     let base = (base :> Eio.Fs.dir_ty r) in
     ctl.base <- Some (base, path);
     let proot = box_dir base in
