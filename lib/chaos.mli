@@ -242,16 +242,17 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     entries take effect in program order, whatever order their barriers ran in,
     and a barrier also commits the pending entries an entry it commits needs:
     the earlier ones in a directory it changes, as one directory's entries stay
-    in order, the one that made a directory it puts a node in, or the ones that
-    emptied a directory it removes. A rename moves the node the image holds,
-    with what the image holds below it; moved into a directory the image does
-    not hold, the node leaves the image with it. Another entry takes effect
-    whole or not at all: one whose directory the image does not hold, or an
-    rmdir of a directory the image still fills, changes nothing. At a crash the
-    policy decides how much of the uncommitted suffix survives, always a prefix
-    of program order, and a dropped operation is rolled back whole; an entry a
-    deferred barrier covers survives, with the entries it needs, whenever it
-    would hold. *)
+    in order, the one that made a directory it puts a node in, the ones that
+    emptied a directory it removes, or, for a rename, the renames that moved a
+    directory above where it lands, so a directory never lands inside itself. A
+    rename moves the node the image holds, with what the image holds below it;
+    moved into a directory the image does not hold, the node leaves the image
+    with it. Another entry takes effect whole or not at all: one whose directory
+    the image does not hold, or an rmdir of a directory the image still fills,
+    changes nothing. At a crash the policy decides how much of the uncommitted
+    suffix survives, always a prefix of program order, and a dropped operation
+    is rolled back whole; an entry a deferred barrier covers survives, with the
+    entries it needs, whenever it would hold. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =

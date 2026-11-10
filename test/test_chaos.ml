@@ -2539,6 +2539,36 @@ let test_crash_deferred_barrier_whole () =
     then Alcotest.failf "cut %d: c without c/x" cut
   done
 
+(* A directory moved into a directory that an earlier pending rename took
+   out of it: the barrier commits that rename too, rather than dropping the
+   directory into itself. *)
+let test_crash_move_needs_ancestor_moves () =
+  Eio_mock.Backend.run @@ fun () ->
+  let raw = Eio_fs.Fs.v () in
+  List.iter (fun d -> Eio.Path.mkdir ~perm:0o755 (raw / d)) [ "a"; "b"; "a/m" ];
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "a/m/f") "0";
+  let ctl = Crash.v () in
+  let fs = Crash.wrap ctl raw in
+  Eio.Path.rename (fs / "a/m") (fs / "b/m");
+  Eio.Path.rename (fs / "a") (fs / "b/m/a");
+  Eio_fs_sync.sync_dir fs;
+  let image =
+    List.map
+      (fun (p, _, k) ->
+        match k with
+        | `Dir -> p ^ "/"
+        | `File s -> p ^ "=" ^ s
+        | `Link t -> p ^ "->" ^ t)
+      (Eio_fs.Chaos.Private.crash_image
+         (Crash.crash ctl;
+          ctl))
+    |> List.sort String.compare
+  in
+  Alcotest.(check (list string))
+    "image"
+    [ "b/"; "b/m/"; "b/m/a/"; "b/m/f=0" ]
+    image
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2906,6 +2936,9 @@ let suite =
         test_crash_dir_handle_barrier_by_inode;
       Alcotest.test_case "crash: a deferred barrier lands with what it needs"
         `Quick test_crash_deferred_barrier_whole;
+      Alcotest.test_case
+        "crash: a rename needs the renames above where it lands" `Quick
+        test_crash_move_needs_ancestor_moves;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

@@ -1134,6 +1134,9 @@ module Crash = struct
     nodes : int64 list; (* the nodes it makes *)
     named : int64 list; (* the nodes it moves or removes *)
     parents : int64 list; (* the directories whose entries it changes *)
+    ancestors : int64 list;
+        (* For a rename, the directories from the root down to where it
+           lands. *)
     mutable synced : bool; (* a sync of that file has run since *)
     mutable committed : bool;
   }
@@ -1181,6 +1184,7 @@ module Crash = struct
         (* The pending entries by the directories whose barrier commits them. *)
     by_node : (int64, metadata_entry Ids.t) Hashtbl.t;
     by_parent : (int64, metadata_entry Ids.t) Hashtbl.t;
+    by_moved : (int64, metadata_entry Ids.t) Hashtbl.t;
     by_attrs : (int64, metadata_entry Ids.t) Hashtbl.t;
     mutable snapshot : state option; (* the last whole snapshot *)
     mutable durable : state option;
@@ -1713,11 +1717,20 @@ module Crash = struct
       (if candidate e then Ids.add e.meta.seq e ctl.pool
        else Ids.remove e.meta.seq ctl.pool)
 
+  let moved e =
+    List.filter_map
+      (fun (_, edit) ->
+        match edit with
+        | Move { ino; _ } -> Some ino
+        | Place _ | Remove _ | Attrs _ -> None)
+      e.delta
+
   let index_entry ctl e =
     ctl.journal <- Ids.add e.meta.seq e ctl.journal;
     List.iter (fun d -> add_to ctl.by_dir d e) e.dirs;
     List.iter (fun n -> add_to ctl.by_node n e) e.nodes;
     List.iter (fun p -> add_to ctl.by_parent p e) e.parents;
+    List.iter (fun n -> add_to ctl.by_moved n e) (moved e);
     Option.iter (fun a -> add_to ctl.by_attrs a e) e.attrs_ino
 
   (* A committed entry leaves the indexes of pending ones. *)
@@ -1726,13 +1739,15 @@ module Crash = struct
     List.iter (fun d -> remove_from ctl.by_dir d e) e.dirs;
     List.iter (fun n -> remove_from ctl.by_node n e) e.nodes;
     List.iter (fun p -> remove_from ctl.by_parent p e) e.parents;
+    List.iter (fun n -> remove_from ctl.by_moved n e) (moved e);
     Option.iter (fun a -> remove_from ctl.by_attrs a e) e.attrs_ino;
     ctl.pool <- Ids.remove e.meta.seq ctl.pool
 
   (* The pending entries before [e] it depends on: those that changed a
      directory [e] changes, as one directory's entries stay in order; those
-     that made a node [e] names; and for an rmdir, those that changed the
-     directory it removes. A directory renamed before [e] changed it is no
+     that made a node [e] names; for an rmdir, those that changed the
+     directory it removes; and for a rename, those that moved a directory
+     above where it lands, so it never lands inside itself. A directory renamed before [e] changed it is no
      dependency: its inode is durable under one name or the other. A change
      of attributes waits for its node and pulls nothing in. *)
   let deps ctl e =
@@ -1748,6 +1763,7 @@ module Crash = struct
                 m []
         in
         List.concat_map (earlier ctl.by_parent) e.parents
+        @ List.concat_map (earlier ctl.by_moved) e.ancestors
         @ List.concat_map (earlier ctl.by_node) (e.parents @ e.named)
         @ List.concat_map
             (fun (_, edit) ->
@@ -1777,6 +1793,19 @@ module Crash = struct
     let meta = metadata_unsynced ~path ~kind ~seq:ctl.seq in
     let root = path_segments root_path in
     let parent p = ino_at owner (parent_path p) in
+    let ancestors =
+      match (kind, resolved) with
+      | Rename _, [ _; dst ] ->
+          let segs = path_segments (parent_path dst) in
+          let lead = if Eio_fs_path.is_abs dst then "/" else "" in
+          List.init
+            (List.length segs + 1 - List.length root)
+            (fun i -> List.length root + i)
+          |> List.filter_map (fun n ->
+              ino_at owner
+                (lead ^ String.concat "/" (List.filteri (fun j _ -> j < n) segs)))
+      | _ -> []
+    in
     let delta, dirs, attrs_ino =
       match (kind, resolved) with
       | (Chmod _ | Chown _), [ p ] -> (
@@ -1864,6 +1893,7 @@ module Crash = struct
         nodes;
         named;
         parents;
+        ancestors;
         synced = false;
         committed = false;
       }
@@ -1874,6 +1904,7 @@ module Crash = struct
     Hashtbl.reset ctl.by_dir;
     Hashtbl.reset ctl.by_node;
     Hashtbl.reset ctl.by_parent;
+    Hashtbl.reset ctl.by_moved;
     Hashtbl.reset ctl.by_attrs
 
   let commit_metadata ctl =
@@ -2038,6 +2069,7 @@ module Crash = struct
                 nodes = [];
                 named = [];
                 parents = [];
+                ancestors = [];
                 synced = true;
                 committed = true;
               }
@@ -2951,6 +2983,7 @@ module Crash = struct
       by_dir = Hashtbl.create 16;
       by_node = Hashtbl.create 16;
       by_parent = Hashtbl.create 16;
+      by_moved = Hashtbl.create 16;
       by_attrs = Hashtbl.create 16;
       snapshot = None;
       durable = None;

@@ -195,6 +195,8 @@ module Model = struct
     seq : int;
     halves : half list;
     dirs : int list; (* the directories it changed *)
+    ancestors : int list;
+        (* for a rename, the directories above where it lands *)
     mutable barred : int list; (* those a barrier has reached *)
     mutable committed : bool;
   }
@@ -335,6 +337,7 @@ module Model = struct
         seq = m.seq;
         halves = List.map snd halves;
         dirs = List.map fst halves;
+        ancestors = [];
         barred = [];
         committed = false;
       }
@@ -357,8 +360,9 @@ module Model = struct
       e.halves
 
   (* The pending entries before [e] it needs: those that changed a
-     directory it changes, those that made a node it names, and for an rmdir
-     those that changed the directory. *)
+     directory it changes, those that made a node it names, for an rmdir
+     those that changed the directory, and for a rename those that moved a
+     directory above where it lands. *)
   let deps m e =
     let names = e.dirs @ named e in
     let removed =
@@ -368,6 +372,10 @@ module Model = struct
       (fun e' ->
         (not e'.committed) && e'.seq < e.seq
         && (List.exists (fun d -> List.mem d e.dirs) e'.dirs
+           || List.exists
+                (function
+                  | Move { id; _ } -> List.mem id e.ancestors | _ -> false)
+                e'.halves
            || List.exists (fun n -> List.mem n names) (nodes e')
            || List.exists (fun d -> List.mem d removed) e'.dirs))
       m.journal
@@ -468,12 +476,18 @@ module Model = struct
     let from = dir_id m.live (parent src) in
     m.live <- move ~src ~dst m.live;
     let up = dir_id m.live (parent dst) in
+    let rec above p acc =
+      let acc = dir_id m.live p :: acc in
+      if String.equal p "" then acc else above (parent p) acc
+    in
+    let ancestors = above (parent dst) [] in
     m.seq <- m.seq + 1;
     m.journal <-
       {
         seq = m.seq;
         halves = [ Move { parent = up; path = dst; id } ];
         dirs = [ from; up ];
+        ancestors;
         barred = [];
         committed = false;
       }
