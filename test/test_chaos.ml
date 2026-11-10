@@ -2665,6 +2665,26 @@ let test_crash_subtree_barrier_by_inode () =
     "a/old and a/g" (false, false)
     (Eio.Path.is_file (post / "a/old"), Eio.Path.is_file (post / "a/g"))
 
+(* A file truncated to nothing, then written past its end: the hole the
+   write leaves can come back zeroed, as written back, and not only with the
+   bytes the truncation cut. *)
+let test_crash_hole_lands_zeroed () =
+  let seen = Hashtbl.create 8 in
+  for seed = 0 to 199 do
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "ABCDEFGHIJ";
+    let ctl = Crash.v ~policy:(Reorder_unsynced seed) ~block_size:1 () in
+    let fs = Crash.wrap ctl raw in
+    Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+        Eio.File.truncate f (i63 0);
+        Eio.File.pwrite_all f ~file_offset:(i63 2) [ Cstruct.of_string "x" ]);
+    Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
+  done;
+  Alcotest.(check (pair bool bool))
+    "zeroed hole, stale bytes" (true, true)
+    (Hashtbl.mem seen "\000\000x", Hashtbl.mem seen "ABx")
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3046,6 +3066,9 @@ let suite =
         test_crash_rename_over_filled_dir;
       Alcotest.test_case "crash: an opened directory's barrier is on its inode"
         `Quick test_crash_subtree_barrier_by_inode;
+      Alcotest.test_case
+        "crash: the hole a write past the end leaves can land zeroed" `Quick
+        test_crash_hole_lands_zeroed;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

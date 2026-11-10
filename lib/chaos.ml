@@ -2166,7 +2166,8 @@ module Crash = struct
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
      left, or a block boundary a write grew the file across, as writeback
-     lands a long append block by block. A truncation changes the length in
+     lands a long append block by block. A write past the end of the file
+     dirties the hole it leaves as well. A truncation changes the length in
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
@@ -2187,7 +2188,8 @@ module Crash = struct
             for b = (prev / bs) + 1 to (size - 1) / bs do
               boundaries := (b * bs) :: !boundaries
             done;
-            (offset, offset + len)
+            (* Past the end of the file, the zeroed hole it leaves too. *)
+            (min prev offset, offset + len)
         | Resize m when m < prev ->
             (* A shrink rewrites only the block cut at its new end; the blocks
                past it keep their bytes until the new length lands. *)

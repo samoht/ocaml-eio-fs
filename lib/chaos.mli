@@ -302,18 +302,21 @@ module Crash : sig
             names; {!Reorder_unsynced} over many seeds finds those. *)
     | Reorder_unsynced of int
         (** Seeded: writes go back to the disk in blocks, as a page cache writes
-            them. Each block an un-synced change dirtied comes back as it was
-            durable or as it stood after any one of those changes, drawn
-            independently of the other blocks. The length is one a change left,
-            or a block boundary a write grew the file across; a truncation
-            changes it in one step, and the block it cuts lands like any other,
-            so a block kept from before it shows its old bytes again when a
-            later length grows over them, as data=writeback may leave them. So a
-            multi-block write may keep any subset of its blocks, while a block
-            is never torn and never holds a later write without the earlier
-            ones. Uncommitted directory operations survive as a prefix of
-            program order whose length is drawn uniformly: metadata never
-            reorders. The [int] is the seed; the same seed and workload
+            them. A write dirties the blocks it covers and, past the end of the
+            file, those of the zeroed hole it leaves; a truncation that shrinks
+            dirties only the block it cuts mid-way, none when it cuts on a
+            boundary, and one that grows dirties the blocks it adds. Each dirty
+            block comes back as it was durable or as it stood after any one of
+            the changes that dirtied it, drawn independently of the other
+            blocks. The length is drawn independently of the blocks: one a
+            change left, or a block boundary a write grew the file across. A
+            block a shrink did not dirty keeps its old bytes, which show again
+            when a later length grows over them, as data=writeback may leave
+            them. So a multi-block write may keep any subset of its blocks,
+            while a block is never torn and never holds a later write without
+            the earlier ones. Uncommitted directory operations survive as a
+            prefix of program order whose length is drawn uniformly: metadata
+            never reorders. The [int] is the seed; the same seed and workload
             reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
