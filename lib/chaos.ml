@@ -2245,15 +2245,16 @@ module Crash = struct
         in
         (plain, live)
 
-  (* The blocks the writes among [changes] dirty, replayed from a file of
-     [len] bytes. *)
-  let written_blocks ~bs len changes =
+  (* The blocks [changes] dirty, or only their writes when [writes], replayed
+     from a file of [len] bytes. *)
+  let dirty_blocks ?(writes = false) ~bs len changes =
     let _, acc =
       List.fold_left
         (fun (prev, acc) change ->
           let acc =
             match change with
-            | Write _ ->
+            | Resize _ when writes -> acc
+            | Write _ | Resize _ ->
                 let lo, hi = dirtied ~bs prev change in
                 if hi > lo then
                   List.init
@@ -2261,7 +2262,6 @@ module Crash = struct
                     (fun i -> (lo / bs) + i)
                   @ acc
                 else acc
-            | Resize _ -> acc
           in
           ( (match change with
             | Write { offset; data } -> max prev (offset + Cstruct.length data)
@@ -2280,7 +2280,7 @@ module Crash = struct
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
      lands in a block without the earlier ones. *)
-  let writeback ~rng ~bs ~cache durable changes =
+  let writeback ?(over = []) ~rng ~bs ~cache durable changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -2361,7 +2361,10 @@ module Crash = struct
         let src =
           match Hashtbl.find_opt taken b with
           | Some blk -> blk
-          | None -> block_of durable b
+          | None -> (
+              match List.assoc_opt b over with
+              | Some blk -> blk
+              | None -> block_of durable b)
         in
         let len = min (Cstruct.length src) (size - (b * bs)) in
         if len > 0 then Cstruct.blit src 0 image (b * bs) len
@@ -2390,36 +2393,16 @@ module Crash = struct
                   let changes = List.map (fun e -> (e.change, e.cached)) mine in
                   (* A writeback that failed only partly wrote any of the
                      blocks it lost. *)
-                  let with_partial durable =
-                    match fs.partial with
-                    | [] -> durable
-                    | partial ->
-                        let d = copy_cs durable in
-                        List.iter
-                          (fun (b, blk) ->
-                            if Random.State.bool rng then begin
-                              let off = b * ctl.block_size in
-                              let n =
-                                max 0
-                                  (min (Cstruct.length blk)
-                                     (Cstruct.length d - off))
-                              in
-                              if n > 0 then Cstruct.blit blk 0 d off n
-                            end)
-                          partial;
-                        d
+                  let over =
+                    List.filter (fun _ -> Random.State.bool rng) fs.partial
                   in
-                  (* The page cache kept what a failed sync lost, or evicted
-                     it. *)
                   match fs.evicted with
                   | Some e when Random.State.bool rng ->
-                      writeback ~rng ~bs:ctl.block_size ~cache:None
-                        (with_partial e)
+                      writeback ~over ~rng ~bs:ctl.block_size ~cache:None e
                         (List.map (fun (c, _) -> (c, false)) changes)
                   | Some _ | None ->
-                      writeback ~rng ~bs:ctl.block_size ~cache:fs.cache
-                        (with_partial (bytes_of fs.durable))
-                        changes)
+                      writeback ~over ~rng ~bs:ctl.block_size ~cache:fs.cache
+                        (bytes_of fs.durable) changes)
               | Survive pred, _ ->
                   List.filter (fun e -> pred (to_unsynced e)) mine
                   |> List.map (fun e -> (e.change, e.cached))
@@ -2619,19 +2602,28 @@ module Crash = struct
   let fail_sync ctl fs =
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
     let pending = List.rev fs.pending in
-    let changes = List.map (fun e -> e.change) pending in
+    (* A kept truncation is in the page cache already. *)
+    let changes =
+      List.filter_map
+        (fun e -> if e.cached then None else Some e.change)
+        pending
+    in
     let live = replay_changes cache changes in
     fs.cache <- Some live;
     (* The pages that failed are clean and unwritten; those that did not
        may be on disk, as they stood. *)
     let bs = ctl.block_size in
-    let written = written_blocks ~bs (Cstruct.length cache) changes in
+    let written =
+      dirty_blocks ~writes:true ~bs (Cstruct.length cache) changes
+    in
     fs.partial <-
-      List.map
+      List.filter_map
         (fun b ->
           let off = b * bs in
-          let n = max 0 (min bs (Cstruct.length live - off)) in
-          (b, if n = 0 then Cstruct.empty else copy_cs (Cstruct.sub live off n)))
+          let n = min bs (Cstruct.length live - off) in
+          (* A page cut away by then is written no more; the tail of the
+             last one past the end is zero. *)
+          if n <= 0 then None else Some (b, copy_cs (Cstruct.sub live off n)))
         written
       @ List.filter (fun (b, _) -> not (List.mem b written)) fs.partial;
     lose ctl fs;
@@ -2664,7 +2656,7 @@ module Crash = struct
         | partial ->
             let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
             let written =
-              written_blocks ~bs:ctl.block_size (Cstruct.length cache)
+              dirty_blocks ~bs:ctl.block_size (Cstruct.length cache)
                 (List.filter_map
                    (fun (c, cached) -> if cached then None else Some c)
                    pending)

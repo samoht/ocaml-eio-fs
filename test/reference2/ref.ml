@@ -420,10 +420,8 @@ let file_sync t id ~ok =
        List.fold_left
          (fun (prev, acc) (seq, ch, _, cache) ->
            ( cache,
-             match ch with
-             | W _ when not (List.mem seq f.cached) ->
-                 blocks_dirtied ~bs:t.bs prev ch @ acc
-             | _ -> acc ))
+             if List.mem seq f.cached then acc
+             else blocks_dirtied ~bs:t.bs prev ch @ acc ))
          (f.base_cache, []) f.pend
      in
      f.partial <- List.filter (fun (b, _) -> not (List.mem b written)) f.partial);
@@ -460,11 +458,11 @@ let file_sync t id ~ok =
     in
     let written = List.sort_uniq compare written in
     f.partial <-
-      List.map
+      List.filter_map
         (fun b ->
           let off = b * t.bs in
-          let n = max 0 (min t.bs (String.length f.cache - off)) in
-          (b, if n = 0 then "" else String.sub f.cache off n))
+          let n = min t.bs (String.length f.cache - off) in
+          if n <= 0 then None else Some (b, String.sub f.cache off n))
         written
       @ List.filter (fun (b, _) -> not (List.mem b written)) f.partial;
     f.pend <- [];
@@ -943,9 +941,7 @@ let reorder_cands ?(evicted = false) t ~bs id =
     block_bytes ~bs durable i
     ::
     (match List.assoc_opt i f.partial with
-    | Some p ->
-        let d = block_bytes ~bs durable i in
-        [ p ^ String.sub d (String.length p) (bs - String.length p) ]
+    | Some p -> [ p ^ String.make (bs - String.length p) '\000' ]
     | None -> [])
   in
   let add_block i v =

@@ -2927,6 +2927,33 @@ let test_crash_partial_writeback () =
     [ "BBCC"; "BBaa"; "aaCC"; "aaaa" ]
     (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
 
+(* A truncation kept by a failed sync is in the page cache already: a
+   second failure leaves the cache as it is, so a later write past its end
+   dirties only its own blocks, and the bytes the first failure lost stay
+   lost. *)
+let test_crash_second_failure () =
+  let ctl = Crash.v ~policy:Drop_unsynced ~block_size:2 () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "f") "xyz";
+  Eio_fs_sync.sync_dir fs;
+  let sched =
+    Schedule.seeded ~probability:1.0 ~kinds:[ `Sync_error ] ~seed:0 ()
+  in
+  let cfs = Chaos.wrap sched fs in
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+      Eio.File.truncate f (i63 1);
+      Eio.File.pwrite_all f ~file_offset:(i63 0) [ Cstruct.of_string "bb" ]);
+  for _ = 1 to 2 do
+    try Eio.Path.with_open_out ~create:`Never (cfs / "f") Eio.File.sync
+    with Eio.Io _ -> ()
+  done;
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+      Eio.File.pwrite_all f ~file_offset:(i63 3) [ Cstruct.of_string "e" ];
+      Eio.File.sync f);
+  Alcotest.(check string)
+    "f" "x\000\000e"
+    (Eio.Path.load (Crash.post_crash ctl / "f"))
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3329,6 +3356,8 @@ let suite =
         test_crash_wrap_once;
       Alcotest.test_case "crash: a failed sync may have written some blocks"
         `Quick test_crash_partial_writeback;
+      Alcotest.test_case "crash: a second failed sync keeps the page cache"
+        `Quick test_crash_second_failure;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
