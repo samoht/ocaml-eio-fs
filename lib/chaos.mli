@@ -251,30 +251,33 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     {!Crash.sync_metadata} and any barrier that commits a later entry, and at a
     crash it survives with the prefix it is part of. A barrier on a directory
     that is not itself durable yet holds from the moment it is, or from the
-    moment another directory the entry changes is: a rename out of a durable
-    directory into a new one is durable once the new one's barrier returns. The
-    model knows files and directories by inode, as ext4 does: a barrier holds
-    for its directory under whatever name it has later, and never for another
-    directory of the same name. A barrier through a directory opened before it
-    was removed or replaced commits that directory's own entries, and nothing of
-    the one now at its name. Committed entries take effect in program order,
-    whatever order their barriers ran in, and a barrier also commits the pending
-    entries an entry it commits needs: the earlier ones in a directory it
-    changes, as one directory's entries stay in order, the ones that emptied a
-    directory it removes or a rename replaces, and, for a rename, the renames
-    that moved a directory above where it lands, so a directory never lands
-    inside itself. The entry that made a directory is not among them: only a
-    barrier on its parent makes a new directory durable. Each entry takes effect
-    whole or not at all: a creation whose directory the image does not hold
-    makes nothing, and an rmdir of a directory the image still fills, or a
-    rename over one, changes nothing. A rename moves the node the image holds,
-    with what the image holds below it; a node made by a creation that made
-    nothing still exists for a committed rename of it, which puts it where it
-    moved, as its inode exists on disk; moved into a directory the image does
-    not hold, a node leaves the image until a later committed rename brings it
-    back. At a crash the policy decides how much of the uncommitted suffix
-    survives, always a prefix of program order, and a dropped operation is
-    rolled back whole; an entry a deferred barrier covers survives, with the
+    moment another directory the entry changes is: with [d/f] durable,
+    [mkdir e; rename d/f e/f; fsync_dir e] makes the rename durable when the
+    barrier returns, so a crash before [e] itself is durable loses the file from
+    both directories. ext4 would keep [e/f], as committing the rename commits
+    the [mkdir]; eio-fs deliberately weakens this, so that a missing barrier on
+    [e]'s parent shows. The model knows files and directories by inode, as ext4
+    does: a barrier holds for its directory under whatever name it has later,
+    and never for another directory of the same name. A barrier through a
+    directory opened before it was removed or replaced commits that directory's
+    own entries, and nothing of the one now at its name. Committed entries take
+    effect in program order, whatever order their barriers ran in, and a barrier
+    also commits the pending entries an entry it commits needs: the earlier ones
+    in a directory it changes, as one directory's entries stay in order, the
+    ones that emptied a directory it removes or a rename replaces, and, for a
+    rename, the renames that moved a directory above where it lands, so a
+    directory never lands inside itself. The entry that made a directory is not
+    among them: only a barrier on its parent makes a new directory durable. Each
+    entry takes effect whole or not at all: a creation whose directory the image
+    does not hold makes nothing, and an rmdir of a directory the image still
+    fills, or a rename over one, changes nothing. A rename moves the node the
+    image holds, with what the image holds below it; a node made by a creation
+    that made nothing still exists for a committed rename of it, which puts it
+    where it moved, as its inode exists on disk; moved into a directory the
+    image does not hold, a node leaves the image until a later committed rename
+    brings it back. At a crash the policy decides how much of the uncommitted
+    suffix survives, always a prefix of program order, and a dropped operation
+    is rolled back whole; an entry a deferred barrier covers survives, with the
     entries it needs, whenever it would hold. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
