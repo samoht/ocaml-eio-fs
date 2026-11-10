@@ -26,16 +26,23 @@ let live ~as_alice ops =
   let ids = ids () in
   let t0 = snapshot ids admin in
   let id_at p = id ids (Eio.Path.stat ~follow:true p).ino in
+  Eio.Switch.run @@ fun sw ->
+  let dirs = Hashtbl.create 2 and handle_ids = Hashtbl.create 2 in
   let trees, evs, _ =
     List.fold_left
       (fun (trees, evs, before) op ->
-        exec base op;
+        (match op with
+        | Dopen (h, p) ->
+            Hashtbl.replace handle_ids h (id_at Eio.Path.(admin / p))
+        | _ -> ());
+        exec ~sw ~dirs base op;
         let after = snapshot ids admin in
         let barrier =
           match op with
           | Fsync p -> [ Bfile (id_at Eio.Path.(admin / p)) ]
           | Fsync_dir "" -> [ Bdir (id_at admin) ]
           | Fsync_dir p -> [ Bdir (id_at Eio.Path.(admin / p)) ]
+          | Dsync h -> [ Bdir (Hashtbl.find handle_ids h) ]
           | _ -> []
         in
         (after :: trees, events ~before ~after ~barrier :: evs, after))
@@ -48,17 +55,19 @@ let is_data (u : Crash.unsynced) =
 
 (* The image a crash after the first [k] operations leaves under [policy],
    and what was pending then. *)
-let crash ~as_alice ops k policy =
+let crash ?block_size ~as_alice ops k policy =
   Eio_mock.Backend.run @@ fun () ->
   let admin, base = fresh ~as_alice in
   let ids = ids () in
   ignore (snapshot ids admin);
-  let ctl = Crash.v ~policy () in
+  let ctl = Crash.v ?block_size ~policy () in
   let fs = (Crash.wrap ctl base :> Eio.Fs.dir_ty Eio.Path.t) in
+  Eio.Switch.run @@ fun sw ->
+  let dirs = Hashtbl.create 2 in
   List.iteri
     (fun i op ->
       if i < k then begin
-        exec fs op;
+        exec ~sw ~dirs fs op;
         ignore (snapshot ids admin)
       end)
     ops;
@@ -78,22 +87,59 @@ let crash ~as_alice ops k policy =
   in
   (List.sort compare image, pending)
 
-(* The states eio-fs leaves, without their data: every data change kept,
-   and the uncommitted metadata cut after each pending entry. *)
+(* The images eio-fs leaves after the first [k] operations: under
+   Drop_unsynced; under Survive with every data change kept and the
+   uncommitted metadata cut after each pending entry; and under
+   Reorder_unsynced for a few seeds at block sizes 1, 7 and 4096, kept
+   apart as their data mixes blocks. *)
+let reorder_seeds = 2
+
 let eio_states ~as_alice ops k =
-  let _, pending = crash ~as_alice ops k (Survive (fun _ -> true)) in
+  let drop, pending = crash ~as_alice ops k Drop_unsynced in
   let cuts =
     -1
     :: List.filter_map
          (fun (u : Crash.unsynced) -> if is_data u then None else Some u.seq)
          pending
   in
-  List.fold_left
-    (fun acc cut ->
-      let keep (u : Crash.unsynced) = is_data u || u.seq <= cut in
-      let image, _ = crash ~as_alice ops k (Survive keep) in
-      States.add (without_data image) acc)
-    States.empty cuts
+  let exact =
+    List.fold_left
+      (fun acc cut ->
+        let keep (u : Crash.unsynced) = is_data u || u.seq <= cut in
+        let image, _ = crash ~as_alice ops k (Survive keep) in
+        States.add image acc)
+      (States.singleton drop) cuts
+  in
+  let reorder =
+    List.concat_map
+      (fun bs ->
+        List.init reorder_seeds (fun seed ->
+            let policy = Crash.Reorder_unsynced seed in
+            (bs, fst (crash ~block_size:bs ~as_alice ops k policy))))
+      [ 1; 7; 4096 ]
+  in
+  (exact, reorder)
+
+(* Whether [content] is one a crash may leave from the [versions] a file
+   had, block by block: a length one of them had or a block boundary
+   between them, and each block as one of them held it. *)
+let blocks_ok ~bs versions content =
+  let n = String.length content in
+  let lens = List.map String.length versions in
+  let lo = List.fold_left min max_int lens and hi = List.fold_left max 0 lens in
+  let block s b =
+    String.init bs (fun j ->
+        let x = (b * bs) + j in
+        if x < String.length s then s.[x] else '\000')
+  in
+  (List.mem n lens || (n mod bs = 0 && n > lo && n < hi))
+  && List.for_all
+       (fun b ->
+         let got = String.sub (block content b) 0 (min bs (n - (b * bs))) in
+         List.exists
+           (fun v -> String.sub (block v b) 0 (String.length got) = got)
+           versions)
+       (List.init ((n + bs - 1) / bs) Fun.id)
 
 (* {1 Workloads} *)
 
@@ -136,20 +182,25 @@ let gen ~as_alice rng len =
 
 (* {1 The differential} *)
 
-(* Why a state the reference allows is missing from eio-fs's:
-   - [Mode]: eio-fs has it with other modes, as a mode change is journaled
-     with the directory operations;
+(* Why a state the reference allows, without its data, is missing from
+   eio-fs's:
    - [Prefix]: what was never committed survives as a program-order prefix
      ("metadata never reorders", chaos.mli);
    - [Ancestors]: a rename waits for the renames that moved a directory
      above where it lands;
+   - [Parent_mode]: it differs from one eio-fs leaves only in the modes of
+     nodes whose chmod a later barrier on their directory committed, as a
+     directory barrier commits its entries' modes;
+   - [Clear_mode]: it differs only in the modes of files a write cleared
+     setuid or setgid from, as that clear waits for a sync;
    - [Other]: nothing documented explains it. *)
-type class_ = Mode | Prefix | Ancestors | Other
+type class_ = Prefix | Ancestors | Parent_mode | Clear_mode | Other
 
 let class_name = function
-  | Mode -> "mode"
   | Prefix -> "prefix"
   | Ancestors -> "ancestors"
+  | Parent_mode -> "parent-mode"
+  | Clear_mode -> "clear-mode"
   | Other -> "other"
 
 type report = {
@@ -161,47 +212,210 @@ type report = {
 
 let take k l = List.filteri (fun i _ -> i < k) l
 
+(* Workloads the random ones may miss, run first: a file met after an
+   uncommitted rename of it, a rename over a directory the image still
+   fills, and a barrier through a directory handle once the directory is
+   gone. *)
+let directed =
+  [
+    [ Rename ("a/f", "b/f"); Append ("b/f", 's'); Fsync "b/f" ];
+    [ Rename ("a", "c"); Append ("c/f", 's'); Fsync "c/f" ];
+    [ Rename ("a/f", "b/f"); Rename ("b", "a"); Fsync_dir "" ];
+    [
+      Dopen (0, "a");
+      Unlink "a/f";
+      Rmdir "a";
+      Mkdir "a";
+      Creat ("a/g", 'g');
+      Dsync 0;
+    ];
+  ]
+
 let differential workloads =
   let unsound = ref [] and n_states = ref 0 in
   let missing = Hashtbl.create 4 and examples = Hashtbl.create 4 in
   for w = 0 to workloads - 1 do
     let rng = Random.State.make [| w |] in
     let as_alice = w mod 2 = 1 in
-    let ops = gen ~as_alice rng (3 + Random.State.int rng 4) in
-    let (root, init), trees, evs = live ~as_alice ops in
+    let ops =
+      match List.nth_opt directed w with
+      | Some ops -> ops
+      | None -> gen ~as_alice rng (3 + Random.State.int rng 4)
+    in
+    let ((root, init) as t0), trees, evs_by_op = live ~as_alice ops in
     let base = bases trees in
     for k = 0 to List.length ops do
-      let evs = List.concat (take k evs) in
-      let r = states ~root ~init ~base evs in
-      let ref_all = States.map without_data r.all in
-      let eio = eio_states ~as_alice ops k in
-      n_states := !n_states + States.cardinal eio;
-      let ctx s =
-        Fmt.str "w%d%s k=%d: %a@.    events %a@.    state %a" w
-          (if as_alice then " alice" else "")
-          k pp_ops (take k ops) pp_events evs pp_state s
+      let evs = List.concat (take k evs_by_op) in
+      let per_op = List.mapi (fun p e -> (p, e)) (take k evs_by_op) in
+      let parent_at p i =
+        let _, nodes = List.nth trees (p + 1) in
+        IM.fold
+          (fun d n acc ->
+            if SM.exists (fun _ c -> c = i) n.ents then Some d else acc)
+          nodes None
       in
+      let mode_nodes ~chmod =
+        List.concat_map
+          (fun (p, es) ->
+            let is_chmod =
+              match List.nth ops p with Chmod _ -> true | _ -> false
+            in
+            List.filter_map
+              (function
+                | Attrs (i, _) when chmod && is_chmod -> (
+                    match parent_at p i with
+                    | Some d
+                      when List.exists
+                             (fun (q, es) -> q >= p && List.mem (Bdir d) es)
+                             per_op ->
+                        Some i
+                    | _ -> None)
+                | Attrs (i, _) when (not chmod) && not is_chmod -> Some i
+                | _ -> None)
+              es)
+          per_op
+      in
+      let parent_modes = mode_nodes ~chmod:true
+      and clear_modes = mode_nodes ~chmod:false in
+      (* A barrier on a directory commits the chmod of an entry it held. *)
+      let covered = Hashtbl.create 8 in
+      let _ =
+        List.fold_left
+          (fun base (p, es) ->
+            (match List.nth ops p with
+            | Chmod _ ->
+                List.iteri
+                  (fun a e ->
+                    match e with
+                    | Attrs (i, _) -> (
+                        match parent_at p i with
+                        | None -> ()
+                        | Some d ->
+                            ignore
+                              (List.fold_left
+                                 (fun qbase (q, es') ->
+                                   if q > p then
+                                     List.iteri
+                                       (fun b e' ->
+                                         if e' = Bdir d then
+                                           Hashtbl.replace covered
+                                             (base + a, qbase + b)
+                                             ())
+                                       es';
+                                   qbase + List.length es')
+                                 0 per_op))
+                    | _ -> ())
+                  es
+            | _ -> ());
+            base + List.length es)
+          0 per_op
+      in
+      let covers i j = Hashtbl.mem covered (i, j) in
+      (* A write's setuid clear is no journal entry until a sync. *)
+      let unjournaled =
+        let clears = Hashtbl.create 4 in
+        ignore
+          (List.fold_left
+             (fun base (p, es) ->
+               (match List.nth ops p with
+               | Chmod _ -> ()
+               | _ ->
+                   List.iteri
+                     (fun a e ->
+                       match e with
+                       | Attrs _ -> Hashtbl.replace clears (base + a) ()
+                       | _ -> ())
+                     es);
+               base + List.length es)
+             0 per_op);
+        Hashtbl.mem clears
+      in
+      let r = states ~covers ~unjournaled ~root ~init ~base evs in
+      let ref_meta = States.map without_data r.all in
+      (* A state eio-fs leaves is a prefix one under its rules: the
+         barriers' closure, with the renames above where one lands and the
+         modes a directory barrier commits, and a prefix of the rest. *)
+      let shaped = States.map without_data r.eio in
+      (* A file made since the setup starts empty. *)
+      let versions id =
+        List.sort_uniq compare
+          ((if IM.mem id (snd t0) then [] else [ "" ])
+          @ List.filter_map
+              (fun (_, nodes) ->
+                match IM.find_opt id nodes with
+                | Some { kind = `F; data; _ } -> Some data
+                | Some _ | None -> None)
+              (take (k + 1) trees))
+      in
+      let exact, reorder = eio_states ~as_alice ops k in
+      n_states := !n_states + States.cardinal exact + List.length reorder;
+      let ctx what s =
+        Fmt.str "w%d%s k=%d (%s): %a@.    events %a@.    state %a" w
+          (if as_alice then " alice" else "")
+          k what pp_ops (take k ops) pp_events evs pp_state s
+      in
+      let bad what s = unsound := ctx what s :: !unsound in
       States.iter
-        (fun s -> unsound := ctx s :: !unsound)
-        (States.diff eio ref_all);
+        (fun s ->
+          if not (States.mem s r.all) then bad "outside, with its data" s
+          else if not (States.mem (without_data s) shaped) then
+            bad "not a prefix state" s)
+        exact;
+      List.iter
+        (fun (bs, s) ->
+          let m = without_data s in
+          if not (States.mem m ref_meta) then bad "outside" s
+          else if not (States.mem m shaped) then bad "not a prefix state" s
+          else
+            List.iter
+              (fun e ->
+                if e.k = `F && not (blocks_ok ~bs (versions e.id) e.content)
+                then
+                  bad
+                    (Fmt.str "%s: blocks of %d bytes, versions %a" e.path bs
+                       Fmt.(Dump.list Dump.string)
+                       (versions e.id))
+                    s)
+              s)
+        reorder;
+      let eio =
+        States.union
+          (States.map without_data exact)
+          (States.of_list (List.map (fun (_, s) -> without_data s) reorder))
+      in
       let prefix = States.map without_data r.prefix
       and ancestors = States.map without_data r.ancestors in
-      let eio_modeless = States.map without_modes eio in
+      let eio_list = States.elements eio in
+      (* Whether [s] is a state eio-fs leaves but for the modes of [nodes]. *)
+      let modes_of nodes s =
+        List.exists
+          (fun e ->
+            List.length e = List.length s
+            && List.for_all2
+                 (fun a b ->
+                   { a with perm = 0 } = { b with perm = 0 }
+                   && (a.perm = b.perm || List.mem a.id nodes))
+                 e s)
+          eio_list
+      in
       States.iter
         (fun s ->
           let c =
-            if States.mem (without_modes s) eio_modeless then Mode
-            else if not (States.mem s prefix) then Prefix
+            if not (States.mem s prefix) then Prefix
             else if not (States.mem s ancestors) then Ancestors
+            else if not (States.mem s shaped) then Parent_mode
+            else if modes_of parent_modes s then Parent_mode
+            else if modes_of (parent_modes @ clear_modes) s then Clear_mode
             else Other
           in
           Hashtbl.replace missing c
             (1 + Option.value ~default:0 (Hashtbl.find_opt missing c));
-          if not (Hashtbl.mem examples c) then Hashtbl.add examples c (ctx s))
-        (States.diff ref_all eio)
+          if not (Hashtbl.mem examples c) then
+            Hashtbl.add examples c (ctx "missing" s))
+        (States.diff ref_meta eio)
     done
   done;
-  let classes = [ Mode; Prefix; Ancestors; Other ] in
+  let classes = [ Prefix; Ancestors; Parent_mode; Clear_mode; Other ] in
   {
     states = !n_states;
     unsound = List.rev !unsound;
@@ -224,7 +438,13 @@ let expected_unsound = 0
 (* What eio-fs never produces over [workloads] workloads, by class. A count
    that moves is a change of the crash model: say why. *)
 let expected_missing =
-  [ (Mode, 1283); (Prefix, 6438); (Ancestors, 0); (Other, 0) ]
+  [
+    (Prefix, 7526);
+    (Ancestors, 0);
+    (Parent_mode, 179);
+    (Clear_mode, 6);
+    (Other, 0);
+  ]
 
 let pp_missing =
   Fmt.(list ~sep:(any ", ") (fun ppf (c, n) -> pf ppf "%s %d" (class_name c) n))

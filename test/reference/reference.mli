@@ -20,12 +20,20 @@ type op =
   | Fsync_dir of string  (** [""] is the root. *)
   | Chmod of string * int
   | Trunc of string * int
+  | Dopen of int * string  (** Open a directory as a numbered handle. *)
+  | Dsync of int  (** A barrier through a directory handle. *)
 
 val pp_op : op Fmt.t
 val pp_ops : op list Fmt.t
 
-val exec : Eio.Fs.dir_ty Eio.Path.t -> op -> unit
-(** [exec fs op] runs [op] below [fs]. *)
+val exec :
+  ?sw:Eio.Switch.t ->
+  ?dirs:(int, [ `Close | Eio.Fs.dir_ty ] Eio.Path.t) Hashtbl.t ->
+  Eio.Fs.dir_ty Eio.Path.t ->
+  op ->
+  unit
+(** [exec ~sw ~dirs fs op] runs [op] below [fs], keeping directory handles in
+    [dirs], opened in [sw]. *)
 
 (** {1 Live trees} *)
 
@@ -97,11 +105,24 @@ type states = {
       (** Those whose journal events are the barriers' closure and a
           program-order prefix of the rest. *)
   ancestors : States.t;
-      (** Those of [prefix] that also hold, with a rename, the renames that
-          moved a directory above where it lands. *)
+      (** Those whose journal events are a prefix past the barriers' closure
+          with a rename waiting for the renames that moved a directory above
+          where it lands. *)
+  eio : States.t;
+      (** The same, with the closure [covers] adds as well: eio-fs's own rules.
+      *)
 }
 
 val states :
-  root:int -> init:node IM.t -> base:node IM.t -> event list -> states
-(** [states ~root ~init ~base evs] are the crash states after [evs] from the
-    tree [init]. *)
+  ?covers:(int -> int -> bool) ->
+  ?unjournaled:(int -> bool) ->
+  root:int ->
+  init:node IM.t ->
+  base:node IM.t ->
+  event list ->
+  states
+(** [states ~covers ~root ~init ~base evs] are the crash states after [evs] from
+    the tree [init]. [covers i j] is whether the [j]th event, a barrier, forces
+    the earlier [i]th under eio-fs's rules beyond the reference's, and
+    [unjournaled i] whether eio-fs keeps the [i]th event out of the journal's
+    program order. *)

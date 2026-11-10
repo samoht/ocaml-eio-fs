@@ -21,6 +21,8 @@ type op =
   | Fsync_dir of string
   | Chmod of string * int
   | Trunc of string * int
+  | Dopen of int * string
+  | Dsync of int
 
 let pp_op ppf = function
   | Mkdir p -> Fmt.pf ppf "mkdir %s" p
@@ -33,10 +35,12 @@ let pp_op ppf = function
   | Fsync_dir p -> Fmt.pf ppf "fsync_dir %S" p
   | Chmod (p, m) -> Fmt.pf ppf "chmod %s %o" p m
   | Trunc (p, n) -> Fmt.pf ppf "trunc %s %d" p n
+  | Dopen (h, p) -> Fmt.pf ppf "d%d = opendir %s" h p
+  | Dsync h -> Fmt.pf ppf "fsyncdir d%d" h
 
 let pp_ops = Fmt.(list ~sep:(any "; ") pp_op)
 
-let exec fs = function
+let exec ?sw ?(dirs = Hashtbl.create 1) fs = function
   | Mkdir p -> Eio.Path.mkdir ~perm:0o777 (fs / p)
   | Creat (p, c) ->
       Eio.Path.with_open_out ~create:(`Exclusive 0o666) (fs / p) (fun f ->
@@ -54,6 +58,11 @@ let exec fs = function
   | Fsync_dir "" -> Eio_fs_sync.sync_dir fs
   | Fsync_dir p -> Eio_fs_sync.sync_dir (fs / p)
   | Chmod (p, m) -> Eio.Path.chmod ~follow:true ~perm:m (fs / p)
+  | Dopen (h, p) -> (
+      match sw with
+      | Some sw -> Hashtbl.replace dirs h (Eio.Path.open_dir ~sw (fs / p))
+      | None -> invalid_arg "Reference.exec: opendir needs a switch")
+  | Dsync h -> Eio_fs_sync.sync_dir (Hashtbl.find dirs h)
 
 (* {1 Live trees, by inode} *)
 
@@ -232,21 +241,23 @@ let bases trees =
         nodes acc)
     IM.empty trees
 
-let touches_of = function
-  | Meta { touches; _ } -> touches
+(* The directories whose entries an event changes: not one it removes, whose
+   own barrier commits only what changed in it. *)
+let entries_of = function
+  | Meta { changes; _ } -> List.map (fun (d, _, _) -> d) changes
   | Init d -> [ d ]
   | Attrs _ | Data _ | Bdir _ | Bfile _ -> []
 
 (* Whether event [a], earlier in program order, must land before [b]:
    events of one directory stay ordered, as do the attributes and the data
    of one inode; a directory barrier waits for the earlier changes to that
-   directory and a file barrier for its file's data and attributes; nothing
+   directory's entries and a file barrier for its file's data and attributes; nothing
    passes a barrier. *)
 let must_precede a b =
   match (a, b) with
   | (Bdir _ | Bfile _), _ -> true
   | _, Bdir d -> (
-      List.mem d (touches_of a)
+      List.mem d (entries_of a)
       || match a with Attrs (i, _) -> i = d | _ -> false)
   | _, Bfile f -> (
       match a with Attrs (i, _) | Data (i, _) -> i = f | _ -> false)
@@ -292,9 +303,15 @@ end)
 let without_data = List.map (fun e -> { e with content = "" })
 let without_modes = List.map (fun e -> { e with perm = 0 })
 
-type states = { all : States.t; prefix : States.t; ancestors : States.t }
+type states = {
+  all : States.t;
+  prefix : States.t;
+  ancestors : States.t;
+  eio : States.t;
+}
 
-let states ~root ~init ~base evs =
+let states ?(covers = fun _ _ -> false) ?(unjournaled = fun _ -> false) ~root
+    ~init ~base evs =
   let evs = Array.of_list evs in
   let n = Array.length evs in
   if n > Sys.int_size - 1 then Fmt.failwith "%d events" n;
@@ -303,18 +320,23 @@ let states ~root ~init ~base evs =
     Array.init n (fun j ->
         let m = ref 0 in
         for i = 0 to j - 1 do
-          if rel evs.(i) evs.(j) then m := !m lor bit i
+          if rel i j then m := !m lor bit i
         done;
         !m)
   in
-  let preds = preds_by must_precede in
-  let preds_anc = preds_by (fun a b -> must_precede a b || ancestor_dep a b) in
+  let on_events rel i j = rel evs.(i) evs.(j) in
+  let preds = preds_by (on_events must_precede) in
+  let anc a b = must_precede a b || ancestor_dep a b in
+  let preds_anc = preds_by (on_events anc) in
+  let preds_eio = preds_by (fun i j -> on_events anc i j || covers i j) in
   let barriers = ref 0 and journal = ref 0 in
   Array.iteri
     (fun i e ->
       match e with
       | Bdir _ | Bfile _ -> barriers := !barriers lor bit i
-      | Meta _ | Init _ | Attrs _ -> journal := !journal lor bit i
+      | (Meta _ | Init _ | Attrs _) when not (unjournaled i) ->
+          journal := !journal lor bit i
+      | Meta _ | Init _ | Attrs _ -> ()
       | Data _ -> ())
     evs;
   let close preds m =
@@ -375,11 +397,13 @@ let states ~root ~init ~base evs =
     go 0 0
   in
   let forced = close preds !barriers
-  and forced_anc = close preds_anc !barriers in
+  and forced_anc = close preds_anc !barriers
+  and forced_eio = close preds_eio !barriers in
   let seen = Hashtbl.create 64 in
   let all = ref States.empty
   and prefix = ref States.empty
-  and ancestors = ref States.empty in
+  and ancestors = ref States.empty
+  and eio = ref States.empty in
   let rec visit mask =
     if not (Hashtbl.mem seen mask) then begin
       Hashtbl.add seen mask ();
@@ -388,7 +412,8 @@ let states ~root ~init ~base evs =
         all := States.add st !all;
         if prefix_shaped forced mask then prefix := States.add st !prefix;
         if prefix_shaped forced_anc mask then
-          ancestors := States.add st !ancestors
+          ancestors := States.add st !ancestors;
+        if prefix_shaped forced_eio mask then eio := States.add st !eio
       end;
       for j = 0 to n - 1 do
         if mask land bit j = 0 && preds.(j) land mask = preds.(j) then
@@ -397,4 +422,4 @@ let states ~root ~init ~base evs =
     end
   in
   visit 0;
-  { all = !all; prefix = !prefix; ancestors = !ancestors }
+  { all = !all; prefix = !prefix; ancestors = !ancestors; eio = !eio }
