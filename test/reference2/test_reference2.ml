@@ -871,6 +871,10 @@ let cases : (string * user * init list * op list) list =
       [
         Write ("f", 0, "BB"); Fsync_fail "f"; Write ("f", 6000, "CC"); Fsync "f";
       ] );
+    ( "failed-sync-cut-page",
+      root_user,
+      [ I_file ("f", "AAAAAAAA") ],
+      [ Write ("f", 6, "CC"); Truncate ("f", 2); Fsync_fail "f" ] );
   ]
 
 (* Findings that mean eio-fs left a state the reference forbids, or did not

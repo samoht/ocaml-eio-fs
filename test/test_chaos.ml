@@ -3047,14 +3047,14 @@ let test_crash_stacked_wrappers_relay_failure () =
     "read-write, read-only" ("pqr", "pqr")
     (run ~ro:false, run ~ro:true)
 
-(* The images seeds 0 to 399 leave of "pqr" after [steps], at blocks of 2
+(* The images seeds 0 to 399 leave of [init] after [steps], at blocks of 2
    bytes, a failed sync injected above the model. *)
-let lost_images steps =
+let lost_images ?(init = "pqr") steps =
   let seen = Hashtbl.create 8 in
   for seed = 0 to 399 do
     let ctl = Crash.v ~policy:(Reorder_unsynced seed) ~block_size:2 () in
     with_crash ctl @@ fun ~raw:_ ~fs ->
-    write_new ~sync:true (fs / "f") "pqr";
+    write_new ~sync:true (fs / "f") init;
     Eio_fs_sync.sync_dir fs;
     let sched =
       Schedule.seeded ~probability:1.0 ~kinds:[ `Sync_error ] ~seed:0 ()
@@ -3066,6 +3066,7 @@ let lost_images steps =
             | `W (o, s) ->
                 Eio.File.pwrite_all f ~file_offset:(i63 o)
                   [ Cstruct.of_string s ]
+            | `T n -> Eio.File.truncate f (i63 n)
             | `F -> (
                 try
                   Eio.Path.with_open_out ~create:`Never (cfs / "f")
@@ -3075,6 +3076,13 @@ let lost_images steps =
     Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) ()
   done;
   List.of_seq (Hashtbl.to_seq_keys seen)
+
+(* A write to a page a truncation then cut away, and a failed sync: the
+   writeback had no page to write, so with the truncation lost the block
+   keeps its bytes on disk. *)
+let test_crash_cut_page_not_written () =
+  let i = lost_images ~init:"pqrs" [ `W (2, "A"); `T 2; `F ] in
+  Alcotest.(check (list string)) "images" [ "pq"; "pqrs" ] (List.sort compare i)
 
 (* Two failed writebacks of one block: either may have landed, the second
    also over the page re-read from disk once the first was evicted. *)
@@ -3564,6 +3572,8 @@ let suite =
         `Quick test_crash_over_chaos_over_user;
       Alcotest.test_case "crash: either failed writeback of a block may land"
         `Quick test_crash_each_failure_may_land;
+      Alcotest.test_case "crash: a page cut before a failure is not written"
+        `Quick test_crash_cut_page_not_written;
       Alcotest.test_case "crash: a lost page may be evicted before any sync"
         `Quick test_crash_evicted_before_sync;
       Alcotest.test_case "crash: a length lands with the setuid clear before it"
