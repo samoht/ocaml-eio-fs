@@ -21,10 +21,10 @@
  (tags (eio filesystem in-memory))
  (description
   "eio-fs is an in-memory filesystem for Eio, with wrappers that inject
-   faults and simulate power loss for crash-consistency tests. It also writes
-   files atomically and durably on any backend, binds POSIX calls that Eio
-   lacks, and embeds a directory tree in a program. The in-memory backend is
-   adapted from Patrick Ferris's eio_mem (https://git.sirref.org/eio_mem).")
+faults and simulate power loss for crash-consistency tests. It also writes
+files atomically and durably on any backend, binds POSIX calls that Eio
+lacks, and embeds a directory tree in a program. The in-memory backend is
+adapted from Patrick Ferris's eio_mem (https://git.sirref.org/eio_mem).")
  (depends
   (hermetic (>= 0.1.0))
   (ocaml (>= 5.3))
