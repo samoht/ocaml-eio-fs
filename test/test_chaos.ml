@@ -2517,6 +2517,28 @@ let test_crash_dir_handle_barrier_by_inode () =
     "b/d/x kept, a/d/y lost" (true, false)
     (Eio.Path.is_file (post / "b/d/x"), Eio.Path.is_file (post / "a/d/y"))
 
+(* A barrier on a new directory, deferred until the directory is durable:
+   wherever the cut falls, the directory never shows without the file the
+   barrier covered. *)
+let test_crash_deferred_barrier_whole () =
+  for cut = 0 to 6 do
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    let keep (u : Crash.unsynced) = u.kind = Data || u.seq <= cut in
+    let ctl = Crash.v ~policy:(Survive keep) () in
+    let fs = Crash.wrap ctl raw in
+    Eio.Path.mkdir ~perm:0o755 (fs / "c");
+    Eio.Path.mkdir ~perm:0o755 (fs / "d");
+    Eio.Path.save ~create:(`Exclusive 0o644) (fs / "d/x") "x";
+    Eio.Path.rename (fs / "d/x") (fs / "c/x");
+    Eio_fs_sync.sync_dir (fs / "c");
+    let post = Crash.post_crash ctl in
+    if
+      Eio.Path.is_directory (post / "c")
+      && not (Eio.Path.is_file (post / "c/x"))
+    then Alcotest.failf "cut %d: c without c/x" cut
+  done
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -2882,6 +2904,8 @@ let suite =
       Alcotest.test_case
         "crash: a directory handle's barrier is on the inode it opened" `Quick
         test_crash_dir_handle_barrier_by_inode;
+      Alcotest.test_case "crash: a deferred barrier lands with what it needs"
+        `Quick test_crash_deferred_barrier_whole;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick

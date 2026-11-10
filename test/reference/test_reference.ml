@@ -219,7 +219,7 @@ let workloads = 3000
 
 (* The states eio-fs produces that the reference forbids, known unsound
    until fixed. *)
-let expected_unsound = 4
+let expected_unsound = 0
 
 (* What eio-fs never produces over [workloads] workloads, by class. A count
    that moves is a change of the crash model: say why. *)

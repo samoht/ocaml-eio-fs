@@ -1553,19 +1553,15 @@ module Crash = struct
           | Some _ | None -> None)
 
   (* Whether every half of [e] lands in [st]: an entry takes effect whole or
-     not at all, so a rename whose destination directory the image does not
-     hold leaves its node where it was, and an rmdir of a directory that
-     still holds entries there removes nothing. *)
+     not at all, so a node put in a directory the image does not hold is not
+     made, and an rmdir of a directory that still holds entries there removes
+     nothing. A rename always lands. *)
   let applies st e =
     List.for_all
       (fun (segs, edit) ->
         match edit with
         | Place { parent; _ } -> Option.is_some (target_dir st segs parent)
-        | Move { parent; ino } -> (
-            match (Inos.find_opt ino st.inos, target_dir st segs parent) with
-            | Some (_ :: _ as from), Some at ->
-                not (is_prefix from at && from <> at)
-            | _ -> false)
+        | Move _ -> true
         | Remove ino -> (
             match Inos.find_opt ino st.inos with
             | Some at -> (
@@ -1580,7 +1576,8 @@ module Crash = struct
      finds its node by inode: a new node goes into the directory that held it
      when the operation ran, a moved node is the image's own, taken from
      wherever it is with what it holds there, and a node is taken out, or
-     given attributes, wherever it is. *)
+     given attributes, wherever it is. A node moved into a directory the image
+     does not hold, or below itself, leaves the image with what it holds. *)
   let replay ~root st e =
     if not (applies st e) then st
     else
@@ -1606,7 +1603,10 @@ module Crash = struct
                       )))
           | Move { parent; ino } -> (
               match (Inos.find_opt ino st.inos, target_dir st segs parent) with
-              | Some from, Some at when from <> at -> (
+              | Some (_ :: _ as from), Some at when is_prefix from at ->
+                  if from = at then st else remove_path st from
+              | Some (_ :: _ as from), None -> remove_path st from
+              | Some from, Some at -> (
                   match tree_find st.tree from with
                   | None -> st
                   | Some node ->
@@ -1920,6 +1920,16 @@ module Crash = struct
         in
         ctl.snapshot <- Some (go snapshot)
 
+  (* Whether [e], which a barrier or a sync reached, holds in [st]: a change
+     of attributes once its node is there, and an entry a barrier reached
+     once a directory it changes is there, as the entry changes that one even
+     where the other is not durable yet. *)
+  let reached st e =
+    let held ino = Inos.mem ino st.inos in
+    (match e.attrs_ino with Some ino -> held ino | None -> true)
+    && ((e.barred <> [] && List.exists held e.dirs)
+       || (e.synced && Option.is_some e.attrs_ino))
+
   (* fsync(2) on a directory commits that directory's entries and nothing
      else: the journal entries that changed it, keyed by its inode, so a
      barrier follows the directory through a rename and never reaches
@@ -1935,12 +1945,7 @@ module Crash = struct
      entry committed late still lands before the later ones it precedes. *)
   let rec settle ctl =
     let st = durable ctl in
-    let held ino = Inos.mem ino st.inos in
-    let ready e =
-      (not e.committed)
-      && (match e.attrs_ino with Some ino -> held ino | None -> true)
-      && (List.exists held e.barred || (e.synced && Option.is_some e.attrs_ino))
-    in
+    let ready e = (not e.committed) && reached st e in
     match
       Ids.fold (fun _ e acc -> if ready e then e :: acc else acc) ctl.pool []
     with
@@ -2243,31 +2248,44 @@ module Crash = struct
       let owner, root_path = root ctl in
       let root = path_segments root_path in
       (* The snapshot with, in program order, every committed entry, every
-         surviving one, and every one a barrier holds for whose directory
-         the image holds by then: a deferred barrier holds once its
-         directory does, wherever the cut fell. *)
+         surviving one, and every one a barrier reached that holds in the
+         image by then, with the entries it needs, as [settle] commits it: a
+         deferred barrier holds once its directory does, wherever the cut
+         fell. An entry pulled in that way may come before entries already
+         replayed, so the replay starts again with it. *)
       let { tree; locs; _ } =
         let snapshot =
           match ctl.snapshot with Some st -> st | None -> assert false
         in
         let included = Hashtbl.create 16 in
-        List.fold_left
-          (fun st e ->
-            let held ino = Inos.mem ino st.inos in
-            let barred () =
-              (match e.attrs_ino with Some ino -> held ino | None -> true)
-              && (List.exists held e.barred
-                 || (e.synced && Option.is_some e.attrs_ino))
-              && List.for_all
-                   (fun d -> Hashtbl.mem included d.meta.seq)
-                   (deps ctl e)
-            in
-            if e.committed || survives e || barred () then begin
-              Hashtbl.replace included e.meta.seq ();
-              replay ~root st e
-            end
-            else st)
-          snapshot journal
+        List.iter
+          (fun e ->
+            if e.committed || survives e then
+              Hashtbl.replace included e.meta.seq ())
+          journal;
+        let rec build () =
+          let again = ref false in
+          let st =
+            List.fold_left
+              (fun st e ->
+                if !again then st
+                else if Hashtbl.mem included e.meta.seq then replay ~root st e
+                else if reached st e then begin
+                  List.iter
+                    (fun d ->
+                      if not (Hashtbl.mem included d.meta.seq) then begin
+                        Hashtbl.replace included d.meta.seq ();
+                        if d != e then again := true
+                      end)
+                    (closure ctl e);
+                  replay ~root st e
+                end
+                else st)
+              snapshot journal
+          in
+          if !again then build () else st
+        in
+        build ()
       in
       restore_root owner root_path tree;
       (* Each tracked file is rewritten where the image holds it, which a

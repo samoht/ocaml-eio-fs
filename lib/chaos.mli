@@ -234,21 +234,24 @@ val wrap : Schedule.t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     barrier (a sync of the directory, opened as a file or not) commits only the
     entries of that directory. A sync of a file also commits a [chmod] or
     [chown] of it. A barrier on a directory that is not itself durable yet holds
-    from the moment it is. The model knows files and directories by inode, as
-    ext4 does: a barrier holds for its directory under whatever name it has
-    later, and never for another directory of the same name. Committed entries
-    take effect in program order, whatever order their barriers ran in, and a
-    barrier also commits the pending entries an entry it commits needs: the
-    earlier ones in a directory it changes, as one directory's entries stay in
-    order, the one that made a directory it puts a node in, or the ones that
+    from the moment it is, or from the moment another directory the entry
+    changes is: a rename out of a durable directory into a new one is durable
+    once the new one's barrier returns. The model knows files and directories by
+    inode, as ext4 does: a barrier holds for its directory under whatever name
+    it has later, and never for another directory of the same name. Committed
+    entries take effect in program order, whatever order their barriers ran in,
+    and a barrier also commits the pending entries an entry it commits needs:
+    the earlier ones in a directory it changes, as one directory's entries stay
+    in order, the one that made a directory it puts a node in, or the ones that
     emptied a directory it removes. A rename moves the node the image holds,
-    with what the image holds below it. An entry takes effect whole or not at
-    all: one whose directory the image does not hold, or an rmdir of a directory
-    the image still fills, changes nothing, so no durable node is lost to it. At
-    a crash the policy decides how much of the uncommitted suffix survives,
-    always a prefix of program order, and a dropped operation is rolled back
-    whole; an entry a deferred barrier covers survives whenever its directory
-    does. *)
+    with what the image holds below it; moved into a directory the image does
+    not hold, the node leaves the image with it. Another entry takes effect
+    whole or not at all: one whose directory the image does not hold, or an
+    rmdir of a directory the image still fills, changes nothing. At a crash the
+    policy decides how much of the uncommitted suffix survives, always a prefix
+    of program order, and a dropped operation is rolled back whole; an entry a
+    deferred barrier covers survives, with the entries it needs, whenever it
+    would hold. *)
 module Crash : sig
   (** The type for the kinds of un-synced change a journal entry records. *)
   type op_kind =

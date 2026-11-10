@@ -269,16 +269,15 @@ module Model = struct
       | Some _ | None -> None
 
   (* An entry lands whole or not at all: a node is put in its directory by
-     identity, a moved node is the world's own with what it holds there, and
-     an rmdir of a directory that still holds entries removes nothing. *)
+     identity and an rmdir of a directory that still holds entries removes
+     nothing. A moved node is the world's own with what it holds there, and
+     leaves the world if moved where the world has no directory, or below
+     itself. *)
   let applies map e =
     List.for_all
       (function
         | Place { parent = pid; path; _ } -> target map path pid <> None
-        | Move { parent = pid; path; id } -> (
-            match (path_of map id, target map path pid) with
-            | Some from, Some at -> not (under from at)
-            | _ -> false)
+        | Move _ -> true
         | Remove id -> (
             match path_of map id with
             | Some p -> not (SM.exists (fun k _ -> under p k) map)
@@ -296,7 +295,11 @@ module Model = struct
         | Some at -> SM.add at node (remove_under at map))
     | Move { parent = pid; path; id } -> (
         match (path_of map id, target map path pid) with
-        | Some from, Some at when not (String.equal from at) ->
+        | Some from, Some at when String.equal from at -> map
+        | Some from, Some at when under from at -> remove_under from map
+        | Some from, None when not (String.equal from "") ->
+            remove_under from map
+        | Some from, Some at ->
             let below =
               SM.fold
                 (fun k v acc ->
@@ -375,8 +378,8 @@ module Model = struct
     m.journal <- []
 
   (* The barrier on directory [dir]: the pending operations that changed it,
-     by id, are barred, and every barred operation whose directory is
-     durable commits, until none is left. *)
+     by id, are barred, and every barred operation one of whose directories
+     is durable commits, until none is left. *)
   let commit_dir m dir =
     let id = dir_id m.live dir in
     List.iter
@@ -389,7 +392,8 @@ module Model = struct
       in
       let ready =
         List.filter
-          (fun e -> (not e.committed) && List.exists held e.barred)
+          (fun e ->
+            (not e.committed) && e.barred <> [] && List.exists held e.dirs)
           m.journal
       in
       if ready <> [] then begin
