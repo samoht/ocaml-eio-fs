@@ -2700,6 +2700,17 @@ module Crash = struct
         pending
     in
     let live = replay_changes cache changes in
+    (* Had an earlier failure's pages been evicted, the changes, kept
+       truncations included, landed over the bytes re-read from disk. *)
+    let evicted =
+      match (fs.cache, fs.evicted) with
+      | None, None -> None
+      | _, e ->
+          Some
+            (replay_changes
+               (Option.value ~default:(bytes_of fs.durable) e)
+               (List.map (fun e -> e.change) pending))
+    in
     fs.cache <- Some live;
     (* The pages that failed are clean and unwritten; those that did not
        may be on disk, as they stood. *)
@@ -2707,17 +2718,25 @@ module Crash = struct
     let written =
       dirty_blocks ~writes:true ~bs (Cstruct.length cache) changes
     in
-    fs.partial <-
-      List.filter_map
-        (fun b ->
-          let off = b * bs in
-          let n = min bs (Cstruct.length live - off) in
-          (* A page cut away by then is written no more; the tail of the
-             last one past the end is zero. *)
-          if n <= 0 then None
-          else Some (b, ctl.seq, copy_cs (Cstruct.sub live off n)))
-        written
-      @ fs.partial;
+    let version src b =
+      let off = b * bs in
+      let n = min bs (Cstruct.length src - off) in
+      (* A page cut away by then is written no more; the tail of the last
+         one past the end is zero. *)
+      if n <= 0 then None else Some (b, ctl.seq, copy_cs (Cstruct.sub src off n))
+    in
+    let versions b =
+      let v = version live b in
+      match Option.bind evicted (fun e -> version e b) with
+      | Some (_, _, e) as w
+        when not
+               (Option.fold ~none:false
+                  ~some:(fun (_, _, l) -> Cstruct.equal l e)
+                  v) ->
+          Option.to_list v @ Option.to_list w
+      | _ -> Option.to_list v
+    in
+    fs.partial <- List.concat_map versions written @ fs.partial;
     lose ctl fs;
     (* A truncation is metadata, journaled apart from the data: the failure
        does not lose it, and it stays pending in program order. *)

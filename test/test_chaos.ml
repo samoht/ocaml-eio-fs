@@ -3076,12 +3076,13 @@ let lost_images steps =
   done;
   List.of_seq (Hashtbl.to_seq_keys seen)
 
-(* Two failed writebacks of one block: either may have landed. *)
+(* Two failed writebacks of one block: either may have landed, the second
+   also over the page re-read from disk once the first was evicted. *)
 let test_crash_each_failure_may_land () =
   let i = lost_images [ `W (0, "A"); `F; `W (1, "B"); `F ] in
   Alcotest.(check (list bool))
-    "first, second" [ true; true ]
-    [ List.mem "Aqr" i; List.mem "ABr" i ]
+    "first, second, second over the evicted page" [ true; true; true ]
+    [ List.mem "Aqr" i; List.mem "ABr" i; List.mem "pBr" i ]
 
 (* A lost page, then a write to it and a crash with no sync: the page
    cache may have evicted the lost page, so the write lands over the bytes
