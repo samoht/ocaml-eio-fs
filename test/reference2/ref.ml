@@ -358,7 +358,7 @@ let merged ~bs ~durable ~base_cache ~cached chs =
         let c = List.mem seq cached in
         ( apply_change plain ch,
           (if c then cache else apply_change cache ch),
-          blocks_dirtied ~bs (if c then plain else cache) ch @ dirty ))
+          (if c then [] else blocks_dirtied ~bs cache ch) @ dirty ))
       (durable, base_cache, []) chs
   in
   let b = Bytes.of_string plain in
@@ -933,7 +933,7 @@ let reorder_cands ?(evicted = false) t ~bs id =
       let c = (not evicted) && List.mem seq f.cached in
       List.iter
         (fun i -> add_block i (block_bytes ~bs cache i))
-        (blocks_dirtied ~bs (if c then !prev else !cprev) ch);
+        (if c then [] else blocks_dirtied ~bs !cprev ch);
       prev := after;
       cprev := cache)
     f.pend;

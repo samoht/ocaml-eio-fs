@@ -983,7 +983,7 @@ module Crash = struct
     egen : int;
     cached : bool;
         (* A truncation a failed sync kept pending, which the page cache
-           already holds. *)
+           already holds: it carries the length only and dirties no block. *)
   }
 
   let next_id = Atomic.make 0
@@ -2225,8 +2225,9 @@ module Crash = struct
         let _ =
           List.fold_left
             (fun (pprev, cprev) (change, cached) ->
+              (* A kept truncation carries its length only. *)
               let lo, hi =
-                dirtied ~bs (if cached then pprev else cprev) change
+                if cached then (0, 0) else dirtied ~bs cprev change
               in
               if hi > lo then
                 for b = lo / bs to (hi - 1) / bs do
@@ -2270,7 +2271,7 @@ module Crash = struct
           done
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
-        dirtied ~bs (if cached.(k) then prev else !cprev) changes.(k)
+        if cached.(k) then (0, 0) else dirtied ~bs !cprev changes.(k)
       in
       (if not cached.(k) then
          cprev :=

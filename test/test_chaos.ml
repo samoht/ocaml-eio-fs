@@ -2835,6 +2835,53 @@ let test_crash_clear_journaled_at_write () =
       run ~barrier:true Drop_unsynced;
     ]
 
+(* A truncation a failed sync keeps carries its length only: the bytes in
+   its block are the durable ones, not those of a write the sync lost. *)
+let test_crash_kept_truncation_length_only () =
+  let run policy work =
+    let ctl = Crash.v ~policy () in
+    with_crash ctl @@ fun ~raw:_ ~fs ->
+    write_new ~sync:true (fs / "f") "WXYZ";
+    Eio_fs_sync.sync_dir fs;
+    let sched =
+      Schedule.scripted
+        [
+          {
+            trigger = Op_on_path { kind = `Sync; path = "f" };
+            fault = Sync_error `Eio;
+          };
+        ]
+    in
+    let cfs = Chaos.wrap sched fs in
+    Eio.Path.with_open_out ~create:`Never (cfs / "f") (fun f ->
+        work f;
+        (try Eio.File.sync f with Eio.Io _ -> ());
+        Eio.File.sync f);
+    Eio.Path.load (Crash.post_crash ctl / "f")
+  in
+  let write f off s =
+    Eio.File.pwrite_all f ~file_offset:(i63 off) [ Cstruct.of_string s ]
+  and trunc f n = Eio.File.truncate f (i63 n) in
+  let keep_all = Crash.Survive (fun _ -> true) in
+  Alcotest.(check (list string))
+    "write then cut, cut then write, a cut that keeps the length"
+    [ "W"; "W"; "W"; "WXYZ" ]
+    [
+      run Drop_unsynced (fun f ->
+          write f 0 "a";
+          trunc f 1);
+      run keep_all (fun f ->
+          write f 0 "a";
+          trunc f 1);
+      run Drop_unsynced (fun f ->
+          trunc f 1;
+          write f 0 "a";
+          trunc f 1);
+      run Drop_unsynced (fun f ->
+          write f 0 "a";
+          trunc f 4);
+    ]
+
 (* {2 The model's authority is the wrapper, not the descriptor}
 
    Over a host directory the wrapper hands eio-fs.unix, and no other caller,
@@ -3231,6 +3278,8 @@ let suite =
       Alcotest.test_case
         "crash: a write's setuid clear is journaled at the write" `Quick
         test_crash_clear_journaled_at_write;
+      Alcotest.test_case "crash: a kept truncation brings no lost write back"
+        `Quick test_crash_kept_truncation_length_only;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
