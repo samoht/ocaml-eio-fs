@@ -575,7 +575,7 @@ let rename_into_new_dir =
     }
     ~ext4:(unmarked pre @ marked [ List.nth pre 2 ])
     ~envelope:(unmarked (pre @ [ lost ]) @ marked [ List.nth pre 2; lost ])
-    ~not_produced:(both [ lost ])
+    ~extra:(marked [ lost ]) ~not_produced:(unmarked [ lost ])
 
 (* A file made in [a], then another moved from [a] to [b], then a barrier
    on [b]. Both change [a], so they stay in order (Ferrite's same-directory

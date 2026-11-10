@@ -286,7 +286,27 @@ module Model = struct
             | None -> true))
       e.halves
 
-  let land_half map = function
+  (* A node moved where the world has no directory waits in limbo, by a name
+     no path has, until a later rename brings it back. *)
+  let limbo id = "\000" ^ string_of_int id
+  let in_limbo p = String.length p > 0 && Char.equal p.[0] '\000'
+
+  let move_subtree map ~from ~at =
+    let below =
+      SM.fold
+        (fun k v acc ->
+          if at_or_under from k then
+            ( String.sub k (String.length from)
+                (String.length k - String.length from),
+              v )
+            :: acc
+          else acc)
+        map []
+    in
+    let map = remove_under at (remove_under from map) in
+    List.fold_left (fun map (suffix, v) -> SM.add (at ^ suffix) v map) map below
+
+  let land_half ~made map = function
     | Remove id -> (
         match path_of map id with
         | Some p when not (String.equal p "") -> remove_under p map
@@ -294,39 +314,42 @@ module Model = struct
     | Place { parent = pid; path; node } -> (
         match target map path pid with
         | None -> map
+        | Some _ when path_of map (id_of node) <> None -> map
         | Some at -> SM.add at node (remove_under at map))
     | Move { parent = pid; path; id } -> (
-        match (path_of map id, target map path pid) with
-        | Some from, Some at when String.equal from at -> map
-        | Some from, Some at when under from at -> remove_under from map
-        | Some from, None when not (String.equal from "") ->
-            remove_under from map
-        | Some from, Some at ->
-            let below =
-              SM.fold
-                (fun k v acc ->
-                  if at_or_under from k then
-                    ( String.sub k (String.length from)
-                        (String.length k - String.length from),
-                      v )
-                    :: acc
-                  else acc)
-                map []
-            in
-            let map = remove_under at (remove_under from map) in
-            List.fold_left
-              (fun map (suffix, v) -> SM.add (at ^ suffix) v map)
-              map below
-        | _ -> map)
+        let at =
+          match target map path pid with Some at -> at | None -> limbo id
+        in
+        match path_of map id with
+        | Some "" -> map
+        | Some from when String.equal from at -> map
+        | Some from ->
+            let at = if under from at then limbo id else at in
+            move_subtree map ~from ~at
+        | None -> (
+            match made id with
+            | Some node -> SM.add at node (remove_under at map)
+            | None -> map))
 
-  let replay map e =
-    if applies map e then List.fold_left land_half map e.halves else map
+  (* The shape the entry that made [id] gave it. *)
+  let made m id =
+    List.find_map
+      (fun e ->
+        List.find_map
+          (function
+            | Place { node; _ } when id_of node = id -> Some node | _ -> None)
+          e.halves)
+      m.journal
+
+  let replay m map e =
+    if applies map e then List.fold_left (land_half ~made:(made m)) map e.halves
+    else map
 
   (* The durable world: the snapshot with every committed entry, in program
      order. *)
   let durable m =
     List.fold_left
-      (fun map e -> if e.committed then replay map e else map)
+      (fun map e -> if e.committed then replay m map e else map)
       m.snapshot (List.rev m.journal)
 
   (* Log an operation: [halves] with the directories they change. *)
@@ -347,24 +370,10 @@ module Model = struct
     let pid = dir_id m.live (parent path) in
     log m [ (pid, Place { parent = pid; path; node = SM.find path m.live }) ]
 
-  (* The ids an entry makes, and those it moves or removes. *)
-  let nodes e =
-    List.filter_map
-      (function
-        | Place { node; _ } -> Some (id_of node) | Move _ | Remove _ -> None)
-      e.halves
-
-  let named e =
-    List.filter_map
-      (function Move { id; _ } | Remove id -> Some id | Place _ -> None)
-      e.halves
-
   (* The pending entries before [e] it needs: those that changed a
-     directory it changes, those that made a node it names, for an rmdir
-     those that changed the directory, and for a rename those that moved a
-     directory above where it lands. *)
+     directory it changes, for an rmdir those that changed the directory, and
+     for a rename those that moved a directory above where it lands. *)
   let deps m e =
-    let names = e.dirs @ named e in
     let removed =
       List.filter_map (function Remove id -> Some id | _ -> None) e.halves
     in
@@ -376,7 +385,6 @@ module Model = struct
                 (function
                   | Move { id; _ } -> List.mem id e.ancestors | _ -> false)
                 e'.halves
-           || List.exists (fun n -> List.mem n names) (nodes e')
            || List.exists (fun d -> List.mem d removed) e'.dirs))
       m.journal
 
@@ -396,7 +404,9 @@ module Model = struct
     let rec settle () =
       let d = durable m in
       let held id =
-        match path_of d id with Some p -> is_dir d p id | None -> false
+        match path_of d id with
+        | Some p -> is_dir d p id && not (in_limbo p)
+        | None -> false
       in
       let ready =
         List.filter
@@ -503,7 +513,8 @@ module Model = struct
 
   (* The exact post-crash tree under [Drop_unsynced]: committed shapes over
      per-file durable contents. *)
-  let expected m = image (durable m) m.durable_data
+  let expected m =
+    image (SM.filter (fun k _ -> not (in_limbo k)) (durable m)) m.durable_data
 
   (* The exact post-crash tree when every change survives: the live one. *)
   let live m = image m.live m.live_data

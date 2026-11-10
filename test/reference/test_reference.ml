@@ -224,7 +224,7 @@ let expected_unsound = 0
 (* What eio-fs never produces over [workloads] workloads, by class. A count
    that moves is a change of the crash model: say why. *)
 let expected_missing =
-  [ (Mode, 1283); (Prefix, 6438); (Ancestors, 0); (Other, 2) ]
+  [ (Mode, 1283); (Prefix, 6438); (Ancestors, 0); (Other, 0) ]
 
 let pp_missing =
   Fmt.(list ~sep:(any ", ") (fun ppf (c, n) -> pf ppf "%s %d" (class_name c) n))

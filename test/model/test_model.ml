@@ -849,8 +849,38 @@ let run_workload ?env ?(alice = false) ~mode ~seed ~len () =
           ino_of_id None
       in
       (* A file durable at the last snapshot and still live is in the image,
-         under some name: nothing that survived removed it. *)
-      let live_ids = List.map snd (model_files m.root) in
+         under some name: nothing that survived removed it, unless it now
+         lives below a directory made since, which a barrier may have moved
+         it into while that directory is not durable. *)
+      let committed_dirs =
+        let rec go pre d acc =
+          SM.fold
+            (fun n e acc ->
+              match e with
+              | D d ->
+                  let p = if pre = "" then n else pre ^ "/" ^ n in
+                  go p d (p :: acc)
+              | F _ | L _ -> acc)
+            d.ents acc
+        in
+        go "" (fst m.committed) []
+      in
+      let under_new_dir p =
+        let rec ups acc = function
+          | [] | [ _ ] -> acc
+          | x :: rest ->
+              let up = match acc with [] -> x | u :: _ -> u ^ "/" ^ x in
+              ups (up :: acc) rest
+        in
+        List.exists
+          (fun d -> not (List.mem d committed_dirs))
+          (ups [] (String.split_on_char '/' p))
+      in
+      let live_ids =
+        List.filter_map
+          (fun (p, id) -> if under_new_dir p then None else Some id)
+          (model_files m.root)
+      in
       List.iter
         (fun (_, id) ->
           if List.mem id live_ids then

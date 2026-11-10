@@ -2352,9 +2352,10 @@ let test_crash_inode_identity () =
 
 (* An entry takes effect whole, with the pending entries it needs, and a
    rename moves the image's own node: synced bytes follow their file to a
-   renamed directory, a durable file survives a rename into a new directory
-   or out of one later removed, and a moved directory carries only what
-   the image holds, with an earlier rename in the same source directory. *)
+   renamed directory, a durable file survives a rename out of a directory
+   later removed but is lost with a new directory whose parent was never
+   synced, and a moved directory carries only what the image holds, with an
+   earlier rename in the same source directory. *)
 let test_crash_entries_whole () =
   let run setup ops =
     let ctl = Crash.v () in
@@ -2401,8 +2402,7 @@ let test_crash_entries_whole () =
          Eio.Path.rename (fs / "P/A/B") (fs / "Q/C");
          Eio.Path.rmdir (fs / "P/A");
          Eio_fs_sync.sync_dir (fs / "P")));
-  check "a rename into a new directory"
-    [ "P/"; "Q/"; "Q/f=durable" ]
+  check "a rename into a new directory, its parent never synced" [ "P/" ]
     (run
        (fun raw ->
          dirs raw [ "P" ];
@@ -2568,6 +2568,24 @@ let test_crash_move_needs_ancestor_moves () =
     "image"
     [ "b/"; "b/m/"; "b/m/a/"; "b/m/f=0" ]
     image
+
+(* A synced file in a new directory, and a barrier on that directory: the
+   directory itself still needs a barrier on its parent. *)
+let test_crash_new_dir_needs_parent_barrier () =
+  let run ~parent =
+    Eio_mock.Backend.run @@ fun () ->
+    let raw = Eio_fs.Fs.v () in
+    let ctl = Crash.v () in
+    let fs = Crash.wrap ctl raw in
+    Eio.Path.mkdir ~perm:0o755 (fs / "d");
+    write_new ~sync:true (fs / "d/f") "x";
+    Eio_fs_sync.sync_dir (fs / "d");
+    if parent then Eio_fs_sync.sync_dir fs;
+    Eio.Path.is_file (Crash.post_crash ctl / "d/f")
+  in
+  Alcotest.(check (pair bool bool))
+    "without, then with the parent's barrier" (false, true)
+    (run ~parent:false, run ~parent:true)
 
 (* {2 The model's authority is the wrapper, not the descriptor}
 
@@ -2939,6 +2957,9 @@ let suite =
       Alcotest.test_case
         "crash: a rename needs the renames above where it lands" `Quick
         test_crash_move_needs_ancestor_moves;
+      Alcotest.test_case
+        "crash: a new directory is durable only by its parent's barrier" `Quick
+        test_crash_new_dir_needs_parent_barrier;
       Alcotest.test_case "crash: an unwrapped controller is refused" `Quick
         test_crash_unwrapped_refused;
       Alcotest.test_case "crash: unsynced write lost" `Quick
