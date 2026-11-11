@@ -3268,6 +3268,17 @@ let test_crash_sparse_write_lengths () =
     "lengths" [ 100; 10001 ]
     (List.sort_uniq Int.compare (List.map String.length i))
 
+(* A truncation zeroes the rest of its 4096-byte block, which the disk may
+   write before the new length, and sector by sector. *)
+let test_crash_truncation_zeroes_block () =
+  let i = sampled_images ~init:(String.make 4096 'a') [ `T 100 ] in
+  let zero k s = String.sub s (512 * k) 512 = String.make 512 '\000' in
+  Alcotest.(check bool)
+    "a sector past the cut zeroed, at the old length" true
+    (List.exists
+       (fun s -> String.length s = 4096 && zero 3 s && not (zero 5 s))
+       i)
+
 (* Two writes into one sector of bytes the file held: a sector is written
    whole, so the second never lands without the first. *)
 let test_crash_survive_keeps_a_sector () =
@@ -3783,6 +3794,8 @@ let suite =
         `Quick test_crash_truncation_then_reuse;
       Alcotest.test_case "crash: a sparse write's lengths" `Quick
         test_crash_sparse_write_lengths;
+      Alcotest.test_case "crash: a truncation zeroes the rest of its block"
+        `Quick test_crash_truncation_zeroes_block;
       Alcotest.test_case "crash: a sector's overwrites survive together" `Quick
         test_crash_survive_keeps_a_sector;
       Alcotest.test_case "crash: a page cut before a failure is not written"
