@@ -3260,6 +3260,14 @@ let test_crash_truncation_then_reuse () =
         Alcotest.fail "the old length does not hold the old bytes")
     i
 
+(* ext4 sets the length on disk as it writes back a page the write put bytes
+   in, not the pages of the hole before it. *)
+let test_crash_sparse_write_lengths () =
+  let i = sampled_images ~init:(String.make 100 'a') [ `W (10000, "b") ] in
+  Alcotest.(check (list int))
+    "lengths" [ 100; 10001 ]
+    (List.sort_uniq Int.compare (List.map String.length i))
+
 (* Two writes into one sector of bytes the file held: a sector is written
    whole, so the second never lands without the first. *)
 let test_crash_survive_keeps_a_sector () =
@@ -3773,6 +3781,8 @@ let suite =
         test_crash_choose_as_ext4;
       Alcotest.test_case "crash: no freed page reused before its truncation"
         `Quick test_crash_truncation_then_reuse;
+      Alcotest.test_case "crash: a sparse write's lengths" `Quick
+        test_crash_sparse_write_lengths;
       Alcotest.test_case "crash: a sector's overwrites survive together" `Quick
         test_crash_survive_keeps_a_sector;
       Alcotest.test_case "crash: a page cut before a failure is not written"
