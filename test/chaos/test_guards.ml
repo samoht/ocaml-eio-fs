@@ -244,25 +244,45 @@ let test_hang () =
                 | exception Eio.Io _ -> Eio.Fiber.await_cancel ()))))
 
 (* A program that retries a failed operation at once spins for ever on a
-   read-only filesystem. *)
+   read-only filesystem. Its own bound, well past the guard's, fails the
+   run instead of spinning for ever when the guard does not stop it. *)
 let test_livelock () =
   let report =
     Expect.report (fun () ->
         Eio_fs.Chaos.check (fun env ->
-            let rec save () =
+            let rec save n =
+              if n > 50_000 then failwith "the spin was not stopped";
               match
                 P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
               with
               | () -> ()
-              | exception Eio.Io _ -> save ()
+              | exception Eio.Io _ -> save (n + 1)
             in
-            save ()))
+            save 0))
   in
   Alcotest.(check string)
     "error"
-    "the run hangs: 10000 filesystem operations failed in a row while its \
+    "the run hangs: the same operation on /f failed 10003 times while its \
      clock stood still"
     (Expect.field "error" report)
+
+(* A batch job that logs a line per item and drops the lines a full disk
+   refuses: each line is a new write, not a retry. The replay runs the
+   scenario where the disk is full from the first line on. *)
+let test_busy_is_not_a_spin () =
+  Eio_fs.Chaos.check ~replay:"fs/00000000/from:write:/log#1.full" (fun env ->
+      let processed = ref 0 in
+      (try
+         P.with_open_out ~append:true ~create:(`If_missing 0o644)
+           P.(env#fs / "log")
+           (fun log ->
+             for i = 1 to 12_000 do
+               incr processed;
+               try Eio.Flow.copy_string (Fmt.str "item %d done\n" i) log
+               with Eio.Io _ -> ()
+             done)
+       with Eio.Io _ -> processed := 12_000);
+      if !processed <> 12_000 then failwith "the batch is incomplete")
 
 (* A workload that catches the cut's cancellation keeps going. *)
 let test_kept_going () =
@@ -386,6 +406,8 @@ let suite =
         `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
+      Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
+        test_busy_is_not_a_spin;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
         test_kept_going;
       Alcotest.test_case "a cut stops a supervisor that retries" `Quick
