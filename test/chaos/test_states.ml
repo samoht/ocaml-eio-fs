@@ -4,9 +4,7 @@ module P = Eio.Path
 
 (* A file [keep] setup made, so recover has something to check. *)
 let setup env = Eio_fs_sync.save P.(env#fs / "keep") "k"
-
-let keep env =
-  if P.load P.(env#fs / "keep") <> "k" then failwith "keep lost"
+let keep env = if P.load P.(env#fs / "keep") <> "k" then failwith "keep lost"
 
 (* A new file whose first sector is stale and whose others hold the write:
    the cut's first state drops the file, so its draws say little of how many

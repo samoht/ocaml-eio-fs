@@ -361,6 +361,36 @@ let next_choices trail =
   in
   go trail
 
+(* The tree of the draws the states met so far make: a node per draw, with
+   the choices it had, and below it the choices taken. *)
+module Draws = struct
+  type t = { mutable width : int; below : (int, t) Hashtbl.t }
+
+  let empty () = { width = 0; below = Hashtbl.create 2 }
+
+  let add t trail =
+    ignore
+      (List.fold_left
+         (fun node (c, n) ->
+           node.width <- n;
+           match Hashtbl.find_opt node.below c with
+           | Some next -> next
+           | None ->
+               let next = empty () in
+               Hashtbl.replace node.below c next;
+               next)
+         t (List.rev trail)
+        : t)
+
+  (* The states the tree allows at least: a choice not taken counts one. *)
+  let rec lower_bound t =
+    if t.width = 0 then 1
+    else
+      Hashtbl.fold
+        (fun _ next acc -> acc - 1 + lower_bound next)
+        t.below t.width
+end
+
 let rec trim = function
   | [] -> []
   | l -> ( match List.rev l with 0 :: r -> trim (List.rev r) | _ -> l)

@@ -618,8 +618,7 @@ module Crash = struct
     | Plan.Drop -> "every unsynced change lost"
     | Keep -> "every change kept, as after a process kill"
     | Enum _ as st ->
-        Fmt.str
-          "state %s of those the cut allows, every one of which the check tries"
+        Fmt.str "state %s of those the cut allows, tried one by one"
           (Plan.state_key st)
     | Seed _ as st ->
         Fmt.str
@@ -836,36 +835,31 @@ module Crash = struct
             (fun s -> thunks (Plan.rcuts s ~recover:(result s).rtrace))
             faults
         in
-        (* Every state each cut allows, enumerated while the first state's
-           draws say they are few, and drawn at random past that. Each cut
-           gets an even share of what is left. *)
+        (* Every state each cut allows, enumerated while the draws met so
+           far allow no more than the limit, and drawn at random past that.
+           Each cut gets an even share of what is left. *)
         let drops = List.filter (fun (s : Plan.crash) -> s.state = Drop) cuts in
         let states left =
           let rec loop left = function
             | [] -> ()
             | (s : Plan.crash) :: rest as cuts ->
                 let allowance = max 1 (left / List.length cuts) in
+                let limit = min allowance enum_limit in
+                let tree = Plan.Draws.empty () in
                 let r = attempt Sampled { s with state = Enum [] } in
+                Plan.Draws.add tree r.trail;
                 let spent = ref 1 in
-                let count =
-                  List.fold_left
-                    (fun acc (_, n) -> min 1_000_000 (acc * n))
-                    1 r.trail
+                let rec go = function
+                  | None -> true
+                  | Some _ when Plan.Draws.lower_bound tree > limit -> false
+                  | Some v ->
+                      incr spent;
+                      let r = attempt Sampled { s with state = Enum v } in
+                      Plan.Draws.add tree r.trail;
+                      go (Plan.next_choices r.trail)
                 in
-                if count <= min allowance enum_limit then begin
-                  let rec go = function
-                    | None -> ()
-                    | Some v ->
-                        if !spent < enum_limit then begin
-                          incr spent;
-                          let r = attempt Sampled { s with state = Enum v } in
-                          go (Plan.next_choices r.trail)
-                        end
-                  in
-                  go (Plan.next_choices r.trail)
-                end
-                else
-                  for seed = 0 to allowance - 2 do
+                if not (go (Plan.next_choices r.trail)) then
+                  for seed = 0 to allowance - !spent - 1 do
                     incr spent;
                     ignore (attempt Sampled { s with state = Seed seed })
                   done;

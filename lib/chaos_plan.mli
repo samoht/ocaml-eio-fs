@@ -154,6 +154,22 @@ val next_choices : (int * int) list -> int list option
     one whose draws, last first, are [trail], each with the number of choices it
     had; [None] after the last. *)
 
+(** The draws the states of a cut make. *)
+module Draws : sig
+  type t
+  (** The type for the tree of the draws met so far. *)
+
+  val empty : unit -> t
+  (** [empty ()] is a tree with no draw. *)
+
+  val add : t -> (int * int) list -> unit
+  (** [add t trail] adds the draws, last first, of one state. *)
+
+  val lower_bound : t -> int
+  (** [lower_bound t] is the number of states the draws met so far allow at
+      least: a choice not yet taken counts as one state. *)
+end
+
 val state_key : state -> string
 (** [state_key st] names [st] in a replay. *)
 
