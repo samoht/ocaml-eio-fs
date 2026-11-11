@@ -369,9 +369,11 @@ module Crash : sig
             as ext4 leaves them: one a change left, or a multiple of 4096 a
             write grew the file across. A block a write put bytes in, in a
             4096-byte page the disk did not hold, past the durable length or in
-            a hole, may also hold stale data, every byte ['7'], as ext4 may
-            commit the page before its bytes land. With 512-byte blocks, a
-            disk's sectors, that is ext4 with [data=writeback]. *)
+            a hole, may also hold stale data, as ext4 may commit the page before
+            its bytes land: the page at the same place that a durable truncation
+            of the file freed, or that a file the crash removed held, and else
+            every byte ['7']. With 512-byte blocks, a disk's sectors, that is
+            ext4 with [data=writeback]. *)
 
   (** The type for when a crash fires while the workload runs. *)
   type trigger =

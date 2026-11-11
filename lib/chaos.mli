@@ -124,11 +124,12 @@ val check :
     whole: it holds what the disk held, zeros where it held nothing, or what it
     held after one of the writes to it, so the writes to it land together. A
     sector a write put bytes in, in a 4096-byte page the disk held nothing of,
-    past the durable length or in a hole, may instead hold stale data, which the
-    check fills with the byte ['7']. Of the uncommitted directory changes, a
-    prefix survives. A failed sync loses the file's unsynced writes, as Linux
-    does, though some of their sectors may already be on disk; the page cache
-    may keep them or evict them. *)
+    past the durable length or in a hole, may instead hold stale data: what the
+    disk held there before, at the same place in a page a synced truncation of
+    the file freed, or in a file the cut removed, and else the byte ['7']. Of
+    the uncommitted directory changes, a prefix survives. A failed sync loses
+    the file's unsynced writes, as Linux does, though some of their sectors may
+    already be on disk; the page cache may keep them or evict them. *)
 module Crash : sig
   val check :
     ?budget:int ->
