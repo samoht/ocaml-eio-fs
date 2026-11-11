@@ -190,6 +190,19 @@ let test_nothing_acked () =
         ~recover:(fun ~acked:_ _ -> ()))
     ()
 
+(* A setup that makes only a directory: recover checks it. *)
+let test_setup_directory () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      P.mkdir ~perm:0o755 P.(env#fs / "objects");
+      Eio_fs_sync.sync_dir env#fs)
+    (fun ~ack:_ env ->
+      try P.save ~create:(`Exclusive 0o644) P.(env#fs / "objects" / "x") "x"
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      if P.kind ~follow:false P.(env#fs / "objects") <> `Directory then
+        failwith "objects lost")
+
 let test_empty_accepted () =
   Expect.refused
     "Eio_fs.Chaos.Crash.check: recover accepts an empty directory, though \
@@ -470,6 +483,8 @@ let suite =
         test_first_run_fails;
       Alcotest.test_case "nothing acked and nothing set up is refused" `Quick
         test_nothing_acked;
+      Alcotest.test_case "a setup that makes a directory makes something" `Quick
+        test_setup_directory;
       Alcotest.test_case "a recover that accepts nothing is refused" `Quick
         test_empty_accepted;
       Alcotest.test_case "a recover that accepts a reachable empty directory"
