@@ -285,6 +285,30 @@ let test_livelock () =
      clock stood still"
     (Expect.field "error" report)
 
+(* The same with a fresh temporary name for each try: each name fails
+   once, and the directory they are in spins. *)
+let test_livelock_fresh_names () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec save n =
+              if n > 50_000 then failwith "the spin was not stopped";
+              match
+                P.save ~create:(`Exclusive 0o644)
+                  P.(env#fs / Fmt.str "a.tmp.%d" n)
+                  "x"
+              with
+              | () -> ()
+              | exception Eio.Io _ -> save (n + 1)
+            in
+            save 0))
+  in
+  Alcotest.(check string)
+    "error"
+    "the run hangs: one kind of operation in / failed 10003 times while its \
+     clock stood still"
+    (Expect.field "error" report)
+
 (* A batch job that logs a line per item and drops the lines a full disk
    refuses: each line is a new write, not a retry. The replay runs the
    scenario where the disk is full from the first line on. *)
@@ -454,6 +478,8 @@ let suite =
       Alcotest.test_case "three tries do not outlast a lasting condition" `Quick
         test_three_tries_and_a_lasting_condition;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
+      Alcotest.test_case "a run that retries at once under fresh names hangs"
+        `Quick test_livelock_fresh_names;
       Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
         test_busy_is_not_a_spin;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
