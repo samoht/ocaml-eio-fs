@@ -62,9 +62,10 @@ let wrap f base =
 (* {1 Runs} *)
 
 (* A program that retries a failed operation at once, with no time passing,
-   spins for ever under a lasting condition. After this many failures in a
-   row while the clock stands still, the operation raises [Failure] instead,
-   and after twice as many it waits for ever. *)
+   spins for ever under a lasting condition. Once one operation on one path
+   has failed this many times more than three tries of each the first run
+   made, while the clock stands still, it raises [Failure] instead, and
+   after twice as many it waits for ever. *)
 let streak_limit = 10_000
 
 type outcome =
@@ -73,7 +74,7 @@ type outcome =
   | Deadlock
   | Time_limit
   | Kept_going
-  | Livelock
+  | Livelock of string * int
 
 let outcome_text = function
   | Passed -> "none"
@@ -84,11 +85,11 @@ let outcome_text = function
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"
-  | Livelock ->
+  | Livelock (path, n) ->
       Fmt.str
-        "the run hangs: %d filesystem operations failed in a row while its \
+        "the run hangs: the same operation on %s failed %d times while its \
          clock stood still"
-        streak_limit
+        path n
 
 (* A cut fails the run's switch with it, which cancels every fiber of the
    run. *)
@@ -207,32 +208,61 @@ let no_longer name ~hash (h, k) =
 
 let check_name = "Eio_fs.Chaos.check"
 
-(* Injected failures in a row while the run's clock stands still. *)
+(* An operation: its kind and the path it names. *)
+type target = Op.kind * string
+
+(* How often the first run made each operation. *)
+let made (trace : Plan.trace) =
+  let t = Hashtbl.create 16 in
+  List.iter
+    (fun (op : Op.t) -> Hashtbl.replace t (op.kind, op.path) op.nth)
+    trace;
+  t
+
+(* Injected failures of each operation while the run's clock stands still,
+   since its last attempt that met no fault. *)
 type streak = {
-  mutable n : int;
+  counts : (target, int) Hashtbl.t;
+  first : (target, int) Hashtbl.t;
   mutable at : float;
-  mutable hit : bool;
+  mutable hit : (string * int) option;
   mutable clock : float Eio.Time.clock_ty Eio.Resource.t option;
 }
 
-let streak () = { n = 0; at = neg_infinity; hit = false; clock = None }
+let streak first =
+  {
+    counts = Hashtbl.create 16;
+    first;
+    at = neg_infinity;
+    hit = None;
+    clock = None;
+  }
 
-let failed st =
+let failed st (op : Op.t) =
   let now = match st.clock with Some c -> Eio.Time.now c | None -> 0. in
   if now <> st.at then begin
     st.at <- now;
-    st.n <- 0
+    Hashtbl.reset st.counts
   end;
-  st.n <- st.n + 1;
-  if st.n >= streak_limit then begin
-    st.hit <- true;
-    if st.n >= 2 * streak_limit then park ();
-    failwith ("Eio_fs.Chaos: " ^ outcome_text Livelock)
+  let key = (op.kind, op.path) in
+  let n = 1 + Option.value ~default:0 (Hashtbl.find_opt st.counts key) in
+  Hashtbl.replace st.counts key n;
+  let limit =
+    streak_limit + (3 * Option.value ~default:0 (Hashtbl.find_opt st.first key))
+  in
+  if n >= limit then begin
+    st.hit <- Some (op.path, limit);
+    if n >= 2 * limit then park ();
+    failwith ("Eio_fs.Chaos: " ^ outcome_text (Livelock (op.path, limit)))
   end
 
-let exec_check ~setup run (s : Plan.check) =
+let met_no_fault st (op : Op.t) =
+  if Hashtbl.length st.counts > 0 then
+    Hashtbl.remove st.counts (op.kind, op.path)
+
+let exec_check ~first ~setup run (s : Plan.check) =
   let trace = ref [] and num = numberer () in
-  let pending = ref s.faults and on = ref false and st = streak () in
+  let pending = ref s.faults and on = ref false and st = streak first in
   let hook mop =
     let op = num mop in
     let fault =
@@ -257,9 +287,11 @@ let exec_check ~setup run (s : Plan.check) =
     trace := (op, Option.map fst fault) :: !trace;
     match fault with
     | Some (_, m) ->
-        failed st;
+        failed st op;
         Some m
-    | None -> None
+    | None ->
+        met_no_fault st op;
+        None
   in
   let outcome =
     match
@@ -275,21 +307,24 @@ let exec_check ~setup run (s : Plan.check) =
     | Ok o -> o
     | Error o -> o
   in
-  let outcome = if st.hit then Livelock else outcome in
+  let outcome =
+    match st.hit with Some (p, n) -> Livelock (p, n) | None -> outcome
+  in
   (List.rev !trace, outcome)
 
 let check ?budget ?replay ?(setup = ignore) run =
   let name = check_name in
   let budget = budget_of name budget in
   let replay = Option.map (parse_replay name) replay in
-  let exec s = exec_check ~setup run s in
-  let first, out = exec Plan.none in
+  let first, out = exec_check ~first:(Hashtbl.create 1) ~setup run Plan.none in
   if out <> Passed then
     fail name "the run with no fault failed: %s" (outcome_text out);
   let first = ops first in
   if first = [] then
     fail name "the workload makes no filesystem operation, so it tests nothing";
+  let exec s = exec_check ~first:(made first) ~setup run s in
   let again = ops (fst (exec Plan.none)) in
+
   if again <> first then
     fail name
       "two runs with no fault made different operations (%s); the workload \
