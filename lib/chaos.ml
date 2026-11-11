@@ -642,7 +642,14 @@ module Crash = struct
             Fmt.str "cut %s of recover, %s, then recover again" (cut_text j)
               (state_text st) );
       ("acked", Fmt.str "%d value(s)" (List.length r.acked));
-      ("lost", Fmt.str "%a" Fmt.(list ~sep:(any "; ") pp_unsynced) r.lost);
+      (* What the cut may have lost: all of it, none of it, or some. *)
+      (let changes =
+         Fmt.str "%a" Fmt.(list ~sep:(any "; ") pp_unsynced) r.lost
+       in
+       match s.state with
+       | Drop -> ("lost", changes)
+       | Keep -> ("lost", "")
+       | Enum _ | Seed _ -> ("unsynced", changes));
     ]
 
   let check ?budget ?replay ?(setup = ignore) run ~recover =
