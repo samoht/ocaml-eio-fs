@@ -40,11 +40,11 @@ let suite =
         (Expect.caught ~tier:"linear" (Conf.test ~bug:`Delete_first));
       Alcotest.test_case "config: no switch sync, by the linear tier" `Quick
         (Expect.caught ~tier:"linear" (Conf.test ~bug:`No_switch_sync));
-      Alcotest.test_case "an idempotent step needs no ack" `Quick
-        (Expect.refused
-           "Eio_fs.Chaos.Crash.check: recover accepts the directory as setup \
-            left it"
-           Probe.guard_idempotent);
+      Alcotest.test_case "an idempotent step: correct" `Quick
+        (Expect.passes (fun () -> Probe.guard_idempotent ()));
+      Alcotest.test_case "an idempotent step in place, by the sampled tier"
+        `Quick
+        (Expect.caught ~tier:"sampled" (Probe.guard_idempotent ~bug:`In_place));
       Alcotest.test_case "a sector holds two writes together" `Quick
         (Expect.passes Probe.sector);
       Alcotest.test_case "toctou: the check does not swap links" `Quick

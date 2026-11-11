@@ -11,7 +11,9 @@ let test_a ?replay ~save () =
       | "new", _ | "old", [] -> ()
       | v, _ -> Fmt.failwith "config is %S" v)
 
-(* A recover that ignores [acked]: the check must refuse it. *)
+(* A recover that ignores [acked]: it checks that the config is whole, not
+   that it is durable, and the check cannot tell it from one whose
+   acknowledged values hold after setup. *)
 let test_a_weak ~save () =
   Eio_fs.Chaos.Crash.check
     ~setup:(fun env -> save env#fs "old")

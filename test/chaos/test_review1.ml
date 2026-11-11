@@ -5,10 +5,8 @@ let suite =
     [
       Alcotest.test_case "kv: correct" `Quick
         (Expect.passes (fun () -> After.test_kv ()));
-      Alcotest.test_case "kv-reopen: an acked recovery is refused" `Quick
-        (Expect.refused
-           "Eio_fs.Chaos.Crash.check: recover accepts the directory as setup \
-            left it" (fun () -> kv_reopen ()));
+      Alcotest.test_case "kv-reopen: correct, its ack checks nothing" `Quick
+        (Expect.passes (fun () -> kv_reopen ()));
       Alcotest.test_case "kv-reopen2: correct" `Quick
         (Expect.passes (fun () -> kv_reopen2 ()));
       Alcotest.test_case

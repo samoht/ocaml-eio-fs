@@ -1,13 +1,20 @@
 module P = Eio.Path
 
 (* Guard: a convergent "apply this config" step whose value setup already
-   holds. *)
-let guard_idempotent () =
+   holds. With [`In_place], it rewrites the file in place. *)
+let guard_idempotent ?bug () =
   Eio_fs.Chaos.Crash.check
     ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "conf") "v1")
     (fun ~ack env ->
       try
-        Eio_fs_sync.save P.(env#fs / "conf") "v1";
+        (match bug with
+        | None -> Eio_fs_sync.save P.(env#fs / "conf") "v1"
+        | Some `In_place ->
+            P.with_open_out ~create:(`Or_truncate 0o644)
+              P.(env#fs / "conf")
+              (fun f ->
+                Eio.Flow.copy_string "v1" f;
+                Eio.File.sync f));
         ack "v1"
       with Eio.Io _ -> ())
     ~recover:(fun ~acked env ->

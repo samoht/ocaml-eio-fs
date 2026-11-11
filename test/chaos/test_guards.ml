@@ -179,16 +179,29 @@ let test_first_run_fails () =
     (fun () -> Eio_fs.Chaos.check (fun env -> ignore (P.load P.(env#fs / "f"))))
     ()
 
-let test_nothing_acked () =
-  Expect.refused
-    "Eio_fs.Chaos.Crash.check: the first run acknowledges nothing and setup \
-     makes nothing"
+let reads_nothing =
+  "Eio_fs.Chaos.Crash.check: recover makes no filesystem operation"
+
+let test_reads_nothing () =
+  Expect.refused reads_nothing
     (fun () ->
       Eio_fs.Chaos.Crash.check
-        (fun ~ack:_ env ->
-          P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "x")
+        (fun ~ack env ->
+          P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "x";
+          ack ())
         ~recover:(fun ~acked:_ _ -> ()))
     ()
+
+(* With no ack and no setup, recover still checks what the workload made is
+   whole. *)
+let test_nothing_acked () =
+  Eio_fs.Chaos.Crash.check
+    (fun ~ack:_ env ->
+      try Eio_fs_sync.save P.(env#fs / "f") "x" with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      match P.load P.(env#fs / "f") with
+      | "x" | (exception Eio.Io _) -> ()
+      | v -> Fmt.failwith "f is %S" v)
 
 (* A setup that makes only a directory: recover checks it. *)
 let test_setup_directory () =
@@ -203,19 +216,32 @@ let test_setup_directory () =
       if P.kind ~follow:false P.(env#fs / "objects") <> `Directory then
         failwith "objects lost")
 
-let test_empty_accepted () =
-  Expect.refused
-    "Eio_fs.Chaos.Crash.check: recover accepts an empty directory, though \
-     setup made files"
-    (fun () ->
-      Eio_fs.Chaos.Crash.check
-        ~setup:(fun env ->
-          P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "x")
-        (fun ~ack:_ env ->
-          try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "y"
-          with Eio.Io _ -> ())
-        ~recover:(fun ~acked:_ _ -> ()))
-    ()
+(* A log setup made, which recover reads as empty when it is missing: a
+   correct recover that accepts an empty directory. *)
+let lenient_log ?(sync = true) () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "log") "")
+    (fun ~ack env ->
+      try
+        P.with_open_out ~append:true ~create:`Never P.(env#fs / "log")
+        @@ fun f ->
+        Eio.Flow.copy_string "r1\n" f;
+        if sync then Eio.File.sync f;
+        ack "r1"
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      let log = try P.load P.(env#fs / "log") with Eio.Io _ -> "" in
+      let lines = String.split_on_char '\n' log in
+      List.iter
+        (fun r -> if not (List.mem r lines) then Fmt.failwith "%s lost" r)
+        acked)
+
+let test_empty_accepted () = lenient_log ()
+
+let test_guard_hides_nothing () =
+  let m = Expect.report (fun () -> lenient_log ~sync:false ()) in
+  Alcotest.(check string)
+    "error" "Failure(\"r1 lost\")" (Expect.field "error" m)
 
 (* A cache that evicts the entry setup made before it inserts another: a cut
    may leave the directory empty, so recover must accept that. *)
@@ -481,12 +507,16 @@ let suite =
         test_nondeterministic;
       Alcotest.test_case "a first run that fails is refused" `Quick
         test_first_run_fails;
-      Alcotest.test_case "nothing acked and nothing set up is refused" `Quick
+      Alcotest.test_case "a recover that reads nothing is refused" `Quick
+        test_reads_nothing;
+      Alcotest.test_case "nothing acked and nothing set up" `Quick
         test_nothing_acked;
       Alcotest.test_case "a setup that makes a directory makes something" `Quick
         test_setup_directory;
-      Alcotest.test_case "a recover that accepts nothing is refused" `Quick
+      Alcotest.test_case "a recover that reads a missing log as empty" `Quick
         test_empty_accepted;
+      Alcotest.test_case "a failure comes before a guard" `Quick
+        test_guard_hides_nothing;
       Alcotest.test_case "a recover that accepts a reachable empty directory"
         `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;

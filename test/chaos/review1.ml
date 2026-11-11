@@ -17,8 +17,9 @@ let check_first env =
     first;
   db
 
-(* A recovery that compacts what setup left, acknowledged: the check refuses
-   it, as every acknowledged value already holds after setup. *)
+(* A recovery that compacts what setup left, acknowledged: every
+   acknowledged value already holds after setup, which the check cannot tell
+   from a recover that ignores [acked]. *)
 let kv_reopen ?bug () =
   Eio_fs.Chaos.Crash.check ~setup:setup_store
     (fun ~ack env ->

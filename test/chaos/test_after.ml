@@ -9,11 +9,9 @@ let suite =
   ( "after",
     [
       Alcotest.test_case "save: correct" `Quick (Expect.passes (test_a ~save));
-      Alcotest.test_case "save: a recover that ignores acked is refused" `Quick
-        (Expect.refused
-           "Eio_fs.Chaos.Crash.check: recover accepts the directory as setup \
-            left it"
-           (test_a_weak ~save));
+      Alcotest.test_case "save: a recover that ignores acked checks the rest"
+        `Quick
+        (Expect.passes (test_a_weak ~save));
       Alcotest.test_case "save: no file sync, by the linear tier" `Quick
         (Expect.caught ~tier:"linear"
            (test_a ~save:(App.save_config ~bug:`No_file_sync)));
