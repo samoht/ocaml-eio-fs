@@ -3208,6 +3208,58 @@ let test_crash_choose_as_ext4 () =
     "an overwrite" [ "pXYs"; "pqrs" ]
     (chosen_images ~init:"pqrs" [ (1, "XY") ])
 
+(* The images [Choose] draws at random for [steps] over a durable [init],
+   each a write or a truncation, with no sync. *)
+let sampled_images ~init steps =
+  let rng = Random.State.make [| 42 |] in
+  let seen = Hashtbl.create 64 in
+  for _ = 1 to 400 do
+    let ctl =
+      Crash.v
+        ~policy:(Choose (fun n -> Random.State.int rng n))
+        ~block_size:512 ()
+    in
+    let image =
+      with_crash ctl @@ fun ~raw:_ ~fs ->
+      write_new ~sync:true (fs / "f") init;
+      Eio_fs_sync.sync_dir fs;
+      Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+          List.iter
+            (function
+              | `W (o, d) ->
+                  Eio.File.pwrite_all f ~file_offset:(i63 o)
+                    [ Cstruct.of_string d ]
+              | `T n -> Eio.File.truncate f (i63 n))
+            steps);
+      Eio.Path.load (Crash.post_crash ctl / "f")
+    in
+    Hashtbl.replace seen image ()
+  done;
+  List.of_seq (Hashtbl.to_seq_keys seen)
+
+(* A truncation frees the pages past it only once it commits: at the length
+   before it, those pages hold their old bytes, whatever a later write put
+   in the blocks they get. *)
+let test_crash_truncation_then_reuse () =
+  let i =
+    sampled_images ~init:(String.make 8192 'a') [ `T 100; `W (5000, "b") ]
+  in
+  List.iter
+    (fun s ->
+      if
+        String.length s = 8192 && String.sub s 4096 4096 <> String.make 4096 'a'
+      then Alcotest.fail "page 1 does not hold its old bytes")
+    i;
+  let i =
+    sampled_images ~init:(String.make 600 'a')
+      [ `T 0; `W (0, String.make 100 'b') ]
+  in
+  List.iter
+    (fun s ->
+      if String.length s = 600 && s <> String.make 600 'a' then
+        Alcotest.fail "the old length does not hold the old bytes")
+    i
+
 (* Two writes into one sector of bytes the file held: a sector is written
    whole, so the second never lands without the first. *)
 let test_crash_survive_keeps_a_sector () =
@@ -3719,6 +3771,8 @@ let suite =
         `Quick test_crash_each_failure_may_land;
       Alcotest.test_case "crash: lengths and sectors as ext4 leaves them" `Quick
         test_crash_choose_as_ext4;
+      Alcotest.test_case "crash: no freed page reused before its truncation"
+        `Quick test_crash_truncation_then_reuse;
       Alcotest.test_case "crash: a sector's overwrites survive together" `Quick
         test_crash_survive_keeps_a_sector;
       Alcotest.test_case "crash: a page cut before a failure is not written"
