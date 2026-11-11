@@ -22,6 +22,29 @@ let stale_head () =
       | s when s = bad -> failwith "stale head"
       | _ | (exception Eio.Io _) -> ())
 
+(* A log reset by a synced truncation, acknowledged, then a new frame with
+   no sync: the page the frame lands in may hold the old frame the truncation
+   freed, which a log with no checksum replays. *)
+let frame c = "rec:" ^ String.make 508 c
+
+let old_frame () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save P.(env#fs / "wal") (frame 'A'))
+    (fun ~ack env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "wal") @@ fun f ->
+        Eio.File.truncate f Optint.Int63.zero;
+        Eio.File.sync f;
+        ack ();
+        Eio.Flow.copy_string (frame 'B') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      keep env;
+      if acked <> [] && P.load P.(env#fs / "wal") = frame 'A' then
+        failwith "an old frame replayed")
+
 let suite =
   ( "states",
     [
@@ -30,4 +53,10 @@ let suite =
           let m = Expect.report stale_head in
           Alcotest.(check string)
             "error" "Failure(\"stale head\")" (Expect.field "error" m));
+      Alcotest.test_case "a fresh sector may hold what a truncation freed"
+        `Quick (fun () ->
+          let m = Expect.report old_frame in
+          Alcotest.(check string)
+            "error" "Failure(\"an old frame replayed\")"
+            (Expect.field "error" m));
     ] )
