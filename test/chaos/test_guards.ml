@@ -356,6 +356,33 @@ let test_cut_stops_supervisor () =
       | v, a :: _ when v < a -> Fmt.failwith "config is %s, acked %s" v a
       | _ -> ())
 
+(* A failure where every change was kept, as after a process kill: its
+   report names no change as lost. *)
+let test_kept_loses_nothing () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.Crash.check
+          (fun ~ack env ->
+            P.with_open_out ~create:(`Exclusive 0o644)
+              P.(env#fs / "f")
+              (fun f ->
+                Eio.Flow.copy_string "half" f;
+                Eio.Flow.copy_string "-whole" f;
+                Eio.File.sync f);
+            Eio_fs_sync.sync_dir env#fs;
+            ack ())
+          ~recover:(fun ~acked env ->
+            match P.load P.(env#fs / "f") with
+            | "" | "half-whole" -> ()
+            | v -> Fmt.failwith "f is %S" v
+            | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+                if acked <> [] then failwith "f is lost"))
+  in
+  Alcotest.(check string)
+    "cut" "before write /f #2, every change kept, as after a process kill"
+    (Expect.field "cut" report);
+  Alcotest.(check string) "lost" "" (Expect.field "lost" report)
+
 (* A recovery that does not sync what it repairs: a second cut during it
    loses the repair. *)
 let test_cut_in_recover () =
@@ -433,6 +460,8 @@ let suite =
         test_kept_going;
       Alcotest.test_case "a cut stops a supervisor that retries" `Quick
         test_cut_stops_supervisor;
+      Alcotest.test_case "a kept state loses nothing" `Quick
+        test_kept_loses_nothing;
       Alcotest.test_case "a cut during recover" `Quick test_cut_in_recover;
       Alcotest.test_case "a check inside another loop" `Quick test_nested;
     ] )
