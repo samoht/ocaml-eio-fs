@@ -118,11 +118,13 @@ type t = {
   clock : Mono.Impl.t;
   limit : Mtime.t;
   mutable past_limit : bool;
+  idle : unit -> bool;
 }
 
 let rec schedule t : exit =
   match Lf_queue.pop t.run_q with
   | Some f -> f ()
+  | None when t.idle () -> schedule t
   | None -> (
       match Mono.Impl.try_advance t.clock ~limit:t.limit with
       | `Advanced -> schedule t
@@ -131,7 +133,7 @@ let rec schedule t : exit =
           t.past_limit <- true;
           `Exit_scheduler)
 
-let run ~limit main =
+let run ?(idle = fun () -> false) ~limit main =
   let clock = { Mono.Impl.now = Mtime.of_uint64_ns 0L; q = Mono.Q.empty } in
   let wall : float Eio.Time.clock_ty Eio.Resource.t =
     Eio.Resource.T (clock, wall_handler)
@@ -145,6 +147,7 @@ let run ~limit main =
       clock;
       limit = Wall.wall_to_mtime limit;
       past_limit = false;
+      idle;
     }
   in
   let rec fork ~new_fiber:fiber fn =

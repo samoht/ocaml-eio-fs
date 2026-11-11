@@ -101,8 +101,8 @@ let env_of clock mono (d : _ Eio.Path.t) : env =
     method mono_clock = mono
   end
 
-let in_loop main =
-  match Quiet_mock.run ~limit:3600. main with
+let in_loop ?idle main =
+  match Quiet_mock.run ?idle ~limit:3600. main with
   | v -> Ok v
   | exception Quiet_mock.Deadlock_detected -> Error Deadlock
   | exception Quiet_mock.Time_limit -> Error Time_limit
@@ -439,21 +439,22 @@ module Crash = struct
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
      outcome, and the unsynced changes the cut lost. *)
-  let phase ~kept_going ~trace ~ctl ~faults ~cut fs f =
+  let phase ~kept_going ~trace ~ctl ~faults ~cut ~stop fs f =
     let num = numberer () and pending = ref faults in
-    let after = ref 0 and lost = ref [] in
+    let after = ref 0 and lost = ref [] and run_sw = ref None in
     let hook mop =
       let op = num mop in
       if not (M.Crash.is_crashed ctl) then
         begin match cut with
         | Some p when Plan.at p op ->
             lost := M.Crash.unsynced ctl;
-            M.Crash.crash ctl
+            M.Crash.crash ctl;
+            stop := !run_sw
         | _ -> ()
         end;
       if M.Crash.is_crashed ctl then begin
         (* The operation the cut falls before, and every one after, is
-           cancelled. The context is left as it is, so a run that catches
+           cancelled; once every fiber waits, so is the run. One that catches
            the cancellation still reaches this hook, and is stopped. *)
         incr after;
         if !after > 1000 then begin
@@ -474,9 +475,17 @@ module Crash = struct
     in
     let wrapped = M.wrap (M.Schedule.hook hook) fs in
     let outcome =
-      match f wrapped with
-      | () -> Passed
-      | exception _ when M.Crash.is_crashed ctl -> Passed
+      match
+        Eio.Switch.run (fun sw ->
+            run_sw := Some sw;
+            f wrapped)
+      with
+      | () ->
+          stop := None;
+          Passed
+      | exception _ when M.Crash.is_crashed ctl ->
+          stop := None;
+          Passed
       | exception x -> Raised x
     in
     let outcome = if !kept_going then Kept_going else outcome in
@@ -488,9 +497,21 @@ module Crash = struct
     let lost = ref [] in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
+    (* A cut stops the run, as nothing runs after a power cut: once every
+       fiber waits, the phase's switch fails, so a fiber that waits on a
+       timer or another fiber stops too. *)
+    let stop = ref None in
+    let idle () =
+      match !stop with
+      | Some sw ->
+          stop := None;
+          Eio.Switch.fail sw Cut;
+          true
+      | None -> false
+    in
     let error =
       match
-        in_loop @@ fun clock mono ->
+        in_loop ~idle @@ fun clock mono ->
         let base = fresh () in
         setup (env_of clock mono base);
         let ctl =
@@ -498,8 +519,8 @@ module Crash = struct
         in
         let fs = M.Crash.wrap ctl base in
         let out, l =
-          phase ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut fs
-            (fun fs ->
+          phase ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
+            ~stop fs (fun fs ->
               run
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then acked := v :: !acked)
@@ -525,7 +546,8 @@ module Crash = struct
             recovering := true;
             let rout, _ =
               phase ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
-                ~cut:rcut rfs (fun fs -> recover ~acked (env_of clock mono fs))
+                ~cut:rcut ~stop rfs (fun fs ->
+                  recover ~acked (env_of clock mono fs))
             in
             match (rout, s.rcut) with
             | Passed, None -> None

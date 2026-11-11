@@ -157,10 +157,11 @@ module Crash : sig
 
       A run passes if [run] returns and [recover] accepts the state. A cut
       raises [Eio.Cancel.Cancelled] from the operation it falls before, and from
-      every one after, as in a cancelled fiber, so neither [run] nor [recover]
-      may catch it: one that makes 1000 more operations after the cut fails as a
-      hang. Any other exception that escapes [run] before the cut fails the
-      check, an injected [Eio.Io] included.
+      every one after, as in a cancelled fiber, and once every fiber waits it
+      cancels them all, as nothing runs after a power cut. Neither [run] nor
+      [recover] may catch it: one that makes 1000 more operations after the cut
+      fails as a hang. Any other exception that escapes [run] before the cut
+      fails the check, an injected [Eio.Io] included.
 
       Three guards fail the check, each saying what to change: a first run that
       acknowledges nothing after a [setup] that made nothing; a [recover] that

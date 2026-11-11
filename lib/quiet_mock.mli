@@ -11,15 +11,17 @@ exception Time_limit
     limit. *)
 
 val run :
+  ?idle:(unit -> bool) ->
   limit:float ->
   (float Eio.Time.clock_ty Eio.Resource.t ->
   Eio.Time.Mono.ty Eio.Resource.t ->
   'a) ->
   'a
-(** [run ~limit main] calls [main clock mono_clock] in a fresh event loop whose
-    clocks start at [0.] and move only when every fiber waits, to the next
-    timer, up to [limit] seconds. It returns what [main] returns, and raises
-    what [main] raises.
+(** [run ~idle ~limit main] calls [main clock mono_clock] in a fresh event loop
+    whose clocks start at [0.] and move only when every fiber waits, to the next
+    timer, up to [limit] seconds. When every fiber waits, [idle ()] runs first
+    (defaults to doing nothing); if it is [true], it woke a fiber, and the clock
+    stays. It returns what [main] returns, and raises what [main] raises.
 
     @raise Deadlock_detected if every fiber waits and no timer is due.
     @raise Time_limit
