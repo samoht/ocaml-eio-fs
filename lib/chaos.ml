@@ -490,7 +490,6 @@ module Crash = struct
     acked : 'a list;
     lost : unsynced list;
     trail : (int * int) list;
-    empty : bool; (* The cut left the directory empty. *)
     error : error option;
   }
 
@@ -556,7 +555,6 @@ module Crash = struct
     let acked = ref [] and trace = ref [] and rtrace = ref [] in
     let lost = ref [] in
     let kept_run = ref false and kept_recover = ref false in
-    let empty = ref false in
     let recovering = ref false in
     (* A cut stops the run, as nothing runs after a power cut: once every
        fiber waits, the phase's switch fails, so a fiber that waits on a
@@ -592,7 +590,6 @@ module Crash = struct
           M.Crash.crash ctl
         end
         else lost := l;
-        empty := Eio.Path.read_dir (M.Crash.post_crash ctl) = [];
         let acked = List.rev !acked in
         match out with
         | Passed -> (
@@ -634,7 +631,6 @@ module Crash = struct
       acked = List.rev !acked;
       lost = !lost;
       trail = !trail;
-      empty = !empty;
       error;
     }
 
@@ -695,59 +691,24 @@ module Crash = struct
          must be deterministic"
         (diverge first_ops again);
     let hash = digest first_ops in
-    (* Guards. *)
-    let sizes, setup_made =
+    let sizes =
       match
         in_loop (fun clock mono ->
             let d = fresh () in
             setup (env_of clock mono d);
-            (files d, Eio.Path.read_dir d <> []))
+            files d)
       with
       | Ok l -> l
       | Error o -> fail name "setup failed: %s" (outcome_text o)
     in
-    if first.acked = [] && not setup_made then
-      fail name
-        "the first run acknowledges nothing and setup makes nothing, so \
-         recover can check nothing. Call [ack v] in the workload once its \
-         program promises that [v] is durable.";
-    let refuses f =
-      match
-        in_loop (fun clock mono ->
-            match f clock mono with () -> false | exception _ -> true)
-      with
-      | Ok refused -> refused
-      | Error _ -> true
-    in
-    if
-      first.acked <> []
-      && not
-           (refuses (fun clock mono ->
-                let d = fresh () in
-                setup (env_of clock mono d);
-                recover ~acked:first.acked (env_of clock mono d)))
-    then
-      fail name
-        "recover accepts the directory as setup left it, told that the first \
-         run acknowledged %d value(s). Either recover does not look at \
-         [acked], or every acknowledged value already holds after setup; then \
-         drop the ack."
-        (List.length first.acked);
-    (* A recover that accepts an empty directory checks nothing of what
-       setup made, unless a cut can leave the directory empty. *)
-    let accepts_empty =
-      setup_made
-      && not
-           (refuses (fun clock mono ->
-                recover ~acked:[] (env_of clock mono (fresh ()))))
-    in
-    let reached_empty = ref false in
+    (* Whether recover looked at the directory in some run. *)
+    let reads = ref (first.rtrace <> []) in
     let tears = Plan.tears ~sizes first_ops in
     let runs = ref 0 and results = Hashtbl.create 64 in
     let attempt ?matched tier s =
       incr runs;
       let r = exec s in
-      if r.empty then reached_empty := true;
+      if r.rtrace <> [] then reads := true;
       Hashtbl.replace results (Plan.crash_key s) r;
       (match r.error with
       | None -> ()
@@ -898,10 +859,10 @@ module Crash = struct
           (fun c -> List.iter (fun run -> run ()) (Plan.spread share c))
           classes;
         states (total - (!runs - before));
-        if accepts_empty && not !reached_empty then
+        if not !reads then
           fail name
-            "recover accepts an empty directory, though setup made files and \
-             no cut leaves the directory empty: check in recover what setup \
+            "recover makes no filesystem operation in any run, so it checks \
+             nothing a cut leaves: read in recover what setup and the workload \
              made."
 end
 

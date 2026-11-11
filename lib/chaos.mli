@@ -172,15 +172,14 @@ module Crash : sig
       fails as a hang. Any other exception that escapes [run] before the cut
       fails the check, an injected [Eio.Io] included.
 
-      Three guards fail the check, each saying what to change: a first run that
-      acknowledges nothing after a [setup] that made nothing; a [recover] that
-      accepts the directory as [setup] left it, told the values the first run
-      acknowledged, which means it ignores [acked], or every acknowledged value
-      already holds after [setup] and the ack should go; and a [recover] that
-      accepts an empty directory when [setup] made files and no cut the check
-      tries leaves the directory empty. Two first runs that
-
-      make different operations fail it too.
+      Two first runs that make different operations fail the check before any
+      scenario runs. Once every scenario has passed, a [recover] that made no
+      filesystem operation in any run fails it: it sees nothing a cut leaves.
+      The check refuses no other [recover], as it cannot without failing correct
+      ones: one that accepts the directory as [setup] left it, told the values
+      the first run acknowledged, may hold them already there, and one that
+      accepts an empty directory may read a missing file as empty. A [recover]
+      that ignores [acked] passes, and misses what a cut loses.
 
       [budget] (defaults to [20_000]) bounds the runs. [replay] runs only the
       scenario a failure named.
