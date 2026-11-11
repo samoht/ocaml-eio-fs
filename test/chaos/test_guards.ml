@@ -204,6 +204,30 @@ let test_empty_accepted () =
         ~recover:(fun ~acked:_ _ -> ()))
     ()
 
+(* A cache that evicts the entry setup made before it inserts another: a cut
+   may leave the directory empty, so recover must accept that. *)
+let test_empty_reachable () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> P.save ~create:(`Exclusive 0o644) P.(env#fs / "k1") "v$")
+    (fun ~ack:_ env ->
+      try
+        P.unlink P.(env#fs / "k1");
+        P.with_open_out ~create:(`Exclusive 0o644)
+          P.(env#fs / "k2.tmp")
+          (fun f ->
+            Eio.Flow.copy_string "w$" f;
+            Eio.File.sync f);
+        P.rename P.(env#fs / "k2.tmp") P.(env#fs / "k2")
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      List.iter
+        (fun n ->
+          if not (Filename.check_suffix n ".tmp") then
+            let v = P.load P.(env#fs / n) in
+            if not (String.ends_with ~suffix:"$" v) then
+              Fmt.failwith "entry %s is %S" n v)
+        (P.read_dir env#fs))
+
 (* A program that waits for good on an error: every fiber waits, and no
    timer is due. *)
 let test_hang () =
@@ -358,6 +382,8 @@ let suite =
         test_nothing_acked;
       Alcotest.test_case "a recover that accepts nothing is refused" `Quick
         test_empty_accepted;
+      Alcotest.test_case "a recover that accepts a reachable empty directory"
+        `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
