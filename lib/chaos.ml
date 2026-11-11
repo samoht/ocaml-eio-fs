@@ -62,9 +62,10 @@ let wrap f base =
 (* {1 Runs} *)
 
 (* A program that retries a failed operation at once, with no time passing,
-   spins for ever under a lasting condition. Once one operation on one path
-   has failed this many times more than three tries of each the first run
-   made, while the clock stands still, it raises [Failure] instead, and
+   spins for ever under a lasting condition. Once one operation on one path,
+   or one kind of operation in one directory, as a retry under a fresh name
+   makes, has failed this many times more than three tries of each the first
+   run made, while the clock stands still, it raises [Failure] instead, and
    after twice as many it waits for ever. *)
 let streak_limit = 10_000
 
@@ -74,7 +75,7 @@ type outcome =
   | Deadlock
   | Time_limit
   | Kept_going
-  | Livelock of string * int
+  | Livelock of [ `Path | `Dir ] * string * int
 
 let outcome_text = function
   | Passed -> "none"
@@ -85,11 +86,16 @@ let outcome_text = function
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"
-  | Livelock (path, n) ->
+  | Livelock (`Path, path, n) ->
       Fmt.str
         "the run hangs: the same operation on %s failed %d times while its \
          clock stood still"
         path n
+  | Livelock (`Dir, dir, n) ->
+      Fmt.str
+        "the run hangs: one kind of operation in %s failed %d times while its \
+         clock stood still"
+        dir n
 
 (* A cut fails the run's switch with it, which cancels every fiber of the
    run. *)
@@ -208,14 +214,29 @@ let no_longer name ~hash (h, k) =
 
 let check_name = "Eio_fs.Chaos.check"
 
-(* An operation: its kind and the path it names. *)
-type target = Op.kind * string
+(* An operation: its kind and the path it names, or the directory that
+   path is in. *)
+type target = Op.kind * [ `Path | `Dir ] * string
+
+let parent path =
+  match String.rindex_opt path '/' with
+  | Some 0 -> "/"
+  | Some i -> String.sub path 0 i
+  | None -> "."
+
+let targets (op : Op.t) =
+  [ (op.kind, `Path, op.path); (op.kind, `Dir, parent op.path) ]
 
 (* How often the first run made each operation. *)
 let made (trace : Plan.trace) =
   let t = Hashtbl.create 16 in
   List.iter
-    (fun (op : Op.t) -> Hashtbl.replace t (op.kind, op.path) op.nth)
+    (fun op ->
+      List.iter
+        (fun k ->
+          Hashtbl.replace t k
+            (1 + Option.value ~default:0 (Hashtbl.find_opt t k)))
+        (targets op))
     trace;
   t
 
@@ -225,7 +246,7 @@ type streak = {
   counts : (target, int) Hashtbl.t;
   first : (target, int) Hashtbl.t;
   mutable at : float;
-  mutable hit : (string * int) option;
+  mutable hit : ([ `Path | `Dir ] * string * int) option;
   mutable clock : float Eio.Time.clock_ty Eio.Resource.t option;
 }
 
@@ -244,21 +265,24 @@ let failed st (op : Op.t) =
     st.at <- now;
     Hashtbl.reset st.counts
   end;
-  let key = (op.kind, op.path) in
-  let n = 1 + Option.value ~default:0 (Hashtbl.find_opt st.counts key) in
-  Hashtbl.replace st.counts key n;
-  let limit =
-    streak_limit + (3 * Option.value ~default:0 (Hashtbl.find_opt st.first key))
-  in
-  if n >= limit then begin
-    st.hit <- Some (op.path, limit);
-    if n >= 2 * limit then park ();
-    failwith ("Eio_fs.Chaos: " ^ outcome_text (Livelock (op.path, limit)))
-  end
+  List.iter
+    (fun ((_, tag, at) as key) ->
+      let n = 1 + Option.value ~default:0 (Hashtbl.find_opt st.counts key) in
+      Hashtbl.replace st.counts key n;
+      let limit =
+        streak_limit
+        + (3 * Option.value ~default:0 (Hashtbl.find_opt st.first key))
+      in
+      if n >= limit then begin
+        st.hit <- Some (tag, at, limit);
+        if n >= 2 * limit then park ();
+        failwith ("Eio_fs.Chaos: " ^ outcome_text (Livelock (tag, at, limit)))
+      end)
+    (targets op)
 
 let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
-    Hashtbl.remove st.counts (op.kind, op.path)
+    List.iter (Hashtbl.remove st.counts) (targets op)
 
 let exec_check ~first ~setup run (s : Plan.check) =
   let trace = ref [] and num = numberer () in
@@ -308,7 +332,7 @@ let exec_check ~first ~setup run (s : Plan.check) =
     | Error o -> o
   in
   let outcome =
-    match st.hit with Some (p, n) -> Livelock (p, n) | None -> outcome
+    match st.hit with Some (t, p, n) -> Livelock (t, p, n) | None -> outcome
   in
   (List.rev !trace, outcome)
 
