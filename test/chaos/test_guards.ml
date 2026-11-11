@@ -266,6 +266,33 @@ let test_kept_going () =
      it catches Eio.Cancel.Cancelled"
     (Expect.field "error" report)
 
+(* A supervisor that runs each save in a new fiber and retries it with
+   backoff until it succeeds: a cut stops it, as nothing runs after a power
+   cut. *)
+let test_cut_stops_supervisor () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> save env#fs "0")
+    (fun ~ack env ->
+      Eio.Switch.run @@ fun sw ->
+      for i = 1 to 3 do
+        let v = string_of_int i in
+        let rec go backoff =
+          match
+            Eio.Promise.await
+              (Eio.Fiber.fork_promise ~sw (fun () -> save env#fs v))
+          with
+          | Ok () -> ack v
+          | Error _ ->
+              Eio.Time.sleep env#clock backoff;
+              go (Float.min 60. (backoff *. 2.))
+        in
+        go 0.1
+      done)
+    ~recover:(fun ~acked env ->
+      match (App.load_config env#fs, List.rev acked) with
+      | v, a :: _ when v < a -> Fmt.failwith "config is %s, acked %s" v a
+      | _ -> ())
+
 (* A recovery that does not sync what it repairs: a second cut during it
    loses the repair. *)
 let test_cut_in_recover () =
@@ -335,6 +362,8 @@ let suite =
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
         test_kept_going;
+      Alcotest.test_case "a cut stops a supervisor that retries" `Quick
+        test_cut_stops_supervisor;
       Alcotest.test_case "a cut during recover" `Quick test_cut_in_recover;
       Alcotest.test_case "a check inside another loop" `Quick test_nested;
     ] )
