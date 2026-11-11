@@ -126,8 +126,10 @@ The tests follow a few rules:
   retries at once with no time passing fails as a hang.
 - `recover` stands for a fresh process: it reads what the disk holds and
   what the workload acknowledged, never state the workload left in memory.
-- A cut cancels the workload, as `Eio.Cancel` cancels a fiber: it must not
-  catch `Eio.Cancel.Cancelled`. Any other exception that escapes the workload
+- A cut cancels the workload, as `Eio.Cancel` cancels a fiber, and every
+  fiber it runs once they all wait: it must not catch
+  `Eio.Cancel.Cancelled`.
+ Any other exception that escapes the workload
   fails the check, an injected `Eio.Io` included, so the workload catches the
   errors its program may raise and checks the results itself.
 - A check blocks the event loop it is called from until it ends. Each run has
