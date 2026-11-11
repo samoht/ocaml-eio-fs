@@ -5,4 +5,5 @@ let () =
       Test_review1.suite;
       Test_review2.suite;
       Test_guards.suite;
+      Test_states.suite;
     ]
