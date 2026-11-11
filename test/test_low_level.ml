@@ -666,6 +666,76 @@ let test_perm_open_directory () =
       Eio.Switch.run (fun sw -> ignore (Eio.Path.open_in ~sw (a / "d"))));
   Eio.Switch.run (fun sw -> ignore (Eio.Path.open_dir ~sw (a / "d")))
 
+(* As Linux answers, checked against eio_posix: mkdir keeps the permission
+   and sticky bits of its mode only, and a new directory is setgid iff its
+   parent is; rename needs search permission on both parents before its
+   source must exist, and refuses a target above its source with ENOTEMPTY
+   before it compares kinds; readlink of anything but a link is EINVAL; a
+   read of a directory is EISDIR. *)
+let test_linux_answers () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o777 (fs / "w");
+  Eio.Path.chown ~follow:false ~uid:1000L ~gid:1000L (fs / "w");
+  let a = Eio_fs.Fs.as_user alice fs in
+  let mode p = Fmt.str "%o" (perm (a / p)) in
+  let mkdir p m =
+    Eio.Path.mkdir ~perm:m (a / p);
+    mode p
+  in
+  Alcotest.(check (list string))
+    "mkdir in a plain parent" [ "755"; "755"; "1755" ]
+    [ mkdir "w/g" 0o2755; mkdir "w/u" 0o4755; mkdir "w/t" 0o1777 ];
+  Eio.Path.chmod ~follow:false ~perm:0o2755 (a / "w/g");
+  Alcotest.(check (list string))
+    "mkdir in a setgid parent"
+    [ "2755"; "2755"; "2755"; "2700" ]
+    [
+      mkdir "w/g/a" 0o755;
+      mkdir "w/g/b" 0o2755;
+      mkdir "w/g/c" 0o6777;
+      mkdir "w/g/d" 0o4700;
+    ];
+  let contains s sub =
+    let n = String.length s and m = String.length sub in
+    let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+    go 0
+  in
+  let message f =
+    match f () with
+    | _ -> "ok"
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) -> "EACCES"
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> "ENOENT"
+    | exception (Eio.Io _ as e) ->
+        let s = Printexc.to_string e in
+        List.fold_left
+          (fun acc (sub, code) ->
+            if acc = "?" && contains s sub then code else acc)
+          "?"
+          [
+            ("directory not empty", "ENOTEMPTY");
+            ("is a directory", "EISDIR");
+            ("invalid argument", "EINVAL");
+          ]
+  in
+  Eio.Path.mkdir ~perm:0o755 (a / "w/nx");
+  Eio.Path.chmod ~follow:false ~perm:0o600 (a / "w/nx");
+  Eio.Path.mkdir ~perm:0o755 (a / "w/p");
+  Eio.Path.save ~create:(`Exclusive 0o644) (a / "w/p/f") "x";
+  Eio.Path.mkdir ~perm:0o755 (a / "w/q");
+  Eio.Path.save ~create:(`Exclusive 0o644) (a / "w/q/f") "x";
+  Alcotest.(check (list string))
+    "errors"
+    [ "EACCES"; "ENOTEMPTY"; "EISDIR"; "EINVAL"; "EINVAL"; "EISDIR" ]
+    [
+      message (fun () -> Eio.Path.rename (a / "w/missing") (a / "w/nx/y"));
+      message (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/p"));
+      message (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/q"));
+      message (fun () -> Eio.Path.read_link (a / "w/p/f"));
+      message (fun () -> Eio.Path.read_link (a / "w/p"));
+      message (fun () -> Eio.Path.load (a / "w/p"));
+    ]
+
 (* Linux: a setgid directory gives new entries its group, and new
    subdirectories its setgid bit; a chown, or a write by a user, clears the
    setuid and setgid bits of a file; a chmod by a user outside the file's
@@ -1231,6 +1301,8 @@ let suite =
         test_perm_move_directory;
       Alcotest.test_case "permissions: open a directory" `Quick
         test_perm_open_directory;
+      Alcotest.test_case "errors and modes as Linux answers them" `Quick
+        test_linux_answers;
       Alcotest.test_case "permissions: setgid directories and privilege bits"
         `Quick test_perm_setgid_and_privileges;
       Alcotest.test_case "a directory barrier opens its directory" `Quick
