@@ -2286,12 +2286,16 @@ module Crash = struct
     List.exists (fun (x, y) -> x < b && y > a) held
 
   (* The bytes [change] dirties in a file of [prev] bytes: a write those it
-     covers and, past the end, the hole it leaves; a shrink only the byte
-     where it cuts, so only a block it cuts mid-way; a growth the bytes it
-     adds. *)
-  let dirtied ~bs prev = function
+     covers and, past the end, the hole it leaves; a shrink the block it cuts
+     mid-way, and with [zero_page] the rest of the page it cuts, which ext4
+     zeroes; a growth the bytes it adds. *)
+  let dirtied ?(zero_page = false) ~bs prev = function
     | Write { offset; data } -> (min prev offset, offset + Cstruct.length data)
-    | Resize m when m < prev -> (m, if m mod bs = 0 then m else m + 1)
+    | Resize m when m < prev ->
+        let block = if m mod bs = 0 then m else m + 1 in
+        if zero_page && m mod page <> 0 then
+          (m, max block (min prev (((m / page) + 1) * page)))
+        else (m, block)
     | Resize m -> (prev, m)
 
   (* [durable] with [changes] replayed over it, where a block they dirty in
@@ -2413,7 +2417,8 @@ module Crash = struct
           end
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
-        if cached.(k) then (0, 0) else dirtied ~bs !cprev changes.(k)
+        if cached.(k) then (0, 0)
+        else dirtied ~zero_page:bytes ~bs !cprev changes.(k)
       in
       (if not cached.(k) then
          cprev :=
