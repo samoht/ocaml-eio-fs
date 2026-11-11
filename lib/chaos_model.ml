@@ -2402,7 +2402,7 @@ module Crash = struct
           if k < len_upto then begin
             let step = if bytes then page else bs in
             for b = (prev / step) + 1 to (size - 1) / step do
-              boundaries := (b * step) :: !boundaries
+              boundaries := (b * step, k) :: !boundaries
             done
           end
       | Resize m -> sizes.(k + 1) <- m);
@@ -2443,21 +2443,46 @@ module Crash = struct
              | _ -> false)
            vs
     in
+    (* The length, and how many changes its metadata holds: a length a
+       change left holds those before it, a page boundary those up to the
+       write that grew the file across it. *)
+    let size, committed =
+      let boundaries = List.sort_uniq compare !boundaries in
+      if rng.bool () || boundaries = [] then
+        let j = rng.int (min n len_upto + 1) in
+        (sizes.(j), j)
+      else
+        let b, k = List.nth boundaries (rng.int (List.length boundaries)) in
+        (b, k + 1)
+    in
+    (* A shrink the length does not hold has freed no block yet: the pages
+       past it keep their blocks, which no later change reaches. *)
+    let upto b =
+      let at = b * bs in
+      let limit = ref max_int in
+      for k = n - 1 downto committed do
+        match changes.(k) with
+        | Resize m
+          when m < sizes.(k)
+               && at >= (m + page - 1) / page * page
+               && at < sizes.(k) ->
+            limit := k
+        | _ -> ()
+      done;
+      !limit
+    in
     let chosen = Hashtbl.create 16 and stale_blocks = Hashtbl.create 4 in
     List.iter
       (fun b ->
-        let ks = List.rev (Hashtbl.find versions b) in
+        let limit = upto b in
+        let ks =
+          List.filter (fun v -> v <= limit) (List.rev (Hashtbl.find versions b))
+        in
         let vs = (0 :: ks) @ if may_be_stale b ks then [ -1 ] else [] in
         let v = List.nth vs (rng.int (List.length vs)) in
         if v > 0 then Hashtbl.replace chosen b v
         else if v < 0 then Hashtbl.replace stale_blocks b ())
       blocks;
-    let size =
-      let boundaries = List.sort_uniq Int.compare !boundaries in
-      if rng.bool () || boundaries = [] then
-        sizes.(rng.int (min n len_upto + 1))
-      else List.nth boundaries (rng.int (List.length boundaries))
-    in
     (* Replay once, taking each chosen block as it stood after its change. *)
     let at = Hashtbl.create 16 in
     Hashtbl.iter

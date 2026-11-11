@@ -2510,7 +2510,8 @@ let test_crash_sync_records_the_mode () =
 
 (* A file truncated and rewritten, unsynced: writeback may land the new
    length over the block from before the truncation, so the bytes it cut
-   come back, and every outcome is one of those. *)
+   come back; at the old length, the block the truncation would free holds
+   its old bytes. Every outcome is one of those. *)
 let test_crash_truncation_follows_writeback () =
   let seen = Hashtbl.create 8 in
   for seed = 0 to 199 do
@@ -2524,8 +2525,7 @@ let test_crash_truncation_follows_writeback () =
   done;
   Alcotest.(check (list string))
     "outcomes"
-    (List.sort String.compare
-       [ ""; "dgj"; "dgjutfwss"; "wtw"; "wtw\000\000\000\000\000\000" ])
+    (List.sort String.compare [ ""; "dgj"; "dgjutfwss"; "wtw" ])
     (List.sort String.compare (List.of_seq (Hashtbl.to_seq_keys seen)))
 
 (* A file's sync commits the file's mode, not an earlier directory operation

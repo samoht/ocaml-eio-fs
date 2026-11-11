@@ -346,11 +346,14 @@ module Crash : sig
             change left, or a block boundary a write grew the file across. A
             block a shrink did not dirty keeps its old bytes, which show again
             when a later length grows over them, as data=writeback may leave
-            them. So a multi-block write may keep any subset of its blocks,
-            while a block is never torn and never holds a later write without
-            the earlier ones. Uncommitted directory operations survive as a
-            prefix of program order whose length is drawn uniformly: metadata
-            never reorders. The [int] is the seed; the same seed and workload
+            them. A shrink the length does not hold has freed no page: at that
+            length the pages past the shrink hold no later change, as ext4
+            reuses no block before the truncation that freed it commits. So a
+            multi-block write may keep any subset of its blocks, while a block
+            is never torn and never holds a later write without the earlier
+            ones. Uncommitted directory operations survive as a prefix of
+            program order whose length is drawn uniformly: metadata never
+            reorders. The [int] is the seed; the same seed and workload
             reproduce the same image. *)
     | Survive of (unsynced -> bool)
         (** Scripted: an un-synced write survives iff the predicate holds;
