@@ -17,7 +17,6 @@ lock only at the final descriptor, while `LOCK_UN` releases it explicitly.
 ```ocaml
 # let () =
     Eio_main.run @@ fun env ->
-    Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 2. @@ fun () ->
     let fs = Eio.Stdenv.fs env in
     let rendezvous_name = Filename.temp_file "shared-lease-spec" "" in
     Sys.remove rendezvous_name;
