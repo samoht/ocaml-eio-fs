@@ -22,8 +22,10 @@ let test_a_weak ~save () =
       | "new" | "old" -> ()
       | v -> Fmt.failwith "config is %S" v)
 
-(* (b) An append-only log of checksummed records. *)
-let records = List.init 6 (Fmt.str "record-%d")
+(* (b) An append-only log of checksummed records, each longer than two
+   sectors, whose sectors a cut may land apart. *)
+let records =
+  List.init 6 (fun i -> Fmt.str "record-%d:%s" i (String.make 1100 'r'))
 
 let rec is_prefix p l =
   match (p, l) with

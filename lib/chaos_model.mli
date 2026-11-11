@@ -365,9 +365,13 @@ module Crash : sig
             dropping the data block it references. *)
     | Choose of (int -> int)
         (** As {!Reorder_unsynced}, with each draw [f n], in [\[0, n)], made by
-            the function, so a caller can enumerate the states; and the bytes a
-            write adds past the end of the file may stop at any byte, not only
-            at a block boundary. *)
+            the function, so a caller can enumerate the states, and with lengths
+            as ext4 leaves them: one a change left, or a multiple of 4096 a
+            write grew the file across. A block a write put bytes in, in a
+            4096-byte page the disk did not hold, past the durable length or in
+            a hole, may also hold stale data, every byte ['7'], as ext4 may
+            commit the page before its bytes land. With 512-byte blocks, a
+            disk's sectors, that is ext4 with [data=writeback]. *)
 
   (** The type for when a crash fires while the workload runs. *)
   type trigger =

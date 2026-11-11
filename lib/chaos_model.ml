@@ -1015,6 +1015,9 @@ module Crash = struct
         (* The blocks failed syncs lost, with the seq each failed at and as
            they stood then: a writeback that failed only partly may have
            written any of them, the one of any failure. *)
+    mutable held : (int * int) list;
+        (* The byte ranges durable writes covered, disjoint and in order:
+           the disk holds the pages they touch, and no other. *)
   }
 
   and entry = {
@@ -1043,6 +1046,9 @@ module Crash = struct
       fino = -1L;
       evicted = None;
       partial = [];
+      held =
+        (if Cstruct.length durable > 0 then [ (0, Cstruct.length durable) ]
+         else []);
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -2245,6 +2251,35 @@ module Crash = struct
           (fun _ e -> if in_delta e then e.recorded <- location :: e.recorded)
           ctl.journal
 
+  (* ext4's block, which it allocates whole, and the disk's sector, which
+     it writes whole. *)
+  let page = 4096
+  let sector = 512
+
+  (* [held] with [change] made durable: a write adds what it covers, a
+     shrink frees the pages past it. *)
+  let hold held = function
+    | Write { offset; data } ->
+        let a = offset and b = offset + Cstruct.length data in
+        if b <= a then held
+        else
+          let before = List.filter (fun (_, y) -> y < a) held
+          and after = List.filter (fun (x, _) -> x > b) held
+          and over = List.filter (fun (x, y) -> y >= a && x <= b) held in
+          let a = List.fold_left (fun a (x, _) -> min a x) a over
+          and b = List.fold_left (fun b (_, y) -> max b y) b over in
+          before @ ((a, b) :: after)
+    | Resize m ->
+        let m = (m + page - 1) / page * page in
+        List.filter_map
+          (fun (x, y) -> if x >= m then None else Some (x, min y m))
+          held
+
+  (* Whether the disk holds the page of the byte range [\[a, b)]. *)
+  let held_at held a b =
+    let a = a / page * page and b = (b + page - 1) / page * page in
+    List.exists (fun (x, y) -> x < b && y > a) held
+
   (* The bytes [change] dirties in a file of [prev] bytes: a write those it
      covers and, past the end, the hole it leaves; a shrink only the byte
      where it cuts, so only a block it cuts mid-way; a growth the bytes it
@@ -2321,6 +2356,10 @@ module Crash = struct
     in
     List.sort_uniq Int.compare acc
 
+  (* The byte that stands for stale data: a digit, so that a reader that
+     trusts what it finds parses a number. *)
+  let stale = '7'
+
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
@@ -2329,16 +2368,15 @@ module Crash = struct
      dirties the hole it leaves as well. A truncation changes the length in
      one step and dirties only the block it cuts, so a block kept from before
      it keeps its old bytes. A block is never torn, and a later change never
-     lands in a block without the earlier ones. *)
-  (* The points that cut [\[a, b)] in quarters, [a] included. *)
-  let quarters a b =
-    if b <= a then []
-    else
-      let step = max 1 ((b - a + 3) / 4) in
-      List.init (((b - a - 1) / step) + 1) (fun i -> a + (i * step))
+     lands in a block without the earlier ones.
 
-  let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ~rng ~bs
-      ~cache durable changes =
+     With [bytes], blocks are sectors and the length is one a change left
+     or a page boundary a write grew the file across, as ext4 extends its
+     on-disk size as writeback lands. A sector a write put bytes in, in a
+     page the disk did not hold, may also hold stale data: ext4 may commit
+     the page's allocation before its bytes land. *)
+  let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ?(held = [])
+      ~rng ~bs ~cache durable changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -2354,17 +2392,12 @@ module Crash = struct
       | Write { offset; data } ->
           let size = max prev (offset + Cstruct.length data) in
           sizes.(k + 1) <- size;
-          if k < len_upto then
-            if bytes then
-              (* Bytes that extend the file may stop at any byte: at the
-                 quarters of what the write adds. *)
-              List.iter
-                (fun x -> if x > prev then boundaries := x :: !boundaries)
-                (quarters prev size)
-            else
-              for b = (prev / bs) + 1 to (size - 1) / bs do
-                boundaries := (b * bs) :: !boundaries
-              done
+          if k < len_upto then begin
+            let step = if bytes then page else bs in
+            for b = (prev / step) + 1 to (size - 1) / step do
+              boundaries := (b * step) :: !boundaries
+            done
+          end
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
         if cached.(k) then (0, 0) else dirtied ~bs !cprev changes.(k)
@@ -2386,12 +2419,31 @@ module Crash = struct
       Hashtbl.fold (fun b _ acc -> b :: acc) versions []
       |> List.sort Int.compare
     in
-    let chosen = Hashtbl.create 16 in
+    (* Whether a write put bytes in block [b], in a page the disk did not
+       hold: the page is allocated by the crash, and may hold stale data. *)
+    let may_be_stale b vs =
+      bytes
+      && (not (held_at held (b * bs) ((b + 1) * bs)))
+      && List.exists
+           (fun v ->
+             match changes.(v - 1) with
+             | Write { offset; data } when not cached.(v - 1) ->
+                 let lo = offset / page * page
+                 and hi =
+                   (offset + Cstruct.length data + page - 1) / page * page
+                 in
+                 b * bs >= lo && b * bs < hi
+             | _ -> false)
+           vs
+    in
+    let chosen = Hashtbl.create 16 and stale_blocks = Hashtbl.create 4 in
     List.iter
       (fun b ->
-        let vs = 0 :: List.rev (Hashtbl.find versions b) in
+        let ks = List.rev (Hashtbl.find versions b) in
+        let vs = (0 :: ks) @ if may_be_stale b ks then [ -1 ] else [] in
         let v = List.nth vs (rng.int (List.length vs)) in
-        if v > 0 then Hashtbl.replace chosen b v)
+        if v > 0 then Hashtbl.replace chosen b v
+        else if v < 0 then Hashtbl.replace stale_blocks b ())
       blocks;
     let size =
       let boundaries = List.sort_uniq Int.compare !boundaries in
@@ -2435,45 +2487,18 @@ module Crash = struct
         let len = min (Cstruct.length src) (size - (b * bs)) in
         if len > 0 then Cstruct.blit src 0 image (b * bs) len
       done;
-    if bytes then begin
-      (* A sector the disk held nothing of may hold any of the bytes the
-         writes put there: each quarter of what a write put there reads back
-         as written or as zeros. A sector that held bytes is written whole. *)
-      let lo = (Cstruct.length durable + 511) / 512 * 512 in
-      let points = ref [ lo; size ] in
-      Array.iteri
-        (fun k change ->
-          match change with
-          | Write { offset; data } when not cached.(k) ->
-              List.iter
-                (fun x -> if x > lo && x < size then points := x :: !points)
-                (quarters offset (offset + Cstruct.length data))
-          | _ -> ())
-        changes;
-      let points = List.sort_uniq Int.compare !points in
-      let rec pieces = function
-        | a :: (b :: _ as rest) ->
-            if b > a then begin
-              let piece = Cstruct.sub image a (b - a) in
-              let landed = ref false in
-              for i = 0 to b - a - 1 do
-                if Cstruct.get_uint8 piece i <> 0 then landed := true
-              done;
-              if !landed && not (rng.bool ()) then Cstruct.memset piece 0
-            end;
-            pieces rest
-        | _ -> ()
-      in
-      if size > lo then pieces points
-    end;
+    Hashtbl.iter
+      (fun b () ->
+        let len = min bs (size - (b * bs)) in
+        if len > 0 then
+          Cstruct.memset (Cstruct.sub image (b * bs) len) (Char.code stale))
+      stale_blocks;
     image
 
   (* A disk writes a 512-byte sector whole, so the overwrites of one sector
      land together: where a surviving write overwrote bytes the file held, its
      sector holds what the page cache held after it, the earlier overwrites
      of that sector included. *)
-  let sector = 512
-
   let sectors_together ~cache durable mine kept image =
     let base = Option.value ~default:durable cache in
     let entries = Array.of_list mine in
@@ -2619,13 +2644,14 @@ module Crash = struct
                     (Option.is_some fs.cache || Option.is_some fs.evicted)
                     && rng.bool ()
                   then
-                    writeback ~over ~len_upto ~bytes ~rng ~bs:ctl.block_size
-                      ~cache:None
+                    writeback ~over ~len_upto ~bytes ~held:fs.held ~rng
+                      ~bs:ctl.block_size ~cache:None
                       (Option.value ~default:(bytes_of fs.durable) fs.evicted)
                       (List.map (fun (c, _) -> (c, false)) changes)
                   else
-                    writeback ~over ~len_upto ~bytes ~rng ~bs:ctl.block_size
-                      ~cache:fs.cache (bytes_of fs.durable) changes
+                    writeback ~over ~len_upto ~bytes ~held:fs.held ~rng
+                      ~bs:ctl.block_size ~cache:fs.cache (bytes_of fs.durable)
+                      changes
               | Survive pred, _ ->
                   let kept =
                     List.filter (fun e -> pred (to_unsynced e)) mine
@@ -2961,6 +2987,7 @@ module Crash = struct
             fs.durable.len <- Cstruct.length c;
             fs.cache <- (if Cstruct.equal c live then None else Some live);
             fs.evicted <- (if Cstruct.equal c e then None else Some e));
+        fs.held <- List.fold_left (fun h (c, _) -> hold h c) fs.held pending;
         lose ctl fs;
         let st = stat () in
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
