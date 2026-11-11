@@ -2377,8 +2377,8 @@ module Crash = struct
      lands in a block without the earlier ones.
 
      With [bytes], blocks are sectors and the length is one a change left
-     or a page boundary a write grew the file across, as ext4 extends its
-     on-disk size as writeback lands. A sector a write put bytes in, in a
+     or the end of a page a write put bytes in, as ext4 extends its on-disk
+     size as writeback lands. A sector a write put bytes in, in a
      page the disk did not hold, may also hold stale data: ext4 may commit
      the page's allocation before its bytes land. [old p] is what a freed
      block the page may have been given held, at page [p] of its file. *)
@@ -2401,7 +2401,13 @@ module Crash = struct
           sizes.(k + 1) <- size;
           if k < len_upto then begin
             let step = if bytes then page else bs in
-            for b = (prev / step) + 1 to (size - 1) / step do
+            (* ext4 extends its on-disk size as it writes back a page the
+               write put bytes in, not one of the hole before it. *)
+            let first =
+              if bytes then max (prev / step) (offset / step) + 1
+              else (prev / step) + 1
+            in
+            for b = first to (size - 1) / step do
               boundaries := (b * step, k) :: !boundaries
             done
           end
