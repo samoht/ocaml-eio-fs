@@ -170,8 +170,10 @@ val root : user
     keeping removal and renaming to the entry's or the directory's owner; read
     on a directory to list it; read, or read and write, on a file to open it. A
     new file or directory loses the user's umask bits and belongs to the user's
-    uid and gid, or to the group of a setgid directory it is made in; a new
-    directory there also takes the setgid bit. A file made there by a user
+    uid and gid, or to the group of a setgid directory it is made in. A new
+    directory keeps only the permission and sticky bits of its mode, and is
+    setgid iff its parent is. A file made in a setgid directory by a user
+
     outside that group loses setgid, as Linux strips it at create. Only a file's
     owner changes its mode, and a user outside the file's group cannot set its
     setgid bit. Only root gives a file away; its owner may move it to one of

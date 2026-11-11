@@ -860,7 +860,8 @@ let mkdirat dir_fd ~perm path =
     let d = as_dir ~path !r in
     let new_stat =
       new_stat fs ~user ~parent:d.stat ~kind:`Directory
-        ~perm:(masked ~user perm) ()
+        ~perm:(masked ~user perm land 0o1777)
+        ()
     in
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
@@ -912,7 +913,7 @@ let read_link dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   match !(Filesystem.lookup ~follow:false dir_fd path) with
   | Symlink s -> s.link_to
-  | _ -> Error.err ("not a symbolic link: " ^ path)
+  | _ -> Error.err ("readlink: invalid argument: " ^ path)
 
 (* Listing a directory needs its read bit: EACCES. *)
 let check_read ~user path r =
@@ -966,15 +967,20 @@ let rmdir dir_fd path =
       else remove_entry (Dir.fs dir_fd) w name
   | Some _ -> Error.err ("rmdir: not a directory: " ^ path)
 
-(* rename(2) refuses to move a directory below itself (EINVAL), a directory
-   over a non-empty directory (ENOTEMPTY) or over a non-directory (ENOTDIR),
-   and a non-directory over a directory (EISDIR). Eio.Fs has no constructor
-   for these, which eio_posix raises as a bare [Eio.Io]. *)
-let check_rename tree ~src ~new_parent ~dst new_path =
+(* rename(2) refuses to move a directory below itself (EINVAL), anything over
+   a directory above it (ENOTEMPTY, before the kinds are compared), a
+   directory over a non-empty directory (ENOTEMPTY) or over a non-directory
+   (ENOTDIR), and a non-directory over a directory (EISDIR). Eio.Fs has no
+   constructor for these, which eio_posix raises as a bare [Eio.Io]. *)
+
+let check_rename tree ~src ~old_parent ~new_parent ~dst new_path =
   let ino = (Resource.stat !src).ino in
   match (!src, Option.map ( ! ) dst) with
   | Resource.Dir _, _ when Filesystem.within tree new_parent ino ->
       Error.err ("rename: invalid argument, into its own subtree: " ^ new_path)
+  | _, Some (Resource.Dir d) when Filesystem.within tree old_parent d.stat.ino
+    ->
+      Error.err ("rename: directory not empty: " ^ new_path)
   | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
       Error.err ("rename: directory not empty: " ^ new_path)
   | Resource.Dir _, Some (File _ | Symlink _) ->
@@ -1019,6 +1025,8 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   (* rename(2) answers EINVAL or EBUSY for a last [.] or [..]. *)
   if is_dot old_name || is_dot new_name then
     Error.err ("rename: invalid argument: " ^ new_path);
+  (* Both lookups need search permission before the source must exist. *)
+  Filesystem.search new_w new_name;
   (* Rename the directory entry itself. In particular, a symlink's target need
      not exist and must not be followed while moving the link. *)
   let old_res =
@@ -1049,7 +1057,7 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       let dst =
         Option.bind existing (fun (dst_ino, _) -> Entries.find_opt dst_ino tree)
       in
-      check_rename tree ~src:old_res ~new_parent ~dst new_path;
+      check_rename tree ~src:old_res ~old_parent ~new_parent ~dst new_path;
       let user = dir_fd.user in
       check_dir_write ~user old_parent old_path;
       check_sticky ~user old_parent old_res old_path;
@@ -1083,9 +1091,9 @@ let check_offset op off =
 
 (* EISDIR, naming the operation and never the contents. *)
 let not_a_file op r =
-  Error.err
-    (op ^ ": not a file: "
-    ^ match r with Resource.Dir _ -> "a directory" | _ -> "not a regular file")
+  match r with
+  | Resource.Dir _ -> Error.err (op ^ ": is a directory")
+  | _ -> Error.err (op ^ ": not a regular file")
 
 (* A descriptor open on a non-regular file still answers the file interface --
    [Eio.Path.open_in] on a directory is legal and the portable directory
