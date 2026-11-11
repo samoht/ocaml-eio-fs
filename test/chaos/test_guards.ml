@@ -243,6 +243,25 @@ let test_hang () =
                 | _ -> ()
                 | exception Eio.Io _ -> Eio.Fiber.await_cancel ()))))
 
+(* Three tries get past two faults, not a lasting condition: a run that
+   demands success after them fails there. *)
+let test_three_tries_and_a_lasting_condition () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec save n =
+              match
+                P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+              with
+              | () -> ()
+              | exception Eio.Io _ when n < 3 -> save (n + 1)
+            in
+            save 1))
+  in
+  let faults = Expect.field "faults" report in
+  if not (String.starts_with ~prefix:"the filesystem is" faults) then
+    Alcotest.failf "the failure is not a lasting condition: %s" faults
+
 (* A program that retries a failed operation at once spins for ever on a
    read-only filesystem. Its own bound, well past the guard's, fails the
    run instead of spinning for ever when the guard does not stop it. *)
@@ -405,6 +424,8 @@ let suite =
       Alcotest.test_case "a recover that accepts a reachable empty directory"
         `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;
+      Alcotest.test_case "three tries do not outlast a lasting condition" `Quick
+        test_three_tries_and_a_lasting_condition;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
       Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
         test_busy_is_not_a_spin;

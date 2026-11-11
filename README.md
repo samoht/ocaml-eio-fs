@@ -117,8 +117,10 @@ run, and a `~replay:"..."` argument that runs that scenario alone.
 
 The tests follow a few rules:
 
-- At most two faults reach a run. A program that tries three times may be
-  asked to succeed.
+- At most two faults reach a run, or one lasting condition. A program that
+  tries three times gets past two faults, but no retry gets past a lasting
+  condition, so the workload must accept that any operation fails.
+
 - A lasting condition, such as a read-only filesystem, reaches every
   operation from where it starts, the retries included. A program that
   retries at once with no time passing fails as a hang.

@@ -26,8 +26,10 @@
 
     {2 Contracts}
 
-    {b At most two faults per run.} A program that tries three times always
-    succeeds, so [run] may demand success.
+    {b At most two faults per run, or one lasting condition.} A program that
+    tries an operation three times gets past two faults, but no retry gets past
+    a lasting condition: [run] must accept that any operation fails, and may
+    demand only that the program handles it.
 
     {b A lasting condition reaches every operation.} A filesystem that turns
     read-only, full, or denies access does so for every operation from then on,
