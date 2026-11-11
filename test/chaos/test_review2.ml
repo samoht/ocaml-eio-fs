@@ -68,4 +68,6 @@ let suite =
         (Expect.passes (Probe.log_budget 400));
       Alcotest.test_case "log: 300 records of varying lengths fit it" `Quick
         (Expect.passes (Probe.log_varying 300));
+      Alcotest.test_case "records: a crash leaves a length the file had" `Quick
+        (Expect.passes Probe.fixed_records);
     ] )

@@ -3122,9 +3122,28 @@ let test_crash_cut_page_not_written () =
   let i = lost_images ~init:"pqrs" [ `W (2, "A"); `T 2; `F ] in
   Alcotest.(check (list string)) "images" [ "pq"; "pqrs" ] (List.sort compare i)
 
-(* Every image [Choose] draws for [steps] over a durable [init], enumerated
-   by walking the tree of its draws. *)
-let chosen_images ~init steps =
+(* The image [Choose] draws for [steps] over a durable [init], grown by a
+   synced truncation to [grow] bytes, with each draw made by [draw]. *)
+let chosen_image ?grow ~init steps draw =
+  let ctl = Crash.v ~policy:(Choose draw) ~block_size:512 () in
+  with_crash ctl @@ fun ~raw:_ ~fs ->
+  write_new ~sync:true (fs / "f") init;
+  Eio_fs_sync.sync_dir fs;
+  Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
+      Option.iter
+        (fun n ->
+          Eio.File.truncate f (i63 n);
+          Eio.File.sync f)
+        grow;
+      List.iter
+        (fun (o, d) ->
+          Eio.File.pwrite_all f ~file_offset:(i63 o) [ Cstruct.of_string d ])
+        steps);
+  Eio.Path.load (Crash.post_crash ctl / "f")
+
+(* Every image [Choose] draws for [steps], enumerated by walking the tree
+   of its draws. *)
+let chosen_images ?grow ~init steps =
   let seen = Hashtbl.create 8 in
   let rec go prefix =
     let trail = ref [] and pos = ref 0 in
@@ -3134,16 +3153,7 @@ let chosen_images ~init steps =
       trail := (c, n) :: !trail;
       c
     in
-    let ctl = Crash.v ~policy:(Choose draw) ~block_size:512 () in
-    ( with_crash ctl @@ fun ~raw:_ ~fs ->
-      write_new ~sync:true (fs / "f") init;
-      Eio_fs_sync.sync_dir fs;
-      Eio.Path.with_open_out ~create:`Never (fs / "f") (fun f ->
-          List.iter
-            (fun (o, d) ->
-              Eio.File.pwrite_all f ~file_offset:(i63 o) [ Cstruct.of_string d ])
-            steps);
-      Hashtbl.replace seen (Eio.Path.load (Crash.post_crash ctl / "f")) () );
+    Hashtbl.replace seen (chosen_image ?grow ~init steps draw) ();
     let rec next = function
       | [] -> None
       | (c, n) :: rest when c + 1 < n ->
@@ -3155,18 +3165,45 @@ let chosen_images ~init steps =
   go [||];
   List.sort compare (List.of_seq (Hashtbl.to_seq_keys seen))
 
-(* Bytes a write puts in a sector the disk held nothing of may land in any
-   order and stop anywhere; a sector that held bytes is written whole, so an
-   append to it or an overwrite lands whole within it. *)
-let test_crash_choose_tears_extensions () =
+(* A crash leaves a length the file had, or a page boundary a write grew it
+   across, as ext4 does. A sector is written whole: in a page the disk held,
+   as it was or after a write; in a page it did not, past the end or in a
+   hole, also as zeros or stale data, as ext4 may commit the page before its
+   bytes. *)
+let test_crash_choose_as_ext4 () =
   Alcotest.(check (list string))
     "a write to an empty file"
-    [ ""; "\000"; "\000\000"; "\000B"; "A"; "A\000"; "AB" ]
+    [ ""; "\000\000"; "77"; "AB" ]
     (chosen_images ~init:"" [ (0, "AB") ]);
   Alcotest.(check (list string))
     "an append"
-    [ "pq"; "pq\000"; "pq\000\000"; "pqA"; "pqAB" ]
+    [ "pq"; "pq\000\000"; "pqAB" ]
     (chosen_images ~init:"pq" [ (2, "AB") ]);
+  let rng = Random.State.make [| 7 |] in
+  let lengths =
+    List.init 200 (fun _ ->
+        String.length
+          (chosen_image ~init:""
+             [ (0, String.make 4200 'A') ]
+             (fun n -> Random.State.int rng n)))
+    |> List.sort_uniq Int.compare
+  in
+  Alcotest.(check (list int))
+    "the lengths of a long write" [ 0; 4096; 4200 ] lengths;
+  let hole =
+    chosen_images ~grow:8192 ~init:"pq" [ (4096, String.make 1024 'A') ]
+  in
+  let sectors a b =
+    "pq" ^ String.make 4094 '\000' ^ a ^ b ^ String.make 3072 '\000'
+  in
+  let a = String.make 512 'A' and z = String.make 512 '\000' in
+  let s = String.make 512 '7' in
+  Alcotest.(check bool)
+    "a write into a hole tears, and may show stale data" true
+    (List.mem (sectors a z) hole
+    && List.mem (sectors s a) hole
+    && List.mem (sectors a a) hole);
+
   Alcotest.(check (list string))
     "an overwrite" [ "pXYs"; "pqrs" ]
     (chosen_images ~init:"pqrs" [ (1, "XY") ])
@@ -3680,8 +3717,8 @@ let suite =
         `Quick test_crash_over_chaos_over_user;
       Alcotest.test_case "crash: either failed writeback of a block may land"
         `Quick test_crash_each_failure_may_land;
-      Alcotest.test_case "crash: an extension tears at any byte" `Quick
-        test_crash_choose_tears_extensions;
+      Alcotest.test_case "crash: lengths and sectors as ext4 leaves them" `Quick
+        test_crash_choose_as_ext4;
       Alcotest.test_case "crash: a sector's overwrites survive together" `Quick
         test_crash_survive_keeps_a_sector;
       Alcotest.test_case "crash: a page cut before a failure is not written"

@@ -207,3 +207,44 @@ let log_budget n () =
         P.(env#fs / "log")
         (String.concat "" (List.map (fun r -> r ^ "\n") recs));
       if List.length recs < List.length acked then failwith "lost records")
+
+(* A file of 64-byte records, each one pwrite and a sync, and a truncation
+   back when one fails: a crash leaves a length the file had, so a whole
+   number of records. *)
+let fixed_records () =
+  let record i = Fmt.str "rec%04d:%s" i (String.make 56 'x') in
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "hdr") "v1")
+    (fun ~ack env ->
+      try
+        P.with_open_out ~create:(`Exclusive 0o644)
+          P.(env#fs / "log")
+          (fun f ->
+            Eio_fs_sync.sync_dir env#fs;
+            for i = 0 to 2 do
+              (* A record that fails is cut away again. *)
+              (try
+                 Eio.File.pwrite_all f
+                   ~file_offset:(Optint.Int63.of_int (i * 64))
+                   [ Cstruct.of_string (record i) ];
+                 Eio.File.sync f
+               with Eio.Io _ as e ->
+                 Eio.File.truncate f (Optint.Int63.of_int (i * 64));
+                 Eio.File.sync f;
+                 raise e);
+              ack i
+            done)
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      if P.load P.(env#fs / "hdr") <> "v1" then failwith "hdr";
+      match P.load P.(env#fs / "log") with
+      | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) ->
+          if acked <> [] then failwith "log lost"
+      | s ->
+          let n = String.length s in
+          if n mod 64 <> 0 then Fmt.failwith "log holds %d bytes" n;
+          List.iter
+            (fun i ->
+              if n < (i + 1) * 64 || String.sub s (i * 64) 64 <> record i then
+                Fmt.failwith "record %d lost" i)
+            acked)
