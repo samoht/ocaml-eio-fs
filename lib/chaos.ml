@@ -696,17 +696,16 @@ module Crash = struct
         (diverge first_ops again);
     let hash = digest first_ops in
     (* Guards. *)
-    let sizes =
+    let sizes, setup_made =
       match
         in_loop (fun clock mono ->
             let d = fresh () in
             setup (env_of clock mono d);
-            files d)
+            (files d, Eio.Path.read_dir d <> []))
       with
       | Ok l -> l
       | Error o -> fail name "setup failed: %s" (outcome_text o)
     in
-    let setup_made = sizes <> [] in
     if first.acked = [] && not setup_made then
       fail name
         "the first run acknowledges nothing and setup makes nothing, so \
