@@ -168,7 +168,9 @@ module Crash : sig
       accepts the directory as [setup] left it, told the values the first run
       acknowledged, which means it ignores [acked], or every acknowledged value
       already holds after [setup] and the ack should go; and a [recover] that
-      accepts an empty directory when [setup] made files. Two first runs that
+      accepts an empty directory when [setup] made files and no cut the check
+      tries leaves the directory empty. Two first runs that
+
       make different operations fail it too.
 
       [budget] (defaults to [20_000]) bounds the runs. [replay] runs only the

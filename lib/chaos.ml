@@ -431,6 +431,7 @@ module Crash = struct
     acked : 'a list;
     lost : unsynced list;
     trail : (int * int) list;
+    empty : bool; (* The cut left the directory empty. *)
     error : error option;
   }
 
@@ -496,6 +497,7 @@ module Crash = struct
     let acked = ref [] and trace = ref [] and rtrace = ref [] in
     let lost = ref [] in
     let kept_run = ref false and kept_recover = ref false in
+    let empty = ref false in
     let recovering = ref false in
     (* A cut stops the run, as nothing runs after a power cut: once every
        fiber waits, the phase's switch fails, so a fiber that waits on a
@@ -531,7 +533,7 @@ module Crash = struct
           M.Crash.crash ctl
         end
         else lost := l;
-        ignore (M.Crash.post_crash ctl : Eio.Fs.dir_ty Eio.Path.t);
+        empty := Eio.Path.read_dir (M.Crash.post_crash ctl) = [];
         let acked = List.rev !acked in
         match out with
         | Passed -> (
@@ -573,6 +575,7 @@ module Crash = struct
       acked = List.rev !acked;
       lost = !lost;
       trail = !trail;
+      empty = !empty;
       error;
     }
 
@@ -666,20 +669,21 @@ module Crash = struct
          [acked], or every acknowledged value already holds after setup; then \
          drop the ack."
         (List.length first.acked);
-    if
+    (* A recover that accepts an empty directory checks nothing of what
+       setup made, unless a cut can leave the directory empty. *)
+    let accepts_empty =
       setup_made
       && not
            (refuses (fun clock mono ->
                 recover ~acked:[] (env_of clock mono (fresh ()))))
-    then
-      fail name
-        "recover accepts an empty directory, though setup made files: check in \
-         recover what setup made.";
+    in
+    let reached_empty = ref false in
     let tears = Plan.tears ~sizes first_ops in
     let runs = ref 0 and results = Hashtbl.create 64 in
     let attempt ?matched tier s =
       incr runs;
       let r = exec s in
+      if r.empty then reached_empty := true;
       Hashtbl.replace results (Plan.crash_key s) r;
       (match r.error with
       | None -> ()
@@ -834,7 +838,12 @@ module Crash = struct
         List.iter
           (fun c -> List.iter (fun run -> run ()) (Plan.spread share c))
           classes;
-        states (total - (!runs - before))
+        states (total - (!runs - before));
+        if accepts_empty && not !reached_empty then
+          fail name
+            "recover accepts an empty directory, though setup made files and \
+             no cut leaves the directory empty: check in recover what setup \
+             made."
 end
 
 module Private = Chaos_model
