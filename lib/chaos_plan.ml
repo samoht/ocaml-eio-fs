@@ -375,13 +375,21 @@ module Draws = struct
          t (List.rev trail)
         : t)
 
-  (* The states the tree allows at least: a choice not taken counts one. *)
-  let rec lower_bound t =
+  (* The states the tree allows, a choice not taken counted as the largest
+     taken one at its draw. *)
+  let rec estimate t =
     if t.width = 0 then 1
     else
-      Hashtbl.fold
-        (fun _ next acc -> acc - 1 + lower_bound next)
-        t.below t.width
+      let sum, widest, taken =
+        Hashtbl.fold
+          (fun _ next (sum, widest, taken) ->
+            let e = estimate next in
+            (min max_int (sum + e), max widest e, taken + 1))
+          t.below (0, 0, 0)
+      in
+      let rest = t.width - taken in
+      if rest > 0 && widest > (max_int - sum) / rest then max_int
+      else sum + (rest * widest)
 end
 
 let rec trim = function

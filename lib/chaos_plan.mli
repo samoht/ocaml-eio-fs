@@ -165,9 +165,9 @@ module Draws : sig
   val add : t -> (int * int) list -> unit
   (** [add t trail] adds the draws, last first, of one state. *)
 
-  val lower_bound : t -> int
-  (** [lower_bound t] is the number of states the draws met so far allow at
-      least: a choice not yet taken counts as one state. *)
+  val estimate : t -> int
+  (** [estimate t] is the number of states the draws met so far allow, a choice
+      not yet taken counted as the largest one taken at its draw. *)
 end
 
 val state_key : state -> string

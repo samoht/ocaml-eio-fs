@@ -2477,9 +2477,30 @@ module Crash = struct
        write that grew the file across it. *)
     let size, committed =
       let boundaries = List.sort_uniq compare !boundaries in
-      if rng.bool () || boundaries = [] then
-        let j = rng.int (min n len_upto + 1) in
-        (sizes.(j), j)
+      if boundaries = [] || rng.bool () then (
+        (* Two counts that leave the same length and the same shrinks
+           pending leave the same state: draw one of each. *)
+        let shrinks = Array.make (n + 1) 0 in
+        for k = n - 1 downto 0 do
+          shrinks.(k) <-
+            (shrinks.(k + 1) + match changes.(k) with Resize _ -> 1 | _ -> 0)
+        done;
+        let js =
+          List.init (min n len_upto + 1) Fun.id
+          |> List.fold_left
+               (fun acc j ->
+                 if
+                   List.exists
+                     (fun i ->
+                       sizes.(i) = sizes.(j) && shrinks.(i) = shrinks.(j))
+                     acc
+                 then acc
+                 else j :: acc)
+               []
+          |> List.rev
+        in
+        let j = List.nth js (rng.int (List.length js)) in
+        (sizes.(j), j))
       else
         let b, k = List.nth boundaries (rng.int (List.length boundaries)) in
         (b, k + 1)

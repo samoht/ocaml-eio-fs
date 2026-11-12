@@ -167,8 +167,9 @@ module Crash : sig
 
       The sampled tier tries the other cuts and faults, pairs of faults, and
       cuts during [recover] after a fault; then every state each cut allows
-      while they are few, at most 64 and within the cut's share of the tier, and
-      states drawn at random past that, saying so in its report.
+      while they fit in the cut's share of the tier, and states drawn at random
+      past that, saying so in its report. What a cut does not use goes to the
+      cuts that allow more states.
 
       A run passes if [run] returns and [recover] accepts the state. A cut
       raises [Eio.Cancel.Cancelled] from the operation it falls before, and from

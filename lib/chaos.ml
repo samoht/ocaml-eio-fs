@@ -498,10 +498,6 @@ module Crash = struct
 
   let name = "Eio_fs.Chaos.Crash.check"
 
-  (* At most this many states a cut allows are enumerated; past it, they are
-     drawn at random. *)
-  let enum_limit = 64
-
   let policy_of trail : Plan.state -> M.Crash.policy = function
     | Drop -> Drop_unsynced
     | Keep -> Survive (fun _ -> true)
@@ -676,9 +672,9 @@ module Crash = struct
           (Plan.state_key st)
     | Seed _ as st ->
         Fmt.str
-          "state %s, drawn at random: the cut allows more than the %d states \
-           the check would try one by one"
-          (Plan.state_key st) enum_limit
+          "state %s, drawn at random: the cut allows more states than its \
+           share of the tier"
+          (Plan.state_key st)
 
   let cut_text = function
     | None -> "at the end"
@@ -854,36 +850,66 @@ module Crash = struct
             faults
         in
         (* Every state each cut allows, enumerated while the draws met so
-           far allow no more than the limit, and drawn at random past that.
-           Each cut gets an even share of what is left. *)
+           far allow no more than the cut's share, and drawn at random past
+           that. Each cut gets an even share of what is left: first every cut
+           whose states fit in it, then, with what those left, the others,
+           smallest first. *)
         let drops = List.filter (fun (s : Plan.crash) -> s.state = Drop) cuts in
+        let enumerate (s : Plan.crash) tree spent allowance next =
+          let rec go = function
+            | None -> None
+            | Some v
+              when Plan.Draws.estimate tree > allowance || !spent >= allowance
+              ->
+                Some v
+            | Some v ->
+                incr spent;
+                let r = attempt Sampled { s with state = Enum v } in
+                Plan.Draws.add tree r.trail;
+                go (Plan.next_choices r.trail)
+          in
+          go next
+        in
         let states left =
-          let rec loop left = function
-            | [] -> ()
+          let rec first left acc = function
+            | [] -> (left, List.rev acc)
             | (s : Plan.crash) :: rest as cuts ->
                 let allowance = max 1 (left / List.length cuts) in
-                let limit = min allowance enum_limit in
                 let tree = Plan.Draws.empty () in
                 let r = attempt Sampled { s with state = Enum [] } in
                 Plan.Draws.add tree r.trail;
                 let spent = ref 1 in
-                let rec go = function
-                  | None -> true
-                  | Some _ when Plan.Draws.lower_bound tree > limit -> false
-                  | Some v ->
-                      incr spent;
-                      let r = attempt Sampled { s with state = Enum v } in
-                      Plan.Draws.add tree r.trail;
-                      go (Plan.next_choices r.trail)
+                let acc =
+                  match
+                    enumerate s tree spent allowance (Plan.next_choices r.trail)
+                  with
+                  | None -> acc
+                  | Some v -> (s, tree, spent, v) :: acc
                 in
-                if not (go (Plan.next_choices r.trail)) then
-                  for seed = 0 to allowance - !spent - 1 do
-                    incr spent;
-                    ignore (attempt Sampled { s with state = Seed seed })
-                  done;
-                loop (left - !spent) rest
+                first (left - !spent) acc rest
           in
-          loop left drops
+          let left, large = first left [] drops in
+          let large =
+            List.stable_sort
+              (fun (_, a, _, _) (_, b, _, _) ->
+                Int.compare (Plan.Draws.estimate a) (Plan.Draws.estimate b))
+              large
+          in
+          let rec share_out left = function
+            | [] -> ()
+            | (s, tree, spent, v) :: rest as cuts ->
+                let share = max 0 (left / List.length cuts) in
+                let allowance = !spent + share and before = !spent in
+                (match enumerate s tree spent allowance (Some v) with
+                | None -> ()
+                | Some _ ->
+                    for seed = 0 to allowance - !spent - 1 do
+                      incr spent;
+                      ignore (attempt Sampled { s with state = Seed seed })
+                    done);
+                share_out (left - (!spent - before)) rest
+          in
+          share_out left large
         in
         let classes = List.filter (( <> ) []) [ others; pairs; recovery ] in
         let total = Plan.sampled_share ~budget ~linear ~classes:1 in
