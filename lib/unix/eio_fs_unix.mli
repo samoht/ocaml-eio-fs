@@ -136,6 +136,19 @@ val pread :
       end of [buf].
     @raise Unix.Unix_error as [pread]. *)
 
+val pwrite :
+  Unix.file_descr -> file_offset:int -> string -> pos:int -> len:int -> int
+(** [pwrite fd ~file_offset buf ~pos ~len] writes up to [len] bytes of [buf]
+    from [pos] to [fd] at byte [file_offset], and is the count written. This is
+    POSIX [pwrite]: one call, and [fd]'s own offset is left where it was. A
+    write takes at most 65536 bytes, and is retried on [EINTR]. Other threads
+    run during the call.
+
+    @raise Stdlib.Invalid_argument
+      if [file_offset], [pos] or [len] is negative or [pos + len] is past the
+      end of [buf].
+    @raise Unix.Unix_error as [pwrite]. *)
+
 val import_file :
   sw:Eio.Switch.t ->
   close_unix:bool ->
