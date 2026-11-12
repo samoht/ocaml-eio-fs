@@ -109,6 +109,15 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
       {!Eio.Fs.Not_native} if a directory has no host descriptor.
     @raise Stdlib.Invalid_argument if a path holds a NUL byte. *)
 
+val clone_trees : _ Eio.Path.t -> _ Eio.Path.t -> string list -> bool
+(** [clone_trees src dst names] clones each [src/name] to [dst/name] with
+    {!clone_tree}, the directories above each made first, all or none: on the
+    first that does not clone, or whose clone raises, each cloned before it is
+    removed and it is [false]. A [name] may hold several segments, as
+    [_build/default]. The directories made above a name are left.
+
+    @raise Stdlib.Invalid_argument if a path holds a NUL byte. *)
+
 (** {1:trees Removable trees} *)
 
 val grant_owner : _ Eio.Path.t -> unit
