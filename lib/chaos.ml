@@ -67,12 +67,13 @@ let wrap f base =
 (* {1 Runs} *)
 
 (* A program that retries a failed operation at once, with no time passing,
-   spins for ever under a lasting condition. Once one operation on one path,
-   or one kind of operation in one directory, as a retry under a fresh name
-   makes, has failed this many times for each time the first run made it,
-   while the clock stands still, it raises [Failure] instead, and after twice
-   as many it waits for ever. *)
-let streak_limit = 10_000
+   spins for ever under a lasting condition. Once one operation on one path
+   has failed 10000 times more than three times the first run made it, or
+   one kind of operation in one directory, as a retry under a fresh name
+   makes, 10000 times more than 1000 times, while the clock stands still, it
+   raises [Failure] instead, and after twice as many it waits for ever. *)
+let streak_limit tag first =
+  10_000 + (first * match tag with `Path -> 3 | `Dir -> 1000)
 
 type outcome =
   | Passed
@@ -275,8 +276,8 @@ let failed st (op : Op.t) =
       let n = 1 + Option.value ~default:0 (Hashtbl.find_opt st.counts key) in
       Hashtbl.replace st.counts key n;
       let limit =
-        streak_limit
-        * max 1 (Option.value ~default:0 (Hashtbl.find_opt st.first key))
+        streak_limit tag
+          (Option.value ~default:0 (Hashtbl.find_opt st.first key))
       in
       if n >= limit then begin
         st.hit <- Some (tag, at, limit);

@@ -33,13 +33,15 @@
 
     {b A lasting condition reaches every operation.} A filesystem that turns
     read-only, full, or denies access does so for every operation from then on,
-    the retries included. A run fails as a hang when one operation on one path,
-    or one kind of operation in one directory, fails 10000 times for each time
-    the first run made it, while its clock stands still. A program that retries
-    at once spins so, under one name or a fresh one each time. A batch that
-    drops what fails does not, nor one that tries up to 10000 names for each
-    name its first run made. No check can tell a spin from a loop that ends
-    later, so one that tries more often than that is taken for a spin.
+    the retries included. A run fails as a hang when, while its clock stands
+    still and with no success there in between, one operation on one path fails
+    10000 times more than three times the first run made it, or one kind of
+    operation in one directory 10000 times more than 1000 times. A program that
+    retries at once spins so, under one name or a fresh one each time. A batch
+    that tries each item up to three times and drops what fails does not, nor a
+    pool that tries up to 1000 names for each name its first run made. No check
+    can tell a spin from a loop that ends later, so one that tries more often
+    than that is taken for a spin.
 
     {b [recover] stands for a fresh process.} It runs after the cut on the
     directory as the disk holds it, knowing only what the workload acknowledged:
