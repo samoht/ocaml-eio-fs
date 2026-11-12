@@ -120,6 +120,34 @@ val grant_owner : _ Eio.Path.t -> unit
     it is, for the removal to name; a [p] that is missing or not a directory is
     left alone. It costs a stat per entry and a listing per directory. *)
 
+type removed = {
+  entries : int;  (** The files, links and directories removed. *)
+  bytes : int;  (** What the non-directories removed weighed. *)
+  refused : string list;
+      (** Each path the removal refused, with the system's reason, in the order
+          they were met; [[]] when nothing is left at the path. *)
+}
+(** The type for what {!remove_tree} did. *)
+
+val remove_tree : ?grant:bool -> ?last:string -> _ Eio.Path.t -> removed
+(** [remove_tree path] removes [path] and, when it is a directory, everything
+    under it, deepest first, each entry reached through [path]'s own directory
+    capability ({!Batch}): a symbolic link is removed and never followed. It
+    costs a stat and an unlink per entry and a listing per directory, in hops
+    per directory: a directory's entries are stated in one and unlinked in the
+    next, whatever they number, and the hops of different directories run at
+    once, four at a time. A cancellation ends it at the next hop, so none
+    outlasts one directory's entries.
+
+    With [~grant:true] (defaults to [false]) each directory is granted its
+    owner's read, write and search before it is read, as {!grant_owner} grants
+    it. The entry [last] of [path], if any, is removed only once every other
+    entry is gone, so a removal that fails leaves it. An entry another process
+    removes meanwhile counts nothing, and a [path] that does not exist removes
+    nothing. A refusal stops no other directory's removal, leaves the
+    directories above it and [last], and a later call goes on with what is left.
+*)
+
 (** {1:files Files over a descriptor} *)
 
 val pread :

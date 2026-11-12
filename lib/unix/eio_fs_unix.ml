@@ -1847,6 +1847,143 @@ module Batch = struct
               (List.fold_left (fun acc op -> attempt run op :: acc) [] ops))
 end
 
+type removed = { entries : int; bytes : int; refused : string list }
+
+(* Four hops at once make most of the gain in a tree's time: eight spend half
+   as much system time again on the volume's locks. *)
+let remove_workers = 4
+
+(* A removal under way: a directory goes in hops of its own, its entries
+   stated in one and unlinked in the next, so a tree costs a few hops per
+   directory whatever each holds, and the hops of a tree's directories run at
+   once, [workers] at a time. A cancellation ends it at the next hop. *)
+type removal = {
+  root : Eio.Fs.dir_ty Eio.Path.t;
+  grant : bool;
+  workers : Eio.Semaphore.t;
+  mutable entries : int;
+  mutable bytes : int;
+  mutable refusals : string list;  (** Newest first. *)
+}
+
+let refuse r p why =
+  r.refusals <- Fmt.str "remove %a: %s" Eio.Path.pp p why :: r.refusals;
+  false
+
+let refuse_io r p err = refuse r p (Fmt.str "%a" Eio.Exn.pp_err err)
+
+let hop r f =
+  Eio.Semaphore.acquire r.workers;
+  Fun.protect ~finally:(fun () -> Eio.Semaphore.release r.workers) f
+
+let counted r size =
+  r.entries <- r.entries + 1;
+  r.bytes <- r.bytes + size
+
+let granted r p perm =
+  if r.grant && perm land 0o700 <> 0o700 then
+    Eio.Path.chmod ~follow:false ~perm:(perm lor 0o700) p
+
+(* Whether the failure of [rel] is an entry gone meanwhile; one that is not
+   is refused. *)
+let gone r rel = function
+  | `Unix (Unix.ENOENT, _, _) -> true
+  | e -> refuse r Eio.Path.(r.root / rel) (Fmt.str "%a" Batch.pp_error e)
+
+(* The directories and the other entries of [paths], stated in one hop, and
+   whether no statement was refused. *)
+let stated r b paths =
+  let stats =
+    hop r @@ fun () -> Batch.run b (List.map (fun p -> Batch.Lstat p) paths)
+  in
+  List.fold_left2
+    (fun (dirs, files, clear) p -> function
+      | Ok (Batch.Stat { kind = `Directory; perm; _ }) ->
+          ((p, perm) :: dirs, files, clear)
+      | Ok (Batch.Stat { size; _ }) ->
+          (dirs, (p, Optint.Int63.to_int size) :: files, clear)
+      | Ok Batch.Done -> (dirs, files, clear)
+      | Error e -> (dirs, files, gone r p e && clear))
+    ([], [], true) paths stats
+
+(* Whether [files], each with its size, went, in one hop. *)
+let unlinked r b files =
+  let unlinks =
+    hop r @@ fun () ->
+    Batch.run b
+      (List.map (fun (p, _) -> Batch.Unlink { path = p; dir = false }) files)
+  in
+  List.fold_left2
+    (fun clear (p, size) -> function
+      | Ok _ ->
+          counted r size;
+          clear
+      | Error e -> gone r p e && clear)
+    true files unlinks
+
+let removed_dir r b rel =
+  match
+    hop r @@ fun () -> Batch.run b [ Batch.Unlink { path = rel; dir = true } ]
+  with
+  | [ Ok _ ] ->
+      counted r 0;
+      true
+  | [ Error e ] -> gone r rel e
+  | _ -> invalid_arg "Eio_fs_unix.remove_tree: one result per operation"
+
+(* Whether nothing is left of the entries [paths]: those that are no directory
+   first, then the others, all at once. *)
+let rec removed_entries r b paths =
+  let dirs, files, clear = stated r b paths in
+  let clear = unlinked r b files && clear in
+  List.for_all Fun.id (Eio.Fiber.List.map (removed_tree r b) dirs) && clear
+
+and removed_tree r b (rel, perm) =
+  let dir = Eio.Path.(r.root / rel) in
+  match
+    granted r dir perm;
+    hop r @@ fun () -> Eio.Path.read_dir dir
+  with
+  | exception Eio.Io (Eio.Fs.E (Not_found _), _) -> true
+  | exception Eio.Io (err, _) -> refuse_io r dir err
+  | names ->
+      removed_entries r b (List.map (fun n -> rel ^ "/" ^ n) names)
+      && removed_dir r b rel
+
+let remove_tree ?(grant = false) ?last (path : [> Eio.Fs.dir_ty ] Eio.Path.t) =
+  let root = (path :> Eio.Fs.dir_ty Eio.Path.t) in
+  let r =
+    {
+      root;
+      grant;
+      workers = Eio.Semaphore.make remove_workers;
+      entries = 0;
+      bytes = 0;
+      refusals = [];
+    }
+  in
+  let contents sw =
+    let b = Batch.v ~sw root in
+    let first, last =
+      List.partition (fun n -> Some n <> last) (Eio.Path.read_dir root)
+    in
+    removed_entries r b first && removed_entries r b last
+  in
+  (match
+     match Eio.Path.stat ~follow:false root with
+     | { kind = `Directory; perm; _ } ->
+         granted r root perm;
+         if Eio.Switch.run contents then (
+           Eio.Path.rmdir root;
+           counted r 0)
+     | { size; _ } ->
+         Eio.Path.unlink root;
+         counted r (Optint.Int63.to_int size)
+   with
+  | () | (exception Eio.Io (Eio.Fs.E (Not_found _), _)) -> ()
+  | exception Eio.Io (err, _) -> ignore (refuse_io r root err));
+  { entries = r.entries; bytes = r.bytes; refused = List.rev r.refusals }
+
 module Private = struct
   let batch_hops = Batch.hops
 end
