@@ -55,6 +55,15 @@ let pread fd ~file_offset buf ~pos ~len =
     invalid_arg "Eio_fs_unix.pread";
   pread_native fd file_offset buf pos len
 
+external pread_cached_native :
+  Unix.file_descr -> int -> bytes -> int -> int -> int
+  = "caml_eio_fs_pread_cached"
+
+let pread_cached fd ~file_offset buf ~pos ~len =
+  if file_offset < 0 || pos < 0 || len < 0 || pos > Bytes.length buf - len then
+    invalid_arg "Eio_fs_unix.pread_cached";
+  pread_cached_native fd file_offset buf pos len
+
 external pwrite_native : Unix.file_descr -> int -> string -> int -> int -> int
   = "caml_eio_fs_pwrite"
 

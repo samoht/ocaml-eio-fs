@@ -136,6 +136,24 @@ val pread :
       end of [buf].
     @raise Unix.Unix_error as [pread]. *)
 
+val pread_cached :
+  Unix.file_descr -> file_offset:int -> bytes -> pos:int -> len:int -> int
+(** [pread_cached fd ~file_offset buf ~pos ~len] is {!val-pread} for a read the
+    operating system's page cache answers, such as a database page read again: a
+    read of at most 65536 bytes keeps the OCaml runtime lock, and lands in [buf]
+    with no copy, which costs less than giving the lock up and taking it back.
+    On Linux it asks with [RWF_NOWAIT] and gives the lock up only for a read
+    that would wait on the device; elsewhere it keeps the lock whatever the read
+    waits on, so no other thread of the domain runs, and no other domain
+    completes a minor collection, until it returns. A longer read is
+    {!val-pread}'s. A program whose other domains must not wait on a read takes
+    {!val-pread}.
+
+    @raise Stdlib.Invalid_argument
+      if [file_offset], [pos] or [len] is negative or [pos + len] is past the
+      end of [buf].
+    @raise Unix.Unix_error as {!val-pread}. *)
+
 val pwrite :
   Unix.file_descr -> file_offset:int -> string -> pos:int -> len:int -> int
 (** [pwrite fd ~file_offset buf ~pos ~len] writes up to [len] bytes of [buf]
