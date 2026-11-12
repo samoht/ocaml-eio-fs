@@ -3674,6 +3674,37 @@ let test_crash_drops_an_entry_planted_by_native_name () =
         "an entry planted by name after the wrap is not in the image" true
         (absent (post / "device.img")))
 
+(* A snapshot reads the tree while the run's other processes write it: a
+   file a child rewrites between the snapshot's stat and its read is read as
+   it stands, one of the images the rewrite passes through, and a snapshot is
+   no failure of the workload. The rewrite through [raw], once the snapshot
+   reads the file, stands in for the child. *)
+let test_crash_snapshot_reads_a_file_being_rewritten () =
+  let ctl = Crash.v () in
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let raw = env#fs in
+  Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "img") "AAAAAAAA";
+  let armed = ref false in
+  let rewrite (op : Op.t) =
+    match op.kind with
+    | `Read when !armed && String.equal (Filename.basename op.path) "img" ->
+        armed := false;
+        Eio.Path.save ~create:(`Or_truncate 0o644) (raw / "img") "BB"
+    | _ -> ()
+  in
+  let fs =
+    Crash.wrap ctl (Chaos.wrap (Schedule.observing rewrite Schedule.empty) raw)
+  in
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  armed := true;
+  Crash.sync_metadata ctl;
+  Alcotest.(check bool) "the rewrite ran during the snapshot" false !armed;
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the image holds the file as it stood" "BB"
+    (Eio.Path.load (post / "img"))
+
 (* An [After_write] trigger crashes the moment the covering write commits; the
    next op through the wrapper fails, and the unsynced block is lost. *)
 let test_crash_after_write_trigger () =
@@ -4094,4 +4125,6 @@ let suite =
         `Quick test_crash_ignores_a_barrier_through_a_bare_descriptor;
       Alcotest.test_case "crash: an entry planted by name is not in the image"
         `Quick test_crash_drops_an_entry_planted_by_native_name;
+      Alcotest.test_case "crash: a snapshot reads a file being rewritten" `Quick
+        test_crash_snapshot_reads_a_file_being_rewritten;
     ] )
