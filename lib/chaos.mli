@@ -93,7 +93,11 @@
       sleeps shorter than 1 ms, that never ends. Fibers on longer timers are no
       busy loop, however many turns they take;
     - a run still going after an hour of its clock fails as a hang: a poll that
-      sleeps 1 ms or more between its tries and never ends. *)
+      sleeps 1 ms or more between its tries and never ends.
+
+    A filesystem operation takes no time and no other fiber runs during it, so a
+    check does not explore a race that needs a fiber to act while another one's
+    operation is under way, as during a slow sync on a disk. *)
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t
