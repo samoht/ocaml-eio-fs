@@ -1,13 +1,39 @@
 (* Each call through [Eio_fs_unix.Inline.fs env] against the same call
-   through [Eio.Stdenv.fs env]: the same answer, or the same error printed
-   the same way. *)
+   through [Eio.Stdenv.fs env]: the same answer, or the same error as eio-fs
+   promises one, which says the operation that failed, on which path, and
+   why. *)
 
 let err fmt = Fmt.kstr (fun s -> Error s) fmt
+
+(* [e] as eio-fs promises it: the operation and the path, which are the
+   context Eio.Path adds, the kind of error and its errno. The system call a
+   backend names and its argument are not part of the promise: eio_linux
+   names statx and openat2, with an empty argument, where eio_posix and
+   Inline.fs name fstatat, openat and opendir, with the path. A comparison
+   of the printed exception would catch Inline.fs reporting another errno
+   or another operation, and not a backend's choice of call. *)
+let promised = function
+  | Eio.Io (err, context) ->
+      let errno = function
+        | Eio_unix.Unix_error (code, _, _) -> Eio_unix.Unix_error (code, "", "")
+        | b -> b
+      in
+      let err : Eio.Exn.err =
+        match err with
+        | Eio.Fs.E (Already_exists b) -> Eio.Fs.E (Already_exists (errno b))
+        | Eio.Fs.E (Not_found b) -> Eio.Fs.E (Not_found (errno b))
+        | Eio.Fs.E (Permission_denied b) ->
+            Eio.Fs.E (Permission_denied (errno b))
+        | Eio.Exn.X b -> Eio.Exn.X (errno b)
+        | err -> err
+      in
+      Eio.Io (err, context)
+  | e -> e
 
 let outcome f =
   match f () with
   | v -> Ok v
-  | exception (Eio.Io _ as e) -> err "%a" Eio.Exn.pp e
+  | exception (Eio.Io _ as e) -> err "%a" Eio.Exn.pp (promised e)
 
 let pp_stat ppf (s : Eio.File.Stat.t) = Eio.File.Stat.pp ppf s
 let stat_t = Alcotest.(result (testable pp_stat ( = )) string)
