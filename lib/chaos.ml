@@ -907,6 +907,10 @@ module Crash = struct
     seqs : (int * int) list;
         (* for each operation, latest first, the last change before it *)
     rtrace : Plan.trace;
+    changed : (int, unit) Hashtbl.t;
+        (* the syncs that changed what a cut leaves, and the operations an
+           ack followed *)
+    rchanged : (int, unit) Hashtbl.t; (* the same in recover *)
     acked_at : int list; (* the operation each ack came after *)
     lost : unsynced list;
     left : string list;
@@ -919,15 +923,27 @@ module Crash = struct
 
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
-     outcome, and the unsynced changes the cut lost. *)
+     outcome, and the unsynced changes the cut lost. The syncs that changed
+     the controller go to [changed]. *)
   let phase ?(guard = ignore) ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs
-      ~stop fs f =
+      ~changed ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
+    (* The last sync, and the controller's stamp before it. *)
+    let sync = ref None in
+    let synced () =
+      match !sync with
+      | Some (i, s) ->
+          sync := None;
+          if M.Crash.stamp ctl <> s then Hashtbl.replace changed i ()
+      | None -> ()
+    in
     let hook (mop : M.Op.t) =
       let op = num mop in
       guard op;
       if not (M.Crash.is_crashed ctl) then begin
+        synced ();
+        if op.kind = `Sync then sync := Some (op.index, M.Crash.stamp ctl);
         (seqs :=
            match !seqs with
            | (s, _) :: rest when s = M.Crash.seq ctl -> (s, op.index) :: rest
@@ -966,7 +982,8 @@ module Crash = struct
       match
         Eio.Switch.run (fun sw ->
             run_sw := Some sw;
-            f wrapped)
+            f wrapped;
+            if not (M.Crash.is_crashed ctl) then synced ())
       with
       | () ->
           stop := None;
@@ -986,6 +1003,7 @@ module Crash = struct
     let trace = record ?cap ~marked () and rtrace = record ?cap () in
     let lost = ref [] and left = ref [] in
     let cut_op = ref None and seqs = ref [] in
+    let changed = Hashtbl.create 16 and rchanged = Hashtbl.create 16 in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
     let halted = ref None and floor = ref 0 and ops = ref 0 in
@@ -1016,11 +1034,12 @@ module Crash = struct
               count_op halted ops;
               add_floor halted ~budget ~floor ~at:op.index (Plan.crash_floor op))
             ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
-            ~cut_op ~seqs ~stop fs
+            ~cut_op ~seqs ~changed ~stop fs
             (fun fs ->
               run
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then begin
+                    Hashtbl.replace changed trace.last ();
                     acked := v :: !acked;
                     acked_at := trace.last :: !acked_at
                   end)
@@ -1047,7 +1066,8 @@ module Crash = struct
               phase
                 ~guard:(fun _ -> count_op halted ops)
                 ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
-                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~stop rfs
+                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~changed:rchanged
+                ~stop rfs
                 (fun fs -> recover ~acked (env_of clock mono fs))
             in
             match (rout, s.rcut) with
@@ -1073,6 +1093,8 @@ module Crash = struct
       cut_op = !cut_op;
       seqs = !seqs;
       rtrace = kept rtrace;
+      changed;
+      rchanged;
       acked_at = List.rev !acked_at;
       lost = !lost;
       left = !left;
@@ -1084,6 +1106,9 @@ module Crash = struct
              s.rcut;
       error;
     }
+
+  let changed r (op : Op.t) = Hashtbl.mem r.changed op.index
+  let rchanged r (op : Op.t) = Hashtbl.mem r.rchanged op.index
 
   (* The values acknowledged, by the operation each came after: their type
      has no printer, and recover names the one it misses. *)
@@ -1250,7 +1275,8 @@ module Crash = struct
       r
     in
     let trace = first_ops in
-    let cuts = Plan.crash_cuts trace in
+    let changed = changed first in
+    let cuts = Plan.crash_cuts ~changed trace in
     let faults = Plan.crash_faults ~tears trace in
     match replay with
     | Some ((h, k) as r) -> (
@@ -1258,12 +1284,12 @@ module Crash = struct
         let find l = List.find_opt (fun s -> Plan.crash_key s = k) l in
         (* The scenarios each run of [l] leads to, one run at a time. *)
         let find_after l f = List.find_map (fun s -> find (f s (exec s))) l in
-        let rcuts s r = Plan.rcuts s ~recover:r.rtrace in
+        let rcuts s r = Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace in
         let candidates =
           [
             (Linear, fun () -> find (cuts @ faults));
             (Linear, fun () -> find_after cuts rcuts);
-            (Sampled, fun () -> find (Plan.crash_others ~tears trace));
+            (Sampled, fun () -> find (Plan.crash_others ~changed ~tears trace));
             ( Sampled,
               fun () ->
                 find_after faults (fun (s : Plan.crash) r ->
@@ -1328,7 +1354,8 @@ module Crash = struct
         let rcuts =
           List.concat_map
             (fun s ->
-              let l = Plan.rcuts s ~recover:(attempt Linear s).rtrace in
+              let r = attempt Linear s in
+              let l = Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace in
               nrcuts := !nrcuts + List.length l;
               if List.length lin + !nrcuts > budget then [] else l)
             cuts
@@ -1353,14 +1380,15 @@ module Crash = struct
                 | _ -> []
               in
               ( Plan.spread quota pairs,
-                Plan.spread quota (Plan.rcuts s ~recover:r.rtrace) ))
+                Plan.spread quota
+                  (Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace) ))
             faults
         in
         if linear > budget then over linear;
         List.iter (fun r -> ignore (attempt Linear r)) rcuts;
         (* Sampled tier. *)
         let thunks = List.map (fun s () -> ignore (attempt Sampled s)) in
-        let others = thunks (Plan.crash_others ~tears trace) in
+        let others = thunks (Plan.crash_others ~changed ~tears trace) in
         let pairs = List.concat_map (fun (p, _) -> thunks p) after_faults in
         let recovery = List.concat_map (fun (_, r) -> thunks r) after_faults in
         (* Every state each cut allows, enumerated while the draws met so

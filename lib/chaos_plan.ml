@@ -300,14 +300,17 @@ type crash = {
 
 let base = { cfaults = []; cut = None; state = Drop; rcut = None }
 
-let changes (op : Op.t) =
+(* A write, a truncation, a directory change or an open that may write
+   changes what a cut leaves; a sync does only where it commits something,
+   which [changed] says, as for any operation an ack follows. *)
+let changes ~changed (op : Op.t) =
   match op.kind with
-  | `Write | `Truncate | `Sync | `Change | `Open_write -> true
-  | _ -> false
+  | `Write | `Truncate | `Change | `Open_write -> true
+  | _ -> changed op
 
 (* After each operation of [ops] that changes the disk, before the one that
    follows it in [trace]; [None] is the end. *)
-let cut_points (trace : trace) ops =
+let cut_points ~changed (trace : trace) ops =
   let next = Hashtbl.create 16 in
   let rec link = function
     | (a : Op.t) :: (b :: _ as rest) ->
@@ -319,7 +322,7 @@ let cut_points (trace : trace) ops =
   let after =
     List.filter_map
       (fun (op : Op.t) ->
-        if changes op then
+        if changes ~changed op then
           Option.map (fun b -> Some (pos_of b)) (Hashtbl.find_opt next op.index)
         else None)
       ops
@@ -371,36 +374,38 @@ let durable_faults ~tears ops =
 
 let both s = [ { s with state = Drop }; { s with state = Keep } ]
 
-let crash_cuts trace =
+let crash_cuts ~changed trace =
   List.concat_map
     (fun cut -> both { base with cut })
-    (cut_points trace (structural trace))
+    (cut_points ~changed trace (structural trace))
 
 let crash_floor op =
-  if always op && changes op then List.length (both base) else 0
+  if always op && changes ~changed:(fun _ -> false) op then
+    List.length (both base)
+  else 0
 
 let crash_faults ~tears trace =
   List.concat_map
     (fun one -> both { base with cfaults = [ one ] })
     (durable_faults ~tears (structural trace))
 
-let crash_others ~tears trace =
+let crash_others ~changed ~tears trace =
   let sel = structural trace in
-  let lin = cut_points trace sel in
+  let lin = cut_points ~changed trace sel in
   List.concat_map
     (fun cut -> both { base with cut })
     (List.filter
        (fun c -> not (List.mem c lin))
-       (cut_points trace (rest trace sel)))
+       (cut_points ~changed trace (rest trace sel)))
   @ List.concat_map
       (fun one -> both { base with cfaults = [ one ] })
       (durable_faults ~tears (rest trace sel))
 
-let rcuts s ~(recover : trace) =
+let rcuts ~changed s ~(recover : trace) =
   List.concat_map
     (fun j ->
       List.map (fun st -> { s with rcut = Some (j, st) }) [ Drop; Keep ])
-    (cut_points recover (structural recover))
+    (cut_points ~changed recover (structural recover))
 
 let crash_seconds ~tears first ~(after : trace) =
   match index_of after (fst first) with

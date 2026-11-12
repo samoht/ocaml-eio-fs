@@ -814,6 +814,28 @@ let recover_syncs dirs =
 let test_idle_syncs_are_no_cut () =
   Alcotest.(check int) "runs" (recover_syncs 1) (recover_syncs 20)
 
+(* A sync of a directory whose own entry is not durable commits nothing,
+   but holds a barrier a later commit honours: it changes what a cut
+   leaves. A second one, and a sync of a synced file, change nothing. *)
+let test_stamp () =
+  Eio_mock.Backend.run @@ fun () ->
+  let module C = Eio_fs.Chaos.Private.Crash in
+  let ctl = C.v () in
+  let fs = C.wrap ctl (Eio_fs.Fs.v ()) in
+  let moved f =
+    let s = C.stamp ctl in
+    f ();
+    C.stamp ctl <> s
+  in
+  P.mkdir ~perm:0o755 P.(fs / "d");
+  P.save ~create:(`Exclusive 0o644) P.(fs / "d" / "f") "x";
+  let d () = Eio_fs_sync.sync_dir P.(fs / "d") in
+  Alcotest.(check bool) "barrier" true (moved d);
+  Alcotest.(check bool) "again" false (moved d);
+  let f () = P.with_open_out ~create:`Never P.(fs / "d" / "f") Eio.File.sync in
+  Alcotest.(check bool) "data" true (moved f);
+  Alcotest.(check bool) "synced file" false (moved f)
+
 (* A poll that reads an open file until it changes, with no yield: no turn
    passes and nothing fails, so only the run's operations stop it. Its own
    bound, past that, fails the run when nothing stops it. *)
@@ -1163,6 +1185,7 @@ let suite =
         test_first_run_stops_at_the_budget;
       Alcotest.test_case "a sync that commits nothing is no cut" `Quick
         test_idle_syncs_are_no_cut;
+      Alcotest.test_case "what a sync changes" `Quick test_stamp;
       Alcotest.test_case "a read poll with no yield stops" `Quick
         test_read_poll_stops;
       Alcotest.test_case "a stat poll under power cuts stops" `Quick

@@ -1315,6 +1315,9 @@ module Crash = struct
         (* The byte ranges writes covered in a file of an in-memory base, by
            path: the rest of it is a hole the disk does not hold. *)
     mutable seq : int;
+    mutable effects : int;
+        (* The commits, barriers and failures of syncs so far: with [seq],
+           what tells a sync that changed nothing a cut leaves. *)
     mutable ops : int;
     mutable crashed : bool;
     mutable image :
@@ -1876,6 +1879,7 @@ module Crash = struct
 
   (* A committed entry leaves the indexes of pending ones. *)
   let mark_committed ctl e =
+    ctl.effects <- ctl.effects + 1;
     e.committed <- true;
     List.iter (fun d -> remove_from ctl.by_dir d e) e.dirs;
     List.iter (fun p -> remove_from ctl.by_parent p e) e.parents;
@@ -2183,6 +2187,7 @@ module Crash = struct
         Ids.iter
           (fun _ e ->
             if not (List.exists (Int64.equal ino) e.barred) then begin
+              ctl.effects <- ctl.effects + 1;
               e.barred <- ino :: e.barred;
               refresh ctl e
             end)
@@ -2205,8 +2210,11 @@ module Crash = struct
       | Some m ->
           Ids.iter
             (fun _ e ->
-              e.synced <- true;
-              refresh ctl e)
+              if not e.synced then begin
+                ctl.effects <- ctl.effects + 1;
+                e.synced <- true;
+                refresh ctl e
+              end)
             m);
       settle ctl
     end
@@ -3154,6 +3162,7 @@ module Crash = struct
   (* A failed barrier loses the pending writes, which the page cache keeps:
      a later change that dirties one of their blocks writes it whole. *)
   let fail_sync ctl fs =
+    ctl.effects <- ctl.effects + 1;
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
     let pending = List.rev fs.pending in
     (* A kept truncation is in the page cache already. *)
@@ -3222,6 +3231,10 @@ module Crash = struct
   let barrier ctl fs ~stat sync =
     match sync () with
     | () ->
+        if
+          fs.pending <> [] || fs.partial <> [] || Option.is_some fs.cache
+          || Option.is_some fs.evicted
+        then ctl.effects <- ctl.effects + 1;
         let pending = List.rev_map (fun e -> (e.change, e.cached)) fs.pending in
         (* A block written now is no longer one a failed sync may have
            left. *)
@@ -3901,6 +3914,7 @@ module Crash = struct
       admin = None;
       subtrees = [];
       seq = 0;
+      effects = 0;
       logged = 0;
       pending_changes = 0;
       ops = 0;
@@ -3942,6 +3956,7 @@ module Crash = struct
 
   let left ctl = ctl.left
   let seq ctl = ctl.seq
+  let stamp ctl = ctl.seq + ctl.effects
 
   let pp_unsynced ppf u =
     match u.kind with

@@ -148,9 +148,13 @@ val tears : sizes:(string * int) list -> trace -> Op.t -> int list
     given the size of each file before [first]: at the 512-byte sectors of the
     bytes it overwrites, and anywhere in those it adds. *)
 
-val crash_cuts : trace -> crash list
-(** [crash_cuts first] is a cut after each structural operation of [first] that
-    changes the disk, and at its end, in both simplest states. *)
+val crash_cuts : changed:(Op.t -> bool) -> trace -> crash list
+(** [crash_cuts ~changed first] is a cut after each structural operation of
+    [first] that changes the disk, and at its end, in both simplest states. A
+    write, a truncation, a directory change or an open that may write changes
+    it; another operation only if [changed] holds for it: a sync that committed
+    something, or an operation an ack followed. A cut after another sync leaves
+    what the cut before it leaves, as nothing a cut reads changed. *)
 
 val crash_floor : Op.t -> int
 (** [crash_floor op] is, likewise, the cuts {!crash_cuts} has for [op] in every
@@ -161,12 +165,13 @@ val crash_faults : tears:(Op.t -> int list) -> trace -> crash list
 (** [crash_faults ~tears first] is each structural sync failed and each
     structural write torn, alone, with a cut at the end. *)
 
-val crash_others : tears:(Op.t -> int list) -> trace -> crash list
-(** [crash_others ~tears first] is the same at the other operations. *)
+val crash_others :
+  changed:(Op.t -> bool) -> tears:(Op.t -> int list) -> trace -> crash list
+(** [crash_others ~changed ~tears first] is the same at the other operations. *)
 
-val rcuts : crash -> recover:trace -> crash list
-(** [rcuts s ~recover] is [s] with a cut after each structural change of
-    [recover], the trace of its recovery, and at its end. *)
+val rcuts : changed:(Op.t -> bool) -> crash -> recover:trace -> crash list
+(** [rcuts ~changed s ~recover] is [s] with a cut after each structural change
+    of [recover], the trace of its recovery, and at its end. *)
 
 val crash_seconds :
   tears:(Op.t -> int list) -> pos * Fault.t -> after:trace -> crash list
