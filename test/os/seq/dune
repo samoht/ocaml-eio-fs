@@ -1,0 +1,3 @@
+(library
+ (name os_seq)
+ (libraries eio unix fmt cstruct optint))

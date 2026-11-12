@@ -1,0 +1,3 @@
+(executable
+ (name record)
+ (libraries os_seq eio eio_posix unix fmt))

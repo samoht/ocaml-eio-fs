@@ -1,0 +1,14 @@
+(test
+ (name test)
+ (libraries os_seq eio eio.mock eio_fs fmt alcotest)
+ (deps
+  (source_tree traces)))
+
+; Re-record the outcomes, on macOS with Docker:
+; REGEN=1 dune build @test/os/regen-traces
+
+(rule
+ (alias regen-traces)
+ (deps
+  (alias traces/regen))
+ (action (progn)))
