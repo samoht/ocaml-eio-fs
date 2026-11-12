@@ -138,10 +138,11 @@ val check :
     past the durable length or in a hole, may instead hold stale data: what the
     disk held there before, at the same place in a page a synced truncation of
     the file freed, or in a file removed before the cut or by it, and else the
-    byte ['7']. Of the uncommitted directory changes, a prefix survives. A
-    failed sync loses the file's unsynced writes, as Linux does, though some of
-    their sectors may already be on disk; the page cache may keep them or evict
-    them. *)
+    byte ['7']. ext4 may give a freed block to any offset of any file; the check
+    tries only the same offset. Of the uncommitted directory changes, a prefix
+    survives. A failed sync loses the file's unsynced writes, as Linux does,
+    though some of their sectors may already be on disk; the page cache may keep
+    them or evict them. *)
 module Crash : sig
   val check :
     ?budget:int ->
