@@ -3006,11 +3006,17 @@ module Crash = struct
          (fun _ ls ->
            List.iter (fun (fs, _, _) -> Hashtbl.replace located fs.id ()) ls)
          locs.at;
+       (* A file the program still names keeps its blocks, even where the
+          cut lost its creation: only a removal frees them. *)
+       let live = Hashtbl.create 8 in
+       Hashtbl.iter
+         (fun _ (fs : fstate) -> Hashtbl.replace live fs.id ())
+         ctl.files;
+       let kept id = Hashtbl.mem located id || Hashtbl.mem live id in
        let gone_files =
          Hashtbl.fold
            (fun id (fs : fstate) acc ->
-             if Hashtbl.mem located id then acc
-             else (fs.rel, bytes_of fs.durable) :: acc)
+             if kept id then acc else (fs.rel, bytes_of fs.durable) :: acc)
            ctl.known []
        and gone_nodes =
          Inos.fold
@@ -3022,7 +3028,7 @@ module Crash = struct
        unsynced_removed :=
          Hashtbl.fold
            (fun id (fs : fstate) acc ->
-             if Hashtbl.mem located id || fs.pending = [] then acc
+             if kept id || fs.pending = [] then acc
              else
                let durable = bytes_of fs.durable in
                let pending =

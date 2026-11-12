@@ -152,10 +152,11 @@ val check :
     hole, that a write put bytes in is written whole, as ext4 allocates it: each
     of its sectors within the length may instead hold stale data. That is what
     the disk held there before, at the same place in a page a synced truncation
-    of the file freed, or in a file removed before the cut or by it, its
-    unsynced bytes included, as writeback may have written them before the
-    removal, and else the byte ['7']. ext4 may give a freed block to any offset
-    of any file; the check tries only the same offset. Of the uncommitted
+    of the file freed, or in a file the workload removed, its unsynced bytes
+    included, as writeback may have written them before the removal, and else
+    the byte ['7']. Only a freed block holds stale data: a file the cut lost and
+    the workload never removed frees none. ext4 may give a freed block to any
+    offset of any file; the check tries only the same offset. Of the uncommitted
     directory changes, a prefix survives. A failed sync loses the file's
     unsynced writes, as Linux does, though some of their sectors may already be
     on disk; the page cache may keep them or evict them. *)
