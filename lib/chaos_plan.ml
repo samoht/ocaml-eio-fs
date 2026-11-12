@@ -161,7 +161,7 @@ let lasting_code l (op : Op.t) : Fault.code option =
   match (l, op.kind) with
   | Read_only, (`Write | `Change | `Open_write) -> Some `Erofs
   | Full, (`Write | `Change | `Open_write) -> Some `Enospc
-  | Denied, (`Open_read | `Open_write | `Change | `Write | `Read_dir | `Stat) ->
+  | Denied, (`Open_read | `Open_write | `Change | `Read_dir | `Stat) ->
       Some `Eacces
   | _ -> None
 

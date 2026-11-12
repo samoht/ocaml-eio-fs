@@ -157,6 +157,7 @@ module Op = struct
     path : string;
     file_offset : int;  (** byte offset for reads/writes, [0] otherwise *)
     length : int;  (** bytes requested/offered, [0] otherwise *)
+    space : bool;
   }
 
   let pp_kind ppf = function
@@ -172,21 +173,17 @@ module Op = struct
   let pp ppf t =
     Fmt.pf ppf "%a %s @%d+%d" pp_kind t.kind t.path t.file_offset t.length
 
-  let read path ~offset ~len =
-    { kind = `Read; path; file_offset = offset; length = len }
+  let v ?(space = false) ?(offset = 0) ?(len = 0) kind path =
+    { kind; path; file_offset = offset; length = len; space }
 
-  let write path ~offset ~len =
-    { kind = `Write; path; file_offset = offset; length = len }
-
-  let read_dir path = { kind = `Read_dir; path; file_offset = 0; length = 0 }
-  let sync path = { kind = `Sync; path; file_offset = 0; length = 0 }
-  let open_read path = { kind = `Open_read; path; file_offset = 0; length = 0 }
-
-  let open_write path =
-    { kind = `Open_write; path; file_offset = 0; length = 0 }
-
-  let stat path = { kind = `Stat; path; file_offset = 0; length = 0 }
-  let change path = { kind = `Change; path; file_offset = 0; length = 0 }
+  let read path ~offset ~len = v ~offset ~len `Read path
+  let write path ~offset ~len = v ~space:true ~offset ~len `Write path
+  let read_dir path = v `Read_dir path
+  let sync path = v `Sync path
+  let open_read path = v `Open_read path
+  let open_write ~space path = v ~space `Open_write path
+  let stat path = v `Stat path
+  let change ~space path = v ~space `Change path
 end
 
 module Schedule = struct
@@ -694,11 +691,20 @@ module Dir_impl = struct
     wrap_ro t.sched ~path file
 
   let open_out t ~sw ~follow ~append ~create path =
-    let fault = Schedule.next t.sched (Op.open_write path) in
+    let (Base_dir ((module B), bv)) = t.boxed in
+    (* Only an open that makes its file needs room. *)
+    let space =
+      create <> `Never
+      &&
+      match B.stat bv ~follow:true path with
+      | _ -> false
+      | exception Eio.Io _ -> true
+    in
+    let fault = Schedule.next t.sched (Op.open_write ~space path) in
     (match fault with
+    | Some (Fault.Open_error `Enospc) when not space -> ()
     | Some (Fault.Open_error c) -> raise_open c path
     | _ -> ());
-    let (Base_dir ((module B), bv)) = t.boxed in
     let file = B.open_out bv ~sw ~follow ~append ~create path in
     swap_after t.boxed fault path;
     wrap_rw t.sched ~path ~append file
@@ -724,14 +730,15 @@ module Dir_impl = struct
     result
 
   (* A change to a directory's entries, named by the entry it makes or
-     removes. *)
-  let change t path =
-    match Schedule.next t.sched (Op.change path) with
+     removes; only one that makes an entry needs room. *)
+  let change ?(space = false) t path =
+    match Schedule.next t.sched (Op.change ~space path) with
+    | Some (Fault.Change_error `Enospc) when not space -> ()
     | Some (Fault.Change_error c) -> raise_open c path
     | _ -> ()
 
   let mkdir t ~perm path =
-    change t path;
+    change ~space:true t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.mkdir bv ~perm path
 
@@ -760,7 +767,7 @@ module Dir_impl = struct
     B.rmdir bv path
 
   let rename t old_path new_dir new_path =
-    change t old_path;
+    change ~space:true t old_path;
     let target =
       match base_dir new_dir with
       | Some base -> base
@@ -770,7 +777,7 @@ module Dir_impl = struct
     B.rename bv old_path target new_path
 
   let rename_exclusive t backend ~source ~target:(new_dir, new_path) =
-    change t source;
+    change ~space:true t source;
     let target =
       match base_dir new_dir with Some base -> base | None -> new_dir
     in
@@ -781,7 +788,7 @@ module Dir_impl = struct
     B.read_link bv path
 
   let symlink ~link_to t path =
-    change t path;
+    change ~space:true t path;
     let (Base_dir ((module B), bv)) = t.boxed in
     B.symlink ~link_to bv path
 

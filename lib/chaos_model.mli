@@ -120,6 +120,11 @@ module Op : sig
         (** The byte offset of a read or a write, and [0] otherwise. *)
     length : int;
         (** The bytes a read requests or a write offers, and [0] otherwise. *)
+    space : bool;
+        (** Whether the operation may fail for want of room: a write, an open
+            that makes its file, a [mkdir], a [symlink] or a [rename]. An
+            [`Enospc] fault on another open or change injects nothing, as Linux
+            never answers it there. *)
   }
   (** The type for operations. *)
 

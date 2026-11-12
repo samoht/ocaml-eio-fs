@@ -30,7 +30,12 @@ let numberer () =
       length = op.length;
     }
 
-let model_fault (op : Op.t) : Fault.t -> M.Fault.t option = function
+(* An [ENOSPC] on an operation that needs no room is none: Linux never
+   answers it there. *)
+let model_fault ~space (op : Op.t) : Fault.t -> M.Fault.t option = function
+  | Fail `Enospc when (not space) && (op.kind = `Change || op.kind = `Open_write)
+    ->
+      None
   | Fail c ->
       Some
         (match op.kind with
@@ -53,9 +58,9 @@ let model_fault (op : Op.t) : Fault.t -> M.Fault.t option = function
 
 let wrap f base =
   let num = numberer () in
-  let hook op =
-    let op = num op in
-    Option.bind (f op) (model_fault op)
+  let hook (mop : M.Op.t) =
+    let op = num mop in
+    Option.bind (f op) (model_fault ~space:mop.space op)
   in
   (M.wrap (M.Schedule.hook hook) base :> Eio.Fs.dir_ty Eio.Path.t)
 
@@ -284,11 +289,14 @@ let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
     List.iter (Hashtbl.remove st.counts) (targets op)
 
-let exec_check ~first ~setup run (s : Plan.check) =
+let exec_check ?(spaces = Hashtbl.create 1) ~first ~setup run (s : Plan.check) =
   let trace = ref [] and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
-  let hook mop =
+  let hook (mop : M.Op.t) =
     let op = num mop in
+    Hashtbl.replace spaces
+      { Plan.kind = op.kind; path = op.path; nth = op.nth }
+      mop.space;
     let fault =
       match s.lasting with
       | Some (l, p) ->
@@ -305,7 +313,8 @@ let exec_check ~first ~setup run (s : Plan.check) =
     in
     let fault =
       match fault with
-      | Some f -> Option.map (fun m -> (f, m)) (model_fault op f)
+      | Some f ->
+          Option.map (fun m -> (f, m)) (model_fault ~space:mop.space op f)
       | None -> None
     in
     trace := (op, Option.map fst fault) :: !trace;
@@ -340,7 +349,10 @@ let check ?budget ?replay ?(setup = ignore) run =
   let name = check_name in
   let budget = budget_of name budget in
   let replay = Option.map (parse_replay name) replay in
-  let first, out = exec_check ~first:(Hashtbl.create 1) ~setup run Plan.none in
+  let spaces = Hashtbl.create 16 in
+  let first, out =
+    exec_check ~spaces ~first:(Hashtbl.create 1) ~setup run Plan.none
+  in
   if out <> Passed then
     fail name "the run with no fault failed: %s" (outcome_text out);
   let first = ops first in
@@ -355,7 +367,16 @@ let check ?budget ?replay ?(setup = ignore) run =
        must be deterministic"
       (diverge first again);
   let hash = digest first in
-  let linear = Plan.check_linear first in
+  (* A scenario whose fault the operation never meets is none. *)
+  let meets (s : Plan.check) =
+    List.for_all
+      (fun (p, f) ->
+        match f with
+        | Fault.Fail `Enospc -> Hashtbl.find_opt spaces p <> Some false
+        | _ -> true)
+      s.faults
+  in
+  let linear = List.filter meets (Plan.check_linear first) in
   let attempt ?matched tier s =
     let trace, out = exec s in
     if out <> Passed then
@@ -373,7 +394,7 @@ let check ?budget ?replay ?(setup = ignore) run =
         match find linear with
         | Some s -> Some (s, Linear)
         | None -> (
-            match find (Plan.check_others first) with
+            match find (List.filter meets (Plan.check_others first)) with
             | Some s -> Some (s, Sampled)
             | None ->
                 List.find_map
@@ -412,7 +433,8 @@ let check ?budget ?replay ?(setup = ignore) run =
           afters
       in
       let classes =
-        List.filter (( <> ) []) [ Plan.check_others first; pairs ]
+        List.filter (( <> ) [])
+          [ List.filter meets (Plan.check_others first); pairs ]
       in
       let share =
         Plan.sampled_share ~budget ~linear:n ~classes:(List.length classes)
@@ -501,7 +523,7 @@ module Crash = struct
   let phase ~kept_going ~trace ~ctl ~faults ~cut ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
-    let hook mop =
+    let hook (mop : M.Op.t) =
       let op = num mop in
       if not (M.Crash.is_crashed ctl) then
         begin match cut with
@@ -525,7 +547,7 @@ module Crash = struct
       match List.partition (fun (p, _) -> Plan.at p op) !pending with
       | (_, f) :: _, rest ->
           pending := rest;
-          let m = model_fault op f in
+          let m = model_fault ~space:mop.space op f in
           trace := (op, Option.map (fun _ -> f) m) :: !trace;
           m
       | [], _ ->

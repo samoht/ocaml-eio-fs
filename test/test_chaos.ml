@@ -434,7 +434,13 @@ let test_directory_short_read_inapplicable () =
     Schedule.seeded ~probability:1. ~kinds:[ `Short_read ] ~seed:29 ()
   in
   let op : Op.t =
-    { kind = `Read_dir; path = "tree"; file_offset = 0; length = 0 }
+    {
+      kind = `Read_dir;
+      path = "tree";
+      file_offset = 0;
+      length = 0;
+      space = false;
+    }
   in
   Alcotest.(check bool)
     "no byte fault selected for directory" true
@@ -451,7 +457,9 @@ let test_seeded_short_read_long_op () =
     Schedule.seeded ~probability:1. ~kinds:[ `Short_read ] ~seed:29 ()
   in
   let length = (1 lsl 30) + 1 in
-  let op : Op.t = { kind = `Read; path = "f"; file_offset = 0; length } in
+  let op : Op.t =
+    { kind = `Read; path = "f"; file_offset = 0; length; space = false }
+  in
   match Chaos.Internal.next sched op with
   | Some (Short_read n) ->
       Alcotest.(check bool)
@@ -724,7 +732,9 @@ let test_scripted_fires_once () =
   let sched =
     Schedule.scripted [ { trigger = Nth_op 2; fault = Short_read 1 } ]
   in
-  let op = { Op.kind = `Read; path = "f"; file_offset = 0; length = 10 } in
+  let op =
+    { Op.kind = `Read; path = "f"; file_offset = 0; length = 10; space = false }
+  in
   let check name expected =
     Alcotest.(check bool)
       name true
@@ -750,7 +760,9 @@ let test_nth_op_on_path () =
         };
       ]
   in
-  let op kind path = { Op.kind; path; file_offset = 0; length = 0 } in
+  let op kind path =
+    { Op.kind; path; file_offset = 0; length = 0; space = false }
+  in
   let faults =
     List.map
       (fun o -> Option.is_some (Chaos.Internal.next sched o))
@@ -773,7 +785,7 @@ let test_nth_op_on_path () =
 
 let ops_fixture =
   let mk kind path file_offset length : Op.t =
-    { kind; path; file_offset; length }
+    { kind; path; file_offset; length; space = false }
   in
   [
     mk `Open_write "a" 0 0;

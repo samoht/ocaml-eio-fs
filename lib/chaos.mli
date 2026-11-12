@@ -88,14 +88,16 @@ val check :
 
     The linear tier tries each of these alone, at each structural operation:
 
-    - the operation fails with each error that fits it: [EACCES], [EROFS] or
-      [ENOSPC] on an open that may write or a directory change, [EACCES] or
-      [EIO] on an open for reading or a stat, [ENOSPC] or [EIO] on a write,
-      [EIO] on a read or a sync;
+    - the operation fails with each error Linux answers there: [EACCES] or
+      [EROFS] on an open that may write or a directory change, and [ENOSPC] on
+      one that makes a file or an entry, [EACCES] or [EIO] on an open for
+      reading or a stat, [ENOSPC] or [EIO] on a write, [EIO] on a read or a
+      sync;
     - a read or a write moves a single byte;
     - a write is torn: half its bytes land, then it fails with [ENOSPC];
     - from that operation on, the filesystem is read-only, full, or denies every
-      access.
+      access: each operation that can meet that error then fails with it, as
+      above, and a write to a file already open is still allowed under the last.
 
     The sampled tier adds the other operations, and a second fault on the
     operations the first one caused, which is where a retry path lives.
@@ -318,7 +320,9 @@ module Fault : sig
   (** The type for faults. One that does not apply to an operation does nothing.
   *)
   type t =
-    | Fail of code  (** The operation fails with that error. *)
+    | Fail of code
+        (** The operation fails with that error. [ENOSPC] applies to a write,
+            and to an open or a change that makes a file or an entry only. *)
     | Short of int  (** A read or a write moves at most [max 1 n] bytes. *)
     | Torn of int
         (** A write stores its first [n] bytes, then fails with [ENOSPC]. *)
