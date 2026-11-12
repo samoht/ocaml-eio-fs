@@ -200,9 +200,11 @@ module Bounded_sink = struct
     t.written <- Int64.add t.written (Int64.of_int count);
     count
 
+  (* Up to 128 KiB, larger than Eio's 4 KiB fallback, without buffering the
+     value whole; it grows from 4 KiB as reads fill it, so a small value
+     allocates little. *)
   let copy t ~src =
-    (* Larger than Eio's 4 KiB fallback, without buffering the value whole. *)
-    let buf = Cstruct.create 131_072 in
+    let buf = ref (Cstruct.create 4096) in
     let rec write_all chunk =
       if not (Cstruct.is_empty chunk) then
         let written = single_write t [ chunk ] in
@@ -210,8 +212,10 @@ module Bounded_sink = struct
     in
     try
       while true do
-        let read = Eio.Flow.single_read src buf in
-        write_all (Cstruct.sub buf 0 read)
+        let read = Eio.Flow.single_read src !buf in
+        write_all (Cstruct.sub !buf 0 read);
+        let n = Cstruct.length !buf in
+        if read = n && n < 131_072 then buf := Cstruct.create (2 * n)
       done
     with End_of_file -> ()
 end

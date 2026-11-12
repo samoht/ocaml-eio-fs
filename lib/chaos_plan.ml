@@ -198,13 +198,9 @@ let check_seconds first ~(after : trace) =
   match index_of after (fst first) with
   | None -> []
   | Some (op1 : Op.t) ->
-      List.filter_map
-        (fun ((p2, _) as two) ->
-          match index_of after p2 with
-          | Some (op2 : Op.t) when op2.index > op1.index ->
-              Some { faults = [ first; two ]; lasting = None }
-          | _ -> None)
-        (singles after)
+      List.filter (fun (op : Op.t) -> op.index > op1.index) after
+      |> singles
+      |> List.map (fun two -> { faults = [ first; two ]; lasting = None })
 
 let faults_key = function
   | [] -> "none"
@@ -345,13 +341,10 @@ let crash_seconds ~tears first ~(after : trace) =
   match index_of after (fst first) with
   | None -> []
   | Some (op1 : Op.t) ->
-      List.concat_map
-        (fun ((p2, _) as two) ->
-          match index_of after p2 with
-          | Some (op2 : Op.t) when op2.index > op1.index ->
-              both { base with cfaults = [ first; two ] }
-          | _ -> [])
-        (durable_faults ~tears (structural after))
+      List.filter (fun (op : Op.t) -> op.index > op1.index) (structural after)
+      |> durable_faults ~tears
+      |> List.concat_map (fun two ->
+          both { base with cfaults = [ first; two ] })
 
 let next_choices trail =
   let rec go = function

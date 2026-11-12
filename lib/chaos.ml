@@ -289,14 +289,17 @@ let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
     List.iter (Hashtbl.remove st.counts) (targets op)
 
-let exec_check ?(spaces = Hashtbl.create 1) ~first ~setup run (s : Plan.check) =
+let exec_check ?spaces ~first ~setup run (s : Plan.check) =
   let trace = ref [] and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
   let hook (mop : M.Op.t) =
     let op = num mop in
-    Hashtbl.replace spaces
-      { Plan.kind = op.kind; path = op.path; nth = op.nth }
-      mop.space;
+    Option.iter
+      (fun t ->
+        Hashtbl.replace t
+          { Plan.kind = op.kind; path = op.path; nth = op.nth }
+          mop.space)
+      spaces;
     let fault =
       match s.lasting with
       | Some (l, p) ->
@@ -423,22 +426,31 @@ let check ?budget ?replay ?(setup = ignore) run =
            check never passes on a partial one. Shrink the workload, or raise \
            ~budget."
           n budget;
-      let afters = List.map (fun s -> (s, attempt Linear s)) linear in
+      let others = List.filter meets (Plan.check_others first) in
+      let share classes = Plan.sampled_share ~budget ~linear:n ~classes in
+      (* The second faults each run allows, spread as it ends, so no run's
+         operations outlive it: a share of the tier's, evenly. *)
+      let singles =
+        List.length
+          (List.filter
+             (fun (s : Plan.check) -> List.length s.faults = 1)
+             linear)
+      in
+      let quota =
+        let sh = share (if others = [] then 1 else 2) in
+        (sh + singles - 1) / max 1 singles
+      in
       let pairs =
         List.concat_map
-          (fun ((s : Plan.check), after) ->
+          (fun (s : Plan.check) ->
+            let after = attempt Linear s in
             match s.faults with
-            | [ one ] -> Plan.check_seconds one ~after
+            | [ one ] -> Plan.spread quota (Plan.check_seconds one ~after)
             | _ -> [])
-          afters
+          linear
       in
-      let classes =
-        List.filter (( <> ) [])
-          [ List.filter meets (Plan.check_others first); pairs ]
-      in
-      let share =
-        Plan.sampled_share ~budget ~linear:n ~classes:(List.length classes)
-      in
+      let classes = List.filter (( <> ) []) [ others; pairs ] in
+      let share = share (List.length classes) in
       List.iter
         (fun c ->
           List.iter
