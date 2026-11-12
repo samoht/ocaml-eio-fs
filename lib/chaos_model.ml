@@ -2449,6 +2449,8 @@ module Crash = struct
     let sizes = Array.make (n + 1) (Cstruct.length durable) in
     let versions = Hashtbl.create 16 in
     let boundaries = ref [] in
+    (* The pages a pending write put bytes in. *)
+    let filled = Hashtbl.create 8 in
     for k = 0 to n - 1 do
       let prev = sizes.(k) in
       (match changes.(k) with
@@ -2457,16 +2459,23 @@ module Crash = struct
           sizes.(k + 1) <- size;
           if k < len_upto then begin
             let step = if bytes then page else bs in
-            (* ext4 extends its on-disk size as it writes back a page the
-               write put bytes in, not one of the hole before it. *)
-            let first =
-              if bytes then max (prev / step) (offset / step) + 1
-              else (prev / step) + 1
-            in
-            for b = first to (size - 1) / step do
-              boundaries := (b * step, k) :: !boundaries
+            (* ext4 extends its on-disk size, up to the file's, as it writes
+               back a page a write put bytes in, this one or an earlier one,
+               not one of the hole before it. *)
+            for b = (prev / step) + 1 to (size - 1) / step do
+              if
+                (not bytes)
+                || b - 1 >= offset / step
+                || Hashtbl.mem filled (b - 1)
+              then boundaries := (b * step, k) :: !boundaries
             done
-          end
+          end;
+          if bytes && Cstruct.length data > 0 then
+            for
+              p = offset / page to (offset + Cstruct.length data - 1) / page
+            do
+              Hashtbl.replace filled p ()
+            done
       | Resize m -> sizes.(k + 1) <- m);
       let lo, hi =
         if cached.(k) then (0, 0)

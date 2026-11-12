@@ -165,24 +165,24 @@ val check :
     changes enter a journal in program order, and a sync of a directory commits
     its entries. At a power cut, unsynced writes may be lost, as ext4 loses them
     with [data=writeback]. A file's length is one it had since its last sync, or
-    the end of a 4096-byte page a write put bytes in and grew it across. A
-    512-byte sector is written whole: it holds what the disk held, zeros where
-    it held nothing, or what it held after one of the writes to it, so the
-    writes to it land together. A truncation zeroes the rest of the 4096-byte
-    page it cuts, sector by sector; at a length from before it, a page it frees
-    holds no later write, as ext4 reuses no block before the truncation commits.
-    A 4096-byte page the disk held nothing of, past the durable length or in a
-    hole, that a write put bytes in is written whole, as ext4 allocates it: each
-    of its sectors within the length may instead hold stale data. That is what
-    the disk held there before, at the same place in a page a synced truncation
-    of the file freed, or in a file the workload removed, its unsynced bytes
-    included, as writeback may have written them before the removal, and else
-    the byte ['7']. Only a freed block holds stale data: a file the cut lost and
-    the workload never removed frees none. ext4 may give a freed block to any
-    offset of any file; the check tries only the same offset. Of the uncommitted
-    directory changes, a prefix survives. A failed sync loses the file's
-    unsynced writes, as Linux does, though some of their sectors may already be
-    on disk; the page cache may keep them or evict them. *)
+    the end of a 4096-byte page a write put bytes in, below a length it had
+    since. A 512-byte sector is written whole: it holds what the disk held,
+    zeros where it held nothing, or what it held after one of the writes to it,
+    so the writes to it land together. A truncation zeroes the rest of the
+    4096-byte page it cuts, sector by sector; at a length from before it, a page
+    it frees holds no later write, as ext4 reuses no block before the truncation
+    commits. A 4096-byte page the disk held nothing of, past the durable length
+    or in a hole, that a write put bytes in is written whole, as ext4 allocates
+    it: each of its sectors within the length may instead hold stale data. That
+    is what the disk held there before, at the same place in a page a synced
+    truncation of the file freed, or in a file the workload removed, its
+    unsynced bytes included, as writeback may have written them before the
+    removal, and else the byte ['7']. Only a freed block holds stale data: a
+    file the cut lost and the workload never removed frees none. ext4 may give a
+    freed block to any offset of any file; the check tries only the same offset.
+    Of the uncommitted directory changes, a prefix survives. A failed sync loses
+    the file's unsynced writes, as Linux does, though some of their sectors may
+    already be on disk; the page cache may keep them or evict them. *)
 module Crash : sig
   val check :
     ?budget:int ->
