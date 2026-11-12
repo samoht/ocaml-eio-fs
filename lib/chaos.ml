@@ -165,10 +165,6 @@ let parse_replay name r =
         (String.sub r' 0 i, String.sub r' (i + 1) (String.length r' - i - 1))
     | _ -> bad ()
 
-type run_trace = (Op.t * Fault.t option) list
-
-let ops (t : run_trace) = List.map fst t
-
 let digest (trace : Plan.trace) =
   let s = Fmt.str "%a" Fmt.(list ~sep:(any ";") Op.pp) trace in
   String.sub (Digest.to_hex (Digest.string s)) 0 8
@@ -203,101 +199,304 @@ type line =
 let max_period = 8
 let min_times = 3
 
-(* The times the block of [p] operations at [i] repeats from [i]. *)
-let times a i p =
-  let n = Array.length a in
-  let rec same j k =
-    k = p || (shape a.(j + k) = shape a.(j + k - p) && same j (k + 1))
-  in
-  let rec go r =
-    let j = i + (r * p) in
-    if j + p <= n && same j 0 then go (r + 1) else r
-  in
-  go 1
-
-(* Runs of a repeated block collapse to its first and last instances. *)
-let collapse trace =
-  let a = Array.of_list trace in
-  let n = Array.length a in
-  let rec go i acc =
-    if i >= n then List.rev acc
-    else
-      let best =
-        List.fold_left
-          (fun (bp, br) p ->
-            let r = times a i p in
-            if r >= min_times && r * p > bp * br then (p, r) else (bp, br))
-          (1, 1)
-          (List.init max_period (fun k -> k + 1))
-      in
-      match best with
-      | p, r when r >= min_times ->
-          let block j = List.init p (fun k -> Line a.(j + k)) in
-          let last = i + ((r - 1) * p) in
-          let repeated =
-            Repeated
-              {
-                period = p;
-                times = r - 2;
-                first = (fst a.(i + p)).index;
-                last = (fst a.(last - 1)).index;
-              }
-          in
-          go
-            (i + (r * p))
-            (List.rev_append (block i @ (repeated :: block last)) acc)
-      | _ -> go (i + 1) (Line a.(i) :: acc)
-  in
-  go 0 []
-
 (* A trace shows at most [keep] lines at each end, and those around the
    first fault. *)
 let keep = 100
 let context = 10
 
-let pp_trace b (trace : run_trace) =
-  let lines = Array.of_list (collapse trace) in
-  let n = Array.length lines in
-  let first_fault =
-    let rec find i =
-      if i >= n then None
-      else match lines.(i) with Line (_, Some _) -> Some i | _ -> find (i + 1)
+(* A run's trace as its report shows it, kept as the run goes. At each
+   place, the block of up to [max_period] operations repeated [min_times]
+   times or more that covers the most operations, the shortest on a tie,
+   collapses to its first and last instances. Of the lines that leaves, only
+   the first and last [window] and those around the first fault are kept, so
+   a run that spins costs no more than one that does not. *)
+module Recorder = struct
+  type entry = (Op.t * Fault.t option) * (Op.kind * string * Fault.t option)
+
+  (* A block repeating at the end of the trace: its first instance, the
+     instances so far, the last whole one and the start of the next. *)
+  type rep = {
+    period : int;
+    first_block : entry array;
+    second : int; (* the first operation of the second instance *)
+    mutable count : int;
+    mutable last_block : entry array;
+    mutable before_last : int; (* the operation before the last instance *)
+    mutable partial : entry list; (* the next instance, latest first *)
+    mutable npartial : int;
+  }
+
+  let window = (2 * keep) + (2 * context) + 1
+  let blank = Repeated { period = 0; times = 0; first = 0; last = 0 }
+
+  type t = {
+    mutable buf : entry array; (* the operations no line holds yet *)
+    mutable len : int;
+    mutable rep : rep option;
+    head : line array; (* the first [window] lines *)
+    ring : line array; (* the last [window] lines *)
+    mutable n : int;
+    mutable fault : int option; (* the line of the first fault *)
+    mutable around : (int * line) list;
+  }
+
+  let v () =
+    {
+      buf = [||];
+      len = 0;
+      rep = None;
+      head = Array.make window blank;
+      ring = Array.make window blank;
+      n = 0;
+      fault = None;
+      around = [];
+    }
+
+  let index ((((op : Op.t), _), _) : entry) = op.index
+
+  let emit t l =
+    let k = t.n in
+    if k < window then t.head.(k) <- l;
+    t.ring.(k mod window) <- l;
+    (match (t.fault, l) with
+    | None, Line (_, Some _) ->
+        t.fault <- Some k;
+        for j = max 0 (k - context) to k do
+          t.around <- (j, t.ring.(j mod window)) :: t.around
+        done
+    | Some f, _ when k <= f + context -> t.around <- (k, l) :: t.around
+    | _ -> ());
+    t.n <- k + 1
+
+  let emit_block t b = Array.iter (fun (e, _) -> emit t (Line e)) b
+
+  let append t e =
+    if t.len = Array.length t.buf then begin
+      let b = Array.make (max 16 (2 * t.len)) e in
+      Array.blit t.buf 0 b 0 t.len;
+      t.buf <- b
+    end;
+    t.buf.(t.len) <- e;
+    t.len <- t.len + 1
+
+  let drop t k =
+    Array.blit t.buf k t.buf 0 (t.len - k);
+    t.len <- t.len - k
+
+  (* The whole instances of the block of [p] operations from the start of
+     the buffer, and whether more may come. *)
+  let run t p =
+    let rec go r =
+      let j = r * p in
+      let rec same k =
+        k >= p
+        || j + k >= t.len
+        || (snd t.buf.(j + k) = snd t.buf.(j + k - p) && same (k + 1))
+      in
+      if not (same 0) then (r, false)
+      else if j + p > t.len then (r, true)
+      else go (r + 1)
     in
-    find 0
-  in
-  let shown i =
-    n <= (2 * keep) + (2 * context) + 1
-    || i < keep
-    || i >= n - keep
-    || match first_fault with Some f -> abs (i - f) <= context | None -> false
-  in
-  let plural k = if k = 1 then "" else "s" in
-  let rec pp i =
-    if i < n then (
-      if shown i then begin
-        (match lines.(i) with
-        | Line (op, None) -> Printf.bprintf b "    %s\n" (Fmt.str "%a" Op.pp op)
-        | Line (op, Some f) ->
-            Printf.bprintf b "    %s  <- %s\n" (Fmt.str "%a" Op.pp op)
-              (Fmt.str "%a" Fault.pp f)
-        | Repeated { period; times; first; last } ->
-            Printf.bprintf b
-              "    ... the %d operation%s above, %d more time%s, #%d to #%d\n"
-              period (plural period) times (plural times) first last);
-        pp (i + 1)
-      end
-      else
-        let rec skip j = if j < n && not (shown j) then skip (j + 1) else j in
-        let j = skip i in
-        Printf.bprintf b "    ... %d more line%s\n" (j - i) (plural (j - i));
-        pp j)
-  in
-  pp 0
+    go 1
+
+  let close t rep rest =
+    t.rep <- None;
+    emit_block t rep.first_block;
+    emit t
+      (Repeated
+         {
+           period = rep.period;
+           times = rep.count - 2;
+           first = rep.second;
+           last = rep.before_last;
+         });
+    emit_block t rep.last_block;
+    List.iter (append t) rest
+
+  (* Decide the lines the buffer starts with, as far as the operations so
+     far allow, or all of them at the end. *)
+  let rec decide ~at_end t =
+    if t.len > 0 then begin
+      let runs = Array.init max_period (fun k -> run t (k + 1)) in
+      let ongoing k = (not at_end) && snd runs.(k) in
+      let best ~only =
+        let bp = ref 1 and br = ref 1 in
+        Array.iteri
+          (fun k (r, _) ->
+            let p = k + 1 in
+            if only k && r >= min_times && r * p > !bp * !br then begin
+              bp := p;
+              br := r
+            end)
+          runs;
+        (!bp, !br)
+      in
+      match List.find_opt ongoing (List.init max_period Fun.id) with
+      | None ->
+          let p, r = best ~only:(fun _ -> true) in
+          if r >= min_times then begin
+            let b = Array.sub t.buf 0 (r * p) in
+            emit_block t (Array.sub b 0 p);
+            emit t
+              (Repeated
+                 {
+                   period = p;
+                   times = r - 2;
+                   first = index b.(p);
+                   last = index b.(((r - 1) * p) - 1);
+                 });
+            emit_block t (Array.sub b ((r - 1) * p) p);
+            drop t (r * p)
+          end
+          else begin
+            emit t (Line (fst t.buf.(0)));
+            drop t 1
+          end;
+          decide ~at_end t
+      | Some k ->
+          (* Past [2 * max_period] operations, every block still repeating
+             is a multiple of the shortest one, which covers as much as
+             they do: once it covers more than any that ended, it wins. *)
+          let q = k + 1 and r = fst runs.(k) in
+          let bp, br = best ~only:(fun k -> not (ongoing k)) in
+          if t.len >= 2 * max_period && r >= min_times && r * q > bp * br then begin
+            let rest =
+              Array.to_list (Array.sub t.buf (r * q) (t.len - (r * q)))
+            in
+            t.rep <-
+              Some
+                {
+                  period = q;
+                  first_block = Array.sub t.buf 0 q;
+                  second = index t.buf.(q);
+                  count = r;
+                  last_block = Array.sub t.buf ((r - 1) * q) q;
+                  before_last = index t.buf.(((r - 1) * q) - 1);
+                  partial = List.rev rest;
+                  npartial = List.length rest;
+                };
+            t.len <- 0;
+            t.buf <- [||]
+          end
+    end
+
+  let add t ((op, fault) as e) =
+    let e = (e, shape (op, fault)) in
+    match t.rep with
+    | None ->
+        append t e;
+        decide ~at_end:false t
+    | Some rep ->
+        let k = rep.npartial in
+        if snd e = snd rep.last_block.(k) then begin
+          rep.partial <- e :: rep.partial;
+          rep.npartial <- k + 1;
+          if k + 1 = rep.period then begin
+            rep.before_last <- index rep.last_block.(rep.period - 1);
+            rep.last_block <- Array.of_list (List.rev rep.partial);
+            rep.partial <- [];
+            rep.npartial <- 0;
+            rep.count <- rep.count + 1
+          end
+        end
+        else begin
+          close t rep (List.rev (e :: rep.partial));
+          decide ~at_end:false t
+        end
+
+  let finish t =
+    (match t.rep with
+    | Some rep -> close t rep (List.rev rep.partial)
+    | None -> ());
+    decide ~at_end:true t
+
+  let line t i =
+    if i < window then t.head.(i)
+    else if i >= t.n - window then t.ring.(i mod window)
+    else List.assoc i t.around
+
+  (* The report's lines: the first and last [keep] and those around the
+     first fault, or all of them when they are few. *)
+  let pp b t =
+    finish t;
+    let n = t.n in
+    let shown i =
+      n <= (2 * keep) + (2 * context) + 1
+      || i < keep
+      || i >= n - keep
+      || match t.fault with Some f -> abs (i - f) <= context | None -> false
+    in
+    let plural k = if k = 1 then "" else "s" in
+    let rec pp i =
+      if i < n then (
+        if shown i then begin
+          (match line t i with
+          | Line (op, None) ->
+              Printf.bprintf b "    %s\n" (Fmt.str "%a" Op.pp op)
+          | Line (op, Some f) ->
+              Printf.bprintf b "    %s  <- %s\n" (Fmt.str "%a" Op.pp op)
+                (Fmt.str "%a" Fault.pp f)
+          | Repeated { period; times; first; last } ->
+              Printf.bprintf b
+                "    ... the %d operation%s above, %d more time%s, #%d to #%d\n"
+                period (plural period) times (plural times) first last);
+          pp (i + 1)
+        end
+        else
+          let rec skip j = if j < n && not (shown j) then skip (j + 1) else j in
+          let j = skip i in
+          Printf.bprintf b "    ... %d more line%s\n" (j - i) (plural (j - i));
+          pp j)
+    in
+    pp 0
+end
+
+(* What a run keeps of its operations: the report's lines, its first [cap]
+   operations, which the plan of the next scenarios reads, and those at
+   [marked] places, which the report names. *)
+type record = {
+  lines : Recorder.t;
+  mutable kept : (Op.t * Fault.t option) list; (* latest first *)
+  mutable nkept : int;
+  cap : int;
+  marked : Op.t -> bool;
+  mutable marks : Op.t list;
+  mutable last : int; (* the last operation's index *)
+}
+
+let record ?(cap = max_int) ?(marked = fun _ -> false) () =
+  {
+    lines = Recorder.v ();
+    kept = [];
+    nkept = 0;
+    cap;
+    marked;
+    marks = [];
+    last = 0;
+  }
+
+let note r ((op : Op.t), fault) =
+  Recorder.add r.lines (op, fault);
+  r.last <- op.index;
+  if r.nkept < r.cap then begin
+    r.kept <- (op, fault) :: r.kept;
+    r.nkept <- r.nkept + 1
+  end;
+  if r.marked op then r.marks <- op :: r.marks
+
+(* The operations kept, in order. *)
+let kept r = List.rev_map fst r.kept
+
+(* The operation at [p], where the report names it. *)
+let found r p =
+  match List.find_opt (Plan.at p) r.marks with
+  | Some op -> Some op
+  | None -> List.find_opt (Plan.at p) (kept r)
 
 (* The report of a failing run: the scenario's lines, the trace, and the
    replay that runs it alone. *)
-let report name ~title ~tier ~hash ~key ~matched ~(trace : run_trace) ~error
-    lines =
+let report name ~title ~tier ~hash ~key ~matched ~(trace : record) ~error lines
+    =
   let b = Buffer.create 256 in
   let line k v = if v <> "" then Printf.bprintf b "  %-9s %s\n" (k ^ ":") v in
   Printf.bprintf b "%s: %s\n" name title;
@@ -311,7 +510,7 @@ let report name ~title ~tier ~hash ~key ~matched ~(trace : run_trace) ~error
     matched;
   line "error" error;
   Printf.bprintf b "  trace:\n";
-  pp_trace b trace;
+  Recorder.pp b trace.lines;
   Printf.bprintf b "  replay:   ~replay:%S" (Fmt.str "fs/%s/%s" hash key);
   failwith (Buffer.contents b)
 
@@ -392,8 +591,12 @@ let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
     List.iter (Hashtbl.remove st.counts) (targets op)
 
-let exec_check ?spaces ~first ~setup run (s : Plan.check) =
-  let trace = ref [] and num = numberer () in
+let exec_check ?spaces ?cap ~first ~setup run (s : Plan.check) =
+  let marked op =
+    List.exists (fun (p, _) -> Plan.at p op) s.faults
+    || match s.lasting with Some (_, p) -> Plan.at p op | None -> false
+  in
+  let trace = record ?cap ~marked () and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
   let hook (mop : M.Op.t) =
     let op = num mop in
@@ -423,7 +626,7 @@ let exec_check ?spaces ~first ~setup run (s : Plan.check) =
           Option.map (fun m -> (f, m)) (model_fault ~space:mop.space op f)
       | None -> None
     in
-    trace := (op, Option.map fst fault) :: !trace;
+    note trace (op, Option.map fst fault);
     match fault with
     | Some (_, m) ->
         failed st op;
@@ -449,7 +652,7 @@ let exec_check ?spaces ~first ~setup run (s : Plan.check) =
   let outcome =
     match st.hit with Some (t, p, n) -> Livelock (t, p, n) | None -> outcome
   in
-  (List.rev !trace, outcome)
+  (trace, outcome)
 
 let check ?budget ?replay ?(setup = ignore) run =
   let name = check_name in
@@ -461,11 +664,16 @@ let check ?budget ?replay ?(setup = ignore) run =
   in
   if out <> Passed then
     fail name "the run with no fault failed: %s" (outcome_text out);
-  let first = ops first in
+  let first = kept first in
   if first = [] then
     fail name "the workload makes no filesystem operation, so it tests nothing";
-  let exec s = exec_check ~first:(made first) ~setup run s in
-  let again = ops (fst (exec Plan.none)) in
+  (* A run keeps no more operations than four times the first run made:
+     past that, the plan of the next scenarios reads its first ones. *)
+  let n = List.length first in
+  let exec ?(cap = (4 * n) + 10_000) s =
+    exec_check ~cap ~first:(made first) ~setup run s
+  in
+  let again = kept (fst (exec ~cap:(n + 1) Plan.none)) in
 
   if again <> first then
     fail name
@@ -488,13 +696,8 @@ let check ?budget ?replay ?(setup = ignore) run =
     if out <> Passed then
       report name ~title:"the workload failed under a fault." ~tier ~hash
         ~key:(Plan.check_key s) ~matched ~trace ~error:(outcome_text out)
-        [
-          ( "faults",
-            Plan.check_text
-              ~at:(fun p -> List.find_opt (Plan.at p) (ops trace))
-              s );
-        ];
-    ops trace
+        [ ("faults", Plan.check_text ~at:(found trace) s) ];
+    kept trace
   in
   match replay with
   | Some ((h, k) as r) -> (
@@ -514,7 +717,7 @@ let check ?budget ?replay ?(setup = ignore) run =
                     | [ one ]
                       when String.starts_with ~prefix:(Plan.check_key s ^ "+") k
                       ->
-                        let after = ops (fst (exec s)) in
+                        let after = kept (fst (exec s)) in
                         Option.map
                           (fun s -> (s, Sampled))
                           (find (Plan.check_seconds one ~after))
@@ -637,7 +840,7 @@ module Crash = struct
     | Drop | Keep | Seed _ -> true
 
   type result = {
-    trace : run_trace;
+    trace : record;
     cut_op : Op.t option; (* the operation the cut fell before *)
     seqs : (int * int) list;
         (* for each operation, latest first, the last change before it *)
@@ -661,7 +864,10 @@ module Crash = struct
     let hook (mop : M.Op.t) =
       let op = num mop in
       if not (M.Crash.is_crashed ctl) then begin
-        seqs := (M.Crash.seq ctl, op.index) :: !seqs;
+        (seqs :=
+           match !seqs with
+           | (s, _) :: rest when s = M.Crash.seq ctl -> (s, op.index) :: rest
+           | l -> (M.Crash.seq ctl, op.index) :: l);
         match cut with
         | Some p when Plan.at p op ->
             cut_op := Some op;
@@ -685,10 +891,10 @@ module Crash = struct
       | (_, f) :: _, rest ->
           pending := rest;
           let m = model_fault ~space:mop.space op f in
-          trace := (op, Option.map (fun _ -> f) m) :: !trace;
+          note trace (op, Option.map (fun _ -> f) m);
           m
       | [], _ ->
-          trace := (op, None) :: !trace;
+          note trace (op, None);
           None
     in
     let wrapped = M.wrap (M.Schedule.hook hook) fs in
@@ -709,10 +915,11 @@ module Crash = struct
     let outcome = if !kept_going then Kept_going else outcome in
     (outcome, !lost)
 
-  let exec ~setup run ~recover (s : Plan.crash) =
+  let exec ?cap ~setup run ~recover (s : Plan.crash) =
     let trail = ref [] and rtrail = ref [] in
     let acked = ref [] and acked_at = ref [] in
-    let trace = ref [] and rtrace = ref [] in
+    let marked op = List.exists (fun (p, _) -> Plan.at p op) s.cfaults in
+    let trace = record ?cap ~marked () and rtrace = record ?cap () in
     let lost = ref [] and left = ref [] in
     let cut_op = ref None and seqs = ref [] in
     let kept_run = ref false and kept_recover = ref false in
@@ -745,9 +952,7 @@ module Crash = struct
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then begin
                     acked := v :: !acked;
-                    acked_at :=
-                      (match !trace with (op, _) :: _ -> op.index | [] -> 0)
-                      :: !acked_at
+                    acked_at := trace.last :: !acked_at
                   end)
                 (env_of clock mono fs))
         in
@@ -792,10 +997,10 @@ module Crash = struct
           else Some (Workload o)
     in
     {
-      trace = List.rev !trace;
+      trace;
       cut_op = !cut_op;
       seqs = !seqs;
-      rtrace = ops (List.rev !rtrace);
+      rtrace = kept rtrace;
       acked_at = List.rev !acked_at;
       lost = !lost;
       left = !left;
@@ -863,7 +1068,7 @@ module Crash = struct
     let at p =
       match r.cut_op with
       | Some op when Plan.at p op -> Some op
-      | _ -> List.find_opt (Plan.at p) (ops r.trace)
+      | _ -> found r.trace p
     in
     [
       ("cut", Fmt.str "%s, %s" (cut_text ~at s.cut) (state_text s.state));
@@ -896,17 +1101,21 @@ module Crash = struct
   let check ?budget ?replay ?(setup = ignore) run ~recover =
     let budget = budget_of name budget in
     let replay = Option.map (parse_replay name) replay in
-    let exec s = exec ~setup run ~recover s in
+    let exec ?cap s = exec ?cap ~setup run ~recover s in
     let first = exec Plan.base in
     (match first.error with
     | Some (Workload o) ->
         fail name "the run with no cut failed: %s" (outcome_text o)
     | _ -> ());
-    let first_ops = ops first.trace in
+    let first_ops = kept first.trace in
     if first_ops = [] then
       fail name
         "the workload makes no filesystem operation, so it tests nothing";
-    let again = ops (exec Plan.base).trace in
+    let n = List.length first_ops in
+    let again = kept (exec ~cap:(n + 1) Plan.base).trace in
+    (* A run keeps no more operations than four times the first run made:
+       past that, the plan of the next scenarios reads its first ones. *)
+    let exec = exec ~cap:((4 * (n + List.length first.rtrace)) + 10_000) in
     if again <> first_ops then
       fail name
         "two runs with no cut made different operations (%s); the workload \
@@ -982,7 +1191,7 @@ module Crash = struct
                 find_after faults (fun (s : Plan.crash) r ->
                     match s.cfaults with
                     | [ one ] when s.state = Drop ->
-                        Plan.crash_seconds ~tears one ~after:(ops r.trace)
+                        Plan.crash_seconds ~tears one ~after:(kept r.trace)
                     | _ -> []) );
             (Sampled, fun () -> find_after faults rcuts);
           ]
@@ -1062,7 +1271,7 @@ module Crash = struct
               let pairs =
                 match s.cfaults with
                 | [ one ] when s.state = Drop ->
-                    Plan.crash_seconds ~tears one ~after:(ops r.trace)
+                    Plan.crash_seconds ~tears one ~after:(kept r.trace)
                 | _ -> []
               in
               ( Plan.spread quota pairs,
