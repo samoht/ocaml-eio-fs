@@ -264,6 +264,47 @@ let one_old () =
       if List.length (List.filter not news) = 1 then failwith "one sector left")
     ()
 
+(* fsyncgate: a program overwrites [f], its sync fails, and it syncs again.
+   The pages the failure lost may have left the page cache, so a read of [f]
+   may see what the disk holds: only a program that writes its data again
+   may trust it. *)
+let overwrite ~rewrite f =
+  Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero
+    [ Cstruct.of_string "new" ];
+  try Eio.File.sync f
+  with Eio.Io _ ->
+    if rewrite then
+      Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero
+        [ Cstruct.of_string "new" ];
+    Eio.File.sync f
+
+let reread ~rewrite () =
+  Eio_fs.Chaos.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "f") "old")
+    (fun env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "f") (overwrite ~rewrite);
+        if P.load P.(env#fs / "f") <> "new" then
+          failwith "a reread lost the write"
+      with Eio.Io _ -> ())
+
+(* The same, where the program copies what it reads back into [g] and
+   acknowledges the copy. *)
+let copy ~rewrite () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      Eio_fs_sync.save P.(env#fs / "f") "old";
+      Eio_fs_sync.save P.(env#fs / "g") "old")
+    (fun ~ack env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "f") (overwrite ~rewrite);
+        Eio_fs_sync.save P.(env#fs / "g") (P.load P.(env#fs / "f"));
+        ack ()
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      if acked <> [] && P.load P.(env#fs / "g") <> "new" then
+        failwith "the copy holds what the disk held")
+
 let suite =
   ( "states",
     [
@@ -315,6 +356,15 @@ let suite =
           Alcotest.(check string)
             "error" "Failure(\"an aborted record replayed\")"
             (Expect.field "error" m));
+      Alcotest.test_case "a read after a failed sync may see the disk" `Quick
+        (Expect.caught ~tier:"linear" (reread ~rewrite:false));
+      Alcotest.test_case "a write again after a failed sync is read back" `Quick
+        (Expect.passes (reread ~rewrite:true));
+      Alcotest.test_case "a copy after a failed sync may hold the disk's bytes"
+        `Quick
+        (Expect.caught ~tier:"linear" (copy ~rewrite:false));
+      Alcotest.test_case "a copy of what was written again holds it" `Quick
+        (Expect.passes (copy ~rewrite:true));
       Alcotest.test_case "a file whose creation a cut lost frees no block"
         `Quick
         (Expect.passes lost_not_freed);
