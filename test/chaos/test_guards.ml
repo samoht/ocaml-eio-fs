@@ -342,7 +342,8 @@ let test_hang () =
                 | _ -> ()
                 | exception Eio.Io _ -> Eio.Fiber.await_cancel ()))))
 
-let busy = "the run is a busy loop: it kept the CPU busy for 10 s of clock"
+let busy =
+  "the run woke 10,000,000 times without waiting 1 ms or more: a busy loop"
 
 (* A fiber that polls with a yield for a file another fiber failed to
    write: each turn of the loop takes time, and the run is a busy loop. Its
@@ -369,24 +370,45 @@ let test_yield_poll_is_busy () =
   in
   Alcotest.(check string) "error" busy (Expect.field "error" report)
 
-(* The same with a sleep of 1 us for each turn. *)
+(* The same with a sleep of 1 us, or 100 us, for each turn. *)
 let test_tiny_sleeps_are_busy () =
-  let report =
-    Expect.report (fun () ->
-        Eio_fs.Chaos.check (fun env ->
-            let ready = ref false in
-            (try
-               P.save ~create:(`Or_truncate 0o644) P.(env#fs / "ready") "go";
-               ready := true
-             with Eio.Io _ -> ());
-            let sleeps = ref 0 in
-            while not !ready do
-              incr sleeps;
-              if !sleeps > 20_000_000 then failwith "the loop was not stopped";
-              Eio.Time.sleep env#clock 1e-6
-            done))
-  in
-  Alcotest.(check string) "error" busy (Expect.field "error" report)
+  List.iter
+    (fun d ->
+      let report =
+        Expect.report (fun () ->
+            Eio_fs.Chaos.check (fun env ->
+                let ready = ref false in
+                (try
+                   P.save ~create:(`Or_truncate 0o644) P.(env#fs / "ready") "go";
+                   ready := true
+                 with Eio.Io _ -> ());
+                let sleeps = ref 0 in
+                while not !ready do
+                  incr sleeps;
+                  if !sleeps > 20_000_000 then
+                    failwith "the loop was not stopped";
+                  Eio.Time.sleep env#clock d
+                done))
+      in
+      Alcotest.(check string) "error" busy (Expect.field "error" report))
+    [ 1e-6; 1e-4 ]
+
+(* A thousand fibers on a heartbeat of 100 ms and three polling every 1 ms,
+   for 1000 s of clock: far more than 10 million turns in all, each fiber
+   waiting on its timer between two, and no busy loop. *)
+let test_timers_are_not_busy () =
+  Eio_fs.Chaos.check (fun env ->
+      match P.mkdir ~perm:0o755 P.(env#fs / "d") with
+      | exception Eio.Io _ -> ()
+      | () ->
+          let ticker period () =
+            while Eio.Time.now env#clock < 1000. do
+              Eio.Time.sleep env#clock period
+            done
+          in
+          Eio.Fiber.all
+            (List.init 1000 (fun _ -> ticker 0.1)
+            @ List.init 3 (fun _ -> ticker 0.001)))
 
 (* A computation that yields 10000 times ends well within a deadline of
    100 ms. *)
@@ -900,6 +922,8 @@ let suite =
         test_yield_poll_is_busy;
       Alcotest.test_case "a loop of tiny sleeps is a busy loop" `Quick
         test_tiny_sleeps_are_busy;
+      Alcotest.test_case "many fibers on timers are not busy" `Quick
+        test_timers_are_not_busy;
       Alcotest.test_case "10000 yields meet a deadline of 100 ms" `Quick
         test_yields_meet_a_deadline;
       Alcotest.test_case "a ping-pong ends with its timer" `Quick
