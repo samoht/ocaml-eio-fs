@@ -292,6 +292,35 @@ let test_freshness_under_check () =
       | got -> Fmt.failwith "out holds %S, built from a stale source" got
       | exception Eio.Io _ -> ())
 
+(* A power cut leaves each inode's times as its version on the disk holds
+   them: a file's at its last sync, a directory's at the last change to it
+   the disk kept. *)
+let test_crash_times () =
+  with_fs @@ fun t root ->
+  let module Crash = Eio_fs.Chaos.Crash in
+  t := 1.;
+  Eio.Path.save ~create:(`Exclusive 0o644) (root / "f") "a";
+  let c = Crash.v Drop_unsynced in
+  let d = Crash.wrap c root in
+  let times p =
+    let s = stat p in
+    [ s.mtime; s.ctime ]
+  in
+  Eio.Path.with_open_out ~create:`Never (d / "f") (fun h ->
+      t := 2.;
+      Eio.Flow.copy_string "b" h;
+      Eio.File.sync h;
+      t := 3.;
+      Eio.Flow.copy_string "c" h);
+  t := 4.;
+  Eio.Path.mkdir ~perm:0o755 (d / "sub");
+  Alcotest.(check (list (float 0.))) "f, live" [ 3.; 3. ] (times (root / "f"));
+  Alcotest.(check (list (float 0.))) "the root, live" [ 4.; 4. ] (times root);
+  let disk = Crash.cut c in
+  Alcotest.(check string) "f, after" "b" (Eio.Path.load (disk / "f"));
+  Alcotest.(check (list (float 0.))) "f, after" [ 2.; 2. ] (times (disk / "f"));
+  Alcotest.(check (list (float 0.))) "the root, after" [ 1.; 1. ] (times disk)
+
 let suite =
   ( "memfs",
     [
@@ -305,4 +334,6 @@ let suite =
         test_no_clock;
       Alcotest.test_case "a freshness check under Chaos.check" `Quick
         test_freshness_under_check;
+      Alcotest.test_case "a power cut keeps the times the disk kept" `Quick
+        test_crash_times;
     ] )
