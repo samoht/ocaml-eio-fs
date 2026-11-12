@@ -92,9 +92,15 @@ type outcome =
   | Livelock of [ `Path | `Dir ] * string * int
   | Over_budget of int (* the operation the first run stopped at *)
 
+(* A report a nested check raised is text, its lines set in. *)
+let exn_text = function
+  | Failure m when String.contains m '\n' ->
+      String.concat "\n    " (String.split_on_char '\n' m)
+  | x -> Printexc.to_string x
+
 let outcome_text = function
   | Passed -> "none"
-  | Raised x -> Printexc.to_string x
+  | Raised x -> exn_text x
   | Deadlock -> "the run hangs: every fiber waits and no timer is due"
   | Time_limit ->
       "the run hangs: it is still running after an hour of its clock"
@@ -193,13 +199,6 @@ let take n l = List.filteri (fun i _ -> i < n) l
 (* {1 Reports, budget, replay} *)
 
 let fail name fmt = Fmt.kstr (fun s -> failwith (name ^ ": " ^ s)) fmt
-
-let refuse_budget name ~budget at =
-  fail name
-    "the linear tier needs more than the budget of %d runs by operation #%d of \
-     the first run, which stopped there, and a check never passes on a partial \
-     one. Shrink the workload, or raise ~budget."
-    budget at
 
 let budget_of name = function
   | None -> 20_000
@@ -566,6 +565,23 @@ let report name ~title ~tier ~hash ~key ~matched ~(trace : record) ~error lines
   Printf.bprintf b "  replay:   ~replay:%S" (Fmt.str "fs/%s/%s" hash key);
   failwith (Buffer.contents b)
 
+(* The first run failed, or stopped at the budget: its trace says where. *)
+let refuse_first name ~(trace : record) out ~budget ~what =
+  let b = Buffer.create 256 in
+  (match out with
+  | Over_budget at ->
+      Printf.bprintf b
+        "%s: the linear tier needs more than the budget of %d runs by \
+         operation #%d of the first run, which stopped there, and a check \
+         never passes on a partial one. Shrink the workload, or raise ~budget.\n"
+        name budget at
+  | o ->
+      Printf.bprintf b "%s: the run with no %s failed: %s\n" name what
+        (outcome_text o));
+  Printf.bprintf b "  trace:\n";
+  Recorder.pp b trace.lines;
+  failwith (String.trim (Buffer.contents b))
+
 let no_longer name ~hash (h, k) =
   if h = hash then
     fail name "the replay names %s, a scenario this check no longer has" k
@@ -726,10 +742,7 @@ let check ?budget ?replay ?(setup = ignore) run =
       ?budget:(if replay = None then Some budget else None)
       ~first:(Hashtbl.create 1) ~setup run Plan.none
   in
-  (match out with
-  | Passed -> ()
-  | Over_budget at -> refuse_budget name ~budget at
-  | _ -> fail name "the run with no fault failed: %s" (outcome_text out));
+  if out <> Passed then refuse_first name ~trace:first out ~budget ~what:"fault";
   let first = kept first in
   if first = [] then
     fail name "the workload makes no filesystem operation, so it tests nothing";
@@ -1223,9 +1236,8 @@ module Crash = struct
       exec ?budget:(if replay = None then Some budget else None) Plan.base
     in
     (match first.error with
-    | Some (Workload (Over_budget at)) -> refuse_budget name ~budget at
     | Some (Workload o) ->
-        fail name "the run with no cut failed: %s" (outcome_text o)
+        refuse_first name ~trace:first.trace o ~budget ~what:"cut"
     | _ -> ());
     let first_ops = kept first.trace in
     if first_ops = [] then
@@ -1286,7 +1298,7 @@ module Crash = struct
             | Again x ->
                 ( "recover, run again after a cut during recovery, rejected \
                    what was left.",
-                  Printexc.to_string x )
+                  exn_text x )
           in
           report name ~title ~tier ~hash ~key:(Plan.crash_key s) ~matched
             ~trace:r.trace ~error:err (lines s r));
@@ -1347,7 +1359,6 @@ module Crash = struct
             Plan.next_choices (exec { s with state = st }).trail
           in
           match s.state with
-          | Seed n when n < 0 || n >= budget / 4 -> false
           | Seed _ | Shape _ -> (
               match more (Enum []) with
               | None -> false
@@ -1357,6 +1368,12 @@ module Crash = struct
         match found with
         | Some (s, _) when not (drawn s && (exec s).allowed) ->
             no_longer name ~hash r
+        | Some ({ state = Seed n; _ }, _) when n >= budget / 4 ->
+            let need = 4 * (n + 1) in
+            fail name
+              "the replay names %s, a state drawn at random under a budget of \
+               %d or more: pass ~budget:%d."
+              k need need
         | Some (s, tier) -> ignore (attempt ?matched tier s)
         | None -> no_longer name ~hash r)
     | None ->

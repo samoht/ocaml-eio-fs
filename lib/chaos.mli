@@ -26,7 +26,8 @@
     A check never passes on a partial linear tier. One that needs more runs than
     its budget fails and says so: shrink the workload or raise [~budget]. The
     first run stops as soon as the tier needs more, so a workload that polls for
-    ever costs no more than the budget allows.
+    ever costs no more than the budget allows, and the report shows its trace up
+    to there.
 
     {2 Contracts}
 
@@ -73,7 +74,9 @@
     workload's first run has changed, a replay finds its scenario again by its
     operations, and its report says so. A replay fails if the check no longer
     has that scenario, and if it names a state drawn at random of a cut that
-    allows two states or fewer, which the check never draws.
+    allows two states or fewer, which the check never draws. A state drawn at
+    random under a larger budget needs that budget again, which the refusal
+    names. The report of a check run inside another is text in the outer one.
 
     A check reads no environment variable and prints nothing. A test that wants
     a larger budget at night reads its own:
