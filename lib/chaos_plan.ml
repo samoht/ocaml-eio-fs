@@ -148,6 +148,37 @@ let structural (trace : trace) =
       | _ -> true)
     trace
 
+(* The operations sure to be structural as a run goes, whatever follows:
+   any but a read, a write or a sync; one of the first three reads or writes
+   of a file, or the first of its length class; a sync after none of those,
+   or after one sure to be. *)
+module Sure = struct
+  type t = {
+    seen : (Op.kind * string, int * (int, unit) Hashtbl.t) Hashtbl.t;
+    last : (string, bool) Hashtbl.t; (* whether a file's last write is *)
+  }
+
+  let v () = { seen = Hashtbl.create 7; last = Hashtbl.create 7 }
+
+  let add t (op : Op.t) =
+    match op.kind with
+    | `Read | `Write ->
+        let k = (op.kind, op.path) in
+        let n, classes =
+          match Hashtbl.find_opt t.seen k with
+          | Some v -> v
+          | None -> (0, Hashtbl.create 4)
+        in
+        let c = length_class op.length in
+        let sure = n < 3 || not (Hashtbl.mem classes c) in
+        Hashtbl.replace classes c ();
+        Hashtbl.replace t.seen k (n + 1, classes);
+        if op.kind = `Write then Hashtbl.replace t.last op.path sure;
+        sure
+    | `Sync -> Option.value ~default:true (Hashtbl.find_opt t.last op.path)
+    | _ -> true
+end
+
 let rest trace sel = List.filter (fun op -> not (List.memq op sel)) trace
 
 (* {1 Sampling} *)
@@ -215,13 +246,8 @@ let of_singles ops =
 let check_linear trace = of_singles (structural trace)
 let check_others trace = of_singles (rest trace (structural trace))
 
-(* Every trace makes an operation structural but a read, a write or a sync,
-   which only some do. *)
-let always (op : Op.t) =
-  match op.kind with `Read | `Write | `Sync -> false | _ -> true
-
-let check_floor ~space op =
-  if not (always op) then 0
+let check_floor ~space ~sure op =
+  if not sure then 0
   else
     List.length
       (List.filter
@@ -379,10 +405,13 @@ let crash_cuts ~changed trace =
     (fun cut -> both { base with cut })
     (cut_points ~changed trace (structural trace))
 
-let crash_floor op =
-  if always op && changes ~changed:(fun _ -> false) op then
-    List.length (both base)
-  else 0
+(* A cut is tried in both states, and each one's recover at its end in
+   both. *)
+let crash_floor ~sure ~changed (op : Op.t) =
+  if not sure then 0
+  else
+    (if changes ~changed:(fun _ -> changed) op then 6 else 0)
+    + if op.kind = `Sync then List.length (both base) else 0
 
 let crash_faults ~tears trace =
   List.concat_map

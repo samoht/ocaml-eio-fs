@@ -97,12 +97,24 @@ val check_linear : trace -> check list
 val check_others : trace -> check list
 (** [check_others first] is the same at the other operations. *)
 
-val check_floor : space:bool -> Op.t -> int
-(** [check_floor ~space op] is the scenarios {!check_linear} has at [op] in
-    every trace that has [op], given whether [op] needs room: those at an
-    operation every trace makes structural, all but a read, a write and a sync,
-    and none at those. Their sum over a run so far is a floor of the tier's
-    size. *)
+(** The operations sure to be structural as a run goes. *)
+module Sure : sig
+  type t
+  (** The type for what a run made so far. *)
+
+  val v : unit -> t
+  (** [v ()] is a run that made nothing yet. *)
+
+  val add : t -> Op.t -> bool
+  (** [add t op] adds [op] to [t], and is [true] iff {!structural} keeps [op] in
+      every trace that starts as [t] does. *)
+end
+
+val check_floor : space:bool -> sure:bool -> Op.t -> int
+(** [check_floor ~space ~sure op] is the scenarios {!check_linear} has at [op]
+    in every trace that has [op], given whether [op] needs room and is sure to
+    be structural: none if it is not. Their sum over a run so far is a floor of
+    the tier's size. *)
 
 val check_seconds : pos * Fault.t -> after:trace -> check list
 (** [check_seconds f ~after] is the pairs of faults whose first is [f] and whose
@@ -156,10 +168,12 @@ val crash_cuts : changed:(Op.t -> bool) -> trace -> crash list
     something, or an operation an ack followed. A cut after another sync leaves
     what the cut before it leaves, as nothing a cut reads changed. *)
 
-val crash_floor : Op.t -> int
-(** [crash_floor op] is, likewise, the cuts {!crash_cuts} has for [op] in every
-    trace that has [op]: two after an open that may write, a truncation or a
-    directory change, and none after the others. *)
+val crash_floor : sure:bool -> changed:bool -> Op.t -> int
+(** [crash_floor ~sure ~changed op] is, likewise, the runs the linear tier of
+    {!Crash.check} has for [op], given that an operation follows it: if [op] is
+    sure to be structural, six for a cut after it, which {!crash_cuts} tries in
+    two states and each with the two cuts at the end of recover, and two for a
+    failure of a sync. *)
 
 val crash_faults : tears:(Op.t -> int list) -> trace -> crash list
 (** [crash_faults ~tears first] is each structural sync failed and each

@@ -649,11 +649,13 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
   let trace = record ?cap ~marked () and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
   let halted = ref None and floor = ref 0 and ops = ref 0 in
+  let sure = Plan.Sure.v () in
   let hook (mop : M.Op.t) =
     let op = num mop in
     count_op halted ops;
-    add_floor halted ~budget ~floor ~at:op.index
-      (Plan.check_floor ~space:mop.space op);
+    if Option.is_some budget then
+      add_floor halted ~budget ~floor ~at:op.index
+        (Plan.check_floor ~space:mop.space ~sure:(Plan.Sure.add sure op) op);
     Option.iter
       (fun t ->
         Hashtbl.replace t
@@ -940,9 +942,9 @@ module Crash = struct
     in
     let hook (mop : M.Op.t) =
       let op = num mop in
+      if not (M.Crash.is_crashed ctl) then synced ();
       guard op;
       if not (M.Crash.is_crashed ctl) then begin
-        synced ();
         if op.kind = `Sync then sync := Some (op.index, M.Crash.stamp ctl);
         (seqs :=
            match !seqs with
@@ -1007,6 +1009,9 @@ module Crash = struct
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
     let halted = ref None and floor = ref 0 and ops = ref 0 in
+    (* The operation before, once the one after it shows it is no cut at the
+       end, and whether it is sure to be structural. *)
+    let sure = Plan.Sure.v () and prev = ref None in
     (* A cut stops the run, as nothing runs after a power cut: once every
        fiber waits, the phase's switch fails, so a fiber that waits on a
        timer or another fiber stops too. *)
@@ -1032,7 +1037,16 @@ module Crash = struct
           phase
             ~guard:(fun op ->
               count_op halted ops;
-              add_floor halted ~budget ~floor ~at:op.index (Plan.crash_floor op))
+              if Option.is_some budget then begin
+                Option.iter
+                  (fun ((p : Op.t), s) ->
+                    add_floor halted ~budget ~floor ~at:op.index
+                      (Plan.crash_floor ~sure:s
+                         ~changed:(Hashtbl.mem changed p.index)
+                         p))
+                  !prev;
+                prev := Some (op, Plan.Sure.add sure op)
+              end)
             ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
             ~cut_op ~seqs ~changed ~stop fs
             (fun fs ->
