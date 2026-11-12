@@ -658,9 +658,80 @@ let test_kept_loses_nothing () =
                 if acked <> [] then failwith "f is lost"))
   in
   Alcotest.(check string)
-    "cut" "before write /f #2, every change kept, as after a process kill"
+    "cut" "before #3 write /f@4+6, every change kept, as after a process kill"
     (Expect.field "cut" report);
   Alcotest.(check string) "lost" "" (Expect.field "lost" report)
+
+(* A report numbers each operation as its trace does: the changes a cut
+   lost, a lasting condition, and what a truncation left. *)
+let test_one_numbering () =
+  let has m line =
+    let n = String.length m and k = String.length line in
+    let rec go i = i + k <= n && (String.sub m i k = line || go (i + 1)) in
+    if not (go 0) then Alcotest.failf "no %S in %s" line m
+  in
+  let lost =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.Crash.check
+          ~setup:(fun env ->
+            Eio_fs_sync.save P.(env#fs / "old") "o";
+            Eio_fs_sync.save P.(env#fs / "x") "x")
+          (fun ~ack env ->
+            try
+              P.save ~create:(`Exclusive 0o644) P.(env#fs / "a") "data";
+              P.unlink P.(env#fs / "old");
+              P.rename P.(env#fs / "x") P.(env#fs / "y");
+              ack ()
+            with Eio.Io _ -> ())
+          ~recover:(fun ~acked env ->
+            if acked <> [] && P.kind ~follow:false P.(env#fs / "y") = `Not_found
+            then failwith "y lost"))
+  in
+  Alcotest.(check string)
+    "lost" "#1 create /a; #2 write /a@0+4; #3 unlink /old; #4 rename /x to /y"
+    (Expect.field "lost" lost);
+  has lost "\n    #4 rename /x to /y\n";
+  let left =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.Crash.check
+          ~setup:(fun env ->
+            Eio_fs_sync.save P.(env#fs / "f") (String.make 9000 'A'))
+          (fun ~ack env ->
+            try
+              P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+              Eio.File.truncate f (Optint.Int63.of_int 1000);
+              Eio.File.pwrite_all f ~file_offset:(Optint.Int63.of_int 2000)
+                [ Cstruct.of_string "BB" ];
+              ack ()
+            with Eio.Io _ -> ())
+          ~recover:(fun ~acked:_ env ->
+            let s = P.load P.(env#fs / "f") in
+            if String.length s = 2002 && s.[2000] <> 'B' then failwith "no BB"))
+  in
+  Alcotest.(check string)
+    "unsynced" "#2 truncate /f to 1000; #3 write /f@2000+2"
+    (Expect.field "unsynced" left);
+  Alcotest.(check string)
+    "left"
+    "/f, 2002 bytes: @512+512 as the truncation to 1000 left it, zeros from \
+     1000; @1536+466 zeros, from the truncation to 1000"
+    (Expect.field "left" left);
+  let spin =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec save n =
+              if n > 50_000 then failwith "the spin was not stopped";
+              match
+                P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+              with
+              | () -> ()
+              | exception Eio.Io _ -> save (n + 1)
+            in
+            save 0))
+  in
+  Alcotest.(check string)
+    "faults" "the filesystem is read-only from #1 open-write /f on"
+    (Expect.field "faults" spin)
 
 (* A recovery that does not sync what it repairs: a second cut during it
    loses the repair. *)
@@ -766,6 +837,7 @@ let suite =
         test_cut_stops_supervisor;
       Alcotest.test_case "a kept state loses nothing" `Quick
         test_kept_loses_nothing;
+      Alcotest.test_case "one numbering in a report" `Quick test_one_numbering;
       Alcotest.test_case "a cut during recover" `Quick test_cut_in_recover;
       Alcotest.test_case "a check inside another loop" `Quick test_nested;
     ] )
