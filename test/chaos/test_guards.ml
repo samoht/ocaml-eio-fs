@@ -372,6 +372,75 @@ let test_livelock_fresh_names () =
      clock stood still"
     (Expect.field "error" report)
 
+(* A log of 300 records, each retried at once until it lands: under a
+   read-only filesystem the first record spins. The check stops it within
+   a few times what the first run made of that write, not 10000 times
+   that. *)
+let test_hot_spin_stops_early () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let tries = ref 0 in
+            try
+              P.with_open_out ~create:(`Or_truncate 0o644) P.(env#fs / "log")
+              @@ fun f ->
+              for i = 0 to 299 do
+                let rec write () =
+                  incr tries;
+                  if !tries > 50_000 then failwith "the spin was not stopped";
+                  try
+                    Eio.File.pwrite_all f
+                      ~file_offset:(Optint.Int63.of_int (i * 8))
+                      [ Cstruct.of_string "record.." ]
+                  with Eio.Io _ -> write ()
+                in
+                write ()
+              done
+            with Eio.Io _ -> ()))
+  in
+  Alcotest.(check string)
+    "error"
+    "the run hangs: the same operation on /log failed 10900 times while its \
+     clock stood still"
+    (Expect.field "error" report)
+
+(* The report of a spin shows the loop once, not each of its turns. *)
+let test_spin_report_is_short () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec save n =
+              if n > 50_000 then failwith "the spin was not stopped";
+              match
+                P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+              with
+              | () -> ()
+              | exception Eio.Io _ -> save (n + 1)
+            in
+            save 0))
+  in
+  let lines = List.length (String.split_on_char '\n' report) in
+  if lines > 100 then Alcotest.failf "the report has %d lines" lines
+
+(* A pool of 50 slots, each trying 300 names once and moving on after any
+   error: under a lasting condition it fails 15000 times with no time
+   passing, and ends. *)
+let test_wide_pool_is_not_a_spin () =
+  Eio_fs.Chaos.check (fun env ->
+      for i = 0 to 49 do
+        let rec take j =
+          if j < 300 then
+            match
+              P.save ~create:(`Exclusive 0o644)
+                P.(env#fs / Fmt.str "s%d.%d" i j)
+                "x"
+            with
+            | () -> ()
+            | exception Eio.Io _ -> take (j + 1)
+        in
+        take 0
+      done)
+
 (* A batch job that logs a line per item and drops the lines a full disk
    refuses: each line is a new write, not a retry. The replay runs the
    scenario where the disk is full from the first line on. *)
@@ -614,6 +683,12 @@ let suite =
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
       Alcotest.test_case "a run that retries at once under fresh names hangs"
         `Quick test_livelock_fresh_names;
+      Alcotest.test_case "a spin on a hot path stops early" `Quick
+        test_hot_spin_stops_early;
+      Alcotest.test_case "the report of a spin is short" `Quick
+        test_spin_report_is_short;
+      Alcotest.test_case "a wide pool is not a spin" `Quick
+        test_wide_pool_is_not_a_spin;
       Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
         test_busy_is_not_a_spin;
       Alcotest.test_case "a pool that tries each name once is not a spin" `Quick
