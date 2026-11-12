@@ -69,6 +69,88 @@ CAMLprim value caml_eio_fs_flock(value fd_v, value mode_v, value nonblocking_v)
   return Val_unit;
 }
 
+/* A blocking flock on a thread that runs no OCaml and that no one joins. A
+   request in the kernel cannot be withdrawn, so a caller that stops waiting
+   leaves the thread to its answer: it is detached, so it holds no domain's
+   or process's exit. It asks through a duplicate of the descriptor, which
+   shares its open file description and so the lock the kernel grants, then
+   writes the request's errno, 0 once granted, to the pipe whose read end the
+   caller holds, and closes the duplicate and its write end. A caller gone
+   leaves the write to fail, EPIPE with SIGPIPE blocked on this thread. */
+struct flock_wait {
+  int fd;
+  int notify;
+  int operation;
+};
+
+static void *flock_wait_run(void *arg)
+{
+  struct flock_wait *w = arg;
+  int r, err;
+  ssize_t n;
+  do
+    r = flock(w->fd, w->operation);
+  while (r == -1 && errno == EINTR);
+  err = r == -1 ? errno : 0;
+  do
+    n = write(w->notify, &err, sizeof err);
+  while (n == -1 && errno == EINTR);
+  close(w->fd);
+  close(w->notify);
+  free(w);
+  return NULL;
+}
+
+CAMLprim value caml_eio_fs_flock_wait_start(value fd_v, value shared_v)
+{
+  struct flock_wait *w;
+  int fds[2], copy, r;
+  pthread_t thread;
+  pthread_attr_t attr;
+  sigset_t all, previous;
+  if (pipe(fds) == -1)
+    caml_uerror("pipe", Nothing);
+  copy = fcntl(Int_val(fd_v), F_DUPFD_CLOEXEC, 0);
+  w = malloc(sizeof *w);
+  if (copy == -1 || w == NULL) {
+    int err = copy == -1 ? errno : ENOMEM;
+    if (copy != -1)
+      close(copy);
+    free(w);
+    close(fds[0]);
+    close(fds[1]);
+    caml_unix_error(err, "flock", Nothing);
+  }
+  fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+  w->fd = copy;
+  w->notify = fds[1];
+  w->operation = Bool_val(shared_v) ? LOCK_SH : LOCK_EX;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  /* The thread takes no signal: the process's handlers belong to OCaml. */
+  sigfillset(&all);
+  pthread_sigmask(SIG_BLOCK, &all, &previous);
+  r = pthread_create(&thread, &attr, flock_wait_run, w);
+  pthread_sigmask(SIG_SETMASK, &previous, NULL);
+  pthread_attr_destroy(&attr);
+  if (r != 0) {
+    close(copy);
+    close(fds[0]);
+    close(fds[1]);
+    free(w);
+    caml_unix_error(r, "pthread_create", Nothing);
+  }
+  return Val_int(fds[0]);
+}
+
+/* Raises the errno a flock wait answered as the Unix error it names. */
+CAMLprim value caml_eio_fs_flock_wait_failed(value err_v)
+{
+  caml_unix_error(Int_val(err_v), "flock", Nothing);
+  return Val_unit;
+}
+
 /* Release a BSD flock. The lock belongs to the open file description, so
    this frees it for every descriptor that shares the description, one an
    execed supervisor inherited included. */
