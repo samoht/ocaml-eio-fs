@@ -96,6 +96,32 @@ let test_replay_unknown_state () =
       ^ ".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1";
     ]
 
+(* A cut that allows two states, which the check tries one by one: a
+   replay of a state drawn at random there, or of a malformed seed, is
+   refused. *)
+let test_replay_drawn_state () =
+  let mkdir ?replay () =
+    Eio_fs.Chaos.Crash.check ?replay
+      (fun ~ack env ->
+        (try P.mkdir ~perm:0o755 P.(env#fs / "d") with Eio.Io _ -> ());
+        ack ())
+      ~recover:(fun ~acked env ->
+        if acked <> [] && not (P.is_directory P.(env#fs / "d")) then
+          failwith "d missing")
+  in
+  let replay = replay_of (Expect.report (fun () -> mkdir ())) in
+  let h = hash replay in
+  List.iter
+    (fun st ->
+      Expect.refused
+        (Fmt.str
+           "Eio_fs.Chaos.Crash.check: the replay names none|end|%s, a scenario \
+            this check no longer has"
+           st)
+        (fun () -> mkdir ~replay:(Fmt.str "fs/%s/none|end|%s" h st) ())
+        ())
+    [ "s0"; "s1"; "s5"; "s-3"; "p1" ]
+
 (* A save of [n] bytes that does not sync: the fix changes the size of what
    it writes, and so the workload's first run. *)
 let config ?replay ~value ~sync () =
@@ -843,6 +869,8 @@ let suite =
         test_replay_state;
       Alcotest.test_case "a replay of a state the cut does not allow" `Quick
         test_replay_unknown_state;
+      Alcotest.test_case "a replay of a drawn state where none is drawn" `Quick
+        test_replay_drawn_state;
       Alcotest.test_case "a replay after a fix is re-matched" `Quick
         test_rematched_replay;
       Alcotest.test_case "a stale replay is refused" `Quick test_stale_replay;
