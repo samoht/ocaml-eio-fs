@@ -56,33 +56,19 @@ external pread_head : Unix.file_descr -> int -> string
 external pread_native : Unix.file_descr -> int -> bytes -> int -> int -> int
   = "caml_eio_fs_pread"
 
-let pread fd ~file_offset buf ~pos ~len =
-  if file_offset < 0 || pos < 0 || len < 0 || pos > Bytes.length buf - len then
-    invalid_arg "Eio_fs_unix.pread";
-  pread_native fd file_offset buf pos len
-
 external pread_cached_native :
   Unix.file_descr -> int -> bytes -> int -> int -> int
   = "caml_eio_fs_pread_cached"
 
-let pread_cached fd ~file_offset buf ~pos ~len =
-  if file_offset < 0 || pos < 0 || len < 0 || pos > Bytes.length buf - len then
-    invalid_arg "Eio_fs_unix.pread_cached";
-  pread_cached_native fd file_offset buf pos len
-
 external pwrite_native : Unix.file_descr -> int -> string -> int -> int -> int
   = "caml_eio_fs_pwrite"
-
-let pwrite fd ~file_offset buf ~pos ~len =
-  if file_offset < 0 || pos < 0 || len < 0 || pos > String.length buf - len then
-    invalid_arg "Eio_fs_unix.pwrite";
-  pwrite_native fd file_offset buf pos len
 
 module type POSITIONED = sig
   type t
 
-  val pread : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
-  val pread_cached : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  val pread :
+    t -> cached:bool -> file_offset:int -> bytes -> pos:int -> len:int -> int
+
   val pwrite : t -> file_offset:int -> string -> pos:int -> len:int -> int
 end
 
@@ -92,6 +78,58 @@ type (_, _, _) Eio.Resource.pi +=
         (module POSITIONED with type t = 't),
         [> `Positioned ] )
       Eio.Resource.pi
+
+(* The most a positioned call moves, as the native calls bound it. *)
+let positioned_max = 65536
+
+let check_span name ~file_offset ~length ~pos ~len =
+  if file_offset < 0 || pos < 0 || len < 0 || pos > length - len then
+    invalid_arg name
+
+let on_descriptor name fd f =
+  eio_unix_errors @@ fun () -> Eio_unix.Fd.use_exn name fd f
+
+let pread ?(cached = false) (file : _ Eio.File.ro) ~file_offset buf ~pos ~len =
+  check_span "Eio_fs_unix.pread" ~file_offset ~length:(Bytes.length buf) ~pos
+    ~len;
+  let (Eio.Resource.T (t, ops)) = file in
+  match Eio.Resource.get_opt ops Positioned with
+  | Some (module P) -> P.pread t ~cached ~file_offset buf ~pos ~len
+  | None -> (
+      match Eio_unix.Resource.fd_opt file with
+      | Some fd ->
+          on_descriptor "Eio_fs_unix.pread" fd @@ fun fd ->
+          if cached then pread_cached_native fd file_offset buf pos len
+          else pread_native fd file_offset buf pos len
+      | None when len = 0 -> 0
+      | None -> (
+          let c = Cstruct.create (min len positioned_max) in
+          match
+            Eio.File.pread file
+              ~file_offset:(Optint.Int63.of_int file_offset)
+              [ c ]
+          with
+          | n ->
+              Cstruct.blit_to_bytes c 0 buf pos n;
+              n
+          | exception End_of_file -> 0))
+
+let pwrite (file : _ Eio.File.rw) ~file_offset buf ~pos ~len =
+  check_span "Eio_fs_unix.pwrite" ~file_offset ~length:(String.length buf) ~pos
+    ~len;
+  let (Eio.Resource.T (t, ops)) = file in
+  match Eio.Resource.get_opt ops Positioned with
+  | Some (module P) -> P.pwrite t ~file_offset buf ~pos ~len
+  | None -> (
+      match Eio_unix.Resource.fd_opt file with
+      | Some fd ->
+          on_descriptor "Eio_fs_unix.pwrite" fd @@ fun fd ->
+          pwrite_native fd file_offset buf pos len
+      | None when len = 0 -> 0
+      | None ->
+          Eio.File.pwrite_single file
+            ~file_offset:(Optint.Int63.of_int file_offset)
+            [ Cstruct.of_string buf ~off:pos ~len:(min len positioned_max) ])
 
 type record_lock_wait
 
@@ -319,7 +357,6 @@ external rename_exclusive_at :
 (* The backend's own file over the host's descriptor, as it opens files
    itself: the descriptor is its resource's, tagged [`Unix_fd], so
    {!sync_file} and {!Eio_unix.Resource.fd_opt} reach it. *)
-let import_file ~sw ~close_unix fd = Eio_unix.File.import_rw ~sw ~close_unix fd
 
 module Exclusive_rename = struct
   type t = unit

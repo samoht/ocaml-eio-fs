@@ -4,7 +4,7 @@
     machinery of {!Eio_fs_sync}. It holds the {{!barriers}barriers} at full
     platform strength (on Darwin {!full_fsync} reaches the platter where [fsync]
     stops at the drive's cache), a filesystem's {{!capacity}capacity},
-    {{!clones}copy-on-write clones}, {{!files}files over a descriptor}, the
+    {{!clones}copy-on-write clones}, {{!files}positioned reads and writes}, the
     {{!sparse}sparse map}, {{!rename}exclusive rename}, POSIX
     {{!record_locks}record locks}, {{!lock_files}lock files} and their leases,
     {{!val-xattrs}extended attributes}, and {{!links}links} and
@@ -167,65 +167,71 @@ val remove_tree : ?grant:bool -> ?last:string -> _ Eio.Path.t -> removed
     directories above it and [last], and a later call goes on with what is left.
 *)
 
-(** {1:files Files over a descriptor} *)
+(** {1:files Positioned reads and writes}
+
+    A program that reads and writes a file at offsets it names, as a database
+    reads its pages, makes one call per page. {!Eio.File.pread} reads into a
+    {!Cstruct.t} and may hand the call to a system thread; {!val-pread} and
+    {!val-pwrite} read into [bytes] and write from a [string] on the calling
+    thread, in one system call. A program that holds a host descriptor opens it
+    as a file with {!Eio_unix.File.import_rw}. *)
 
 val pread :
-  Unix.file_descr -> file_offset:int -> bytes -> pos:int -> len:int -> int
-(** [pread fd ~file_offset buf ~pos ~len] reads up to [len] bytes of [fd] from
-    byte [file_offset] into [buf] at [pos], and is the count read, [0] at the
-    end of the file. This is POSIX [pread], which [Unix] does not bind: one
-    call, and [fd]'s own offset is left where it was, so readers sharing [fd]
-    need no lock. A read takes at most 65536 bytes, and is retried on [EINTR].
-    Other threads run during the call.
+  ?cached:bool ->
+  _ Eio.File.ro ->
+  file_offset:int ->
+  bytes ->
+  pos:int ->
+  len:int ->
+  int
+(** [pread ~cached file ~file_offset buf ~pos ~len] reads up to [len] bytes of
+    [file] from byte [file_offset] into [buf] at [pos], and is the count read,
+    [0] at the end of the file. It reads at most 65536 bytes, and [file]'s own
+    offset does not move:
+    - a file that registers {!Positioned} answers it;
+    - a file over a host descriptor is read by POSIX [pread], which [Unix] does
+      not bind, retried on [EINTR];
+    - any other file is read by one {!Eio.File.pread}.
 
-    @raise Stdlib.Invalid_argument
-      if [file_offset], [pos] or [len] is negative or [pos + len] is past the
-      end of [buf].
-    @raise Unix.Unix_error as [pread]. *)
-
-val pread_cached :
-  Unix.file_descr -> file_offset:int -> bytes -> pos:int -> len:int -> int
-(** [pread_cached fd ~file_offset buf ~pos ~len] is {!val-pread} for a read the
-    operating system's page cache answers, such as a database page read again: a
-    read of at most 65536 bytes keeps the OCaml runtime lock, and lands in [buf]
+    On a host descriptor, other threads run during the call. With [cached]
+    (defaults to [false]) the read is one the page cache answers, such as a
+    database page read again: it keeps the OCaml runtime lock and lands in [buf]
     with no copy, which costs less than giving the lock up and taking it back.
     On Linux it asks with [RWF_NOWAIT] and gives the lock up only for a read
     that would wait on the device; elsewhere it keeps the lock whatever the read
     waits on, so no other thread of the domain runs, and no other domain
-    completes a minor collection, until it returns. A longer read is
-    {!val-pread}'s. A program whose other domains must not wait on a read takes
-    {!val-pread}.
+    completes a minor collection, until it returns.
 
     @raise Stdlib.Invalid_argument
       if [file_offset], [pos] or [len] is negative or [pos + len] is past the
       end of [buf].
-    @raise Unix.Unix_error as {!val-pread}. *)
+    @raise Eio.Io as the read fails. *)
 
 val pwrite :
-  Unix.file_descr -> file_offset:int -> string -> pos:int -> len:int -> int
-(** [pwrite fd ~file_offset buf ~pos ~len] writes up to [len] bytes of [buf]
-    from [pos] to [fd] at byte [file_offset], and is the count written. This is
-    POSIX [pwrite]: one call, and [fd]'s own offset is left where it was. A
-    write takes at most 65536 bytes, and is retried on [EINTR]. Other threads
-    run during the call.
+  _ Eio.File.rw -> file_offset:int -> string -> pos:int -> len:int -> int
+(** [pwrite file ~file_offset s ~pos ~len] writes up to [len] bytes of [s] from
+    [pos] to [file] at byte [file_offset], and is the count written. It writes
+    at most 65536 bytes, [file]'s own offset does not move, and [file] answers
+    it as it answers {!val-pread}: through {!Positioned}, by POSIX [pwrite] on a
+    host descriptor, retried on [EINTR] while other threads run, or by one
+    {!Eio.File.pwrite_single}.
 
     @raise Stdlib.Invalid_argument
       if [file_offset], [pos] or [len] is negative or [pos + len] is past the
-      end of [buf].
-    @raise Unix.Unix_error as [pwrite]. *)
+      end of [s].
+    @raise Eio.Io as the write fails. *)
 
 (** The positioned calls of a file that answers them itself. *)
 module type POSITIONED = sig
   type t
+  (** The type for the files. *)
 
-  val pread : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
-  (** [pread] is {!val-pread} on the file. *)
-
-  val pread_cached : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
-  (** [pread_cached] is {!val-pread_cached} on the file. *)
+  val pread :
+    t -> cached:bool -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  (** [pread t ~cached ~file_offset buf ~pos ~len] is {!val-pread} on [t]. *)
 
   val pwrite : t -> file_offset:int -> string -> pos:int -> len:int -> int
-  (** [pwrite] is {!val-pwrite} on the file. *)
+  (** [pwrite t ~file_offset s ~pos ~len] is {!val-pwrite} on [t]. *)
 end
 
 type (_, _, _) Eio.Resource.pi +=
@@ -234,31 +240,12 @@ type (_, _, _) Eio.Resource.pi +=
         (module POSITIONED with type t = 't),
         [> `Positioned ] )
       Eio.Resource.pi
-        (** The operations a file registers in its resource handler when it
-            answers positioned calls itself. A program that reads and writes a
-            file through its descriptor, past [Eio.File], asks this first: a
-            wrapper that carries the descriptor it stands in front of (to count,
-            observe or alter its calls) registers it, and every call then goes
-            through the wrapper. *)
-
-val import_file :
-  sw:Eio.Switch.t ->
-  close_unix:bool ->
-  Unix.file_descr ->
-  [ `Unix_fd | Eio.File.rw_ty ] Eio.Resource.t
-(** [import_file ~sw ~close_unix fd] is
-    [Eio_unix.File.import_rw ~sw ~close_unix fd]: the file [fd], a descriptor on
-    a regular file, read and written by the running backend as the files it
-    opens itself are: positional reads and writes, [stat], [seek], [sync] and
-    [truncate]. The descriptor is closed with the file, or when [sw] finishes,
-    iff [close_unix]; {!Eio_unix.Fd.remove} on its {!Eio_unix.Resource.fd} takes
-    it back without closing it. The backend may make [fd] non-blocking
-    (eio_posix does), which changes nothing for a regular file. A caller that
-    keeps a descriptor open across handles, as SQLite's os_unix.c keeps one on
-    its inode while a lock stands, opens no other.
-
-    @raise Stdlib.Invalid_argument
-      if [sw] has finished, as {!Eio_unix.Fd.of_unix}. *)
+        (** The positioned calls a file registers in its resource handler when
+            it answers them itself: a wrapper that carries the descriptor it
+            stands in front of, to count, observe or alter its calls, registers
+            it, and {!val-pread} and {!val-pwrite} then go through the wrapper.
+            The wrapper reaches its base with {!val-pread} and {!val-pwrite}
+            too. *)
 
 (** {1:sparse The sparse map} *)
 

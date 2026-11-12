@@ -282,39 +282,6 @@ let test_sync_file_takes_the_descriptor_when_nothing_is_registered () =
         "the barrier skipped the descriptor of a file that registers none"
   | exception Invalid_argument _ -> ()
 
-(* A file imported over a host descriptor reads and writes the descriptor's
-   file at the offsets asked, and is that descriptor: [fd_opt] reaches it, and
-   a switch that ends leaves open what [close_unix:false] says it does not
-   own. The bytes written are not a period of the offsets read. *)
-let test_import_file () =
-  with_real_dir @@ fun dir ->
-  let name = Option.get (Eio.Path.native (dir / "f")) in
-  let raw = Unix.openfile name [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
-  Fun.protect ~finally:(fun () -> Unix.close raw) @@ fun () ->
-  let at = Optint.Int63.of_int in
-  Eio.Switch.run (fun sw ->
-      let file = Eio_fs_unix.import_file ~sw ~close_unix:false raw in
-      Eio.File.pwrite_all file ~file_offset:(at 3)
-        [ Cstruct.of_string "abcdefg" ];
-      let buf = Cstruct.create 4 in
-      Eio.File.pread_exact file ~file_offset:(at 5) [ buf ];
-      Alcotest.(check string)
-        "read at its offset" "cdef" (Cstruct.to_string buf);
-      Alcotest.(check int)
-        "stat reads the file's size" 10
-        (Optint.Int63.to_int (Eio.File.stat file).size);
-      Eio.File.truncate file (at 6);
-      Alcotest.(check string)
-        "the host reads what the file wrote" "\000\000\000abc"
-        (In_channel.with_open_bin name In_channel.input_all);
-      Alcotest.(check bool)
-        "the resource is the descriptor" true
-        (match Eio_unix.Resource.fd_opt file with
-        | None -> false
-        | Some fd -> Eio_unix.Fd.use_exn "import" fd (fun fd -> fd = raw)));
-  Alcotest.(check int)
-    "the descriptor outlives the switch" 6 (Unix.fstat raw).st_size
-
 (* The same ordering in the shape a store publishes in, over the real
    filesystem it runs on. The crash wrapper's file hands its caller no host
    descriptor, so the barrier reaches the model's own sync and not a real
@@ -590,50 +557,55 @@ let test_statvfs_reports_raw_block_capacity () =
 
 (* ---- positioned reads ---- *)
 
-(* POSIX pread: the bytes at the offset asked, the count read, 0 at the end of
-   the file, and the descriptor's own offset where it was. A pread written as a
-   seek and a read passes the first three and fails the last. [pread_cached]
-   keeps the same contract with the runtime lock held. *)
-let pread_leaves_the_offset name pread () =
-  with_real_dir @@ fun dir ->
-  let path = Eio.Path.native_exn (dir / "pread.bin") in
+(* A host file of [text] opened read-write as [fd], and as a file over that
+   descriptor. *)
+let with_host_file dir name text fn =
+  let path = Eio.Path.native_exn (dir / name) in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
-  let text = "0123456789abcdef" in
   let n = Unix.write_substring fd text 0 (String.length text) in
   Alcotest.(check int) "the whole text was written" (String.length text) n;
+  Eio.Switch.run @@ fun sw ->
+  fn fd (Eio_unix.File.import_rw ~sw ~close_unix:false fd)
+
+(* POSIX pread: the bytes at the offset asked, the count read, 0 at the end of
+   the file, and the descriptor's own offset where it was. A pread written as a
+   seek and a read passes the first three and fails the last. A cached read
+   keeps the same contract with the runtime lock held. *)
+let pread_leaves_the_offset ~cached () =
+  with_real_dir @@ fun dir ->
+  with_host_file dir "pread.bin" "0123456789abcdef" @@ fun fd file ->
+  let pread = Eio_fs_unix.pread ~cached file in
   ignore (Unix.lseek fd 3 Unix.SEEK_SET : int);
   let buf = Bytes.make 8 '.' in
-  let got = pread fd ~file_offset:10 buf ~pos:2 ~len:4 in
+  let got = pread ~file_offset:10 buf ~pos:2 ~len:4 in
   Alcotest.(check int) "four bytes read" 4 got;
   Alcotest.(check string)
     "the bytes at offset 10, at pos 2" "..abcd.." (Bytes.to_string buf);
   Alcotest.(check int)
     "the descriptor's offset is untouched" 3
     (Unix.lseek fd 0 Unix.SEEK_CUR);
-  let got = pread fd ~file_offset:14 buf ~pos:0 ~len:8 in
+  let got = pread ~file_offset:14 buf ~pos:0 ~len:8 in
   Alcotest.(check int) "a read across the end takes what is there" 2 got;
   Alcotest.(check int)
     "a read at the end is 0" 0
-    (pread fd ~file_offset:16 buf ~pos:0 ~len:8);
+    (pread ~file_offset:16 buf ~pos:0 ~len:8);
   Alcotest.check_raises "a range past the buffer is refused"
-    (Invalid_argument ("Eio_fs_unix." ^ name))
-    (fun () -> ignore (pread fd ~file_offset:0 buf ~pos:6 ~len:4 : int))
+    (Invalid_argument "Eio_fs_unix.pread") (fun () ->
+      ignore (pread ~file_offset:0 buf ~pos:6 ~len:4 : int))
 
-(* A read longer than the 65536 bytes [pread_cached] reads with the lock held
-   is {!Eio_fs_unix.pread}'s, which takes at most 65536 bytes a call: the count
-   says so, and the bytes are the file's. A read that kept the lock past the
-   bound would answer 70000. *)
+(* A cached read longer than the 65536 bytes it reads with the lock held is
+   an uncached one, which takes at most 65536 bytes a call: the count says
+   so, and the bytes are the file's. A read that kept the lock past the bound
+   would answer 70000. *)
 let test_pread_cached_bound () =
-  with_real_dir_env @@ fun _env dir ->
-  let path = Eio.Path.native_exn (dir / "pread_long.bin") in
-  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
-  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  with_real_dir @@ fun dir ->
   let text = String.init 70000 (fun i -> Char.chr (i mod 251)) in
-  let n = Unix.write_substring fd text 0 (String.length text) in
-  Alcotest.(check int) "the whole text was written" (String.length text) n;
+  with_host_file dir "pread_long.bin" text @@ fun _ file ->
   let buf = Bytes.make 70000 '.' in
-  let got = Eio_fs_unix.pread_cached fd ~file_offset:0 buf ~pos:0 ~len:70000 in
+  let got =
+    Eio_fs_unix.pread ~cached:true file ~file_offset:0 buf ~pos:0 ~len:70000
+  in
   Alcotest.(check int) "one call reads 65536 bytes" 65536 got;
   Alcotest.(check string)
     "they are the file's" (String.sub text 0 65536)
@@ -643,31 +615,88 @@ let test_pread_cached_bound () =
    count written, and the descriptor's own offset where it was. A pwrite
    written as a seek and a write passes the first two and fails the last. *)
 let test_pwrite_leaves_the_offset () =
-  with_real_dir_env @@ fun _env dir ->
-  let path = Eio.Path.native_exn (dir / "pwrite.bin") in
-  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
-  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
-  let text = "0123456789abcdef" in
-  let n = Unix.write_substring fd text 0 (String.length text) in
-  Alcotest.(check int) "the whole text was written" (String.length text) n;
+  with_real_dir @@ fun dir ->
+  with_host_file dir "pwrite.bin" "0123456789abcdef" @@ fun fd file ->
   ignore (Unix.lseek fd 3 Unix.SEEK_SET : int);
-  let got = Eio_fs_unix.pwrite fd ~file_offset:10 "..WXYZ.." ~pos:2 ~len:4 in
+  let got = Eio_fs_unix.pwrite file ~file_offset:10 "..WXYZ.." ~pos:2 ~len:4 in
   Alcotest.(check int) "four bytes written" 4 got;
   Alcotest.(check int)
     "the descriptor's offset is untouched" 3
     (Unix.lseek fd 0 Unix.SEEK_CUR);
-  let got = Eio_fs_unix.pwrite fd ~file_offset:18 "!" ~pos:0 ~len:1 in
+  let got = Eio_fs_unix.pwrite file ~file_offset:18 "!" ~pos:0 ~len:1 in
   Alcotest.(check int) "a write past the end extends the file" 1 got;
   let buf = Bytes.make 19 '.' in
   Alcotest.(check int)
     "the file reads back" 19
-    (Eio_fs_unix.pread fd ~file_offset:0 buf ~pos:0 ~len:19);
+    (Eio_fs_unix.pread file ~file_offset:0 buf ~pos:0 ~len:19);
   Alcotest.(check string)
     "the span at offset 10, the gap as zeros" "0123456789WXYZef\000\000!"
     (Bytes.to_string buf);
   Alcotest.check_raises "a range past the buffer is refused"
     (Invalid_argument "Eio_fs_unix.pwrite") (fun () ->
-      ignore (Eio_fs_unix.pwrite fd ~file_offset:0 "abc" ~pos:2 ~len:2 : int))
+      ignore (Eio_fs_unix.pwrite file ~file_offset:0 "abc" ~pos:2 ~len:2 : int))
+
+(* A file with no host descriptor, in memory, is read and written by Eio's
+   own positioned calls, with the same counts: what lands, what is read back,
+   and 0 at the end. *)
+let test_positioned_in_memory () =
+  with_in_memory_fs @@ fun fs ->
+  Eio.Path.with_open_out ~create:(`Exclusive 0o600) (fs / "f") @@ fun file ->
+  Alcotest.(check int)
+    "the span is written" 4
+    (Eio_fs_unix.pwrite file ~file_offset:2 "..abcd.." ~pos:2 ~len:4);
+  let buf = Bytes.make 8 '.' in
+  Alcotest.(check int)
+    "what is there is read" 3
+    (Eio_fs_unix.pread file ~file_offset:3 buf ~pos:1 ~len:6);
+  Alcotest.(check string) "at pos 1" ".bcd...." (Bytes.to_string buf);
+  Alcotest.(check int)
+    "a read at the end is 0" 0
+    (Eio_fs_unix.pread ~cached:true file ~file_offset:6 buf ~pos:0 ~len:8)
+
+(* [file] with a [Positioned] that counts each call, then makes it on [file]
+   as it was. *)
+let counted (type a) calls (t : a)
+    (ops : (a, Eio.File.rw_ty) Eio.Resource.handler) :
+    Eio.File.rw_ty Eio.Resource.t =
+  let base t = (Eio.Resource.T (t, ops) : Eio.File.rw_ty Eio.Resource.t) in
+  let module P = struct
+    type t = a
+
+    let pread t ~cached ~file_offset buf ~pos ~len =
+      incr calls;
+      Eio_fs_unix.pread ~cached (base t) ~file_offset buf ~pos ~len
+
+    let pwrite t ~file_offset s ~pos ~len =
+      incr calls;
+      Eio_fs_unix.pwrite (base t) ~file_offset s ~pos ~len
+  end in
+  Eio.Resource.T
+    ( t,
+      Eio.Resource.handler
+        (Eio.Resource.H (Eio_fs_unix.Positioned, (module P))
+        :: Eio.Resource.bindings ops) )
+
+let counting calls (Eio.Resource.T (t, ops) : Eio.File.rw_ty Eio.Resource.t) =
+  counted calls t ops
+
+(* A file that registers [Positioned] answers every positioned call itself,
+   ahead of the descriptor it carries: a wrapper in front of a host file
+   counts each, and its base still moves the bytes. *)
+let test_positioned_wrapper () =
+  with_real_dir @@ fun dir ->
+  with_host_file dir "wrapped.bin" "0123" @@ fun _ file ->
+  let calls = ref 0 in
+  let file = counting calls (file :> Eio.File.rw_ty Eio.Resource.t) in
+  Alcotest.(check int)
+    "written" 2
+    (Eio_fs_unix.pwrite file ~file_offset:1 "xy" ~pos:0 ~len:2);
+  let buf = Bytes.make 4 '.' in
+  Alcotest.(check int)
+    "read" 4
+    (Eio_fs_unix.pread ~cached:true file ~file_offset:0 buf ~pos:0 ~len:4);
+  Alcotest.(check string) "through the base" "0xy3" (Bytes.to_string buf);
+  Alcotest.(check int) "both calls went through the wrapper" 2 !calls
 
 (* ---- the sparse map ----
 
@@ -3445,8 +3474,6 @@ let suite =
         test_sync_dir_refuses_a_name_a_link_took;
       Alcotest.test_case "barrier refuses a relative link" `Quick
         test_sync_dir_refuses_a_relative_link;
-      Alcotest.test_case "an imported descriptor is a file" `Quick
-        test_import_file;
       Alcotest.test_case "file barrier asks the registration first" `Quick
         test_sync_file_asks_the_registration_before_the_descriptor;
       Alcotest.test_case "file barrier takes an unregistered file's descriptor"
@@ -3474,13 +3501,17 @@ let suite =
       Alcotest.test_case "path calls stay in their directory" `Quick
         test_path_calls_stay_in_their_directory;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
-        (pread_leaves_the_offset "pread" Eio_fs_unix.pread);
-      Alcotest.test_case "pread_cached leaves the descriptor's offset" `Quick
-        (pread_leaves_the_offset "pread_cached" Eio_fs_unix.pread_cached);
-      Alcotest.test_case "pread_cached hands a long read to pread" `Quick
+        (pread_leaves_the_offset ~cached:false);
+      Alcotest.test_case "a cached pread leaves the descriptor's offset" `Quick
+        (pread_leaves_the_offset ~cached:true);
+      Alcotest.test_case "a long cached pread is an uncached one" `Quick
         test_pread_cached_bound;
       Alcotest.test_case "pwrite leaves the descriptor's offset" `Quick
         test_pwrite_leaves_the_offset;
+      Alcotest.test_case "positioned calls on a file in memory" `Quick
+        test_positioned_in_memory;
+      Alcotest.test_case "a file that registers Positioned answers" `Quick
+        test_positioned_wrapper;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
         test_seek_data_and_hole_walk_the_file;
       Alcotest.test_case "extents report the physical map" `Quick
