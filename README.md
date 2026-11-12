@@ -217,7 +217,11 @@ lost, and directory changes reach the disk in program order. A pass holds for
 that model, not for APFS. On macOS, `fsync` stops at the drive's cache: pass
 `Eio_fs_unix.barrier` to `Eio_fs_sync` so that a sync reaches the disk.
 
-Where POSIX systems differ, the in-memory filesystem answers as Linux does. It
+Where POSIX systems differ, the in-memory filesystem answers as Linux does,
+or, with `~os:`Macos`, as macOS does on its default APFS volume: a name
+matches whatever its case and Unicode normalisation, and the errors, modes
+and groups are macOS's. `Eio_fs.Fs` lists the differences; a trace of both
+kernels, recorded through `Unix` and eio_posix, checks them. Under Linux it
 has `fs.protected_symlinks` on, as most distributions do: in a sticky
 directory others may write, such as `/tmp`, a link is followed only by its
 owner or the directory's.
@@ -240,10 +244,13 @@ its budget fails and says so. Shrink the workload, or raise `~budget`.
 Code that runs on both should avoid these:
 
 - `x/.`, `x/d/..` and trailing slashes. The in-memory filesystem resolves them
-  as Linux does. eio_posix rewrites the first two lexically
+  as the kernel does. eio_posix rewrites the first two lexically
   ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)), and fails a
   creating open with a trailing slash differently
   ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)).
+- Directory permissions on macOS. eio_posix needs read permission on each
+  directory a path walks, and follows up to 40 links to stat a path where
+  the kernel stops at 32. The in-memory filesystem answers as the kernel.
 
 ## Licence
 
