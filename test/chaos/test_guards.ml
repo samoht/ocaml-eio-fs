@@ -397,6 +397,27 @@ let test_tiny_sleeps_are_busy () =
       Alcotest.(check string) "error" busy (Expect.field "error" report))
     [ 1e-6; 1e-4 ]
 
+(* A loop of 9.9 million yields then a sleep of 1 ms: each sleep ends a run
+   of turns in a row, and the run stops at 10 million turns in all. Its own
+   bound, past that, fails the run when nothing stops it. *)
+let test_too_many_turns () =
+  Expect.refused
+    "Eio_fs.Chaos.check: the run with no fault failed: the run took 10,000,000 \
+     turns, more than a check can repeat: a busy loop, or a workload too large \
+     for a check"
+    (fun () ->
+      Eio_fs.Chaos.check (fun env ->
+          (try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+           with Eio.Io _ -> ());
+          for _ = 1 to 3 do
+            for _ = 1 to 9_900_000 do
+              Eio.Fiber.yield ()
+            done;
+            Eio.Time.Mono.sleep env#mono_clock 0.001
+          done;
+          failwith "the loop was not stopped"))
+    ()
+
 (* A thousand fibers on a heartbeat of 100 ms and three polling every 1 ms,
    for 1000 s of clock: far more than 10 million turns in all, each fiber
    waiting on its timer between two, and no busy loop. *)
@@ -1041,6 +1062,8 @@ let suite =
         test_yield_poll_is_busy;
       Alcotest.test_case "a loop of tiny sleeps is a busy loop" `Quick
         test_tiny_sleeps_are_busy;
+      Alcotest.test_case "a run stops at 10 million turns" `Quick
+        test_too_many_turns;
       Alcotest.test_case "many fibers on timers are not busy" `Quick
         test_timers_are_not_busy;
       Alcotest.test_case "10000 yields meet a deadline of 100 ms" `Quick
