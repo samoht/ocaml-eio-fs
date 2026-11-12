@@ -52,10 +52,13 @@
 
     A check is deterministic. A failure raises [Failure] with the scenario, the
     tier that found it, the operations of the failing run, and the
-    [~replay:"..."] argument that runs that scenario alone. When the workload's
-    first run has changed, a replay finds its scenario again by its operations,
-    and its report says so. A replay fails if the check no longer has that
-    scenario.
+    [~replay:"..."] argument that runs that scenario alone. A power cut's report
+    also says after which operation each value was acknowledged, and, for a
+    state drawn among those the cut allows, what each file holds: its length,
+    and each run of sectors that holds a write, zeros or stale data, with where
+    the stale data comes from. When the workload's first run has changed, a
+    replay finds its scenario again by its operations, and its report says so. A
+    replay fails if the check no longer has that scenario.
 
     A check reads no environment variable and prints nothing. A test that wants
     a larger budget at night reads its own:

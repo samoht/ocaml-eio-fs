@@ -514,11 +514,12 @@ module Crash = struct
         let rng = Random.State.make [| s |] in
         Choose (fun n -> Random.State.int rng n)
 
-  type 'a result = {
+  type result = {
     trace : run_trace;
     rtrace : Plan.trace;
-    acked : 'a list;
+    acked_at : int list; (* the operation each ack came after *)
     lost : unsynced list;
+    left : string list;
     trail : (int * int) list;
     error : error option;
   }
@@ -582,8 +583,9 @@ module Crash = struct
 
   let exec ~setup run ~recover (s : Plan.crash) =
     let trail = ref [] in
-    let acked = ref [] and trace = ref [] and rtrace = ref [] in
-    let lost = ref [] in
+    let acked = ref [] and acked_at = ref [] in
+    let trace = ref [] and rtrace = ref [] in
+    let lost = ref [] and left = ref [] in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
     (* A cut stops the run, as nothing runs after a power cut: once every
@@ -612,7 +614,12 @@ module Crash = struct
             ~stop fs (fun fs ->
               run
                 ~ack:(fun v ->
-                  if not (M.Crash.is_crashed ctl) then acked := v :: !acked)
+                  if not (M.Crash.is_crashed ctl) then begin
+                    acked := v :: !acked;
+                    acked_at :=
+                      (match !trace with (op, _) :: _ -> op.index | [] -> 0)
+                      :: !acked_at
+                  end)
                 (env_of clock mono fs))
         in
         if not (M.Crash.is_crashed ctl) then begin
@@ -620,6 +627,7 @@ module Crash = struct
           M.Crash.crash ctl
         end
         else lost := l;
+        left := M.Crash.left ctl;
         let acked = List.rev !acked in
         match out with
         | Passed -> (
@@ -658,11 +666,27 @@ module Crash = struct
     {
       trace = List.rev !trace;
       rtrace = ops (List.rev !rtrace);
-      acked = List.rev !acked;
+      acked_at = List.rev !acked_at;
       lost = !lost;
+      left = !left;
       trail = !trail;
       error;
     }
+
+  (* The values acknowledged, by the operation each came after: their type
+     has no printer, and recover names the one it misses. *)
+  let acked_text = function
+    | [] -> "none"
+    | ats ->
+        let n = List.length ats in
+        let shown = List.filteri (fun i _ -> i < 8) ats in
+        Fmt.str "%d value%s, after %s%s" n
+          (if n = 1 then "" else "s")
+          (String.concat ", "
+             (List.map
+                (function 0 -> "the start" | i -> Fmt.str "#%d" i)
+                shown))
+          (if n > 8 then Fmt.str " and %d more" (n - 8) else "")
 
   let state_text = function
     | Plan.Drop -> "every unsynced change lost"
@@ -680,7 +704,7 @@ module Crash = struct
     | None -> "at the end"
     | Some p -> "before " ^ Plan.pos_text p
 
-  let lines (s : Plan.crash) (r : _ result) =
+  let lines (s : Plan.crash) (r : result) =
     [
       ("cut", Fmt.str "%s, %s" (cut_text s.cut) (state_text s.state));
       ("faults", Plan.faults_text s.cfaults);
@@ -690,7 +714,7 @@ module Crash = struct
         | Some (j, st) ->
             Fmt.str "cut %s of recover, %s, then recover again" (cut_text j)
               (state_text st) );
-      ("acked", Fmt.str "%d value(s)" (List.length r.acked));
+      ("acked", acked_text r.acked_at);
       (* What the cut may have lost: all of it, none of it, or some. *)
       (let changes =
          Fmt.str "%a" Fmt.(list ~sep:(any "; ") pp_unsynced) r.lost
@@ -699,6 +723,14 @@ module Crash = struct
        | Drop -> ("lost", changes)
        | Keep -> ("lost", "")
        | Enum _ | Seed _ -> ("unsynced", changes));
+      ( "left",
+        match s.state with
+        | Drop | Keep -> ""
+        | Enum _ | Seed _ ->
+            let n = List.length r.left in
+            (List.filteri (fun i _ -> i < 8) r.left
+            @ if n > 8 then [ Fmt.str "and %d more files" (n - 8) ] else [])
+            |> String.concat "\n            " );
     ]
 
   let check ?budget ?replay ?(setup = ignore) run ~recover =

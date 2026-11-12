@@ -1281,9 +1281,12 @@ module Crash = struct
     mutable clears : metadata_entry Ids.t; (* the pending setuid clears *)
     by_attrs : (int64, metadata_entry Ids.t) Hashtbl.t;
     mutable snapshot : state option; (* the last whole snapshot *)
-    mutable snapped : Cstruct.t Inos.t;
-        (* The bytes of every file a whole snapshot held, by inode: once
-           removed, its blocks are free, even after the snapshot moved on. *)
+    mutable snapped : (string * Cstruct.t) Inos.t;
+        (* The path and bytes of every file a whole snapshot held, by inode:
+           once removed, its blocks are free, even after the snapshot moved
+           on. *)
+    mutable left : string list;
+        (* What the crash left of the unsynced writes, file by file. *)
     mutable durable : state option;
         (* The snapshot with the committed entries replayed over it, or
            [None] until it is built again. *)
@@ -2034,8 +2037,10 @@ module Crash = struct
     ctl.durable <- Some st;
     ctl.snapped <-
       fold_nodes
-        (fun _ n acc ->
-          match n with File f -> Inos.add f.ino f.data acc | _ -> acc)
+        (fun segs n acc ->
+          match n with
+          | File f -> Inos.add f.ino ("/" ^ String.concat "/" segs, f.data) acc
+          | _ -> acc)
         [] st.tree ctl.snapped
 
   let commit_metadata ctl =
@@ -2403,9 +2408,12 @@ module Crash = struct
      size as writeback lands. A sector a write put bytes in, in a
      page the disk did not hold, may also hold stale data: ext4 may commit
      the page's allocation before its bytes land. [old p] is what a freed
-     block the page may have been given held, at page [p] of its file. *)
+     block the page may have been given held, at page [p] of its file, and
+     where it was. [describe] is told the length and, run by run, what each
+     block holds. *)
   let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ?(held = [])
-      ?(old = fun _ -> None) ~rng ~bs ~cache durable changes =
+      ?(old = fun _ -> None) ?(describe = fun _ _ -> ()) ~rng ~bs ~cache durable
+      changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -2576,13 +2584,33 @@ module Crash = struct
           let dst = Cstruct.sub image (b * bs) len in
           match old (b * bs / page) with
           | None -> Cstruct.memset dst (Char.code stale)
-          | Some pg ->
+          | Some (pg, _) ->
               (* Past the old file's end its block held zeros. *)
               Cstruct.memset dst 0;
               let off = b * bs mod page in
               let n = max 0 (min len (Cstruct.length pg - off)) in
               if n > 0 then Cstruct.blit pg off dst 0 n)
       stale_blocks;
+    (let source b =
+       if Hashtbl.mem stale_blocks b then
+         `Stale (Option.map snd (old (b * bs / page)))
+       else
+         match Hashtbl.find_opt chosen b with
+         | Some v -> `Change (v - 1)
+         | None when List.mem_assoc b over -> `Over
+         | None -> `Durable
+     in
+     let runs = ref [] in
+     if size > 0 then
+       for b = (size - 1) / bs downto 0 do
+         let len = min bs (size - (b * bs)) in
+         let src = source b in
+         match !runs with
+         | (off, n, s) :: rest when s = src && off = (b + 1) * bs ->
+             runs := (b * bs, n + len, s) :: rest
+         | _ -> runs := (b * bs, len, src) :: !runs
+       done;
+     describe size !runs);
     image
 
   (* A disk writes a 512-byte sector whole, so the overwrites of one sector
@@ -2668,20 +2696,57 @@ module Crash = struct
          in program order. An overwrite within the length may land without
          it. *)
       let clear_cut = Hashtbl.create 4 in
-      (* The files the image no longer holds, whose blocks are free. *)
+      (* The files the image no longer holds, whose blocks are free, by
+         path. *)
       let removed = ref [] in
       let old fs p =
         match List.assoc_opt p fs.freed with
-        | Some _ as pg -> pg
+        | Some pg -> Some (pg, fs.rel ^ " held there before its truncation")
         | None ->
             List.find_map
-              (fun c ->
+              (fun (path, c) ->
                 if Cstruct.length c > p * page then
                   Some
-                    (Cstruct.sub c (p * page)
-                       (min page (Cstruct.length c - (p * page))))
+                    ( Cstruct.sub c (p * page)
+                        (min page (Cstruct.length c - (p * page))),
+                      "the removed " ^ path ^ " held there" )
                 else None)
               !removed
+      in
+      (* What the crash left of each file's unsynced writes. *)
+      let left = ref [] in
+      let describe (fs : fstate) mine size runs =
+        let durable = Cstruct.length (bytes_of fs.durable) in
+        let run (off, n, src) =
+          let at = Fmt.str "@%d+%d" off n in
+          match src with
+          | `Durable when off >= durable -> Some (at ^ " zeros")
+          | `Durable -> None
+          | `Change k -> (
+              match (List.nth mine k : entry).change with
+              | Write { offset; data } ->
+                  Some
+                    (Fmt.str "%s as the write @%d+%d left it" at offset
+                       (Cstruct.length data))
+              | Resize m ->
+                  Some (Fmt.str "%s as the truncation to %d left it" at m))
+          | `Over -> Some (at ^ " as a failed sync wrote it")
+          | `Stale None -> Some (Fmt.str "%s stale %C" at stale)
+          | `Stale (Some from) -> Some (Fmt.str "%s stale (what %s)" at from)
+        in
+        let parts = List.filter_map run runs in
+        let parts =
+          match List.length parts with
+          | n when n > 8 ->
+              List.filteri (fun i _ -> i < 8) parts
+              @ [ Fmt.str "and %d more runs" (n - 8) ]
+          | _ -> parts
+        in
+        if parts <> [] || size <> durable then
+          left :=
+            Fmt.str "%s, %d bytes%s" fs.rel size
+              (if parts = [] then "" else ": " ^ String.concat "; " parts)
+            :: !left
       in
       let content fs =
         match Hashtbl.find_opt contents fs.id with
@@ -2750,13 +2815,14 @@ module Crash = struct
                     && rng.bool ()
                   then
                     writeback ~over ~len_upto ~bytes ~held:fs.held ~old:(old fs)
-                      ~rng ~bs:ctl.block_size ~cache:None
+                      ~describe:(describe fs mine) ~rng ~bs:ctl.block_size
+                      ~cache:None
                       (Option.value ~default:(bytes_of fs.durable) fs.evicted)
                       (List.map (fun (c, _) -> (c, false)) changes)
                   else
                     writeback ~over ~len_upto ~bytes ~held:fs.held ~old:(old fs)
-                      ~rng ~bs:ctl.block_size ~cache:fs.cache
-                      (bytes_of fs.durable) changes
+                      ~describe:(describe fs mine) ~rng ~bs:ctl.block_size
+                      ~cache:fs.cache (bytes_of fs.durable) changes
               | Survive pred, _ ->
                   let kept =
                     List.filter (fun e -> pred (to_unsynced e)) mine
@@ -2877,11 +2943,13 @@ module Crash = struct
        let gone_files =
          Hashtbl.fold
            (fun id (fs : fstate) acc ->
-             if Hashtbl.mem located id then acc else bytes_of fs.durable :: acc)
+             if Hashtbl.mem located id then acc
+             else (fs.rel, bytes_of fs.durable) :: acc)
            ctl.known []
        and gone_nodes =
          Inos.fold
-           (fun ino data acc -> if Inos.mem ino inos then acc else data :: acc)
+           (fun ino (path, data) acc ->
+             if Inos.mem ino inos then acc else (path, data) :: acc)
            ctl.snapped []
        in
        removed := gone_files @ gone_nodes);
@@ -2910,6 +2978,7 @@ module Crash = struct
                 | _ | (exception Eio.Io _) -> ())
               ls)
         locs.at;
+      ctl.left <- List.rev !left;
       ctl.image <-
         fold_nodes
           (fun segs node acc ->
@@ -3727,6 +3796,7 @@ module Crash = struct
       by_attrs = Hashtbl.create 16;
       snapshot = None;
       snapped = Inos.empty;
+      left = [];
       durable = None;
       by_rel = Paths.empty;
       root_box = None;
@@ -3770,6 +3840,8 @@ module Crash = struct
     match ctl.base with
     | Some b -> b
     | None -> invalid_arg "Chaos.Crash.post_crash: controller was never wrapped"
+
+  let left ctl = ctl.left
 
   let pp_unsynced ppf u =
     match u.kind with

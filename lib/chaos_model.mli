@@ -479,6 +479,11 @@ module Crash : sig
 
       @raise Eio.Io ("power lost") if [t] has crashed. *)
 
+  val left : t -> string list
+  (** [left t] is, file by file, what [t]'s crash left of the unsynced writes
+      under a {!Choose} policy: the length, and each run of sectors that holds
+      something else than the durable bytes, with what it holds. *)
+
   val unsynced : t -> unsynced list
   (** [unsynced t] are the changes not yet made durable, in program order: every
       write no sync made durable, and every journal entry not committed. That
