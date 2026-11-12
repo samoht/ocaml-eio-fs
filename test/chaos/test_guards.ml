@@ -282,6 +282,30 @@ let test_hang () =
                 | _ -> ()
                 | exception Eio.Io _ -> Eio.Fiber.await_cancel ()))))
 
+(* A fiber that polls with a yield for a file another fiber failed to write:
+   time passes while it polls, so the run reaches its hour. Its own bound,
+   well past that, fails the run when time stands still. *)
+let test_poll_reaches_the_hour () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let p = P.(env#fs / "ready") in
+            Eio.Fiber.both
+              (fun () ->
+                try P.save ~create:(`Or_truncate 0o644) p "go"
+                with Eio.Io _ -> ())
+              (fun () ->
+                let polls = ref 0 in
+                while P.kind ~follow:false p = `Not_found do
+                  incr polls;
+                  if !polls > 1_000_000 then failwith "the poll was not stopped";
+                  Eio.Fiber.yield ()
+                done)))
+  in
+  Alcotest.(check string)
+    "error" "the run hangs: it is still running after an hour of its clock"
+    (Expect.field "error" report)
+
 (* Three tries get past two faults, not a lasting condition: a run that
    demands success after them fails there. *)
 let test_three_tries_and_a_lasting_condition () =
@@ -583,6 +607,8 @@ let suite =
       Alcotest.test_case "a recover that accepts a reachable empty directory"
         `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;
+      Alcotest.test_case "a poll reaches the hour" `Quick
+        test_poll_reaches_the_hour;
       Alcotest.test_case "three tries do not outlast a lasting condition" `Quick
         test_three_tries_and_a_lasting_condition;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
