@@ -663,6 +663,36 @@ let test_heap_stays_flat () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
+(* A save retried after a yield on a read-only filesystem: ten million
+   operations before the run is a busy loop. The check keeps only what the
+   report shows, so the heap stays flat as the run goes, and the report
+   is short. *)
+let test_busy_heap_stays_flat () =
+  Gc.compact ();
+  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec save n =
+              if n mod 100_000 = 0 then
+                top := max !top (Gc.quick_stat ()).heap_words;
+              if n > 20_000_000 then failwith "the poll was not stopped";
+              match
+                P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+              with
+              | () -> ()
+              | exception Eio.Io _ ->
+                  Eio.Fiber.yield ();
+                  save (n + 1)
+            in
+            save 0))
+  in
+  Alcotest.(check string) "error" busy (Expect.field "error" report);
+  let lines = List.length (String.split_on_char '\n' report) in
+  if lines > 20 then Alcotest.failf "the report has %d lines" lines;
+  let grown = !top - base in
+  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+
 (* The same for power cuts: a check keeps no run's operations once it has
    drawn from them, so the heap stays flat as runs go, and does not grow
    with the number of runs, nor, as it draws states, with the number of cuts
@@ -947,6 +977,8 @@ let suite =
       Alcotest.test_case "only the errors Linux returns" `Quick
         test_errors_linux_returns;
       Alcotest.test_case "the heap stays flat" `Quick test_heap_stays_flat;
+      Alcotest.test_case "the heap stays flat in a busy loop" `Quick
+        test_busy_heap_stays_flat;
       Alcotest.test_case "the heap stays flat under power cuts" `Quick
         test_crash_heap_stays_flat;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
