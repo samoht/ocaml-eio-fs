@@ -3093,6 +3093,26 @@ let test_xattr_does_not_follow () =
     "the link does not report its target's attribute" None
     (List.assoc_opt "user.a" (Eio_fs_unix.xattrs link))
 
+(* A revoked tree keeps no write bit, its links untouched, and its owner can
+   be granted it again. *)
+let test_revoke_writes () =
+  with_real_dir @@ fun dir ->
+  let tree = dir / "tree" in
+  Eio.Path.mkdirs ~perm:0o755 (tree / "sub");
+  Eio.Path.save ~create:(`Exclusive 0o644) (tree / "sub" / "file") "data";
+  Eio.Path.save ~create:(`Exclusive 0o444) (tree / "kept") "data";
+  Eio.Path.symlink ~link_to:"sub/file" (tree / "link");
+  Eio_fs_unix.revoke_writes tree;
+  let perm p = (Eio.Path.stat ~follow:false p).perm in
+  Alcotest.(check (list int))
+    "no entry keeps a write bit"
+    [ 0o555; 0o555; 0o444; 0o444 ]
+    (List.map perm [ tree; tree / "sub"; tree / "sub" / "file"; tree / "kept" ]);
+  Alcotest.(check string)
+    "the link is left" "sub/file"
+    (Eio.Path.read_link (tree / "link"));
+  Eio_fs_unix.grant_owner tree
+
 (* The lease is a kernel flock, which dies with its holder: a process that
    exits holding it leaves no stale lock, and the next taker is granted it at
    once, with no takeover. *)
@@ -3582,4 +3602,6 @@ let suite =
         test_xattr_round_trip;
       Alcotest.test_case "xattr(7) calls do not follow a final link" `Quick
         test_xattr_does_not_follow;
+      Alcotest.test_case "a revoked tree keeps no write bit" `Quick
+        test_revoke_writes;
     ] )
