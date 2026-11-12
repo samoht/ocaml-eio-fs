@@ -316,29 +316,88 @@ let test_hang () =
                 | _ -> ()
                 | exception Eio.Io _ -> Eio.Fiber.await_cancel ()))))
 
-(* A fiber that polls with a yield for a file another fiber failed to write:
-   time passes while it polls, so the run reaches its hour. Its own bound,
-   well past that, fails the run when time stands still. *)
-let test_poll_reaches_the_hour () =
+let busy = "the run is a busy loop: it kept the CPU busy for 10 s of clock"
+
+(* A fiber that polls with a yield for a file another fiber failed to
+   write: each turn of the loop takes time, and the run is a busy loop. Its
+   own bound, past that, fails the run when nothing stops it. *)
+let test_yield_poll_is_busy () =
   let report =
     Expect.report (fun () ->
         Eio_fs.Chaos.check (fun env ->
-            let p = P.(env#fs / "ready") in
+            let ready = ref false in
             Eio.Fiber.both
               (fun () ->
-                try P.save ~create:(`Or_truncate 0o644) p "go"
+                try
+                  P.save ~create:(`Or_truncate 0o644) P.(env#fs / "ready") "go";
+                  ready := true
                 with Eio.Io _ -> ())
               (fun () ->
                 let polls = ref 0 in
-                while P.kind ~follow:false p = `Not_found do
+                while not !ready do
                   incr polls;
-                  if !polls > 1_000_000 then failwith "the poll was not stopped";
+                  if !polls > 20_000_000 then
+                    failwith "the poll was not stopped";
                   Eio.Fiber.yield ()
                 done)))
   in
-  Alcotest.(check string)
-    "error" "the run hangs: it is still running after an hour of its clock"
-    (Expect.field "error" report)
+  Alcotest.(check string) "error" busy (Expect.field "error" report)
+
+(* The same with a sleep of 1 us for each turn. *)
+let test_tiny_sleeps_are_busy () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let ready = ref false in
+            (try
+               P.save ~create:(`Or_truncate 0o644) P.(env#fs / "ready") "go";
+               ready := true
+             with Eio.Io _ -> ());
+            let sleeps = ref 0 in
+            while not !ready do
+              incr sleeps;
+              if !sleeps > 20_000_000 then failwith "the loop was not stopped";
+              Eio.Time.sleep env#clock 1e-6
+            done))
+  in
+  Alcotest.(check string) "error" busy (Expect.field "error" report)
+
+(* A computation that yields 10000 times ends well within a deadline of
+   100 ms. *)
+let test_yields_meet_a_deadline () =
+  Eio_fs.Chaos.check (fun env ->
+      (try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+       with Eio.Io _ -> ());
+      Eio.Time.with_timeout_exn env#clock 0.1 (fun () ->
+          for _ = 1 to 10_000 do
+            Eio.Fiber.yield ()
+          done))
+
+(* Two fibers that pass a token back and forth until a timer of 10 ms stops
+   them: time passes as they do, and the timer ends the run. *)
+let test_ping_pong_until_a_timer () =
+  Eio_fs.Chaos.check (fun env ->
+      (try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+       with Eio.Io _ -> ());
+      let stop = ref false in
+      let ping = Eio.Stream.create 1 and pong = Eio.Stream.create 1 in
+      let rec player turns inbox outbox =
+        if turns > 20_000_000 then failwith "the timer never fired";
+        if not !stop then begin
+          Eio.Stream.take inbox;
+          Eio.Stream.add outbox ();
+          player (turns + 1) inbox outbox
+        end
+      in
+      Eio.Stream.add ping ();
+      Eio.Fiber.all
+        [
+          (fun () -> player 0 ping pong);
+          (fun () -> player 0 pong ping);
+          (fun () ->
+            Eio.Time.sleep env#clock 0.01;
+            stop := true);
+        ])
 
 (* Three tries get past two faults, not a lasting condition: a run that
    demands success after them fails there. *)
@@ -809,8 +868,14 @@ let suite =
       Alcotest.test_case "a recover that accepts a reachable empty directory"
         `Quick test_empty_reachable;
       Alcotest.test_case "a run every fiber waits in hangs" `Quick test_hang;
-      Alcotest.test_case "a poll reaches the hour" `Quick
-        test_poll_reaches_the_hour;
+      Alcotest.test_case "a yield poll is a busy loop" `Quick
+        test_yield_poll_is_busy;
+      Alcotest.test_case "a loop of tiny sleeps is a busy loop" `Quick
+        test_tiny_sleeps_are_busy;
+      Alcotest.test_case "10000 yields meet a deadline of 100 ms" `Quick
+        test_yields_meet_a_deadline;
+      Alcotest.test_case "a ping-pong ends with its timer" `Quick
+        test_ping_pong_until_a_timer;
       Alcotest.test_case "three tries do not outlast a lasting condition" `Quick
         test_three_tries_and_a_lasting_condition;
       Alcotest.test_case "a run that retries at once hangs" `Quick test_livelock;
