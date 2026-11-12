@@ -119,6 +119,31 @@ let lost_not_freed () =
       if (not (P.is_file P.(env#fs / "g"))) && String.contains f 'G' then
         failwith "f holds what the lost g had")
 
+(* A hole [setup] left in a file, by a write past the end or a truncation
+   that grows it: an unsynced write into it lands in a page the disk does
+   not hold, which may hold stale data. *)
+let setup_hole ~grow () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      P.with_open_out ~create:(`Exclusive 0o644) P.(env#fs / "f") @@ fun f ->
+      if grow then Eio.File.truncate f (Optint.Int63.of_int 8192)
+      else begin
+        Eio.Flow.copy_string "head" f;
+        Eio.File.pwrite_all f ~file_offset:(Optint.Int63.of_int 8192)
+          [ Cstruct.of_string "tail" ]
+      end)
+    (fun ~ack:_ env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+        Eio.File.pwrite_all f ~file_offset:(Optint.Int63.of_int 5000)
+          [ Cstruct.of_string "new" ]
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      if String.contains (P.load P.(env#fs / "f")) '7' then
+        failwith "stale data in the hole")
+
 (* A new page with no sync: its first sector stale under the written ones.
    The cut's first state drops the file, and the states that vary the first
    sector come last one by one, past what the check enumerates. *)
@@ -237,6 +262,15 @@ let suite =
       Alcotest.test_case "a file whose creation a cut lost frees no block"
         `Quick
         (Expect.passes lost_not_freed);
+      Alcotest.test_case "a write into a hole setup left may meet stale data"
+        `Quick (fun () ->
+          List.iter
+            (fun grow ->
+              let m = Expect.report (setup_hole ~grow) in
+              Alcotest.(check string)
+                "error" "Failure(\"stale data in the hole\")"
+                (Expect.field "error" m))
+            [ false; true ]);
       Alcotest.test_case "a stale first sector of a large new page is reached"
         `Quick (fun () ->
           let m = Expect.report stale_first in
