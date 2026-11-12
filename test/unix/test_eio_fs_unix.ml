@@ -413,6 +413,125 @@ let test_clone_tree () =
         | _ -> false
         | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) -> true)
 
+(* remove_tree removes a whole tree: with [~grant] a directory its owner can
+   neither read nor search is granted first, and a symbolic link is removed,
+   never followed. Three files of five bytes, a link and three directories are
+   seven entries, and 15 bytes and the link's target. A path that does not exist
+   removes nothing. *)
+let test_remove_tree () =
+  with_real_dir @@ fun dir ->
+  let tree = Eio.Path.(dir / "tree") and kept = Eio.Path.(dir / "kept") in
+  Eio.Path.mkdirs ~perm:0o755 Eio.Path.(tree / "a" / "b");
+  Eio.Path.mkdir ~perm:0o755 kept;
+  Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(kept / "f") "kept!";
+  List.iter
+    (fun p -> Eio.Path.save ~create:(`Exclusive 0o444) p "bytes")
+    Eio.Path.[ tree / "f"; tree / "a" / "f"; tree / "a" / "b" / "f" ];
+  Eio.Path.symlink ~link_to:(snd kept) Eio.Path.(tree / "a" / "link");
+  Eio.Path.chmod ~follow:false ~perm:0o000 Eio.Path.(tree / "a" / "b");
+  Eio.Path.chmod ~follow:false ~perm:0o500 Eio.Path.(tree / "a");
+  let r = Eio_fs_unix.remove_tree ~grant:true tree in
+  Alcotest.(check (list string)) "nothing refused" [] r.refused;
+  Alcotest.(check (pair int int))
+    "every entry and byte"
+    (7, 15 + String.length (snd kept))
+    (r.entries, r.bytes);
+  Alcotest.(check bool)
+    "nothing left" true
+    (Eio.Path.kind ~follow:false tree = `Not_found);
+  Alcotest.(check string)
+    "the link's target stays" "kept!"
+    (Eio.Path.load Eio.Path.(kept / "f"));
+  let again = Eio_fs_unix.remove_tree tree in
+  Alcotest.(check (pair int (list string)))
+    "a path that does not exist" (0, [])
+    (again.entries, again.refused)
+
+(* A refusal names the path and stops what stands above it, with [last], and
+   no other directory: a read-only directory keeps its file, the root keeps
+   [last], and the sibling goes. The next call, granting, removes the rest. A
+   removal that goes on past a refusal loses [last], and one that stops at the
+   first leaves the sibling. *)
+let test_remove_tree_refused () =
+  with_real_dir @@ fun dir ->
+  let tree = Eio.Path.(dir / "tree") in
+  let shut = Eio.Path.(tree / "shut") and open_ = Eio.Path.(tree / "open") in
+  Eio.Path.mkdirs ~perm:0o755 shut;
+  Eio.Path.mkdirs ~perm:0o755 open_;
+  List.iter
+    (fun p -> Eio.Path.save ~create:(`Exclusive 0o644) p "bytes")
+    Eio.Path.[ shut / "f"; open_ / "f"; tree / "last" ];
+  Eio.Path.chmod ~follow:false ~perm:0o500 shut;
+  let r = Eio_fs_unix.remove_tree ~last:"last" tree in
+  Alcotest.(check int) "one refusal" 1 (List.length r.refused);
+  Alcotest.(check bool)
+    "it names the file refused" true
+    (String.ends_with ~suffix:"Permission denied" (List.hd r.refused));
+  Alcotest.(check (pair int int))
+    "the sibling, counted" (2, 5) (r.entries, r.bytes);
+  Alcotest.(check string)
+    "last stays" "bytes"
+    (Eio.Path.load Eio.Path.(tree / "last"));
+  let rest = Eio_fs_unix.remove_tree ~grant:true ~last:"last" tree in
+  Alcotest.(check (pair int (list string)))
+    "the rest goes" (4, [])
+    (rest.entries, rest.refused);
+  Alcotest.(check bool)
+    "nothing left" true
+    (Eio.Path.kind ~follow:false tree = `Not_found)
+
+(* The hops a removal makes follow its directories, not its files: a directory
+   of 1,000 files costs what one of 100 does. One hop per entry is the cost of
+   the tree Eio.Path walks. *)
+let test_remove_tree_hops () =
+  with_real_dir @@ fun dir ->
+  let hops n =
+    let tree = Eio.Path.(dir / Fmt.str "tree-%d" n) in
+    Eio.Path.mkdir ~perm:0o755 tree;
+    for i = 1 to n do
+      Eio.Path.save ~create:(`Exclusive 0o644)
+        Eio.Path.(tree / string_of_int i)
+        "x"
+    done;
+    let before = Eio_fs_unix.Private.batch_hops () in
+    let r = Eio_fs_unix.remove_tree tree in
+    Alcotest.(check (pair int (list string)))
+      "every entry"
+      (n + 1, [])
+      (r.entries, r.refused);
+    Eio_fs_unix.Private.batch_hops () - before
+  in
+  let small = hops 100 in
+  Alcotest.(check int) "the hops of 1,000 files, as of 100" small (hops 1000)
+
+(* A cancellation ends a removal at its next hop and leaves the rest: it
+   lands within a directory's entries, where a removal made in one hop would
+   run to the tree's end, since a system thread under way is never
+   cancelled. *)
+let test_remove_tree_cancelled () =
+  with_real_dir @@ fun dir ->
+  let tree = Eio.Path.(dir / "tree") in
+  Eio.Path.mkdir ~perm:0o755 tree;
+  for i = 1 to 50 do
+    let d = Eio.Path.(tree / string_of_int i) in
+    Eio.Path.mkdir ~perm:0o755 d;
+    Eio.Path.save ~create:(`Exclusive 0o644) Eio.Path.(d / "f") "x"
+  done;
+  let before = Eio_fs_unix.Private.batch_hops () in
+  let ended =
+    Eio.Fiber.first
+      (fun () ->
+        ignore (Eio_fs_unix.remove_tree tree);
+        `Whole)
+      (fun () ->
+        while Eio_fs_unix.Private.batch_hops () = before do
+          Eio.Fiber.yield ()
+        done;
+        `Stopped)
+  in
+  Alcotest.(check bool) "the stop ended it" true (ended = `Stopped);
+  Alcotest.(check bool) "the rest stands" true (Eio.Path.read_dir tree <> [])
+
 let test_statvfs_reports_raw_block_capacity () =
   with_real_dir @@ fun dir ->
   let usage = Eio_fs_unix.statvfs dir in
@@ -3289,6 +3408,13 @@ let suite =
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
+      Alcotest.test_case "remove_tree" `Quick test_remove_tree;
+      Alcotest.test_case "remove_tree stops above a refusal" `Quick
+        test_remove_tree_refused;
+      Alcotest.test_case "remove_tree's hops follow its directories" `Quick
+        test_remove_tree_hops;
+      Alcotest.test_case "remove_tree ends at a cancellation" `Quick
+        test_remove_tree_cancelled;
       Alcotest.test_case "calls on a path raise Eio.Io" `Quick
         test_path_calls_raise_eio_io;
       Alcotest.test_case "path calls stay in their directory" `Quick
