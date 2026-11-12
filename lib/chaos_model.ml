@@ -2803,11 +2803,14 @@ module Crash = struct
       image
     end
 
+  (* The image is rebuilt whole even in a fiber being cancelled, as the one
+     whose operation cuts the power often is. *)
   let do_crash ctl =
     if not ctl.crashed then begin
       if Option.is_none ctl.base then
         invalid_arg "Chaos.Crash: controller was never wrapped";
       ctl.crashed <- true;
+      Eio.Cancel.protect @@ fun () ->
       let data_rng =
         match ctl.policy with
         | Reorder_unsynced seed ->
