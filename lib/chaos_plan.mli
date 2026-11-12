@@ -212,10 +212,11 @@ val tears : sizes:(string * int) list -> trace -> Op.t -> int list
 val crash_cuts : changed:(Op.t -> bool) -> trace -> crash list
 (** [crash_cuts ~changed first] is a cut after each structural operation of
     [first] that changes the disk, and at its end, in both simplest states. A
-    write, a truncation, a directory change or an open that may write changes
-    it; another operation only if [changed] holds for it: a sync that committed
-    something, or an operation an ack followed. A cut after another sync leaves
-    what the cut before it leaves, as nothing a cut reads changed. *)
+    write, a truncation or a directory change changes it; another operation only
+    if [changed] holds for it: a sync or an open that changed the controller, as
+    one that commits something or meets a file the first time, or an operation
+    an ack followed. A cut after another sync or open leaves what the cut before
+    it leaves, as nothing a cut reads changed. *)
 
 val crash_floor : sure:bool -> changed:bool -> Op.t -> int
 (** [crash_floor ~sure ~changed op] is, likewise, the runs the linear tier of

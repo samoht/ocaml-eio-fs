@@ -493,9 +493,9 @@ module Crash : sig
   (** [seq t] is the place in program order of the last change [t] tracked. *)
 
   val stamp : t -> int
-  (** [stamp t] grows with each change [t] tracks and each commit, barrier or
-      failure of a sync: a sync that leaves it as it was changed nothing a cut
-      leaves. *)
+  (** [stamp t] grows with each change [t] tracks, each commit, barrier or
+      failure of a sync, and each file or mode an open meets: a sync or an open
+      that leaves it as it was changed nothing a cut leaves. *)
 
   val unsynced : t -> unsynced list
   (** [unsynced t] are the changes not yet made durable, in program order: every

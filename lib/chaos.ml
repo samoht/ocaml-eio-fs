@@ -924,8 +924,8 @@ module Crash = struct
         (* for each operation, latest first, the last change before it *)
     rtrace : Plan.trace;
     changed : (int, unit) Hashtbl.t;
-        (* the syncs that changed what a cut leaves, and the operations an
-           ack followed *)
+        (* the syncs and opens that changed what a cut leaves, and the
+           operations an ack followed *)
     rchanged : (int, unit) Hashtbl.t; (* the same in recover *)
     acked_at : int list; (* the operation each ack came after *)
     lost : unsynced list;
@@ -939,13 +939,13 @@ module Crash = struct
 
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
-     outcome, and the unsynced changes the cut lost. The syncs that changed
-     the controller go to [changed]. *)
+     outcome, and the unsynced changes the cut lost. The syncs and opens
+     that changed the controller go to [changed]. *)
   let phase ?(guard = ignore) ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs
       ~changed ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
-    (* The last sync, and the controller's stamp before it. *)
+    (* The last sync or open, and the controller's stamp before it. *)
     let sync = ref None in
     let synced () =
       match !sync with
@@ -959,7 +959,8 @@ module Crash = struct
       if not (M.Crash.is_crashed ctl) then synced ();
       guard op;
       if not (M.Crash.is_crashed ctl) then begin
-        if op.kind = `Sync then sync := Some (op.index, M.Crash.stamp ctl);
+        if op.kind = `Sync || op.kind = `Open_write then
+          sync := Some (op.index, M.Crash.stamp ctl);
         (seqs :=
            match !seqs with
            | (s, _) :: rest when s = M.Crash.seq ctl -> (s, op.index) :: rest

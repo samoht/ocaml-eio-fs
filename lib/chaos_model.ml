@@ -1316,8 +1316,9 @@ module Crash = struct
            path: the rest of it is a hole the disk does not hold. *)
     mutable seq : int;
     mutable effects : int;
-        (* The commits, barriers and failures of syncs so far: with [seq],
-           what tells a sync that changed nothing a cut leaves. *)
+        (* The commits, barriers and failures of syncs, and the files and
+           modes opens met, so far: with [seq], what tells a sync or an open
+           that changed nothing a cut leaves. *)
     mutable ops : int;
     mutable crashed : bool;
     mutable image :
@@ -3654,9 +3655,11 @@ module Crash = struct
       let fs =
         match Hashtbl.find_opt d.dctl.files key with
         | Some fs ->
+            if fs.perm <> perm then d.dctl.effects <- d.dctl.effects + 1;
             fs.perm <- perm;
             fs
         | None ->
+            d.dctl.effects <- d.dctl.effects + 1;
             let fs =
               fresh_file
                 ?held:(if known then None else d.dctl.held rel)
@@ -3669,8 +3672,11 @@ module Crash = struct
               found;
             fs
       in
-      fs.mode <-
-        (match found with Some st -> st.perm | None -> create_perm create);
+      let mode =
+        match found with Some st -> st.perm | None -> create_perm create
+      in
+      if fs.mode <> mode then d.dctl.effects <- d.dctl.effects + 1;
+      fs.mode <- mode;
       (* An unsynced truncation of pre-existing durable data is itself a change
          that a crash may lose. *)
       if is_trunc create && had_bytes then clog_change d.dctl fs (Resize 0);

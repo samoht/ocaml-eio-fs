@@ -463,13 +463,11 @@ type crash = {
 
 let base = { cfaults = []; cut = None; state = Drop; rcut = None }
 
-(* A write, a truncation, a directory change or an open that may write
-   changes what a cut leaves; a sync does only where it commits something,
-   which [changed] says, as for any operation an ack follows. *)
+(* A write, a truncation or a directory change changes what a cut leaves; a
+   sync or an open that may write does only where it changed the
+   controller, which [changed] says, as for any operation an ack follows. *)
 let changes ~changed (op : Op.t) =
-  match op.kind with
-  | `Write | `Truncate | `Change | `Open_write -> true
-  | _ -> changed op
+  match op.kind with `Write | `Truncate | `Change -> true | _ -> changed op
 
 (* After each operation of [ops] that changes the disk, before the one that
    follows it in [trace]; [None] is the end. *)
