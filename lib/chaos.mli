@@ -190,8 +190,10 @@ module Crash : sig
       The sampled tier tries the other cuts and faults, pairs of faults, and
       cuts during [recover] after a fault; then every state each cut allows
       while they fit in the cut's share of the tier, and states drawn at random
-      past that, saying so in its report. What a cut does not use goes to the
-      cuts that allow more states.
+      past that, saying so in its report. A fourth of those draws are uniform;
+      the others have a shape writeback leaves: a prefix of the sectors and
+      changes landed and the rest not, all of them but one, or only one. What a
+      cut does not use goes to the cuts that allow more states.
 
       A run passes if [run] returns and [recover] accepts the state. A cut
       raises [Eio.Cancel.Cancelled] from the operation it falls before, and from

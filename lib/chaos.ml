@@ -607,7 +607,7 @@ module Crash = struct
   let policy_of trail : Plan.state -> M.Crash.policy = function
     | Drop -> Drop_unsynced
     | Keep -> Survive (fun _ -> true)
-    | Enum v ->
+    | Enum v | Shape v ->
         let v = Array.of_list v and pos = ref 0 in
         Choose
           (fun n ->
@@ -623,7 +623,7 @@ module Crash = struct
      range, and no choice for a draw it did not make. *)
   let allows (st : Plan.state) trail =
     match st with
-    | Enum v ->
+    | Enum v | Shape v ->
         List.for_all (fun (c, n) -> c < n) trail
         && List.length v <= List.length trail
     | Drop | Keep | Seed _ -> true
@@ -821,7 +821,7 @@ module Crash = struct
     | Enum _ as st ->
         Fmt.str "state %s of those the cut allows, tried one by one"
           (Plan.state_key st)
-    | Seed _ as st ->
+    | (Seed _ | Shape _) as st ->
         Fmt.str
           "state %s, drawn at random: the cut allows more states than its \
            share of the tier"
@@ -874,11 +874,11 @@ module Crash = struct
        match s.state with
        | Drop -> ("lost", changes)
        | Keep -> ("lost", "")
-       | Enum _ | Seed _ -> ("unsynced", changes));
+       | Enum _ | Seed _ | Shape _ -> ("unsynced", changes));
       ( "left",
         match s.state with
         | Drop | Keep -> ""
-        | Enum _ | Seed _ ->
+        | Enum _ | Seed _ | Shape _ ->
             let n = List.length r.left in
             (List.filteri (fun i _ -> i < 8) r.left
             @ if n > 8 then [ Fmt.str "and %d more files" (n - 8) ] else [])
@@ -924,6 +924,19 @@ module Crash = struct
     let attempt ?matched tier s =
       incr runs;
       let r = exec s in
+      (* A shape is named by the choices it made, which a replay makes
+         again. *)
+      let s =
+        match s.state with
+        | Shape _ ->
+            {
+              s with
+              state =
+                Shape
+                  (List.rev_map (fun (c, n) -> if c < n then c else 0) r.trail);
+            }
+        | _ -> s
+      in
       if r.rtrace <> [] then reads := true;
       (match r.error with
       | None -> ()
@@ -1069,33 +1082,36 @@ module Crash = struct
                 let r = attempt Sampled { s with state = Enum [] } in
                 Plan.Draws.add tree r.trail;
                 let spent = ref 1 in
+                let widths = List.rev_map snd r.trail in
                 let acc =
                   match
                     enumerate s tree spent allowance (Plan.next_choices r.trail)
                   with
                   | None -> acc
-                  | Some v -> (s, tree, spent, v) :: acc
+                  | Some v -> (s, tree, spent, v, widths) :: acc
                 in
                 first (left - !spent) acc rest
           in
           let left, large = first left [] drops in
           let large =
             List.stable_sort
-              (fun (_, a, _, _) (_, b, _, _) ->
+              (fun (_, a, _, _, _) (_, b, _, _, _) ->
                 Int.compare (Plan.Draws.estimate a) (Plan.Draws.estimate b))
               large
           in
           let rec share_out left = function
             | [] -> ()
-            | (s, tree, spent, v) :: rest as cuts ->
+            | (s, tree, spent, v, widths) :: rest as cuts ->
                 let share = max 0 (left / List.length cuts) in
                 let allowance = !spent + share and before = !spent in
                 (match enumerate s tree spent allowance (Some v) with
                 | None -> ()
                 | Some _ ->
-                    for seed = 0 to allowance - !spent - 1 do
+                    for i = 0 to allowance - !spent - 1 do
                       incr spent;
-                      ignore (attempt Sampled { s with state = Seed seed })
+                      ignore
+                        (attempt Sampled
+                           { s with state = Plan.shape ~widths i })
                     done);
                 share_out (left - (!spent - before)) rest
           in

@@ -253,7 +253,27 @@ let check_text ?at s =
 
 (* {1 Crash.check} *)
 
-type state = Drop | Keep | Enum of int list | Seed of int
+type state = Drop | Keep | Enum of int list | Seed of int | Shape of int list
+
+let shape ~widths i =
+  let rng = Random.State.make [| i |] in
+  let d = List.length widths in
+  let last n = max 0 (n - 1) in
+  match i mod 4 with
+  | 0 -> Seed (i / 4)
+  | 1 ->
+      let t = Random.State.int rng (d + 1) in
+      Shape (List.mapi (fun k n -> if k < t then last n else 0) widths)
+  | 2 ->
+      let j = Random.State.int rng (max 1 d) in
+      Shape
+        (List.mapi
+           (fun k n ->
+             if k = j && n > 1 then 1 + Random.State.int rng (n - 1) else 0)
+           widths)
+  | _ ->
+      let j = Random.State.int rng (max 1 d) in
+      Shape (List.mapi (fun k n -> if k = j then 0 else last n) widths)
 
 type crash = {
   cfaults : (pos * Fault.t) list;
@@ -427,18 +447,22 @@ let state_key = function
   | Keep -> "keep"
   | Enum v -> "e" ^ String.concat "." (List.map string_of_int (trim v))
   | Seed s -> Fmt.str "s%d" s
+  | Shape v -> "p" ^ String.concat "." (List.map string_of_int (trim v))
 
 let state_of_key k =
+  let choices k mk =
+    let body = String.sub k 1 (String.length k - 1) in
+    if body = "" then Some (mk [])
+    else
+      match List.map int_of_string (String.split_on_char '.' body) with
+      | v -> Some (mk v)
+      | exception Failure _ -> None
+  in
   match k with
   | "drop" -> Some Drop
   | "keep" -> Some Keep
-  | _ when String.length k > 0 && k.[0] = 'e' -> (
-      let body = String.sub k 1 (String.length k - 1) in
-      if body = "" then Some (Enum [])
-      else
-        match List.map int_of_string (String.split_on_char '.' body) with
-        | v -> Some (Enum v)
-        | exception Failure _ -> None)
+  | _ when String.length k > 0 && k.[0] = 'e' -> choices k (fun v -> Enum v)
+  | _ when String.length k > 0 && k.[0] = 'p' -> choices k (fun v -> Shape v)
   | _ when String.length k > 0 && k.[0] = 's' ->
       Option.map
         (fun s -> Seed s)

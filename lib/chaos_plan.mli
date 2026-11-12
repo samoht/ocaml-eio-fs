@@ -113,9 +113,17 @@ val check_text : ?at:(pos -> Op.t option) -> check -> string
 (** {1 Crash.check} *)
 
 (** The type for the state a cut leaves: every unsynced change lost, every one
-    kept, one of the states the cut allows by the draws that build it, or one
-    drawn at random from a seed. *)
-type state = Drop | Keep | Enum of int list | Seed of int
+    kept, one of the states the cut allows by the draws that build it, one drawn
+    at random from a seed, or one drawn with a shape, given by the draws that
+    build it. *)
+type state = Drop | Keep | Enum of int list | Seed of int | Shape of int list
+
+val shape : widths:int list -> int -> state
+(** [shape ~widths i] is the [i]th state drawn at random for a cut whose draws,
+    in the state where each takes its first choice, have [widths] choices: a
+    fourth of them from a seed, and the others with a shape, as writeback leaves
+    one: a prefix of the draws taking their last choice and the rest their
+    first, every draw its first but one, or every draw its last but one. *)
 
 type crash = {
   cfaults : (pos * Fault.t) list;
