@@ -435,6 +435,20 @@ module Inline = struct
         in
         (Eio_unix.File.import_rw ~sw ~close_unix:true fd
           :> Eio.File.rw_ty Eio.Resource.t)
+
+      (* The names but [.] and [..], as eio_posix lists them before
+         Eio.Path.read_dir sorts them. *)
+      let read_dir _ path =
+        let path = match resolve path with "" -> "." | p -> p in
+        eio_unix_errors @@ fun () ->
+        let h = Unix.opendir path in
+        let rec names acc =
+          match Unix.readdir h with
+          | "." | ".." -> names acc
+          | name -> names (name :: acc)
+          | exception End_of_file -> acc
+        in
+        Fun.protect ~finally:(fun () -> Unix.closedir h) (fun () -> names [])
     end in
     let ops =
       Eio.Resource.handler
