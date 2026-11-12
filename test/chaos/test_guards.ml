@@ -782,6 +782,38 @@ let test_first_run_stops_at_the_budget () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
+(* A recover that syncs [dirs] directories it did not change: those syncs
+   commit nothing, so they are no cut, and the runs do not grow with them. *)
+let recover_syncs dirs =
+  let runs = ref 0 in
+  let dir i = Fmt.str "d%d" i in
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      for i = 1 to dirs do
+        P.mkdir ~perm:0o755 P.(env#fs / dir i)
+      done;
+      Eio_fs_sync.sync_dir env#fs)
+    (fun ~ack env ->
+      incr runs;
+      for i = 1 to 3 do
+        try
+          Eio_fs_sync.save P.(env#fs / "d1" / Fmt.str "f%d" i) "x";
+          Eio_fs_sync.sync_dir P.(env#fs / "d1");
+          ack i
+        with Eio.Io _ -> ()
+      done)
+    ~recover:(fun ~acked env ->
+      for i = 1 to dirs do
+        Eio_fs_sync.sync_dir P.(env#fs / dir i)
+      done;
+      List.iter
+        (fun i -> ignore (P.load P.(env#fs / "d1" / Fmt.str "f%d" i)))
+        acked);
+  !runs
+
+let test_idle_syncs_are_no_cut () =
+  Alcotest.(check int) "runs" (recover_syncs 1) (recover_syncs 20)
+
 (* A poll that reads an open file until it changes, with no yield: no turn
    passes and nothing fails, so only the run's operations stop it. Its own
    bound, past that, fails the run when nothing stops it. *)
@@ -1129,6 +1161,8 @@ let suite =
         test_busy_heap_stays_flat;
       Alcotest.test_case "a first run stops at the budget" `Quick
         test_first_run_stops_at_the_budget;
+      Alcotest.test_case "a sync that commits nothing is no cut" `Quick
+        test_idle_syncs_are_no_cut;
       Alcotest.test_case "a read poll with no yield stops" `Quick
         test_read_poll_stops;
       Alcotest.test_case "a stat poll under power cuts stops" `Quick
