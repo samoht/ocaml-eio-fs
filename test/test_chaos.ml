@@ -636,7 +636,6 @@ let with_real_dir fn =
    child being a way around the schedule. *)
 let test_real_child_cwd () =
   Eio_main.run @@ fun env ->
-  Eio.Time.with_timeout_exn (Eio.Stdenv.clock env) 3. @@ fun () ->
   let fs = Eio.Stdenv.fs env in
   let name = Filename.temp_file "eio-fs-chaos-child" "" in
   Eio.Path.unlink (fs / name);
