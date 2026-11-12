@@ -231,6 +231,35 @@ CAMLprim value caml_eio_fs_pread(value fd_v, value off_v, value buf_v,
   CAMLreturn(Val_long(n));
 }
 
+/* Up to [len] bytes of [buf] from [pos] written to [fd] at byte [off], with
+   pwrite(2): one call, the descriptor's offset untouched. The bytes are copied
+   to a stack buffer before the runtime lock is released, since the heap may
+   move [buf] meanwhile; [len] is capped at that buffer's size. The count
+   written. */
+#define EIO_FS_PWRITE_MAX 65536
+
+CAMLprim value caml_eio_fs_pwrite(value fd_v, value off_v, value buf_v,
+                                  value pos_v, value len_v)
+{
+  CAMLparam5(fd_v, off_v, buf_v, pos_v, len_v);
+  char stack[EIO_FS_PWRITE_MAX];
+  int fd = Int_val(fd_v);
+  off_t off = (off_t)Long_val(off_v);
+  size_t len = Long_val(len_v);
+  ssize_t n;
+  if (len > EIO_FS_PWRITE_MAX)
+    len = EIO_FS_PWRITE_MAX;
+  memcpy(stack, String_val(buf_v) + Long_val(pos_v), len);
+  do {
+    caml_enter_blocking_section();
+    n = pwrite(fd, stack, len, off);
+    caml_leave_blocking_section();
+  } while (n == -1 && errno == EINTR);
+  if (n == -1)
+    caml_unix_error(errno, "pwrite", Nothing);
+  CAMLreturn(Val_long(n));
+}
+
 /* The process holding a record lock that would refuse an exclusive lock over
    the whole file (POSIX fcntl F_GETLK), or 0 when none does. F_GETLK answers
    about other processes only: this process's own locks never conflict. */

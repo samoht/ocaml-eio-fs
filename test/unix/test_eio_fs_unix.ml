@@ -474,6 +474,36 @@ let test_pread_leaves_the_offset () =
     (Invalid_argument "Eio_fs_unix.pread") (fun () ->
       ignore (Eio_fs_unix.pread fd ~file_offset:0 buf ~pos:6 ~len:4 : int))
 
+(* POSIX pwrite: the bytes of the span asked land at the offset asked, the
+   count written, and the descriptor's own offset where it was. A pwrite
+   written as a seek and a write passes the first two and fails the last. *)
+let test_pwrite_leaves_the_offset () =
+  with_real_dir_env @@ fun _env dir ->
+  let path = Eio.Path.native_exn (dir / "pwrite.bin") in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let text = "0123456789abcdef" in
+  let n = Unix.write_substring fd text 0 (String.length text) in
+  Alcotest.(check int) "the whole text was written" (String.length text) n;
+  ignore (Unix.lseek fd 3 Unix.SEEK_SET : int);
+  let got = Eio_fs_unix.pwrite fd ~file_offset:10 "..WXYZ.." ~pos:2 ~len:4 in
+  Alcotest.(check int) "four bytes written" 4 got;
+  Alcotest.(check int)
+    "the descriptor's offset is untouched" 3
+    (Unix.lseek fd 0 Unix.SEEK_CUR);
+  let got = Eio_fs_unix.pwrite fd ~file_offset:18 "!" ~pos:0 ~len:1 in
+  Alcotest.(check int) "a write past the end extends the file" 1 got;
+  let buf = Bytes.make 19 '.' in
+  Alcotest.(check int)
+    "the file reads back" 19
+    (Eio_fs_unix.pread fd ~file_offset:0 buf ~pos:0 ~len:19);
+  Alcotest.(check string)
+    "the span at offset 10, the gap as zeros" "0123456789WXYZef\000\000!"
+    (Bytes.to_string buf);
+  Alcotest.check_raises "a range past the buffer is refused"
+    (Invalid_argument "Eio_fs_unix.pwrite") (fun () ->
+      ignore (Eio_fs_unix.pwrite fd ~file_offset:0 "abc" ~pos:2 ~len:2 : int))
+
 (* ---- the sparse map ----
 
    A file with a hole in it, built by writing at two offsets far enough apart
@@ -3134,6 +3164,8 @@ let suite =
         test_path_calls_stay_in_their_directory;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
         test_pread_leaves_the_offset;
+      Alcotest.test_case "pwrite leaves the descriptor's offset" `Quick
+        test_pwrite_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick
         test_seek_data_and_hole_walk_the_file;
       Alcotest.test_case "extents report the physical map" `Quick
