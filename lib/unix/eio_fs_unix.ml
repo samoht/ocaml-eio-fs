@@ -363,6 +363,87 @@ module At = struct
     }
 end
 
+(* {2 Calls on the calling thread} *)
+
+external inline_stat_native : string -> bool -> At.stat
+  = "caml_eio_fs_inline_fstatat"
+
+external inline_openat : string -> int -> int -> Unix.file_descr
+  = "caml_eio_fs_inline_openat"
+
+let inline_stat ~follow path =
+  At.to_stat (eio_unix_errors (fun () -> inline_stat_native path follow))
+
+(* The bits caml_eio_fs_inline_openat reads. *)
+let inline_flags ~write ~append ~follow (create : Eio.Fs.create) =
+  let bit b n = if b then n else 0 in
+  let create =
+    match create with
+    | `Never -> 0
+    | `If_missing _ -> 4
+    | `Or_truncate _ -> 4 lor 8
+    | `Exclusive _ -> 4 lor 16
+  in
+  bit write 1 lor bit append 2 lor create lor bit (not follow) 32
+
+let inline_perm : Eio.Fs.create -> int = function
+  | `Never -> 0
+  | `If_missing p | `Or_truncate p | `Exclusive p -> p
+
+let inline_open ~write ~append ~follow ~create path =
+  eio_unix_errors (fun () ->
+      inline_openat path
+        (inline_flags ~write ~append ~follow create)
+        (inline_perm create))
+
+module Inline = struct
+  let fs (env : < fs : Eio.Fs.dir_ty Eio.Path.t ; .. >) =
+    let Eio.Resource.T (bv, bops), root = env#fs in
+    let module B = (val Eio.Resource.get bops Eio.Fs.Pi.Dir) in
+    (* The path the unconfined root resolves from the working directory, as
+       its own calls resolve it. *)
+    let resolve path =
+      match B.native bv path with
+      | Some p -> p
+      | None -> invalid_arg "Eio_fs_unix.Inline.fs: a path with no native form"
+    in
+    let module O = struct
+      include B
+
+      let stat _ ~follow path = inline_stat ~follow (resolve path)
+
+      let open_in _ ~sw ~follow path =
+        let fd =
+          inline_open ~write:false ~append:false ~follow ~create:`Never
+            (resolve path)
+        in
+        match Unix.fstat fd with
+        | { st_kind = S_FIFO; _ } ->
+            (* A FIFO is read as the root reads one, awaiting its writer. *)
+            Unix.close fd;
+            B.open_in bv ~sw ~follow path
+        | _ ->
+            (Eio_unix.File.import_ro ~sw ~close_unix:true fd
+              :> Eio.File.ro_ty Eio.Resource.t)
+        | exception e ->
+            Unix.close fd;
+            raise e
+
+      let open_out _ ~sw ~follow ~append ~create path =
+        let fd =
+          inline_open ~write:true ~append ~follow ~create (resolve path)
+        in
+        (Eio_unix.File.import_rw ~sw ~close_unix:true fd
+          :> Eio.File.rw_ty Eio.Resource.t)
+    end in
+    let ops =
+      Eio.Resource.handler
+        (Eio.Resource.H (Eio.Fs.Pi.Dir, (module O))
+        :: Eio.Resource.bindings bops)
+    in
+    ((Eio.Resource.T (bv, ops) :> Eio.Fs.dir_ty Eio.Resource.t), root)
+end
+
 (* Why a [with_parent] refused a path: it names nothing beneath its
    directory, or a parent on the way is not a directory it may descend. *)
 type Eio.Exn.Backend.t += Unsafe_parent of string
