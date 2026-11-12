@@ -366,6 +366,25 @@ let test_busy_is_not_a_spin () =
        with Eio.Io _ -> processed := 12_000);
       if !processed <> 12_000 then failwith "the batch is incomplete")
 
+(* A pool of 10 slots, each trying 1100 names once and moving on after any
+   error: under a lasting condition it fails 11000 times with no time passing,
+   and ends. *)
+let test_pool_is_not_a_spin () =
+  Eio_fs.Chaos.check (fun env ->
+      for i = 0 to 9 do
+        let rec take j =
+          if j < 1100 then
+            match
+              P.save ~create:(`Exclusive 0o644)
+                P.(env#fs / Fmt.str "s%d.%d" i j)
+                "x"
+            with
+            | () -> ()
+            | exception Eio.Io _ -> take (j + 1)
+        in
+        take 0
+      done)
+
 (* Linux needs no room to remove an entry, change a mode, or open a file
    that exists, and checks access at the open, not at each write: a program
    that frees space on a full disk, or writes to a file it opened, never
@@ -571,6 +590,8 @@ let suite =
         `Quick test_livelock_fresh_names;
       Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
         test_busy_is_not_a_spin;
+      Alcotest.test_case "a pool that tries each name once is not a spin" `Quick
+        test_pool_is_not_a_spin;
       Alcotest.test_case "only the errors Linux returns" `Quick
         test_errors_linux_returns;
       Alcotest.test_case "the heap stays flat" `Quick test_heap_stays_flat;
