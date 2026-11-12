@@ -3220,6 +3220,55 @@ let test_crash_choose_as_ext4 () =
     "an overwrite" [ "pXYs"; "pqrs" ]
     (chosen_images ~init:"pqrs" [ (1, "XY") ])
 
+(* Every image of [new] a cut after [steps] leaves, over a disk that holds
+   [old], enumerated by walking the tree of its draws. *)
+let images_over_old steps =
+  let seen = Hashtbl.create 8 in
+  let rec go prefix =
+    let trail = ref [] and pos = ref 0 in
+    let draw n =
+      let c = if !pos < Array.length prefix then prefix.(!pos) else 0 in
+      incr pos;
+      trail := (c, n) :: !trail;
+      c
+    in
+    let ctl = Crash.v ~policy:(Choose draw) ~block_size:512 () in
+    let image =
+      Eio_mock.Backend.run @@ fun () ->
+      Eio_fs.run @@ fun env ->
+      write_new (env#fs / "old") (String.make 512 'o');
+      let fs = Crash.wrap ctl env#fs in
+      steps ctl fs;
+      match Eio.Path.load (Crash.post_crash ctl / "new") with
+      | s -> s
+      | exception Eio.Io _ -> "-"
+    in
+    Hashtbl.replace seen image ();
+    let rec next = function
+      | [] -> None
+      | (c, n) :: rest when c + 1 < n ->
+          Some (Array.of_list (List.rev_map fst rest @ [ c + 1 ]))
+      | _ :: rest -> next rest
+    in
+    Option.iter go (next !trail)
+  in
+  go [||];
+  List.of_seq (Hashtbl.to_seq_keys seen)
+
+(* A file the disk held when the controller was wrapped, removed, and
+   committed by a metadata sync that takes a new snapshot: its blocks are
+   free, and a new file's page may hold what it held there. *)
+let test_crash_removed_before_snapshot () =
+  let images =
+    images_over_old (fun ctl fs ->
+        Eio.Path.unlink (fs / "old");
+        Crash.sync_metadata ctl;
+        write_new (fs / "new") (String.make 512 'n'))
+  in
+  Alcotest.(check bool)
+    "new holds what old held" true
+    (List.mem (String.make 512 'o') images)
+
 (* The images [Choose] draws at random for [steps] over a durable [init],
    each a write or a truncation, with no sync. *)
 let sampled_images ~init steps =
@@ -3804,6 +3853,8 @@ let suite =
         test_crash_choose_as_ext4;
       Alcotest.test_case "crash: no freed page reused before its truncation"
         `Quick test_crash_truncation_then_reuse;
+      Alcotest.test_case "crash: a removal a snapshot folded frees its blocks"
+        `Quick test_crash_removed_before_snapshot;
       Alcotest.test_case "crash: a sparse write's lengths" `Quick
         test_crash_sparse_write_lengths;
       Alcotest.test_case "crash: a truncation zeroes the rest of its block"
