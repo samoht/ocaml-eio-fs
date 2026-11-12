@@ -67,7 +67,8 @@
     size is bounded by the workload's structure rather than by how long it spun.
     When the workload's first run has changed, a replay finds its scenario again
     by its operations, and its report says so. A replay fails if the check no
-    longer has that scenario.
+    longer has that scenario, and if it names a state drawn at random of a cut
+    that allows two states or fewer, which the check never draws.
 
     A check reads no environment variable and prints nothing. A test that wants
     a larger budget at night reads its own:

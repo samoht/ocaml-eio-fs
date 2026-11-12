@@ -138,9 +138,9 @@ let mix () =
 (* An unsynced overwrite of 64 sectors allows 2^64 states, drawn at random:
    the draws give fair weight to those with a shape, an in-order writeback
    that landed a prefix, and a single sector left behind. *)
-let overwrite ~recover =
+let overwrite ?replay ~recover () =
   let old = String.make 32768 'o' in
-  Eio_fs.Chaos.Crash.check
+  Eio_fs.Chaos.Crash.check ?replay
     ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "f") old)
     (fun ~ack:_ env ->
       try
@@ -154,18 +154,22 @@ let overwrite ~recover =
 
 (* The first k sectors new, the rest old, at a k no torn write leaves: the
    tears fall after 1, 16, 32 and 48 sectors. *)
-let prefix () =
-  overwrite ~recover:(fun news ->
+let prefix ?replay () =
+  overwrite ?replay
+    ~recover:(fun news ->
       let k = List.length (List.filter Fun.id news) in
       if
         k > 1
         && k mod 16 <> 0
         && List.for_all Fun.id (List.mapi (fun i n -> n = (i < k)) news)
       then failwith "a prefix landed")
+    ()
 
 let one_old () =
-  overwrite ~recover:(fun news ->
+  overwrite
+    ~recover:(fun news ->
       if List.length (List.filter not news) = 1 then failwith "one sector left")
+    ()
 
 let suite =
   ( "states",
@@ -174,6 +178,14 @@ let suite =
           let m = Expect.report prefix in
           Alcotest.(check string)
             "error" "Failure(\"a prefix landed\")" (Expect.field "error" m));
+      Alcotest.test_case "a replay of a drawn state runs it" `Quick (fun () ->
+          let m = Expect.report prefix in
+          let replay =
+            Scanf.sscanf (Expect.field "replay" m) "~replay:%S" Fun.id
+          in
+          let again = Expect.report (prefix ~replay) in
+          Alcotest.(check string)
+            "cut" (Expect.field "cut" m) (Expect.field "cut" again));
       Alcotest.test_case "a single sector left of an overwrite is drawn" `Quick
         (fun () ->
           let m = Expect.report one_old in

@@ -463,10 +463,11 @@ let state_of_key k =
   | "keep" -> Some Keep
   | _ when String.length k > 0 && k.[0] = 'e' -> choices k (fun v -> Enum v)
   | _ when String.length k > 0 && k.[0] = 'p' -> choices k (fun v -> Shape v)
-  | _ when String.length k > 0 && k.[0] = 's' ->
-      Option.map
-        (fun s -> Seed s)
-        (int_of_string_opt (String.sub k 1 (String.length k - 1)))
+  | _ when String.length k > 0 && k.[0] = 's' -> (
+      let body = String.sub k 1 (String.length k - 1) in
+      match int_of_string_opt body with
+      | Some s when string_of_int s = body -> Some (Seed s)
+      | Some _ | None -> None)
   | _ -> None
 
 let cut_key = function None -> "end" | Some p -> "before:" ^ pos_key p

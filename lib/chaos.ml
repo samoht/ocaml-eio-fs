@@ -999,8 +999,24 @@ module Crash = struct
                   | None -> None)
               | None -> None)
         in
+        (* A state drawn at random is one of a cut that allows more than two
+           states, which the check may not try one by one, by a seed below a
+           fourth of the budget. *)
+        let drawn (s : Plan.crash) =
+          let more (st : Plan.state) =
+            Plan.next_choices (exec { s with state = st }).trail
+          in
+          match s.state with
+          | Seed n when n < 0 || n >= budget / 4 -> false
+          | Seed _ | Shape _ -> (
+              match more (Enum []) with
+              | None -> false
+              | Some v -> Option.is_some (more (Enum v)))
+          | Drop | Keep | Enum _ -> true
+        in
         match found with
-        | Some (s, _) when not (exec s).allowed -> no_longer name ~hash r
+        | Some (s, _) when not (drawn s && (exec s).allowed) ->
+            no_longer name ~hash r
         | Some (s, tier) -> ignore (attempt ?matched tier s)
         | None -> no_longer name ~hash r)
     | None ->
