@@ -291,35 +291,25 @@ module Crash : sig
             earlier one. [Survive (fun _ -> true)] is a process kill: the disk
             keeps what the program saw. *)
 
-  (** The type for what a cut keeps of a change that reached a directory on disk
-      other than through the wrapper: by name, or from a process the workload
-      started. A check in memory has no such change. *)
-  type outside =
-    | Dropped
-        (** Nothing: the disk is rebuilt from what the wrapper saw, so such a
-            change is gone whatever the policy keeps. *)
-    | Kept
-        (** All of it, as durable. Where the wrapper's own changes are not
-            durable yet, the policy decides, starting from what the directory
-            held when the wrapper first changed that path; anywhere else, the
-            disk holds what the directory holds at the cut, as a process that
-            syncs its own writes leaves it. A barrier on a directory another
-            process made commits what the wrapper put in it. The wrapper sees no
-            other process's syncs: what a test checks this way is the wrapper's
-            writes, with the others' kept. Stop those processes before calling
-            {!cut}. *)
-
   type t
   (** The type for power-cut controllers. *)
 
-  val v : ?outside:outside -> policy -> t
-  (** [v ~outside policy] is a controller whose cut rebuilds the disk by
-      [policy] and [outside] (defaults to {!Dropped}). *)
+  val v : policy -> t
+  (** [v policy] is a controller whose cut rebuilds the disk by [policy]. *)
 
   val wrap : t -> _ Eio.Path.t -> Eio.Fs.dir_ty Eio.Path.t
   (** [wrap t base] is [base] with its writes and directory changes tracked by
       [t]. What [base] holds when [wrap] is called is durable. [base] may be in
       memory or on disk; a hole in a file on disk counts as written zeros.
+
+      A change that reaches [base] other than through the wrapper, by name or
+      from a process the workload started, is kept by a cut as durable, as a
+      process that syncs its own writes leaves it: the wrapper sees no other
+      process's syncs, so what a test checks is the wrapper's writes, with the
+      others' kept. At a path the wrapper changed, the policy decides, starting
+      from what [base] held there when the wrapper first changed it, and a
+      barrier on a directory another process made commits what the wrapper put
+      in it. Stop those processes before calling {!cut}.
 
       @raise Invalid_argument if [t] is already wrapped. *)
 

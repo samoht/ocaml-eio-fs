@@ -423,7 +423,7 @@ module Crash : sig
     | Dropped  (** Nothing: the image is rebuilt from the model alone. *)
     | Kept
         (** All of it, as durable, where the model holds no change; see
-            [Chaos.Crash.v]. *)
+            [Chaos.Crash.wrap], whose controllers all keep it. *)
 
   val v :
     ?policy:policy ->

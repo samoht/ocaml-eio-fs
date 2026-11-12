@@ -217,6 +217,9 @@ assert (
 - A removed file that is still open frees its blocks at once, where ext4 waits
   for its last close: a failure that needs its bytes in another file before
   then may not happen on ext4.
+- A power cut built by hand with `Eio_fs.Chaos.Crash.wrap` keeps every change
+  another process made beside the wrapper, synced or not: check that
+  process's own durability in a test of its own.
 - A filesystem operation takes no time and no other fiber runs during it: to
   test a race during a slow sync, force it with an `Eio_fs.Chaos.wrap` hook.
 - After a failed sync, a read sees the lost writes as still cached, never

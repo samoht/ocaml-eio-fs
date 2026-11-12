@@ -873,12 +873,15 @@ module Crash = struct
   let pp_unsynced = M.Crash.pp_unsynced
 
   type policy = Drop_unsynced | Survive of (unsynced -> bool)
-  type outside = M.Crash.outside = Dropped | Kept
   type t = M.Crash.t
 
-  let v ?outside = function
-    | Drop_unsynced -> M.Crash.v ~policy:Drop_unsynced ?outside ()
-    | Survive p -> M.Crash.v ~policy:(Survive p) ?outside ()
+  (* A controller built by hand may wrap a directory other processes write,
+     so its cut keeps their changes. A check reaches its directory through
+     the wrapper alone and builds its own on [Dropped], the same states for
+     less work. *)
+  let v = function
+    | Drop_unsynced -> M.Crash.v ~policy:Drop_unsynced ~outside:Kept ()
+    | Survive p -> M.Crash.v ~policy:(Survive p) ~outside:Kept ()
 
   let wrap t base = (M.Crash.wrap t base :> Eio.Fs.dir_ty Eio.Path.t)
   let unsynced = M.Crash.unsynced

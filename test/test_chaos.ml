@@ -3738,6 +3738,39 @@ let test_crash_kept_barrier_on_a_childs_directory () =
 let test_crash_kept_rename_over_a_childs_file_lost () =
   rename_over_a_childs_file ~barrier:false
 
+(* A controller built through the public API keeps what a child writes by
+   name beside its wrapper, while the wrapper's own unsynced rewrite is the
+   policy's to drop. *)
+let test_crash_public_controller_keeps_a_childs_entry () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-crash" "" in
+  Sys.remove dir;
+  Eio.Path.mkdir ~perm:0o755 Eio.Path.(fs / dir);
+  Fun.protect ~finally:(fun () ->
+      Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / dir))
+  @@ fun () ->
+  let ctl = Eio_fs.Chaos.Crash.(v Drop_unsynced) in
+  let wrapped = Eio_fs.Chaos.Crash.wrap ctl Eio.Path.(fs / dir) in
+  let write create s =
+    Eio.Path.with_open_out ~create (wrapped / "img") (fun file ->
+        Eio.File.pwrite_all file ~file_offset:(i63 0) [ Cstruct.of_string s ];
+        if s = "AAAA" then Eio.File.sync file)
+  in
+  write (`Exclusive 0o600) "AAAA";
+  Eio_fs_sync.sync_dir wrapped;
+  write (`Or_truncate 0o600) "BBBB";
+  Out_channel.with_open_bin
+    (Eio.Path.native_exn (wrapped / "device.img"))
+    (fun oc -> output_string oc "DEVICE");
+  let post = Eio_fs.Chaos.Crash.cut ctl in
+  Alcotest.(check string)
+    "the wrapper's unsynced rewrite is dropped" "AAAA"
+    (Eio.Path.load (post / "img"));
+  Alcotest.(check string)
+    "the child's entry is kept" "DEVICE"
+    (Eio.Path.load (post / "device.img"))
+
 (* A snapshot reads the tree while the run's other processes write it: a
    file a child rewrites between the snapshot's stat and its read is read as
    it stands, one of the images the rewrite passes through, and a snapshot is
@@ -4195,6 +4228,8 @@ let suite =
         test_crash_kept_barrier_on_a_childs_directory;
       Alcotest.test_case "crash: kept, a lost rename over a child's file" `Quick
         test_crash_kept_rename_over_a_childs_file_lost;
+      Alcotest.test_case "crash: a public controller keeps a child's entry"
+        `Quick test_crash_public_controller_keeps_a_childs_entry;
       Alcotest.test_case "crash: a snapshot reads a file being rewritten" `Quick
         test_crash_snapshot_reads_a_file_being_rewritten;
     ] )
