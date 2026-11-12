@@ -621,7 +621,11 @@ module Crash = struct
             if c < n then c else 0)
     | Seed s ->
         let rng = Random.State.make [| s |] in
-        Choose (fun n -> Random.State.int rng n)
+        Choose
+          (fun n ->
+            let c = Random.State.int rng n in
+            trail := (c, n) :: !trail;
+            c)
 
   (* Whether the cut allows [st], given the draws it made: no choice out of
      range, and no choice for a draw it did not make. *)
@@ -1076,7 +1080,9 @@ module Crash = struct
            far allow no more than the cut's share, and drawn at random past
            that. Each cut gets an even share of what is left: first every cut
            whose states fit in it, then, with what those left, the others,
-           smallest first. *)
+           smallest first. Of a cut past its share only its size is kept, so
+           memory stays that of one cut: one that fits in its new share is
+           enumerated again from its first state. *)
         let drops = List.filter (fun (s : Plan.crash) -> s.state = Drop) cuts in
         let enumerate (s : Plan.crash) tree spent allowance next =
           let rec go = function
@@ -1093,47 +1099,60 @@ module Crash = struct
           in
           go next
         in
+        (* The states of cut [s] one by one, up to [allowance] runs: [None]
+           once they are all tried, else the draws' estimate. *)
+        let enumerate_from_first s spent allowance =
+          let tree = Plan.Draws.empty () in
+          incr spent;
+          let r = attempt Sampled { s with state = Enum [] } in
+          Plan.Draws.add tree r.trail;
+          match
+            enumerate s tree spent allowance (Plan.next_choices r.trail)
+          with
+          | None -> None
+          | Some _ -> Some (Plan.Draws.estimate tree)
+        in
         let states left =
           let rec first left acc = function
             | [] -> (left, List.rev acc)
             | (s : Plan.crash) :: rest as cuts ->
                 let allowance = max 1 (left / List.length cuts) in
-                let tree = Plan.Draws.empty () in
-                let r = attempt Sampled { s with state = Enum [] } in
-                Plan.Draws.add tree r.trail;
-                let spent = ref 1 in
-                let widths = List.rev_map snd r.trail in
+                let spent = ref 0 in
                 let acc =
-                  match
-                    enumerate s tree spent allowance (Plan.next_choices r.trail)
-                  with
+                  match enumerate_from_first s spent allowance with
                   | None -> acc
-                  | Some v -> (s, tree, spent, v, widths) :: acc
+                  | Some estimate -> (s, estimate, !spent) :: acc
                 in
                 first (left - !spent) acc rest
           in
           let left, large = first left [] drops in
           let large =
-            List.stable_sort
-              (fun (_, a, _, _, _) (_, b, _, _, _) ->
-                Int.compare (Plan.Draws.estimate a) (Plan.Draws.estimate b))
-              large
+            List.stable_sort (fun (_, a, _) (_, b, _) -> Int.compare a b) large
           in
           let rec share_out left = function
             | [] -> ()
-            | (s, tree, spent, v, widths) :: rest as cuts ->
+            | (s, estimate, before) :: rest as cuts ->
                 let share = max 0 (left / List.length cuts) in
-                let allowance = !spent + share and before = !spent in
-                (match enumerate s tree spent allowance (Some v) with
-                | None -> ()
-                | Some _ ->
-                    for i = 0 to allowance - !spent - 1 do
-                      incr spent;
-                      ignore
-                        (attempt Sampled
-                           { s with state = Plan.shape ~widths i })
-                    done);
-                share_out (left - (!spent - before)) rest
+                let spent = ref 0 in
+                if share = 0 then ()
+                else if estimate <= before + share then
+                  ignore
+                    (enumerate_from_first s spent (before + share) : int option)
+                else begin
+                  (* The first draw is a seed, which needs no widths: its
+                      draws give them to the others. *)
+                  incr spent;
+                  let r =
+                    attempt Sampled { s with state = Plan.shape ~widths:[] 0 }
+                  in
+                  let widths = List.rev_map snd r.trail in
+                  for i = 1 to share - 1 do
+                    incr spent;
+                    ignore
+                      (attempt Sampled { s with state = Plan.shape ~widths i })
+                  done
+                end;
+                share_out (left - !spent) rest
           in
           share_out left large
         in
