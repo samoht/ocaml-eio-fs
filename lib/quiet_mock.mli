@@ -10,7 +10,8 @@ exception Time_limit
 (** Raised by {!run} when its clock would move past the limit. *)
 
 exception Busy
-(** Raised by {!run} when it resumes fibers more than 10 million times. *)
+(** Raised by {!run} when it resumes fibers 10 million times in a row with no
+    fiber waiting 1 ms or more for a timer while every fiber waited. *)
 
 val run :
   ?idle:(unit -> bool) ->
@@ -28,4 +29,6 @@ val run :
 
     @raise Deadlock_detected if every fiber waits and no timer is due.
     @raise Time_limit if the clock would move past [limit].
-    @raise Busy if it resumes fibers more than 10 million times. *)
+    @raise Busy
+      if it resumes fibers 10 million times in a row with no fiber waiting 1 ms
+      or more for a timer while every fiber waited. *)

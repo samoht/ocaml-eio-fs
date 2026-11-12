@@ -91,7 +91,8 @@ let outcome_text = function
   | Deadlock -> "the run hangs: every fiber waits and no timer is due"
   | Time_limit ->
       "the run hangs: it is still running after an hour of its clock"
-  | Busy -> "the run is a busy loop: it kept the CPU busy for 10 s of clock"
+  | Busy ->
+      "the run woke 10,000,000 times without waiting 1 ms or more: a busy loop"
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"

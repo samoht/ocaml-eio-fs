@@ -13,7 +13,8 @@ open! Hermetic
      going reports as a run past its time limit;
    - each turn, a fiber resumed by a yield, another fiber or a timer,
      charges [turn] of clock, as a program's CPU time passes between two,
-     and a run of more than [max_turns] stops as a busy loop.
+     and a run of [max_turns] turns in a row in which no fiber waited
+     [min_wait] or more for a timer stops as a busy loop.
 
    Hang detection and deterministic virtual time need a loop the check owns.
    eio-net carries the same copy. This one needs no eio.mock.
@@ -52,7 +53,7 @@ module Mono = struct
   end
 
   module Job = struct
-    type t = { time : Mtime.t; resolver : unit Eio.Promise.u }
+    type t = { time : Mtime.t; since : Mtime.t; resolver : unit Eio.Promise.u }
 
     let compare a b = Mtime.compare a.time b.time
   end
@@ -70,7 +71,7 @@ module Mono = struct
       else
         let p, r = Eio.Promise.create () in
         let k = object end in
-        t.q <- Q.add k { time; resolver = r } t.q;
+        t.q <- Q.add k { time; since = t.now; resolver = r } t.q;
         try Eio.Promise.await p
         with Eio.Cancel.Cancelled _ as ex ->
           t.q <- Q.remove k t.q;
@@ -88,14 +89,15 @@ module Mono = struct
       drain ();
       t.now <- time
 
-    (* Eio_mock's [try_advance], which does not move past [limit]. *)
+    (* Eio_mock's [try_advance], which does not move past [limit], and says
+       how long the timer it moves to waited. *)
     let try_advance t ~limit =
       match Q.min t.q with
       | None -> `Idle
       | Some (_, v) when Mtime.compare v.time limit > 0 -> `Past_limit
       | Some (_, v) ->
           set_time t v.time;
-          `Advanced
+          `Advanced (Mtime.span v.since v.time)
   end
 
   let handler = Eio.Time.Pi.clock (module Impl)
@@ -122,7 +124,7 @@ type t = {
   clock : Mono.Impl.t;
   limit : Mtime.t;
   mutable past_limit : bool;
-  mutable turns : int;
+  mutable turns : int; (* since a fiber last waited [min_wait] or more *)
   mutable busy : bool;
   idle : unit -> bool;
 }
@@ -131,6 +133,7 @@ type t = {
    loaded Mac: 1 us, fixed. *)
 let turn = Mtime.Span.(1 * us)
 let max_turns = 10_000_000
+let min_wait = Mtime.Span.(1 * ms)
 
 let rec schedule t : exit =
   match Lf_queue.pop t.run_q with
@@ -157,7 +160,9 @@ let rec schedule t : exit =
   | None when t.idle () -> schedule t
   | None -> (
       match Mono.Impl.try_advance t.clock ~limit:t.limit with
-      | `Advanced -> schedule t
+      | `Advanced waited ->
+          if Mtime.Span.compare waited min_wait >= 0 then t.turns <- 0;
+          schedule t
       | `Idle -> `Exit_scheduler
       | `Past_limit ->
           t.past_limit <- true;
