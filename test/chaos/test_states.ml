@@ -154,4 +154,13 @@ let suite =
           Alcotest.(check string)
             "acked" "1 value, after #2"
             (field freed_by_unlink "acked"));
+      Alcotest.test_case "a report's trace holds the truncation" `Quick
+        (fun () ->
+          let m = Expect.report old_frame in
+          let line = "\n    #2 truncate /wal to 0\n" in
+          let n = String.length m and k = String.length line in
+          let rec has i =
+            i + k <= n && (String.sub m i k = line || has (i + 1))
+          in
+          if not (has 0) then Alcotest.failf "no truncation in %s" m);
     ] )
