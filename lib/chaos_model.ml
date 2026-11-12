@@ -2415,14 +2415,14 @@ module Crash = struct
 
      With [bytes], blocks are sectors and the length is one a change left
      or the end of a page a write put bytes in, as ext4 extends its on-disk
-     size as writeback lands. A sector a write put bytes in, in a
-     page the disk did not hold, may also hold stale data: ext4 may commit
-     the page's allocation before its bytes land. [old p] is what a freed
-     block the page may have been given held, at page [p] of its file, and
-     where it was. [describe] is told the length and, run by run, what each
+     size as writeback lands. A page the disk did not hold that a write put
+     bytes in is written whole, and each of its sectors may also hold stale
+     data: ext4 may commit the page's allocation before its bytes land.
+     [old p] is what the freed blocks the page may have been given held, at
+     page [p] of its file, and where each was; one of them is drawn. [describe] is told the length and, run by run, what each
      block holds. *)
   let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ?(held = [])
-      ?(old = fun _ -> None) ?(describe = fun _ _ -> ()) ~rng ~bs ~cache durable
+      ?(old = fun _ -> []) ?(describe = fun _ _ -> ()) ~rng ~bs ~cache durable
       changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
@@ -2461,11 +2461,36 @@ module Crash = struct
            match changes.(k) with
            | Write { offset; data } -> max !cprev (offset + Cstruct.length data)
            | Resize m -> m);
-      if hi > lo then
-        for b = lo / bs to (hi - 1) / bs do
+      (* ext4 writes a page it allocates whole: with [bytes], a write into
+         a page the disk does not hold dirties the rest of the page within
+         the length too. *)
+      let pages =
+        match changes.(k) with
+        | Write { offset; data } when bytes && not cached.(k) ->
+            let last = (offset + Cstruct.length data - 1) / page in
+            List.filter_map
+              (fun pg ->
+                let a = pg * page in
+                let b = min (a + page) sizes.(k + 1) in
+                if b > a && not (held_at held a b) then Some (a, b) else None)
+              (List.init
+                 (max 0 (last - (offset / page) + 1))
+                 (fun i -> (offset / page) + i))
+        | _ -> []
+      in
+      let dirty = Hashtbl.create 8 in
+      List.iter
+        (fun (lo, hi) ->
+          if hi > lo then
+            for b = lo / bs to (hi - 1) / bs do
+              Hashtbl.replace dirty b ()
+            done)
+        ((lo, hi) :: pages);
+      Hashtbl.iter
+        (fun b () ->
           let vs = Option.value ~default:[] (Hashtbl.find_opt versions b) in
-          Hashtbl.replace versions b ((k + 1) :: vs)
-        done
+          Hashtbl.replace versions b ((k + 1) :: vs))
+        dirty
     done;
     (* Each dirty block's version, in block order: [0] is the durable one, [k]
        the one after change [k]. *)
@@ -2546,10 +2571,17 @@ module Crash = struct
         let ks =
           List.filter (fun v -> v <= limit) (List.rev (Hashtbl.find versions b))
         in
-        let vs = (0 :: ks) @ if may_be_stale b ks then [ -1 ] else [] in
+        let stale =
+          if may_be_stale b ks then
+            List.init
+              (max 1 (List.length (old (b * bs / page))))
+              (fun i -> -1 - i)
+          else []
+        in
+        let vs = (0 :: ks) @ stale in
         let v = List.nth vs (rng.int (List.length vs)) in
         if v > 0 then Hashtbl.replace chosen b v
-        else if v < 0 then Hashtbl.replace stale_blocks b ())
+        else if v < 0 then Hashtbl.replace stale_blocks b (-1 - v))
       blocks;
     (* Replay once, taking each chosen block as it stood after its change. *)
     let at = Hashtbl.create 16 in
@@ -2588,11 +2620,11 @@ module Crash = struct
         if len > 0 then Cstruct.blit src 0 image (b * bs) len
       done;
     Hashtbl.iter
-      (fun b () ->
+      (fun b i ->
         let len = min bs (size - (b * bs)) in
         if len > 0 then
           let dst = Cstruct.sub image (b * bs) len in
-          match old (b * bs / page) with
+          match List.nth_opt (old (b * bs / page)) i with
           | None -> Cstruct.memset dst (Char.code stale)
           | Some (pg, _) ->
               (* Past the old file's end its block held zeros. *)
@@ -2602,13 +2634,14 @@ module Crash = struct
               if n > 0 then Cstruct.blit pg off dst 0 n)
       stale_blocks;
     (let source b =
-       if Hashtbl.mem stale_blocks b then
-         `Stale (Option.map snd (old (b * bs / page)))
-       else
-         match Hashtbl.find_opt chosen b with
-         | Some v -> `Change (v - 1)
-         | None when List.mem_assoc b over -> `Over
-         | None -> `Durable
+       match Hashtbl.find_opt stale_blocks b with
+       | Some i ->
+           `Stale (Option.map snd (List.nth_opt (old (b * bs / page)) i))
+       | None -> (
+           match Hashtbl.find_opt chosen b with
+           | Some v -> `Change (v - 1)
+           | None when List.mem_assoc b over -> `Over
+           | None -> `Durable)
      in
      let runs = ref [] in
      if size > 0 then
@@ -2708,20 +2741,37 @@ module Crash = struct
       let clear_cut = Hashtbl.create 4 in
       (* The files the image no longer holds, whose blocks are free, by
          path. *)
-      let removed = ref [] in
+      let removed = ref [] and unsynced_removed = ref [] in
+      let page_of c p =
+        if Cstruct.length c > p * page then
+          Some
+            (Cstruct.sub c (p * page)
+               (min page (Cstruct.length c - (p * page))))
+        else None
+      in
+      (* What a block the page [p] of [fs] may have been given held: a page
+         a shrink of [fs] freed, else the first removed file that had one
+         there; and the pages a removed file held unsynced, which writeback
+         may have put on disk before the removal. *)
       let old fs p =
-        match List.assoc_opt p fs.freed with
-        | Some pg -> Some (pg, fs.rel ^ " held there before its truncation")
-        | None ->
-            List.find_map
-              (fun (path, c) ->
-                if Cstruct.length c > p * page then
-                  Some
-                    ( Cstruct.sub c (p * page)
-                        (min page (Cstruct.length c - (p * page))),
-                      "the removed " ^ path ^ " held there" )
-                else None)
-              !removed
+        (match List.assoc_opt p fs.freed with
+          | Some pg -> [ (pg, fs.rel ^ " held there before its truncation") ]
+          | None ->
+              Option.to_list
+                (List.find_map
+                   (fun (path, c) ->
+                     Option.map
+                       (fun pg -> (pg, "the removed " ^ path ^ " held there"))
+                       (page_of c p))
+                   !removed))
+        @ List.filter_map
+            (fun (path, durable, live) ->
+              match (page_of live p, page_of durable p) with
+              | Some pg, Some d when Cstruct.equal pg d -> None
+              | Some pg, _ ->
+                  Some (pg, "the removed " ^ path ^ " held there unsynced")
+              | None, _ -> None)
+            !unsynced_removed
       in
       (* What the crash left of each file's unsynced writes. *)
       let left = ref [] in
@@ -2968,7 +3018,22 @@ module Crash = struct
              if Inos.mem ino inos then acc else (path, data) :: acc)
            ctl.snapped []
        in
-       removed := gone_files @ gone_nodes);
+       removed := gone_files @ gone_nodes;
+       unsynced_removed :=
+         Hashtbl.fold
+           (fun id (fs : fstate) acc ->
+             if Hashtbl.mem located id || fs.pending = [] then acc
+             else
+               let durable = bytes_of fs.durable in
+               let pending =
+                 List.rev_map (fun e -> (e.change, e.cached)) fs.pending
+               in
+               let _, live =
+                 replay_cached ~bs:ctl.block_size durable ~cache:fs.cache
+                   pending
+               in
+               (fs.rel, durable, live) :: acc)
+           ctl.known []);
       restore_root owner root_path tree;
       (* Each tracked file is rewritten where the image holds it, which a
          rename may have made another name than the one it was met at. *)
