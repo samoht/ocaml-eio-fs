@@ -144,6 +144,7 @@ module Op = struct
     [ `Read
     | `Read_dir
     | `Write
+    | `Truncate
     | `Sync
     | `Open_read
     | `Open_write
@@ -164,6 +165,7 @@ module Op = struct
     | `Read -> Fmt.string ppf "read"
     | `Read_dir -> Fmt.string ppf "read-dir"
     | `Write -> Fmt.string ppf "write"
+    | `Truncate -> Fmt.string ppf "truncate"
     | `Sync -> Fmt.string ppf "sync"
     | `Open_read -> Fmt.string ppf "open"
     | `Open_write -> Fmt.string ppf "open-write"
@@ -178,6 +180,7 @@ module Op = struct
 
   let read path ~offset ~len = v ~offset ~len `Read path
   let write path ~offset ~len = v ~space:true ~offset ~len `Write path
+  let truncate path ~len = v ~offset:len `Truncate path
   let read_dir path = v `Read_dir path
   let sync path = v `Sync path
   let open_read path = v `Open_read path
@@ -607,7 +610,13 @@ module Rw_impl = struct
     do_pwrite t.sched t.path ~append:t.append (writable t) ~file_offset bufs
 
   let sync t = do_sync t.sched t.path (writable t)
-  let truncate t len = Eio.File.truncate (writable t) len
+
+  let truncate t len =
+    match
+      Schedule.next t.sched (Op.truncate t.path ~len:(Optint.Int63.to_int len))
+    with
+    | Some (Fault.Write_error c) -> raise_io c t.path
+    | _ -> Eio.File.truncate (writable t) len
 end
 
 let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =

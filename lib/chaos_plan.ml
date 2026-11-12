@@ -8,6 +8,7 @@ module Op = struct
     | `Read
     | `Read_dir
     | `Write
+    | `Truncate
     | `Sync
     | `Change ]
 
@@ -27,6 +28,7 @@ module Op = struct
     | `Read -> "read"
     | `Read_dir -> "read-dir"
     | `Write -> "write"
+    | `Truncate -> "truncate"
     | `Sync -> "sync"
     | `Change -> "change"
 
@@ -35,6 +37,8 @@ module Op = struct
     | `Read | `Write ->
         Fmt.pf ppf "#%d %s %s@%d+%d" t.index (kind_name t.kind) t.path
           t.file_offset t.length
+    | `Truncate ->
+        Fmt.pf ppf "#%d truncate %s to %d" t.index t.path t.file_offset
     | k -> Fmt.pf ppf "#%d %s %s" t.index (kind_name k) t.path
 end
 
@@ -159,7 +163,7 @@ let lasting_text = function
 
 let lasting_code l (op : Op.t) : Fault.code option =
   match (l, op.kind) with
-  | Read_only, (`Write | `Change | `Open_write) -> Some `Erofs
+  | Read_only, (`Write | `Truncate | `Change | `Open_write) -> Some `Erofs
   | Full, (`Write | `Change | `Open_write) -> Some `Enospc
   | Denied, (`Open_read | `Open_write | `Change | `Read_dir | `Stat) ->
       Some `Eacces
@@ -170,7 +174,7 @@ let check_faults (op : Op.t) : Fault.t list =
   | `Read -> [ Short 1; Fail `Eio ]
   | `Read_dir -> [ Fail `Eio ]
   | `Write -> [ Short 1; Torn (op.length / 2); Fail `Enospc; Fail `Eio ]
-  | `Sync -> [ Fail `Eio ]
+  | `Truncate | `Sync -> [ Fail `Eio ]
   | `Open_read -> [ Fail `Eacces; Fail `Eio ]
   | `Open_write | `Change -> [ Fail `Eacces; Fail `Erofs; Fail `Enospc ]
   | `Stat -> [ Fail `Eacces; Fail `Eio ]
@@ -240,7 +244,7 @@ let base = { cfaults = []; cut = None; state = Drop; rcut = None }
 
 let changes (op : Op.t) =
   match op.kind with
-  | `Write | `Sync | `Change | `Open_write -> true
+  | `Write | `Truncate | `Sync | `Change | `Open_write -> true
   | _ -> false
 
 (* After each operation of [ops] that changes the disk, before the one that

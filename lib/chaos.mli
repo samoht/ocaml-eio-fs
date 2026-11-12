@@ -96,8 +96,8 @@ val check :
     - the operation fails with each error Linux answers there: [EACCES] or
       [EROFS] on an open that may write or a directory change, and [ENOSPC] on
       one that makes a file or an entry, [EACCES] or [EIO] on an open for
-      reading or a stat, [ENOSPC] or [EIO] on a write, [EIO] on a read or a
-      sync;
+      reading or a stat, [ENOSPC] or [EIO] on a write, [EIO] on a read, a
+      truncation or a sync;
     - a read or a write moves a single byte;
     - a write is torn: half its bytes land, then it fails with [ENOSPC];
     - from that operation on, the filesystem is read-only, full, or denies every
@@ -290,6 +290,7 @@ module Op : sig
     | `Read  (** A read of a file's bytes. *)
     | `Read_dir
     | `Write  (** A write of a file's bytes. *)
+    | `Truncate  (** A truncation of a file; [file_offset] is its new length. *)
     | `Sync  (** A sync of a file or of a directory. *)
     | `Change
       (** A change to a directory's entries ([mkdir], [symlink], [unlink],
@@ -307,7 +308,9 @@ module Op : sig
     nth : int;
         (** The operation's place among those of its kind on its path, from [1].
         *)
-    file_offset : int;  (** Where a read or a write starts, [0] otherwise. *)
+    file_offset : int;
+        (** Where a read or a write starts, a truncation's new length, [0]
+            otherwise. *)
     length : int;  (** The bytes a read asks for or a write offers. *)
   }
   (** The type for operations. *)

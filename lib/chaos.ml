@@ -40,7 +40,7 @@ let model_fault ~space (op : Op.t) : Fault.t -> M.Fault.t option = function
       Some
         (match op.kind with
         | `Read | `Read_dir -> Read_error c
-        | `Write -> Write_error c
+        | `Write | `Truncate -> Write_error c
         | `Sync -> Sync_error c
         | `Open_read | `Open_write -> Open_error c
         | `Stat -> Stat_error c

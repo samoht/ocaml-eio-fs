@@ -9,6 +9,7 @@ module Op : sig
     | `Read
     | `Read_dir
     | `Write
+    | `Truncate
     | `Sync
     | `Change ]
 

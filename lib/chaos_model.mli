@@ -96,6 +96,9 @@ module Op : sig
       (** A directory listing, by either enumeration entry point. It accepts
           {!Fault.t.Read_error}, never a byte-oriented short read. *)
     | `Write  (** A write of a file's bytes, streaming or positioned. *)
+    | `Truncate
+      (** A truncation of a file; its [file_offset] is the new length. It
+          accepts {!Fault.t.Write_error}, which no seeded schedule injects. *)
     | `Sync
       (** A sync: a file's, or a directory's through [Eio_fs_sync.sync_dir],
           whose path is the directory. *)
