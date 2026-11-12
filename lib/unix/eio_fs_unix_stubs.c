@@ -1329,9 +1329,10 @@ CAMLprim value caml_eio_fs_readlinkat(value dirfd_v, value name_v)
   }
 }
 
-/* The calls of Eio_fs_unix.Inline.fs, made on the calling thread. Each
-   names itself as eio_posix's own call does, so an error reads the same
-   whichever made it. */
+/* The calls of Eio_fs_unix.Inline.fs, made on the calling thread. An
+   error names the call made here, with the path; which call a backend
+   makes, and so the name its error carries, is the backend's, and only the
+   errno, the operation and the path are promised alike. */
 
 CAMLprim value caml_eio_fs_inline_fstatat(value path_v, value follow_v)
 {
