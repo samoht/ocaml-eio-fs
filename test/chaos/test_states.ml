@@ -45,6 +45,34 @@ let old_frame () =
       if acked <> [] && P.load P.(env#fs / "wal") = frame 'A' then
         failwith "an old frame replayed")
 
+(* A compaction wrote [new] and made it durable, then removed [old] and
+   committed the removal: an unsynced append to [new] lands in a block the
+   removal freed, and may show the record [old] held there. *)
+let sectors s = String.concat "" (List.map (fun c -> String.make 512 c) s)
+
+let freed_by_unlink () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save
+        P.(env#fs / "old")
+        (sectors [ 'A'; 'B'; 'C'; 'D'; 'E'; 'F'; 'G'; 'H'; 'I'; 'J' ]);
+      Eio_fs_sync.save P.(env#fs / "new") (String.make 4096 'n'))
+    (fun ~ack env ->
+      try
+        P.unlink P.(env#fs / "old");
+        Eio_fs_sync.sync_dir env#fs;
+        ack ();
+        P.with_open_out ~append:true ~create:`Never P.(env#fs / "new")
+        @@ fun f -> Eio.Flow.copy_string (String.make 512 'x') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      match P.load P.(env#fs / "new") with
+      | s when String.length s > 4096 && s.[4096] = 'I' ->
+          failwith "a removed record replayed"
+      | _ | (exception Eio.Io _) -> ())
+
 let suite =
   ( "states",
     [
@@ -58,5 +86,11 @@ let suite =
           let m = Expect.report old_frame in
           Alcotest.(check string)
             "error" "Failure(\"an old frame replayed\")"
+            (Expect.field "error" m));
+      Alcotest.test_case "a fresh sector may hold what a removal freed" `Quick
+        (fun () ->
+          let m = Expect.report freed_by_unlink in
+          Alcotest.(check string)
+            "error" "Failure(\"a removed record replayed\")"
             (Expect.field "error" m));
     ] )
