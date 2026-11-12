@@ -91,6 +91,23 @@ let stale_first () =
           failwith "stale first sector"
       | _ | (exception Eio.Io _) -> ())
 
+(* An unsynced overwrite of eight sectors the disk holds leaves 256 states,
+   each sector old or new, which the tier has room to try one by one: one
+   mix of them breaks recover. *)
+let mix () =
+  let old = String.make 4096 'o' and planted = "onoonoon" in
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "f") old)
+    (fun ~ack:_ env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+        Eio.Flow.copy_string (String.make 4096 'n') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      let s = P.load P.(env#fs / "f") in
+      if String.init 8 (fun i -> s.[i * 512]) = planted then
+        failwith "a planted mix")
+
 let suite =
   ( "states",
     [
@@ -116,4 +133,9 @@ let suite =
           let m = Expect.report stale_first in
           Alcotest.(check string)
             "error" "Failure(\"stale first sector\")" (Expect.field "error" m));
+      Alcotest.test_case "every mix of an overwrite's sectors is tried" `Quick
+        (fun () ->
+          let m = Expect.report mix in
+          Alcotest.(check string)
+            "error" "Failure(\"a planted mix\")" (Expect.field "error" m));
     ] )
