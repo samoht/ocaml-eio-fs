@@ -179,7 +179,10 @@ module Sure = struct
     | _ -> true
 end
 
-let rest trace sel = List.filter (fun op -> not (List.memq op sel)) trace
+let rest trace sel =
+  let s = Hashtbl.create 64 in
+  List.iter (fun (op : Op.t) -> Hashtbl.replace s op.index ()) sel;
+  List.filter (fun (op : Op.t) -> not (Hashtbl.mem s op.index)) trace
 
 (* {1 Sampling} *)
 
@@ -245,6 +248,33 @@ let of_singles ops =
 
 let check_linear trace = of_singles (structural trace)
 let check_others trace = of_singles (rest trace (structural trace))
+
+(* Spread as [spread] spreads [check_others], but the scenarios are counted
+   first and built only once picked. *)
+let check_others_spread ~keep trace =
+  let ops = rest trace (structural trace) in
+  let at op = List.filter keep (of_singles [ op ]) in
+  let total = List.fold_left (fun n op -> n + List.length (at op)) 0 ops in
+  let pick n =
+    if total <= n then List.concat_map at ops
+    else
+      let next i = i * total / n in
+      let rec go i k acc = function
+        | [] -> List.rev acc
+        | op :: rest ->
+            let c = Array.of_list (at op) in
+            let m = Array.length c in
+            let rec take i acc =
+              if i < n && next i < k + m then
+                take (i + 1) (c.(next i - k) :: acc)
+              else (i, acc)
+            in
+            let i, acc = take i acc in
+            go i (k + m) acc rest
+      in
+      go 0 0 [] ops
+  in
+  (total, pick)
 
 let check_floor ~space ~sure op =
   if not sure then 0
@@ -319,9 +349,13 @@ let interleave l =
       if j < n then Some a.(j) else None)
     (List.init (1 lsl b) Fun.id)
 
-(* At most [limit] of [changed] in order, and of [rest], evenly. *)
-let aim limit (changed, rest) =
-  (List.filteri (fun i _ -> i < limit) changed, interleave (spread limit rest))
+(* At most [limit] of the pairs [pairs] makes at [changed], in order, and
+   of those at [rest], evenly: each operation makes one pair or more, so
+   [limit] operations of each are enough. *)
+let aim limit pairs (changed, rest) =
+  let first l = List.filteri (fun i _ -> i < limit) l in
+  ( first (pairs (first changed)),
+    interleave (spread limit (pairs (spread limit rest))) )
 
 module Pairs = struct
   type 'a t = {
@@ -368,7 +402,7 @@ let check_seconds ?(limit = max_int) one ~first ~(after : trace) =
           (fun two -> { faults = [ one; two ]; lasting = None })
           (singles ops)
       in
-      aim limit (pairs changed, pairs rest)
+      aim limit pairs (changed, rest)
 
 let faults_key = function
   | [] -> "none"
@@ -549,7 +583,7 @@ let crash_seconds ?(limit = max_int) ~tears one ~first ~(after : trace) =
           (fun two -> both { base with cfaults = [ one; two ] })
           (durable_faults ~tears ops)
       in
-      aim limit (pairs changed, pairs rest)
+      aim limit pairs (changed, rest)
 
 let next_choices trail =
   let rec go = function

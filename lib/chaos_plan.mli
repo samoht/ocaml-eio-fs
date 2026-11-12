@@ -98,6 +98,12 @@ val check_linear : trace -> check list
 val check_others : trace -> check list
 (** [check_others first] is the same at the other operations. *)
 
+val check_others_spread :
+  keep:(check -> bool) -> trace -> int * (int -> check list)
+(** [check_others_spread ~keep first] is the number of scenarios of
+    [check_others first] for which [keep] holds, and a function that is [n] of
+    them, as {!spread} picks them, built only as they are picked. *)
+
 (** The operations sure to be structural as a run goes. *)
 module Sure : sig
   type t

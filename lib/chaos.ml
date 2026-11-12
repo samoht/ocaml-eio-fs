@@ -820,11 +820,11 @@ let check ?budget ?replay ?(setup = ignore) run =
            check never passes on a partial one. Shrink the workload, or raise \
            ~budget."
           n budget;
-      let others = List.filter meets (Plan.check_others first) in
+      let others, pick_others = Plan.check_others_spread ~keep:meets first in
       let share classes = Plan.sampled_share ~budget ~linear:n ~classes in
       (* The second faults each run allows, drawn as it ends, so no run's
          operations outlive it: the best of each, round by round. *)
-      let sh = share (if others = [] then 1 else 2) in
+      let sh = share (if others = 0 then 1 else 2) in
       let best = Plan.Pairs.v sh in
       List.iter
         (fun (s : Plan.check) ->
@@ -838,15 +838,13 @@ let check ?budget ?replay ?(setup = ignore) run =
       let pairs = Plan.Pairs.to_list best in
       let classes =
         List.filter
-          (fun (c, _) -> c <> [])
-          [ (others, Plan.spread); (pairs, take) ]
+          (fun (n, _) -> n > 0)
+          [ (others, pick_others); (List.length pairs, fun n -> take n pairs) ]
       in
       let share = share (List.length classes) in
       List.iter
-        (fun (c, pick) ->
-          List.iter
-            (fun s -> ignore (attempt Sampled s : record))
-            (pick share c))
+        (fun (_, pick) ->
+          List.iter (fun s -> ignore (attempt Sampled s : record)) (pick share))
         classes
 
 (* {1 Crash} *)
