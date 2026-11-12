@@ -168,19 +168,22 @@ val root : user
     rules: search ([x]) on every directory a path walks; write and search on the
     directory where an entry is made, removed or renamed, with the sticky bit
     keeping removal and renaming to the entry's or the directory's owner; read
-    on a directory to list it; read, or read and write, on a file to open it. A
-    new file or directory loses the user's umask bits and belongs to the user's
-    uid and gid, or to the group of a setgid directory it is made in. A new
-    directory keeps only the permission and sticky bits of its mode, and is
-    setgid iff its parent is. A file made in a setgid directory by a user
-    outside that group loses setgid, as Linux strips it at create. Only a file's
-    owner changes its mode, and a user outside the file's group cannot set its
-    setgid bit. Only root gives a file away; its owner may move it to one of
-    their own groups. A chown of a regular file, or a write to one by a user
-    other than root, clears its setuid bit, and its setgid bit when its group
-    may execute it. Root needs no bit to read, write or search, as on Linux, so
-    a test that runs as {!root}, the default, misses the bugs a user meets: a
-    directory it cannot create in, a file it cannot open. *)
+    on a directory to list it; read, or read and write, on a file to open it. In
+    a sticky directory that others may write, a link is followed as the last
+    component of a path only by its owner, or if the directory's owner owns it,
+    root included: Linux does so with [fs.protected_symlinks] set, as most
+    distributions set it. A new file or directory loses the user's umask bits
+    and belongs to the user's uid and gid, or to the group of a setgid directory
+    it is made in. A new directory keeps only the permission and sticky bits of
+    its mode, and is setgid iff its parent is. A file made in a setgid directory
+    by a user outside that group loses setgid, as Linux strips it at create.
+    Only a file's owner changes its mode, and a user outside the file's group
+    cannot set its setgid bit. Only root gives a file away; its owner may move
+    it to one of their own groups. A chown of a regular file, or a write to one
+    by a user other than root, clears its setuid bit, and its setgid bit when
+    its group may execute it. Root needs no bit to read, write or search, as on
+    Linux, so a test that runs as {!root}, the default, misses the bugs a user
+    meets: a directory it cannot create in, a file it cannot open. *)
 module Fs : sig
   val v : ?user:user -> unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [v ~user ()] is the root of a fresh, empty in-memory filesystem whose

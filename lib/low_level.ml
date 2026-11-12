@@ -540,6 +540,18 @@ module Filesystem = struct
         | None -> None
         | Some ino -> Entries.find_opt ino w.tree)
 
+  (* fs.protected_symlinks, 1 on Linux distributions: a last component that
+     is a link in a sticky world-writable directory is followed only by the
+     link's owner, or when the directory's owner owns it, root included:
+     EACCES. *)
+  let may_follow w name (s : Symlink.t) =
+    let dir = Resource.stat !(here w) in
+    if
+      dir.perm land 0o1002 = 0o1002
+      && (not (Int64.equal s.stat.uid (User.id w.user.uid)))
+      && not (Int64.equal s.stat.uid dir.uid)
+    then Error.permission_denied name
+
   (* A link to the empty path names nothing: ENOENT. *)
   let link_target name (s : Symlink.t) =
     if String.equal s.link_to "" then Error.not_found name;
@@ -606,6 +618,7 @@ module Filesystem = struct
     in
     match !r with
     | Resource.Symlink s when follow || slash ->
+        may_follow w name s;
         follow_link w.follows;
         let w, name, slash' = locate w (link_target name s) in
         final ~follow:true w name ~slash:(slash || slash')
@@ -803,6 +816,7 @@ let open_locked ~mode dir_fd path flags =
               match !r with
               | Resource.Symlink _ when nofollow -> Error.symlink_loop ()
               | Resource.Symlink s ->
+                  Filesystem.may_follow w name s;
                   Filesystem.follow_link w.follows;
                   let w, name, slash =
                     Filesystem.locate w (Filesystem.link_target name s)
