@@ -859,6 +859,37 @@ let recover_syncs dirs =
 let test_idle_syncs_are_no_cut () =
   Alcotest.(check int) "runs" (recover_syncs 1) (recover_syncs 20)
 
+(* A log appended to after [reopens] opens of it that write nothing: an
+   open of a file the check already tracks changes nothing a cut leaves. *)
+let reopens n =
+  let runs = ref 0 in
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "log") "")
+    (fun ~ack env ->
+      incr runs;
+      for i = 1 to 3 do
+        try
+          for _ = 1 to n do
+            P.with_open_out ~append:true ~create:`Never
+              P.(env#fs / "log")
+              ignore
+          done;
+          Eio_fs_sync.append_lines P.(env#fs / "log") [ string_of_int i ];
+          ack i
+        with Eio.Io _ -> ()
+      done)
+    ~recover:(fun ~acked env ->
+      let log = P.load P.(env#fs / "log") in
+      List.iter
+        (fun i ->
+          if not (List.mem (string_of_int i) (String.split_on_char '\n' log))
+          then Fmt.failwith "%d lost" i)
+        acked);
+  !runs
+
+let test_idle_opens_are_no_cut () =
+  Alcotest.(check int) "runs" (reopens 0) (reopens 10)
+
 (* A sync of a directory whose own entry is not durable commits nothing,
    but holds a barrier a later commit honours: it changes what a cut
    leaves. A second one, and a sync of a synced file, change nothing. *)
@@ -1308,6 +1339,8 @@ let suite =
         test_first_run_stops_at_the_budget;
       Alcotest.test_case "a sync that commits nothing is no cut" `Quick
         test_idle_syncs_are_no_cut;
+      Alcotest.test_case "an open that changes nothing is no cut" `Quick
+        test_idle_opens_are_no_cut;
       Alcotest.test_case "what a sync changes" `Quick test_stamp;
       Alcotest.test_case "the syncs that commit count in the floor" `Quick
         test_syncs_count_in_the_floor;
