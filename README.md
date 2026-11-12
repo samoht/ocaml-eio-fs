@@ -31,6 +31,11 @@ assert (Eio.Path.load Eio.Path.(fs / "hello") = "world")
 `Eio_fs.Fs.load dir` returns a new in-memory filesystem holding a copy of the
 tree at `dir`. `Eio_fs.Path.pp_tree` prints a tree on any backend.
 
+The in-memory filesystem resolves a path one component at a time, as
+path_resolution(7) describes, while eio_posix rewrites `x/.` and `x/d/..`
+lexically before the kernel sees them, so the two may answer such a path
+differently.
+
 ## Chaos tests
 
 `Eio_fs.Chaos.check` runs a workload many times on fresh in-memory
@@ -120,7 +125,6 @@ The tests follow a few rules:
 - At most two faults reach a run, or one lasting condition. A program that
   tries three times gets past two faults, but no retry gets past a lasting
   condition, so the workload must accept that any operation fails.
-
 - A lasting condition, such as a read-only filesystem, reaches every
   operation from where it starts, the retries included. A program that
   retries at once with no time passing fails as a hang.
@@ -128,10 +132,9 @@ The tests follow a few rules:
   what the workload acknowledged, never state the workload left in memory.
 - A cut cancels the workload, as `Eio.Cancel` cancels a fiber, and every
   fiber it runs once they all wait: it must not catch
-  `Eio.Cancel.Cancelled`.
- Any other exception that escapes the workload
-  fails the check, an injected `Eio.Io` included, so the workload catches the
-  errors its program may raise and checks the results itself.
+  `Eio.Cancel.Cancelled`. Any other exception that escapes the workload fails
+  the check, an injected `Eio.Io` included, so the workload catches the errors
+  its program may raise and checks the results itself.
 - A check blocks the event loop it is called from until it ends. Each run has
   its own event loop, whose clock moves only when every fiber waits, so a
   timeout of an hour takes no time.

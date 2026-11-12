@@ -173,7 +173,6 @@ val root : user
     uid and gid, or to the group of a setgid directory it is made in. A new
     directory keeps only the permission and sticky bits of its mode, and is
     setgid iff its parent is. A file made in a setgid directory by a user
-
     outside that group loses setgid, as Linux strips it at create. Only a file's
     owner changes its mode, and a user outside the file's group cannot set its
     setgid bit. Only root gives a file away; its owner may move it to one of
