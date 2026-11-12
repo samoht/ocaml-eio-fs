@@ -715,6 +715,8 @@ module Link = struct
           | Error (`Invalid reason) -> err_read "%s: %s" t.path reason)
 end
 
+type block = [ `Yes | `No | `Fibers | `For of float ]
+type create = [ `Never | `If_missing of Eio.File.Unix_perm.t ]
 type refusal = { path : string; holder : int option; record : string }
 
 exception Lock_unavailable of refusal
@@ -1185,8 +1187,7 @@ let update_lock_contents file contents =
 (* An absent rendezvous is created exclusively, so the kernel refuses the name
    a link holds rather than following it; an existing one is opened without
    creating and its identity settled by [check_locked_file]. *)
-let open_lock_file ~sw ~name
-    ~(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ]) path =
+let open_lock_file ~sw ~name ~(create : create) path =
   match create with
   | `Never -> Eio.Path.open_out ~sw ~create:`Never path
   | `If_missing perm -> (
@@ -1401,10 +1402,8 @@ let take_lease_lock ~shared ~patience ~on_wait ~name file =
         "Eio_fs_unix.Lease: %s: the rendezvous carries no Unix file descriptor"
         name
 
-let rec acquire ~sw ?lease
-    ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes) ?patience
-    ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
-      `If_missing 0o600) ?contents ?(on_wait = ignore) path =
+let rec acquire ~sw ?lease ?(block : block = `Yes) ?patience
+    ?(create : create = `If_missing 0o600) ?contents ?(on_wait = ignore) path =
   let name = lock_name path in
   let steps = ref [] in
   let taken give_back = steps := give_back :: !steps in
@@ -1630,8 +1629,6 @@ module Lease = struct
     let_go : unit -> unit;
   }
 
-  type block = [ `Yes | `No | `Fibers | `For of float ]
-
   let fd t = t.fd
 
   let unlock t =
@@ -1759,16 +1756,16 @@ module Lease = struct
         Printexc.raise_with_backtrace e bt
 
   let take ~sw ?gate ?block ?create ?contents ?on_wait path =
-    match (gate, block) with
-    | Some gate, _ ->
-        gated ~sw ~gate
-          ~block:(Option.value block ~default:`Yes)
-          ?create ?contents ?on_wait path
-    | None, Some `Readers ->
-        invalid_arg "Eio_fs_unix.Lease: a take with block `Readers needs a gate"
-    | None, Some (#block as block) ->
-        taken ~sw ~lease:`Exclusive ~block ?create ?contents ?on_wait path
-    | None, None -> taken ~sw ~lease:`Exclusive ?create ?contents ?on_wait path
+    match gate with
+    | Some gate ->
+        let block =
+          (Option.value block ~default:`Yes :> [ block | `Readers ])
+        in
+        gated ~sw ~gate ~block ?create ?contents ?on_wait path
+    | None -> taken ~sw ~lease:`Exclusive ?block ?create ?contents ?on_wait path
+
+  let take_after_readers ~sw ~gate ?create ?contents ?on_wait path =
+    gated ~sw ~gate ~block:`Readers ?create ?contents ?on_wait path
 
   let with_exclusive ?gate ?block ?create ?contents ?on_wait path fn =
     Eio.Switch.run @@ fun sw ->

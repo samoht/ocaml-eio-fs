@@ -381,6 +381,21 @@ val await_record_lock :
 
 (** {1:lock_files Lock files} *)
 
+type block =
+  [ `Yes  (** Wait for the holder. *)
+  | `No  (** Refuse with {!Lock_unavailable}. *)
+  | `Fibers
+    (** Wait for a fiber of this process; refuse another process's hold. *)
+  | `For of float
+    (** Wait up to that many seconds of the monotonic clock, then refuse. *) ]
+(** The type for what a take does when another caller holds the lock. *)
+
+type create =
+  [ `Never  (** Refuse an absent file with {!Eio.Fs.Not_found}. *)
+  | `If_missing of Eio.File.Unix_perm.t
+    (** Create an absent file with that mode, less the umask. *) ]
+(** The type for what a take does when the lock file is absent. *)
+
 type refusal = {
   path : string;  (** The native path of the lock file. *)
   holder : int option;
@@ -397,8 +412,8 @@ type refusal = {
 (** The type for a refused lock: which file, and who holds it. *)
 
 exception Lock_unavailable of refusal
-(** Raised by {!with_lock} when the lock is held and [block] says not to wait
-    for the holder. It prints as {!pp_refusal} does. *)
+(** Raised by a take, such as {!with_lock}, that another holder refuses as its
+    {!type-block} policy says. It prints as {!pp_refusal} does. *)
 
 val pp_refusal : refusal Fmt.t
 (** [pp_refusal] formats a refusal as ["<path> is held by process <pid>"] for
@@ -412,8 +427,8 @@ type Eio.Exn.Backend.t +=
             regular file. *)
 
 val with_lock :
-  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
-  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+  ?block:block ->
+  ?create:create ->
   ?contents:string ->
   ?on_wait:(unit -> unit) ->
   _ Eio.Path.t ->
@@ -425,17 +440,13 @@ val with_lock :
     or raises.
 
     [create] (defaults to [`If_missing 0o600], owner-only) says what an absent
-    rendezvous does: [`If_missing perm] creates it with mode [perm] less the
-    umask, and [`Never] raises {!Eio.Fs.Not_found}. [contents], when present,
-    replaces the lock file's contents through the locked handle. [block]
-    (defaults to [`Yes]) says what a hold another caller already has does:
-    [`Yes] waits, [`No] raises {!Lock_unavailable}, [`Fibers] waits only for a
-    fiber of this process, and [`For seconds] waits up to a monotonic bound.
-    Locks are coordinated between fibers by device and inode, and between
-    processes by the POSIX record lock. It also excludes {!Lease} readers and
-    writers. On Linux, where BSD [flock] and POSIX record locks are independent,
-    it takes an exclusive [flock] too; on Darwin the record lock already
-    conflicts with leases.
+    rendezvous does. [contents], when present, replaces the lock file's contents
+    through the locked handle. [block] (defaults to [`Yes]) says what a hold
+    another caller already has does. Locks are coordinated between fibers by
+    device and inode, and between processes by the POSIX record lock. It also
+    excludes {!Lease} readers and writers. On Linux, where BSD [flock] and POSIX
+    record locks are independent, it takes an exclusive [flock] too; on Darwin
+    the record lock already conflicts with leases.
 
     With [`Yes] or [`For seconds], a POSIX record lock another process holds is
     waited for by the kernel's blocking request ([fcntl] [F_SETLKW]), which
@@ -492,8 +503,8 @@ module Held : sig
 
   val take :
     sw:Eio.Switch.t ->
-    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
-    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?block:block ->
+    ?create:create ->
     ?contents:string ->
     ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
@@ -547,8 +558,8 @@ module Lease : sig
   val take :
     sw:Eio.Switch.t ->
     ?gate:_ Eio.Path.t ->
-    ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
-    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?block:block ->
+    ?create:create ->
     ?contents:string ->
     ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
@@ -559,6 +570,30 @@ module Lease : sig
       same defaults, cancellation and refusals as {!with_exclusive}, and raises
       as it does. *)
 
+  val take_after_readers :
+    sw:Eio.Switch.t ->
+    gate:_ Eio.Path.t ->
+    ?create:create ->
+    ?contents:string ->
+    ?on_wait:(unit -> unit) ->
+    _ Eio.Path.t ->
+    t
+  (** [take_after_readers ~sw ~gate path] is [take ~sw ~gate path] that waits
+      for [path]'s shared holders alone: a lease only shared holders hold is
+      waited for as [`Yes] waits, and an exclusive holder, or another take
+      through [gate] under way, refuses it as [`No] does. A reader's look, a
+      shared lease taken and let go at once, delays the take and never refuses
+      it. [gate] is tried without waiting and held throughout the wait, so no
+      exclusive take comes in between this take's look at the holders and its
+      own; the wait is sound only if every exclusive take of [path] passes
+      [gate]. [create], [contents] and [on_wait] are {!with_exclusive}'s.
+
+      @raise Lock_unavailable
+        when an exclusive holder or another take through [gate] refuses it.
+      @raise Eio.Io as {!with_exclusive} raises it.
+      @raise Stdlib.Invalid_argument
+        when the filesystem provides no Unix descriptor. *)
+
   val release : t -> unit
   (** [release lease] closes this holder's descriptor and gives back its
       process-local admission, then lets its gate go. Repeated calls do nothing.
@@ -568,8 +603,8 @@ module Lease : sig
 
   val with_exclusive :
     ?gate:_ Eio.Path.t ->
-    ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
-    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?block:block ->
+    ?create:create ->
     ?contents:string ->
     ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
@@ -582,31 +617,23 @@ module Lease : sig
       inherited it.
 
       [create] (defaults to [`If_missing 0o600], owner-only) says what an absent
-      rendezvous does: [`If_missing perm] creates it with mode [perm] less the
-      umask, and [`Never] raises {!Eio.Fs.Not_found}. [contents], when present,
-      replaces the rendezvous contents while the lease is held. [block]
-      (defaults to [`Yes]) selects the wait policy used by {!with_lock}.
+      rendezvous does. [contents], when present, replaces the rendezvous
+      contents while the lease is held. [block] (defaults to [`Yes]) says what a
+      hold another caller already has does.
 
       [gate], when given, is a lease on a file of its own that every exclusive
       take of [path] passes: the take holds it exclusively before it takes
       [path], and for as long as this descriptor holds [path], until {!release},
       the callback's return or [sw]'s end, so no take of [path] is made between
-      another's look at its holders and its take. A held gate is waited for or
-      refused as [block] says of [path], and the refusal is that of [path]'s
-      holder when an exclusive one holds it, else that of the take under way,
-      whose [contents] (or nothing) the gate's file holds. The file is created
-      when absent, with [create]'s permissions or [0o600]; its directory must
-      exist. A take that finds [path] absent with [create] [`Never] removes the
-      gate it holds. A caller that removes [path] holding it removes [gate]
-      first, holding it too: a take that waited on a removed gate takes the file
-      its name holds then.
-
-      With [block] [`Readers], which needs a [gate], a lease only shared holders
-      hold is waited for as with [`Yes], and one an exclusive holder holds is
-      refused as with [`No]: a reader's look, a shared lease taken and let go at
-      once, delays the take and never refuses it. The gate is tried without
-      waiting, so another take under way refuses the take, and is held
-      throughout its wait, which is for the shared holders alone.
+      another's look at its holders and its take, as {!take_after_readers}
+      needs. A held gate is waited for or refused as [block] says of [path], and
+      the refusal is that of [path]'s holder when an exclusive one holds it,
+      else that of the take under way, whose [contents] (or nothing) the gate's
+      file holds. The file is created when absent, with [create]'s permissions
+      or [0o600]; its directory must exist. A take that finds [path] absent with
+      [create] [`Never] removes the gate it holds. A caller that removes [path]
+      holding it removes [gate] first, holding it too: a take that waited on a
+      removed gate takes the file its name holds then.
 
       With [block] [`Yes] or [`For seconds], a lease another process holds is
       waited for by the kernel's blocking [flock], which answers when that
@@ -639,12 +666,11 @@ module Lease : sig
         path or the gate is not its own regular file.
       @raise Eio.Io as [flock] fails otherwise.
       @raise Stdlib.Invalid_argument
-        when the filesystem provides no Unix descriptor, or [block] is
-        [`Readers] and no [gate] is given. *)
+        when the filesystem provides no Unix descriptor. *)
 
   val with_shared :
-    ?block:[ `Yes | `No | `Fibers | `For of float ] ->
-    ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+    ?block:block ->
+    ?create:create ->
     ?on_wait:(unit -> unit) ->
     _ Eio.Path.t ->
     (t -> 'a) ->
@@ -664,8 +690,8 @@ module Lease : sig
 end
 
 val lock_section :
-  ?block:[ `Yes | `No | `Fibers | `For of float ] ->
-  ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
+  ?block:block ->
+  ?create:create ->
   ?contents:string ->
   _ Eio.Path.t ->
   Eio_fs_sync.Lock.t

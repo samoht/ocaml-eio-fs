@@ -3224,10 +3224,17 @@ let test_switch_lease_cancel () =
   in
   a_wait_is_cancellable ~kind:"lease" take ~free:lease_free ()
 
+(* [Lease.take_after_readers], held for the call of [fn]. *)
+let after_readers ?on_wait ~gate lock fn =
+  Eio.Switch.run @@ fun sw ->
+  let lease = Eio_fs_unix.Lease.take_after_readers ~sw ~gate ?on_wait lock in
+  Fun.protect
+    ~finally:(fun () -> Eio_fs_unix.Lease.release lease)
+    (fun () -> fn lease)
+
 (* A reader's look at a lease, a shared lease taken and let go at once, is
-   waited for by an exclusive take with [`Readers], which takes the lease
-   once the look lets go; an exclusive holder refuses it, and a take with no
-   gate is refused before it takes anything. A take that read the look as a
+   waited for by a take after readers, which takes the lease once the look
+   lets go; an exclusive holder refuses it. A take that read the look as a
    holder, as [`No] does, refuses a lease nobody keeps. *)
 let test_lease_waits_out_readers () =
   with_real_dir @@ fun dir ->
@@ -3242,7 +3249,7 @@ let test_lease_waits_out_readers () =
           Eio.Promise.await waiting))
     (fun () ->
       Eio.Promise.await looking;
-      Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers
+      after_readers ~gate
         ~on_wait:(fun () -> Eio.Promise.resolve waited ())
         lock
         (fun _ -> entered := true));
@@ -3251,19 +3258,13 @@ let test_lease_waits_out_readers () =
     "it said it waits" true
     (Option.is_some (Eio.Promise.peek waiting));
   Eio_fs_unix.Lease.with_exclusive lock (fun _ ->
-      match
-        Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers lock (fun _ ->
-            ())
-      with
+      match after_readers ~gate lock ignore with
       | () -> Alcotest.fail "an exclusive holder did not refuse the take"
-      | exception Eio_fs_unix.Lock_unavailable _ -> ());
-  match Eio_fs_unix.Lease.with_exclusive ~block:`Readers lock (fun _ -> ()) with
-  | () -> Alcotest.fail "a take for readers with no gate was made"
-  | exception Invalid_argument _ -> ()
+      | exception Eio_fs_unix.Lock_unavailable _ -> ())
 
 (* A take that waits for readers waits for nothing else, whichever instant
-   another take comes in: a reader holds the lease shared, so a take with
-   [`Readers] is refused at once, finds only the reader, and says it waits
+   another take comes in: a reader holds the lease shared, so a take after
+   readers is refused at once, finds only the reader, and says it waits
    (on_wait); there the reader lets go and another process takes the lease
    exclusively through the same gate, before this take asks the kernel
    again, the interleaving forced by reading that process's answer with the
@@ -3335,8 +3336,7 @@ let test_lease_waits_for_readers_alone () =
   in
   let took =
     Eio.Fiber.fork_promise ~sw (fun () ->
-        Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers ~on_wait lock
-          ignore)
+        after_readers ~gate ~on_wait lock ignore)
   in
   let answer = Eio.Promise.await answer in
   Eio.Promise.resolve set_read ();
