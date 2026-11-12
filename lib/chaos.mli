@@ -70,10 +70,15 @@
 
     {2 Runs}
 
-    Each run's clocks start at [0.] and move only when every fiber waits, so a
-    sleep takes no time. A run in which every fiber waits and no timer is due
-    fails as a hang, and so does one still running after an hour of its clock.
-*)
+    Each run's clocks start at [0.] and move when every fiber waits, so a sleep
+    takes no time, or when the run polls, as real time passes while a program
+    does: after 1000 turns at one instant in which every runnable fiber had just
+    yielded, they move by 10 ms, or to the next timer if that comes first. Once
+    a fiber has yielded for 5 seconds of the clock with no wait in between, each
+    move is a tenth of how long it has, so a poll with a timeout ends, and one
+    with none reaches the hour below in bounded time. A run in which every fiber
+    waits and no timer is due fails as a hang, and so does one still running
+    after an hour of its clock. *)
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t
