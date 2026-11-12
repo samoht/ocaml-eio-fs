@@ -3049,12 +3049,12 @@ let test_switch_lease_cancel () =
 
 (* A reader's look at a lease, a shared lease taken and let go at once, is
    waited for by an exclusive take with [`Readers], which takes the lease
-   once the look lets go; an exclusive holder refuses it. A take that read
-   the look as a holder, as [`No] does, refuses a lease nobody keeps: the
-   failure mq's lease takers, build slots and run lock met under readers. *)
+   once the look lets go; an exclusive holder refuses it, and a take with no
+   gate is refused before it takes anything. A take that read the look as a
+   holder, as [`No] does, refuses a lease nobody keeps. *)
 let test_lease_waits_out_readers () =
   with_real_dir_env @@ fun _env dir ->
-  let lock = dir / "readers" in
+  let lock = dir / "readers" and gate = dir / "readers.gate" in
   let looking, looked = Eio.Promise.create () in
   let waiting, waited = Eio.Promise.create () in
   let entered = ref false in
@@ -3065,7 +3065,7 @@ let test_lease_waits_out_readers () =
           Eio.Promise.await waiting))
     (fun () ->
       Eio.Promise.await looking;
-      Eio_fs_unix.Lease.with_exclusive ~block:`Readers
+      Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers
         ~on_wait:(fun () -> Eio.Promise.resolve waited ())
         lock
         (fun _ -> entered := true));
@@ -3075,10 +3075,125 @@ let test_lease_waits_out_readers () =
     (Option.is_some (Eio.Promise.peek waiting));
   Eio_fs_unix.Lease.with_exclusive lock (fun _ ->
       match
-        Eio_fs_unix.Lease.with_exclusive ~block:`Readers lock (fun _ -> ())
+        Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers lock (fun _ ->
+            ())
       with
       | () -> Alcotest.fail "an exclusive holder did not refuse the take"
-      | exception Eio_fs_unix.Lock_unavailable _ -> ())
+      | exception Eio_fs_unix.Lock_unavailable _ -> ());
+  match Eio_fs_unix.Lease.with_exclusive ~block:`Readers lock (fun _ -> ()) with
+  | () -> Alcotest.fail "a take for readers with no gate was made"
+  | exception Invalid_argument _ -> ()
+
+(* A take that waits for readers waits for nothing else, whichever instant
+   another take comes in: a reader holds the lease shared, so a take with
+   [`Readers] is refused at once, finds only the reader, and says it waits
+   (on_wait); there the reader lets go and another process takes the lease
+   exclusively through the same gate, before this take asks the kernel
+   again, the interleaving forced by reading that process's answer with the
+   domain blocked, so no fiber runs in between. That process is refused, and
+   this take is granted as the reader let go, while it still runs. A take
+   that read the holders once, before its blocking take, let that process in
+   and waited behind it for its whole hold. *)
+let test_lease_waits_for_readers_alone () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "readers" and gate = dir / "readers.gate" in
+  Eio.Path.save ~create:(`Or_truncate 0o600) lock "";
+  let to_child, child_in = Unix.pipe ~cloexec:true () in
+  let child_out, from_child = Unix.pipe ~cloexec:true () in
+  let pid =
+    Unix.create_process Sys.executable_name
+      [|
+        Sys.executable_name;
+        "--take-gated-eio-fs-lease";
+        Eio.Path.native_exn gate;
+        Eio.Path.native_exn lock;
+      |]
+      to_child from_child Unix.stderr
+  in
+  Unix.close to_child;
+  Unix.close from_child;
+  let ended = ref false in
+  let ends () =
+    if not !ended then begin
+      ended := true;
+      Unix.close child_in;
+      let rec reap () =
+        match Unix.waitpid [] pid with
+        | _ -> ()
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+      in
+      reap ()
+    end
+  in
+  Fun.protect ~finally:(fun () ->
+      ends ();
+      Unix.close child_out)
+  @@ fun () ->
+  (* The child exits once it answers, and its SIGCHLD may interrupt the
+     read. *)
+  let rec no_eintr f =
+    try f () with Unix.Unix_error (Unix.EINTR, _, _) -> no_eintr f
+  in
+  let take () =
+    ignore
+      (no_eintr (fun () -> Unix.write_substring child_in "take\n" 0 5) : int);
+    let b = Bytes.create 16 in
+    let n = no_eintr (fun () -> Unix.read child_out b 0 16) in
+    String.trim (Bytes.sub_string b 0 n)
+  in
+  Eio.Switch.run @@ fun sw ->
+  let reader, set_reader = Eio.Promise.create () in
+  let read, set_read = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      Eio_fs_unix.Lease.with_shared ~block:`No ~create:`Never lock (fun lease ->
+          Eio.Promise.resolve set_reader lease;
+          Eio.Promise.await read));
+  let reader = Eio.Promise.await reader in
+  let answer, set_answer = Eio.Promise.create () in
+  let on_wait () =
+    if not (Eio.Promise.is_resolved answer) then begin
+      Eio_fs_unix.Lease.unlock reader;
+      Eio.Promise.resolve set_answer (take ())
+    end
+  in
+  let took =
+    Eio.Fiber.fork_promise ~sw (fun () ->
+        Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers ~on_wait lock
+          ignore)
+  in
+  let answer = Eio.Promise.await answer in
+  Eio.Promise.resolve set_read ();
+  Alcotest.(check string) "the other process is refused" "refused" answer;
+  match Eio.Promise.await took with
+  | Ok () -> ends ()
+  | Error e -> Alcotest.failf "the take was not granted: %a" Fmt.exn e
+
+(* A remover of a lease removes its gate holding it, and a take that waited
+   on that gate takes the file its name holds next, which the name then
+   shows held: a take that kept the removed file excludes no other. *)
+let test_lease_gate_removed_under_a_waiter () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "removed" and gate = dir / "removed.gate" in
+  let at_gate = ref `Not_taken in
+  ( Eio.Switch.run @@ fun sw ->
+    Eio_fs_unix.Lease.with_exclusive ~gate lock @@ fun _ ->
+    Eio.Fiber.fork ~sw (fun () ->
+        Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Yes lock (fun _ ->
+            at_gate :=
+              if not (Eio.Path.is_file gate) then `Gone
+              else
+                match
+                  Eio_fs_unix.Lease.with_exclusive ~block:`No gate ignore
+                with
+                | () -> `Free
+                | exception Eio_fs_unix.Lock_unavailable _ -> `Held));
+    Eio.Path.unlink gate;
+    Eio.Path.unlink lock );
+  match !at_gate with
+  | `Held -> ()
+  | `Free -> Alcotest.fail "the waiter holds no lock on the gate at its name"
+  | `Gone -> Alcotest.fail "the waiter holds a gate no name holds"
+  | `Not_taken -> Alcotest.fail "the waiter never took the lease"
 
 let lease_test_case =
   Alcotest.test_case "a lease follows its inherited descriptor" `Quick
@@ -3092,8 +3207,23 @@ let lease_readers_test_case =
   Alcotest.test_case "a lease taker waits out a reader's look" `Quick
     test_lease_waits_out_readers
 
+let lease_readers_alone_test_case =
+  Alcotest.test_case "a lease taker waits for readers alone" `Quick
+    test_lease_waits_for_readers_alone
+
+let lease_gate_removed_test_case =
+  Alcotest.test_case "a removed gate is taken again by its waiter" `Quick
+    test_lease_gate_removed_under_a_waiter
+
 let lease_suite =
-  ("lease", [ lease_test_case; lease_unlock_test_case; lease_readers_test_case ])
+  ( "lease",
+    [
+      lease_test_case;
+      lease_unlock_test_case;
+      lease_readers_test_case;
+      lease_readers_alone_test_case;
+      lease_gate_removed_test_case;
+    ] )
 
 let suite =
   ( "eio_fs_unix",
@@ -3180,6 +3310,8 @@ let suite =
       lease_test_case;
       lease_unlock_test_case;
       lease_readers_test_case;
+      lease_readers_alone_test_case;
+      lease_gate_removed_test_case;
       Alcotest.test_case "a record lock wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"record" take_record);
       Alcotest.test_case "a record lock wait answers at a cancel" `Quick

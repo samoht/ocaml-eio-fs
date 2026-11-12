@@ -436,11 +436,12 @@ module Lease : sig
       open file description, so every descriptor sharing that description, one a
       supervisor inherited included, holds nothing from then on. The descriptors
       stay open. An exclusive callback still returns to let go of its
-      process-local admission; a shared acquisition gives that admission back
-      immediately. *)
+      process-local admission and its gate; a shared acquisition gives that
+      admission back immediately. *)
 
   val take :
     sw:Eio.Switch.t ->
+    ?gate:_ Eio.Path.t ->
     ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
@@ -448,18 +449,20 @@ module Lease : sig
     _ Eio.Path.t ->
     t
   (** [take ~sw path] acquires the exclusive lease described by
-      {!with_exclusive}. Its descriptor and process-local admission remain held
-      until {!release} or [sw]'s release hooks run. Acquisition has the same
-      defaults, cancellation and refusals as {!with_exclusive}, and raises as it
-      does. *)
+      {!with_exclusive}. Its descriptor, process-local admission and gate remain
+      held until {!release} or [sw]'s release hooks run. Acquisition has the
+      same defaults, cancellation and refusals as {!with_exclusive}, and raises
+      as it does. *)
 
   val release : t -> unit
   (** [release lease] closes this holder's descriptor and gives back its
-      process-local admission. Repeated calls do nothing. An inherited copy of
-      the descriptor keeps its kernel lease until its last copy closes; use
-      {!unlock} to release the shared open file description immediately. *)
+      process-local admission, then lets its gate go. Repeated calls do nothing.
+      An inherited copy of the descriptor keeps its kernel lease until its last
+      copy closes; use {!unlock} to release the shared open file description
+      immediately. *)
 
   val with_exclusive :
+    ?gate:_ Eio.Path.t ->
     ?block:[ `Yes | `No | `Fibers | `For of float | `Readers ] ->
     ?create:[ `Never | `If_missing of Eio.File.Unix_perm.t ] ->
     ?contents:string ->
@@ -479,12 +482,26 @@ module Lease : sig
       replaces the rendezvous contents while the lease is held. [block]
       (defaults to [`Yes]) selects the wait policy used by {!with_lock}.
 
-      With [block] [`Readers], a lease only shared holders hold is waited for as
-      with [`Yes], and one an exclusive holder holds is refused as with [`No]: a
-      reader's look, a shared lease taken and let go at once, delays the take
-      and never refuses it. The holders are read by a shared lease tried without
-      waiting once the take is refused, so an exclusive holder that takes the
-      lease in that instant is waited for in turn.
+      [gate], when given, is a lease on a file of its own that every exclusive
+      take of [path] passes: the take holds it exclusively before it takes
+      [path], and for as long as this descriptor holds [path], until {!release},
+      the callback's return or [sw]'s end, so no take of [path] is made between
+      another's look at its holders and its take. A held gate is waited for or
+      refused as [block] says of [path], and the refusal is that of [path]'s
+      holder when an exclusive one holds it, else that of the take under way,
+      whose [contents] (or nothing) the gate's file holds. The file is created
+      when absent, with [create]'s permissions or [0o600]; its directory must
+      exist. A take that finds [path] absent with [create] [`Never] removes the
+      gate it holds. A caller that removes [path] holding it removes [gate]
+      first, holding it too: a take that waited on a removed gate takes the file
+      its name holds then.
+
+      With [block] [`Readers], which needs a [gate], a lease only shared holders
+      hold is waited for as with [`Yes], and one an exclusive holder holds is
+      refused as with [`No]: a reader's look, a shared lease taken and let go at
+      once, delays the take and never refuses it. The gate is tried without
+      waiting, so another take under way refuses the take, and is held
+      throughout its wait, which is for the shared holders alone.
 
       With [block] [`Yes] or [`For seconds], a lease another process holds is
       waited for by the kernel's blocking [flock], which answers when that
@@ -514,10 +531,11 @@ module Lease : sig
         [`Never].
       @raise Eio.Io
         with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when the
-        path is not its own regular file.
+        path or the gate is not its own regular file.
       @raise Eio.Io as [flock] fails otherwise.
       @raise Stdlib.Invalid_argument
-        when the filesystem provides no Unix descriptor. *)
+        when the filesystem provides no Unix descriptor, or [block] is
+        [`Readers] and no [gate] is given. *)
 
   val with_shared :
     ?block:[ `Yes | `No | `Fibers | `For of float ] ->
@@ -530,7 +548,7 @@ module Lease : sig
       file description. Readers may overlap, including fibers of this process.
       An exclusive lease or {!with_lock} excludes these readers. The creation,
       wait, cancellation and path checks are those of {!with_exclusive}; readers
-      do not replace the rendezvous contents.
+      take no gate and do not replace the rendezvous contents.
 
       Returning closes the callback's descriptor without unlocking. An inherited
       descriptor keeps the hold until its last copy closes. {!unlock} releases

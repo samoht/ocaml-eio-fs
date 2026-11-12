@@ -73,6 +73,27 @@ let exit_holding path =
     Eio.Path.(Eio.Stdenv.fs env / path)
     (fun _ -> Unix._exit 0)
 
+let gated_taker_arg = "--take-gated-eio-fs-lease"
+
+(* Another process's take of the lease over [path] through [gate], without
+   waiting: on a line on standard input it answers [taken] or [refused] on
+   standard output, then holds what it took until its standard input ends. *)
+let gated_taker gate path =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  ignore (In_channel.input_line stdin : string option);
+  match
+    Eio_fs_unix.Lease.with_exclusive
+      ~gate:Eio.Path.(fs / gate)
+      ~block:`No
+      Eio.Path.(fs / path)
+      (fun _ ->
+        print_endline "taken";
+        ignore (In_channel.input_all stdin : string))
+  with
+  | () -> ()
+  | exception Eio_fs_unix.Lock_unavailable _ -> print_endline "refused"
+
 let lease_test_arg = "--test-inherited-lease"
 let try_lock_arg = "--try-eio-fs-lock"
 
@@ -106,6 +127,8 @@ let () =
   | [ _; arg ] when String.equal arg hold_lease_arg -> hold_lease ()
   | [ _; arg; path ] when String.equal arg try_lock_arg -> try_lock path
   | [ _; arg; path ] when String.equal arg exit_holding_arg -> exit_holding path
+  | [ _; arg; gate; path ] when String.equal arg gated_taker_arg ->
+      gated_taker gate path
   | [ _; arg ] when String.equal arg lease_test_arg ->
       Sys.argv.(1) <- "test";
       Alcotest.run "eio-fs.unix.lease" [ Test_eio_fs_unix.lease_suite ]
