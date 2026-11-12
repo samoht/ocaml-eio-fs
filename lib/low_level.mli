@@ -124,6 +124,11 @@ val held : Dir.fd -> string -> (int * int) list option
     [path], in order, following links: the rest of it is a hole. It is [None] if
     [path] is not a regular file. *)
 
+val set_times :
+  Dir.fd -> string -> atime:float -> mtime:float -> ctime:float -> unit
+(** [set_times dir path ~atime ~mtime ~ctime] sets the times of [path], not
+    followed. *)
+
 val read_dir : Dir.fd -> string -> string list
 (** [read_dir dir path] is the names in the directory [path], without [.] and
     [..]. *)

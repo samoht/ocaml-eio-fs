@@ -1050,6 +1050,7 @@ module Crash = struct
     mutable freed : (int * Cstruct.t) list;
         (* The pages durable shrinks freed, by index, newest first, as the
            disk held them. *)
+    mutable synced : Eio.File.Stat.t option; (* its stat at its last sync *)
   }
 
   and entry = {
@@ -1087,6 +1088,7 @@ module Crash = struct
                l
          | None -> if n > 0 then [ (0, n) ] else []);
       freed = [];
+      synced = None;
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -1147,6 +1149,12 @@ module Crash = struct
   }
   (* An un-synced change, as seen by a scripted survival predicate. *)
 
+  (* An inode's times, as its version a journal commits holds them. *)
+  type times = { atime : float; mtime : float; ctime : float }
+
+  let times_of (st : Eio.File.Stat.t) =
+    { atime = st.atime; mtime = st.mtime; ctime = st.ctime }
+
   (* A directory tree as an image holds it: the durable image, and the
      subtrees a directory operation touched. *)
   type tree =
@@ -1156,17 +1164,30 @@ module Crash = struct
         uid : int64;
         gid : int64;
         ino : int64;
+        times : times;
       }
     | Dir of {
         perm : int;
         uid : int64;
         gid : int64;
         ino : int64;
+        times : times;
         entries : tree Paths.t;
       }
-    | Link of { target : string; uid : int64; gid : int64; ino : int64 }
+    | Link of {
+        target : string;
+        uid : int64;
+        gid : int64;
+        ino : int64;
+        times : times;
+      }
 
   let ino_of = function File f -> f.ino | Dir d -> d.ino | Link l -> l.ino
+
+  let times_of_node = function
+    | File f -> f.times
+    | Dir d -> d.times
+    | Link l -> l.times
 
   module Inos = Map.Make (Int64)
 
@@ -1218,7 +1239,14 @@ module Crash = struct
     | Place of { parent : int64; node : tree }
     | Move of { parent : int64; ino : int64 }
     | Remove of int64
-    | Attrs of { ino : int64; perm : int; uid : int64; gid : int64 }
+    | Attrs of {
+        ino : int64;
+        perm : int;
+        uid : int64;
+        gid : int64;
+        times : times;
+      }
+    | Times of { ino : int64; times : times }
 
   type delta = (string list * edit) list
 
@@ -1331,6 +1359,8 @@ module Crash = struct
     mutable held : string -> (int * int) list option;
         (* The byte ranges writes covered in a file of an in-memory base, by
            path: the rest of it is a hole the disk does not hold. *)
+    mutable set_times : string -> times -> unit;
+        (* Sets the times of an entry of an in-memory base, by path. *)
     mutable seq : int;
     mutable effects : int;
         (* The commits, barriers and failures of syncs, and the files and
@@ -1449,15 +1479,15 @@ module Crash = struct
      and its own read is not in the snapshot, as it is not on the disk. *)
   let rec snapshot_at (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:false path with
-    | { kind = `Regular_file; perm; uid; gid; ino; _ } ->
+    | { kind = `Regular_file; perm; uid; gid; ino; _ } as st ->
         let data =
           with_readable owner path (fun () ->
               Switch.run (fun sw ->
                   read_all (B.open_in bv ~sw ~follow:true path)))
           |> copy_cs
         in
-        File { data; perm; uid; gid; ino }
-    | { kind = `Directory; perm; uid; gid; ino; _ } ->
+        File { data; perm; uid; gid; ino; times = times_of st }
+    | { kind = `Directory; perm; uid; gid; ino; _ } as st ->
         let entries =
           B.read_dir bv path
           |> List.fold_left
@@ -1468,9 +1498,10 @@ module Crash = struct
                  | exception e when is_gone e -> m)
                Paths.empty
         in
-        Dir { perm; uid; gid; ino; entries }
-    | { kind = `Symbolic_link; uid; gid; ino; _ } ->
-        Link { target = B.read_link bv path; uid; gid; ino }
+        Dir { perm; uid; gid; ino; times = times_of st; entries }
+    | { kind = `Symbolic_link; uid; gid; ino; _ } as st ->
+        Link
+          { target = B.read_link bv path; uid; gid; ino; times = times_of st }
     | _ -> invalid_arg "Chaos.Crash: unsupported filesystem entry"
 
   (* The entry at [path] given back to its owner, unless it has them: a host
@@ -1499,14 +1530,18 @@ module Crash = struct
      the image names (its kind and inode, and a file no other name links) is
      kept, its inode and times with it, as a power cut spares them on a disk,
      and only what differs is rewritten. Any other entry is replaced. *)
-  let rec restore_at (Base_dir ((module B), bv) as owner) path tree =
+  let rec restore_at ~stamp owner path tree =
+    restore_node ~stamp owner path tree;
+    stamp path (times_of_node tree)
+
+  and restore_node ~stamp (Base_dir ((module B), bv) as owner) path tree =
     let now =
       match B.stat bv ~follow:false path with
       | st -> Some st
       | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
     in
     match (tree, now) with
-    | File { data; perm; uid; gid; ino }, Some st
+    | File { data; perm; uid; gid; ino; _ }, Some st
       when st.kind = `Regular_file && Int64.equal st.ino ino
            && Int64.equal st.nlink 1L ->
         if not (Cstruct.equal (current_data owner path) data) then begin
@@ -1531,7 +1566,7 @@ module Crash = struct
         B.symlink ~link_to:target bv path;
         restore_owner owner path ~uid ~gid
     | Dir d, Some st when st.kind = `Directory && Int64.equal st.ino d.ino ->
-        refill owner path st d.entries;
+        refill ~stamp owner path st d.entries;
         restore_owner owner path ~uid:d.uid ~gid:d.gid;
         restore_perm owner path d.perm
     | Dir { perm; uid; gid; entries; _ }, _ ->
@@ -1541,15 +1576,15 @@ module Crash = struct
         B.mkdir bv ~perm:(perm lor 0o700) path;
         Paths.iter
           (fun name child ->
-            restore_at owner (Eio_fs_path.append path name) child)
+            restore_at ~stamp owner (Eio_fs_path.append path name) child)
           entries;
         restore_owner owner path ~uid ~gid;
         B.chmod bv ~follow:false ~perm path
 
   (* The directory [path], whose stat is [st], made to hold [entries]: what it
      holds that they do not name goes, each of them is restored in place. *)
-  and refill (Base_dir ((module B), bv) as owner) path (st : Eio.File.Stat.t)
-      entries =
+  and refill ~stamp (Base_dir ((module B), bv) as owner) path
+      (st : Eio.File.Stat.t) entries =
     if st.perm land 0o700 <> 0o700 then
       B.chmod bv ~follow:false ~perm:(st.perm lor 0o700) path;
     B.read_dir bv path
@@ -1557,18 +1592,20 @@ module Crash = struct
         if not (Paths.mem name entries) then
           remove_at owner (Eio_fs_path.append path name));
     Paths.iter
-      (fun name child -> restore_at owner (Eio_fs_path.append path name) child)
+      (fun name child ->
+        restore_at ~stamp owner (Eio_fs_path.append path name) child)
       entries
 
-  let restore_root (Base_dir ((module B), bv) as owner) path = function
-    | Dir { perm; uid; gid; entries; _ } ->
+  let restore_root ~stamp (Base_dir ((module B), bv) as owner) path = function
+    | Dir { perm; uid; gid; entries; times; _ } ->
         let st = B.stat bv ~follow:true path in
-        refill owner path st entries;
+        refill ~stamp owner path st entries;
         if String.equal path "" then restore_perm owner path st.perm
         else begin
           restore_owner owner path ~uid ~gid;
           B.chmod bv ~follow:true ~perm path
-        end
+        end;
+        stamp path times
     | File _ | Link _ ->
         invalid_arg "Chaos.Crash: wrapped root is not a directory"
 
@@ -1732,10 +1769,15 @@ module Crash = struct
     in
     set_node st segs None
 
-  let with_attrs ~perm ~uid ~gid = function
-    | File f -> File { f with perm; uid; gid }
-    | Dir d -> Dir { d with perm; uid; gid }
-    | Link l -> Link { l with uid; gid }
+  let with_attrs ~perm ~uid ~gid ~times = function
+    | File f -> File { f with perm; uid; gid; times }
+    | Dir d -> Dir { d with perm; uid; gid; times }
+    | Link l -> Link { l with uid; gid; times }
+
+  let with_times times = function
+    | File f -> File { f with times }
+    | Dir d -> Dir { d with times }
+    | Link l -> Link { l with times }
 
   let rec drop prefix segs =
     match (prefix, segs) with
@@ -1779,7 +1821,7 @@ module Crash = struct
                 | Some (Dir d) -> Paths.is_empty d.entries
                 | Some (File _ | Link _) | None -> true)
             | None -> true)
-        | Attrs _ -> true)
+        | Attrs _ | Times _ -> true)
       e.delta
 
   (* A node a rename took where the image has no directory for it stays in
@@ -1834,6 +1876,19 @@ module Crash = struct
      as one made in a directory the image lacks, is put where it moved as
      [made] gives it, and a node moved into a directory the image does not
      hold, or below itself, goes to limbo. *)
+  (* [st] with [f] applied to the node [ino], wherever it is. *)
+  let on_node st ino f =
+    match Inos.find_opt ino st.inos with
+    | None -> st
+    | Some at -> (
+        match tree_find st.tree at with
+        | None -> st
+        | Some node -> (
+            let node = f node in
+            match at with
+            | [] -> { st with tree = node }
+            | _ -> { st with tree = tree_replace st.tree at (Some node) }))
+
   let replay ~root ~made st e =
     if not (applies st e) then st
     else
@@ -1844,19 +1899,9 @@ module Crash = struct
               match Inos.find_opt ino st.inos with
               | Some (_ :: _ as at) -> remove_path st at
               | Some [] | None -> st)
-          | Attrs { ino; perm; uid; gid } -> (
-              match Inos.find_opt ino st.inos with
-              | None -> st
-              | Some at -> (
-                  match tree_find st.tree at with
-                  | None -> st
-                  | Some node -> (
-                      let node = with_attrs ~perm ~uid ~gid node in
-                      match at with
-                      | [] -> { st with tree = node }
-                      | _ ->
-                          { st with tree = tree_replace st.tree at (Some node) }
-                      )))
+          | Attrs { ino; perm; uid; gid; times } ->
+              on_node st ino (with_attrs ~perm ~uid ~gid ~times)
+          | Times { ino; times } -> on_node st ino (with_times times)
           | Move { parent; ino } -> (
               let at =
                 match target_dir st segs parent with
@@ -1902,7 +1947,7 @@ module Crash = struct
           (fun (segs, edit) ->
             match edit with
             | Place _ -> is_prefix segs s
-            | Move _ | Remove _ | Attrs _ -> false)
+            | Move _ | Remove _ | Attrs _ | Times _ -> false)
           delta
 
   (* [locs] in an image keyed below [root]. *)
@@ -1950,7 +1995,7 @@ module Crash = struct
       (fun (_, edit) ->
         match edit with
         | Move { ino; _ } -> Some ino
-        | Place _ | Remove _ | Attrs _ -> None)
+        | Place _ | Remove _ | Attrs _ | Times _ -> None)
       e.delta
 
   let index_entry ctl e =
@@ -1997,7 +2042,7 @@ module Crash = struct
             (fun (_, edit) ->
               match edit with
               | Remove ino -> earlier ctl.by_parent ino
-              | Place _ | Move _ | Attrs _ -> [])
+              | Place _ | Move _ | Attrs _ | Times _ -> [])
             e.delta
 
   (* [e] and, transitively, the pending entries it depends on. *)
@@ -2048,7 +2093,13 @@ module Crash = struct
           | Some segs ->
               let edit =
                 Attrs
-                  { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
+                  {
+                    ino = st.ino;
+                    perm = st.perm;
+                    uid = st.uid;
+                    gid = st.gid;
+                    times = times_of st;
+                  }
               in
               ([ (segs, edit) ], [ st.ino ], Some st.ino)
           | None -> ([], [], None))
@@ -2104,7 +2155,7 @@ module Crash = struct
         (fun (_, edit) ->
           match edit with
           | Place { node; _ } -> Some (ino_of node)
-          | Move _ | Remove _ | Attrs _ -> None)
+          | Move _ | Remove _ | Attrs _ | Times _ -> None)
         delta
     in
     let parents =
@@ -2112,6 +2163,26 @@ module Crash = struct
       | Chmod _ | Chown _ -> []
       | _ -> List.sort_uniq Int64.compare dirs
     in
+    (* The times the change gave the directories it changed, and the node a
+       rename moved: they land with it, as ext4 journals them together. *)
+    let stamps =
+      match (kind, delta) with
+      | (Chmod _ | Chown _), _ | _, [] -> []
+      | _ ->
+          let (Base_dir ((module B), bv)) = owner in
+          let moved =
+            match (kind, resolved) with
+            | Rename _, [ _; dst ] -> [ dst ]
+            | _ -> []
+          in
+          List.filter_map
+            (fun p ->
+              match B.stat bv ~follow:false p with
+              | st -> Some ([], Times { ino = st.ino; times = times_of st })
+              | exception Eio.Io _ -> None)
+            (List.map parent_path resolved @ moved)
+    in
+    let delta = delta @ stamps in
     index_entry ctl
       {
         meta;
@@ -2243,7 +2314,7 @@ module Crash = struct
                       if touched pre then st
                       else
                         match B.stat bv ~follow:false (at pre) with
-                        | { kind = `Directory; perm; uid; gid; ino; _ } ->
+                        | { kind = `Directory; perm; uid; gid; ino; _ } as s ->
                             set_node st pre
                               (Some
                                  (Dir
@@ -2252,6 +2323,7 @@ module Crash = struct
                                       uid;
                                       gid;
                                       ino;
+                                      times = times_of s;
                                       entries = Paths.empty;
                                     }))
                         | _ | (exception Eio.Io _) -> st)
@@ -2299,19 +2371,29 @@ module Crash = struct
           | Some (Dir m) -> names m.entries
           | Some (File _ | Link _) | None -> []
         in
-        let entries =
+        let all =
           List.sort_uniq String.compare (names d.entries @ model_names)
-          |> List.fold_left
-               (fun acc name ->
-                 match
-                   kept_entry ~touched ~model (segs @ [ name ])
-                     (Paths.find_opt name d.entries)
-                 with
-                 | Some tree -> Paths.add name tree acc
-                 | None -> acc)
-               Paths.empty
         in
-        Dir { d with entries }
+        let entries =
+          List.fold_left
+            (fun acc name ->
+              match
+                kept_entry ~touched ~model (segs @ [ name ])
+                  (Paths.find_opt name d.entries)
+              with
+              | Some tree -> Paths.add name tree acc
+              | None -> acc)
+            Paths.empty all
+        in
+        (* A directory the model changed has the times the model holds. *)
+        let times =
+          match tree_find model segs with
+          | Some (Dir m)
+            when List.exists (fun name -> touched (segs @ [ name ])) all ->
+              m.times
+          | Some _ | None -> d.times
+        in
+        Dir { d with entries; times }
 
   (* How the entry that made [ino] put it: where, as what, and the files it
      recorded below it. *)
@@ -2324,7 +2406,7 @@ module Crash = struct
             match edit with
             | Place { node; _ } when Int64.equal (ino_of node) ino ->
                 Some (segs, node, e.recorded)
-            | Place _ | Move _ | Remove _ | Attrs _ -> None)
+            | Place _ | Move _ | Remove _ | Attrs _ | Times _ -> None)
           e.delta
 
   let replay_in ctl st e =
@@ -2479,8 +2561,14 @@ module Crash = struct
         delta =
           [
             ( segs,
-              Attrs { ino = st.ino; perm = st.perm; uid = st.uid; gid = st.gid }
-            );
+              Attrs
+                {
+                  ino = st.ino;
+                  perm = st.perm;
+                  uid = st.uid;
+                  gid = st.gid;
+                  times = times_of st;
+                } );
           ];
         recorded = [];
         attrs_ino = Some st.ino;
@@ -2537,7 +2625,7 @@ module Crash = struct
                   match tree_find node (drop s segs) with
                   | Some (File f) -> Int64.equal f.ino ino
                   | Some (Dir _ | Link _) | None -> false)
-              | Place _ | Move _ | Remove _ | Attrs _ -> false)
+              | Place _ | Move _ | Remove _ | Attrs _ | Times _ -> false)
             e.delta
         in
         Ids.iter
@@ -3319,7 +3407,7 @@ module Crash = struct
             | File _ | Link _ ->
                 invalid_arg "Chaos.Crash: wrapped root is not a directory")
       in
-      restore_root owner root_path tree;
+      restore_root ~stamp:ctl.set_times owner root_path tree;
       (* Each tracked file is rewritten where the image holds it, which a
          rename may have made another name than the one it was met at. *)
       let rel_of key =
@@ -3340,7 +3428,19 @@ module Crash = struct
                 | { kind = `Regular_file; _ } ->
                     fs.owner <- proot;
                     fs.rel <- rel;
-                    rewrite ctl fs content
+                    rewrite ctl fs content;
+                    (* The later of the versions the image and its last sync
+                       hold. *)
+                    let times =
+                      List.filter_map Fun.id
+                        [
+                          Option.map times_of_node
+                            (tree_find tree (path_segments key));
+                          Option.map times_of fs.synced;
+                        ]
+                      |> List.sort (fun a b -> Float.compare b.ctime a.ctime)
+                    in
+                    Option.iter (ctl.set_times rel) (List.nth_opt times 0)
                 | _ | (exception Eio.Io _) -> ())
               ls)
         locs.at;
@@ -3570,6 +3670,7 @@ module Crash = struct
           held;
         lose ctl fs;
         let st = stat () in
+        fs.synced <- Some st;
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
@@ -4191,6 +4292,7 @@ module Crash = struct
       durable = None;
       by_rel = Paths.empty;
       held = (fun _ -> None);
+      set_times = (fun _ _ -> ());
       root_box = None;
       admin = None;
       subtrees = [];
@@ -4219,6 +4321,9 @@ module Crash = struct
     ctl.root_box <- Some proot;
     ctl.admin <- Some admin;
     ctl.held <- (fun rel -> Memfs.held (base, rel));
+    ctl.set_times <-
+      (fun rel t ->
+        Memfs.set_times (base, rel) ~atime:t.atime ~mtime:t.mtime ~ctime:t.ctime);
     snap ctl (state_of (snapshot_at admin path) no_locs);
     (wrap_cdir ctl ~ino:None ~root:proot ~prefix:"" ~base, path)
 

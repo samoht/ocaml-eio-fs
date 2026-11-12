@@ -901,6 +901,12 @@ let held dir_fd path =
   | Resource.File f -> Some f.held
   | Dir _ | Symlink _ -> None
 
+(* What a disk kept of an inode's times, as a power cut leaves them. *)
+let set_times dir_fd path ~atime ~mtime ~ctime =
+  locked (Dir.fs dir_fd) @@ fun () ->
+  Resource.update (Filesystem.lookup ~follow:false dir_fd path) (fun s ->
+      { s with atime; mtime; ctime })
+
 (* chmod(2): only the owner or root: EPERM. *)
 let chmod ~follow dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->

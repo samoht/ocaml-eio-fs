@@ -319,9 +319,14 @@ module Crash : sig
   val cut : t -> Eio.Fs.dir_ty Eio.Path.t
   (** [cut t] cuts the power, if [t] has not cut it yet, and is the base
       directory, which now holds what the disk kept. An entry the cut spared
-      keeps its inode and times, as on a disk. Every operation through the
-      wrapper fails after the cut. Called from a {!Chaos.wrap} hook over the
-      wrapper, it cuts the power before that operation, in the middle of a run:
+      keeps its inode, as on a disk. On an in-memory base, each entry has the
+      times of its version the disk kept, as ext4 journals them with the inode:
+      a directory's from the last change to it the cut kept, a file's from that
+      or its last sync, whichever came later. An unsynced write that survives
+      does not move them. On a disk, an entry the cut spared keeps its times.
+      Every operation through the wrapper fails after the cut. Called from a
+      {!Chaos.wrap} hook over the wrapper, it cuts the power before that
+      operation, in the middle of a run:
       {[
         let t = Crash.v Drop_unsynced in
         let hook (op : Op.t) =

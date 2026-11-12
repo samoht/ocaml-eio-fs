@@ -32,6 +32,12 @@ val held : _ Eio.Path.t -> (int * int) list option
     an in-memory filesystem, in order: the rest of it is a hole. It is [None] if
     [path] is not one. *)
 
+val set_times :
+  _ Eio.Path.t -> atime:float -> mtime:float -> ctime:float -> unit
+(** [set_times path ~atime ~mtime ~ctime] sets the times of [path], not
+    followed, as root, if it is in an in-memory filesystem, and does nothing
+    otherwise. *)
+
 val load :
   ?clock:_ Eio.Time.clock ->
   ?filter:('a Eio.Path.t -> bool) ->

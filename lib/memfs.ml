@@ -233,6 +233,14 @@ let held ((d, path) : _ Eio.Path.t) =
   | None -> None
   | Some fd -> ( try Low_level.held fd path with Eio.Io _ -> None)
 
+let set_times ((d, path) : _ Eio.Path.t) ~atime ~mtime ~ctime =
+  match as_memfs_dir d with
+  | None -> ()
+  | Some fd ->
+      Low_level.set_times
+        { fd with user = Low_level.User.root }
+        path ~atime ~mtime ~ctime
+
 (* The root is followed and must be a directory; the filter is asked about
    it before anything is made, and every entry below it is copied as it is,
    a link kept a link. *)
