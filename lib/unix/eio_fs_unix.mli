@@ -167,6 +167,33 @@ val pwrite :
       end of [buf].
     @raise Unix.Unix_error as [pwrite]. *)
 
+(** The positioned calls of a file that answers them itself. *)
+module type POSITIONED = sig
+  type t
+
+  val pread : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  (** [pread] is {!val-pread} on the file. *)
+
+  val pread_cached : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  (** [pread_cached] is {!val-pread_cached} on the file. *)
+
+  val pwrite : t -> file_offset:int -> string -> pos:int -> len:int -> int
+  (** [pwrite] is {!val-pwrite} on the file. *)
+end
+
+type (_, _, _) Eio.Resource.pi +=
+  | Positioned :
+      ( 't,
+        (module POSITIONED with type t = 't),
+        [> `Positioned ] )
+      Eio.Resource.pi
+        (** The operations a file registers in its resource handler when it
+            answers positioned calls itself. A program that reads and writes a
+            file through its descriptor, past [Eio.File], asks this first: a
+            wrapper that carries the descriptor it stands in front of (to count,
+            observe or alter its calls) registers it, and every call then goes
+            through the wrapper. *)
+
 val import_file :
   sw:Eio.Switch.t ->
   close_unix:bool ->

@@ -72,6 +72,21 @@ let pwrite fd ~file_offset buf ~pos ~len =
     invalid_arg "Eio_fs_unix.pwrite";
   pwrite_native fd file_offset buf pos len
 
+module type POSITIONED = sig
+  type t
+
+  val pread : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  val pread_cached : t -> file_offset:int -> bytes -> pos:int -> len:int -> int
+  val pwrite : t -> file_offset:int -> string -> pos:int -> len:int -> int
+end
+
+type (_, _, _) Eio.Resource.pi +=
+  | Positioned :
+      ( 't,
+        (module POSITIONED with type t = 't),
+        [> `Positioned ] )
+      Eio.Resource.pi
+
 type record_lock_wait
 
 external record_lock_wait_start :
