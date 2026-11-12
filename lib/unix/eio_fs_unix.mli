@@ -4,11 +4,13 @@
     machinery of {!Eio_fs_sync}. It holds the {{!barriers}barriers} at full
     platform strength (on Darwin {!full_fsync} reaches the platter where [fsync]
     stops at the drive's cache), a filesystem's {{!capacity}capacity},
-    {{!clones}copy-on-write clones}, {{!files}positioned reads and writes}, the
-    {{!sparse}sparse map}, {{!rename}exclusive rename}, POSIX
-    {{!record_locks}record locks}, {{!lock_files}lock files} and their leases,
-    {{!val-xattrs}extended attributes}, and {{!links}links} and
-    {{!batches}batches} confined beneath a directory.
+    {{!clones}copy-on-write clones}, {{!trees}tree removal} in batches,
+    {{!files}positioned reads and writes}, the {{!sparse}sparse map},
+    {{!rename}exclusive rename}, POSIX {{!record_locks}record locks},
+    {{!lock_files}lock files} and their leases,
+    {{!val-xattrs}extended attributes}, {{!links}links} and {{!batches}batches}
+    confined beneath a directory, and a root whose calls run
+    {{!inline}on the calling thread}.
 
     A call that takes an [Eio.Path.t] or an [Eio.File.t] reports a failure as
     [Eio.Io], as Eio's own backends do; one that takes a [Unix.file_descr]
