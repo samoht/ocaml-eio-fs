@@ -253,8 +253,6 @@ Code that runs on both should avoid these:
   ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)), and fails a
   creating open with a trailing slash differently
   ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)).
-- Absolute symbolic links. Through the root `Eio_fs.Fs.v` returns, one is
-  followed where eio_posix refuses it. Use relative targets.
 
 ## Licence
 

@@ -177,9 +177,9 @@ val root : user
     [Eio.Path.chmod ~follow:false] on a symbolic link raises the error
     EOPNOTSUPP names, and a symbolic link to the empty path is refused with
     [Not_found]. Its paths have no native spelling ({!Eio.Path.native} is
-    [None]), and an absolute symbolic link resolves from the filesystem's root,
-    so through the root that {!Fs.v} returns it is followed where eio_posix
-    would refuse it. One filesystem may be used from several domains at once.
+    [None]). The root {!Fs.v} returns stands for [Eio.Stdenv.fs]: an absolute
+    path or link target resolves from it, as eio_posix resolves one from [/]
+    through [fs]. One filesystem may be used from several domains at once.
 
     A path resolves one component at a time, as path_resolution(7) describes: a
     [".."] climbs from the directory the walk has reached, a link's target
