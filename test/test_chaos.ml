@@ -1990,6 +1990,40 @@ let test_crash_cancelled_real () =
         "real fs: the synced bytes, restored under a cancel" "AAAA"
         (Eio.Path.load (post / "img")))
 
+(* A file renamed over another, its directory synced, while an earlier
+   directory operation elsewhere is still pending: the image that keeps the
+   pending one holds the new file's bytes at the name, never the bytes of
+   the file it replaced. *)
+let test_crash_replaced_under_pending_real () =
+  let ctl = Crash.v ~policy:(Crash.Survive (fun _ -> true)) () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.mkdir ~perm:0o755 (fs / "refs");
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+        (fs / "refs" / "x")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "old" ];
+          Eio.File.sync file);
+      Crash.sync_metadata ctl;
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+        (fs / "refs" / "x.lock")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "new" ];
+          Eio.File.sync file);
+      Eio.Path.mkdir ~perm:0o755 (fs / "other");
+      Eio.Path.rename (fs / "refs" / "x.lock") (fs / "refs" / "x");
+      Eio_fs_sync.sync_dir (fs / "refs");
+      Crash.crash ctl)
+    ~check:(fun post ->
+      Alcotest.(check bool)
+        "real fs: the pending directory kept" true
+        (Eio.Path.kind ~follow:false (post / "other") = `Directory);
+      Alcotest.(check string)
+        "real fs: the new bytes at the replaced name" "new"
+        (Eio.Path.load (post / "refs" / "x")))
+
 (* The kernel-side variant of the reverted tmp-rename: the rollback must
    physically undo a rename on the real filesystem. *)
 let test_crash_rename_revert_real () =
@@ -3993,6 +4027,9 @@ let suite =
         `Quick test_crash_spared_identity_real;
       Alcotest.test_case "crash: a cancelled crash restores its image (real fs)"
         `Quick test_crash_cancelled_real;
+      Alcotest.test_case
+        "crash: a replaced file under a pending operation (real fs)" `Quick
+        test_crash_replaced_under_pending_real;
       Alcotest.test_case "crash: committed unlink stays deleted" `Quick
         test_crash_committed_unlink_stays_deleted;
       Alcotest.test_case "crash: uncommitted unlink rolls back" `Quick
