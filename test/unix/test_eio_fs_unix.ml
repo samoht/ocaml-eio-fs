@@ -1030,6 +1030,27 @@ let test_lock_range () =
 let lease_free ~env:_ lock =
   Eio_fs_unix.Lease.with_exclusive ~block:`Yes lock (fun _ -> ())
 
+(* A lease wait cancelled in a domain of its own lets that domain end while
+   the holder still holds: the kernel's request it leaves behind holds no
+   join, so the domain ends at once and the holder lets go when told. A wait
+   that held the domain would end only once the holder let go at its own
+   bound, which it answers as [`Exited 3]. *)
+let test_cancelled_lease_wait_ends_its_domain () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let _, release = holding_process ~sw ~env ~kind:"lease" ~lock in
+  Eio.Domain_manager.run (Eio.Stdenv.domain_mgr env) (fun () ->
+      let waiting, now_waiting = Eio.Promise.create () in
+      Eio.Fiber.first
+        (fun () ->
+          take_lease
+            ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+            lock
+            (fun () -> Alcotest.fail "a held lease was granted"))
+        (fun () -> Eio.Promise.await waiting));
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
+
 let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
   with_real_dir @@ fun dir ->
   let lock = dir / "lease" in
@@ -3218,6 +3239,8 @@ let suite =
         (a_wait_is_cancellable ~kind:"record" take_record ~free:record_free);
       Alcotest.test_case "a lease wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"lease" take_lease);
+      Alcotest.test_case "a cancelled lease wait ends its domain" `Quick
+        test_cancelled_lease_wait_ends_its_domain;
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
       Alcotest.test_case "a bounded record lock wait answers at the release"
