@@ -48,9 +48,16 @@ val release : Eio_fs_unix.Lease.t -> unit = <fun>
 
 An exclusive take that meets a reader's look, a shared lease taken and let
 go at once, waits it out with `block: \`Readers` and is refused only by an
-exclusive holder: the look delays the take and never refuses it.
+exclusive holder or another take under way: the look delays the take and
+never refuses it. The take holds a gate, a lease on a file of its own that
+every exclusive take of the path passes, from before its look at the holders
+to its end, so no other take is made between that look and its blocking take
+and the wait is for readers alone.
 
 ```ocaml
-# fun path -> Eio_fs_unix.Lease.with_exclusive ~block:`Readers path ignore;;
-- : [> Eio.Fs.dir_ty ] Eio.Path.t -> unit = <fun>
+# fun ~gate path ->
+    Eio_fs_unix.Lease.with_exclusive ~gate ~block:`Readers path ignore;;
+- : gate:[> Eio.Fs.dir_ty ] Eio.Path.t ->
+    [> Eio.Fs.dir_ty ] Eio.Path.t -> unit
+= <fun>
 ```
