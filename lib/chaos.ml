@@ -80,6 +80,19 @@ let streak_limit tag first =
    from: it stops there, so its operations stay bounded. *)
 let max_ops = 100_000
 
+(* How long an operation that meets no fault takes on the run's clock: a
+   sync waits for the disk, another operation for the CPU. Other fibers run
+   meanwhile. *)
+let sync_time = Mtime.Span.(1 * ms)
+let op_time = Mtime.Span.(1 * us)
+let now_ns mono = Int64.to_int (Mtime.to_uint64_ns (Eio.Time.Mono.now mono))
+
+(* [spend mono span] waits [span], and is how long the clock moved. *)
+let spend mono span =
+  let t0 = now_ns mono in
+  Eio.Time.Mono.sleep_span mono span;
+  now_ns mono - t0
+
 type outcome =
   | Passed
   | Raised of exn
@@ -616,26 +629,37 @@ let made (trace : Plan.trace) =
   t
 
 (* Injected failures of each operation while the run's clock stands still,
-   since its last attempt that met no fault. *)
+   since its last attempt that met no fault. The time operations took does
+   not move it: a retry spins whatever operations it makes between two
+   failures. *)
 type streak = {
   counts : (target, int) Hashtbl.t;
   first : (target, int) Hashtbl.t;
-  mutable at : float;
+  mutable at : int;
   mutable hit : ([ `Path | `Dir ] * string * int) option;
-  mutable clock : float Eio.Time.clock_ty Eio.Resource.t option;
+  mutable mono : Eio.Time.Mono.ty Eio.Resource.t option;
+  mutable taken : int; (* the time operations took, in ns *)
 }
 
 let streak first =
   {
     counts = Hashtbl.create 16;
     first;
-    at = neg_infinity;
+    at = min_int;
     hit = None;
-    clock = None;
+    mono = None;
+    taken = 0;
   }
 
+let take_time st (op : Op.t) =
+  match st.mono with
+  | Some m ->
+      let span = if op.kind = `Sync then sync_time else op_time in
+      st.taken <- st.taken + spend m span
+  | None -> ()
+
 let failed st (op : Op.t) =
-  let now = match st.clock with Some c -> Eio.Time.now c | None -> 0. in
+  let now = match st.mono with Some m -> now_ns m - st.taken | None -> 0 in
   if now <> st.at then begin
     st.at <- now;
     Hashtbl.reset st.counts
@@ -707,12 +731,13 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
         Some m
     | None ->
         met_no_fault st op;
+        take_time st op;
         None
   in
   let outcome =
     match
       in_loop ~halted @@ fun clock mono ->
-      st.clock <- Some clock;
+      st.mono <- Some mono;
       let base = fresh clock in
       setup (env_of clock mono base);
       let fs = M.wrap (M.Schedule.hook hook) base in
@@ -944,12 +969,15 @@ module Crash = struct
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
      outcome, and the unsynced changes the cut lost. The syncs and opens
-     that changed the controller go to [changed]. *)
-  let phase ?(guard = ignore) ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs
-      ~changed ~stop fs f =
+     that changed the controller go to [changed]. An operation that meets no
+     fault takes its time before its effect, and a sync in the middle of its
+     own, through [pause], which the controller runs. *)
+  let phase ?(guard = ignore) ~kept_going ~trace ~ctl ~pause ~mono ~faults ~cut
+      ~cut_op ~seqs ~changed ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
-    (* The last sync or open, and the controller's stamp before it. *)
+    (* The last sync or open, and the controller's stamp before its effect,
+       which follows with no other operation in between. *)
     let sync = ref None in
     let synced () =
       match !sync with
@@ -958,44 +986,67 @@ module Crash = struct
           if M.Crash.stamp ctl <> s then Hashtbl.replace changed i ()
       | None -> ()
     in
+    let cancelled () =
+      (* The operation the cut falls before, and every one after, is
+         cancelled; once every fiber waits, so is the run. One that catches
+         the cancellation still reaches this hook, and is stopped. *)
+      incr after;
+      if !after > 1000 then begin
+        kept_going := true;
+        park ()
+      end;
+      raise (Eio.Cancel.Cancelled Cut)
+    in
+    (* The operation about to have its effect. *)
+    let landing (op : Op.t) ~tracked =
+      if M.Crash.is_crashed ctl then cancelled ();
+      synced ();
+      if tracked then sync := Some (op.index, M.Crash.stamp ctl);
+      seqs :=
+        match !seqs with
+        | (s, _) :: rest when s = M.Crash.seq ctl -> (s, op.index) :: rest
+        | l -> (M.Crash.seq ctl, op.index) :: l
+    in
+    (* The sync whose time the controller takes next. *)
+    let syncing = ref None in
+    (pause :=
+       fun () ->
+         let op = !syncing in
+         syncing := None;
+         ignore (spend mono sync_time : int);
+         Option.iter (landing ~tracked:true) op);
     let hook (mop : M.Op.t) =
       let op = num mop in
       if not (M.Crash.is_crashed ctl) then synced ();
       guard op;
-      if not (M.Crash.is_crashed ctl) then begin
-        if op.kind = `Sync || op.kind = `Open_write then
-          sync := Some (op.index, M.Crash.stamp ctl);
-        (seqs :=
-           match !seqs with
-           | (s, _) :: rest when s = M.Crash.seq ctl -> (s, op.index) :: rest
-           | l -> (M.Crash.seq ctl, op.index) :: l);
-        match cut with
+      if not (M.Crash.is_crashed ctl) then
+        begin match cut with
         | Some p when Plan.at p op ->
             cut_op := Some op;
             lost := M.Crash.unsynced ctl;
             M.Crash.crash ctl;
             stop := !run_sw
         | _ -> ()
-      end;
-      if M.Crash.is_crashed ctl then begin
-        (* The operation the cut falls before, and every one after, is
-           cancelled; once every fiber waits, so is the run. One that catches
-           the cancellation still reaches this hook, and is stopped. *)
-        incr after;
-        if !after > 1000 then begin
-          kept_going := true;
-          park ()
         end;
-        raise (Eio.Cancel.Cancelled Cut)
-      end;
+      if M.Crash.is_crashed ctl then cancelled ();
+      let tracked = op.kind = `Sync || op.kind = `Open_write in
       match List.partition (fun (p, _) -> Plan.at p op) !pending with
       | (_, f) :: _, rest ->
           pending := rest;
           let m = model_fault ~space:mop.space op f in
           note trace (op, Option.map (fun _ -> f) m);
+          landing op ~tracked;
           m
       | [], _ ->
           note trace (op, None);
+          if op.kind = `Sync then begin
+            syncing := Some op;
+            landing op ~tracked:false
+          end
+          else begin
+            ignore (spend mono op_time : int);
+            landing op ~tracked
+          end;
           None
     in
     let wrapped = M.wrap (M.Schedule.hook hook) fs in
@@ -1048,8 +1099,11 @@ module Crash = struct
         in_loop ~idle ~halted @@ fun clock mono ->
         let base = fresh clock in
         setup (env_of clock mono base);
+        let pause = ref ignore in
         let ctl =
-          M.Crash.v ~policy:(policy_of trail s.state) ~block_size:512 ()
+          M.Crash.v ~policy:(policy_of trail s.state) ~block_size:512
+            ~pause:(fun () -> !pause ())
+            ()
         in
         let fs = M.Crash.wrap ctl base in
         let out, l =
@@ -1066,8 +1120,8 @@ module Crash = struct
                   !prev;
                 prev := Some (op, Plan.Sure.add sure op)
               end)
-            ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
-            ~cut_op ~seqs ~changed ~stop fs
+            ~kept_going:kept_run ~trace ~ctl ~pause ~mono ~faults:s.cfaults
+            ~cut:s.cut ~cut_op ~seqs ~changed ~stop fs
             (fun fs ->
               run
                 ~ack:(fun v ->
@@ -1087,20 +1141,24 @@ module Crash = struct
         let acked = List.rev !acked in
         match out with
         | Passed -> (
+            let rpause = ref ignore in
             let rctl, rcut =
+              let pause () = !rpause () in
               match s.rcut with
               | Some (j, st) ->
-                  (M.Crash.v ~policy:(policy_of rtrail st) ~block_size:512 (), j)
-              | None -> (M.Crash.v ~policy:Drop_unsynced (), None)
+                  ( M.Crash.v ~policy:(policy_of rtrail st) ~block_size:512
+                      ~pause (),
+                    j )
+              | None -> (M.Crash.v ~policy:Drop_unsynced ~pause (), None)
             in
             let rfs = M.Crash.wrap rctl base in
             recovering := true;
             let rout, _ =
               phase
                 ~guard:(fun _ -> count_op halted ops)
-                ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
-                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~changed:rchanged
-                ~stop rfs
+                ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~pause:rpause
+                ~mono ~faults:[] ~cut:rcut ~cut_op:(ref None) ~seqs:(ref [])
+                ~changed:rchanged ~stop rfs
                 (fun fs -> recover ~acked (env_of clock mono fs))
             in
             match (rout, s.rcut) with

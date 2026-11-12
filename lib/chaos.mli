@@ -39,14 +39,14 @@
     {b A lasting condition reaches every operation.} A filesystem that turns
     read-only, full, or denies access does so for every operation from then on,
     the retries included. A run fails as a hang when, while its clock stands
-    still and with no success there in between, one operation on one path fails
-    10000 times more than three times the first run made it, or one kind of
-    operation in one directory 10000 times more than 1000 times. A program that
-    retries at once spins so, under one name or a fresh one each time. A batch
-    that tries each item up to three times and drops what fails does not, nor a
-    pool that tries up to 1000 names for each name its first run made. No check
-    can tell a spin from a loop that ends later, so one that tries more often
-    than that is taken for a spin.
+    still but for the time operations take, and with no success there in
+    between, one operation on one path fails 10000 times more than three times
+    the first run made it, or one kind of operation in one directory 10000 times
+    more than 1000 times. A program that retries at once spins so, under one
+    name or a fresh one each time. A batch that tries each item up to three
+    times and drops what fails does not, nor a pool that tries up to 1000 names
+    for each name its first run made. No check can tell a spin from a loop that
+    ends later, so one that tries more often than that is taken for a spin.
 
     {b [recover] stands for a fresh process.} It runs after the cut on the
     directory as the disk holds it, knowing only what the workload acknowledged:
@@ -108,9 +108,11 @@
     - a run still going after an hour of its clock fails as a hang: a poll that
       sleeps 1 ms or more between its tries and never ends.
 
-    A filesystem operation takes no time and no other fiber runs during it, so a
-    check does not explore a race that needs a fiber to act while another one's
-    operation is under way, as during a slow sync on a disk. *)
+    An operation takes time, and other fibers run meanwhile: a sync of a file or
+    a directory 1 ms, any other operation 1 us, and one that fails none. Its
+    effect lands at the end of that time. A sync covers what was written before
+    it: a write another fiber makes while it runs stays unsynced, as Linux's
+    fsync(2) promises nothing about it. *)
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t

@@ -224,9 +224,6 @@ owner or the directory's.
 
 ### What a check can miss
 
-- A race during a slow sync. A filesystem operation takes no time, and no
-  other fiber runs during it. Force the interleaving with an
-  `Eio_fs.Chaos.wrap` hook.
 - A read after a failed sync. The check keeps the lost writes in the page
   cache, where Linux may evict them. Do not trust a read after a failed sync.
 - Stale data from another offset. A new block gets stale data only from the

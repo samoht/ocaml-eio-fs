@@ -94,14 +94,15 @@ module Mono = struct
       drain ();
       t.now <- time
 
-    (* Eio_mock's [try_advance], which does not move past [limit], and says
-       how long the timer it moves to waited. *)
+    (* Eio_mock's [try_advance], which does not move past [limit], nor back
+       to a timer the turns since passed, and says how long the timer it
+       moves to waited. *)
     let try_advance t ~limit =
       match Q.min t.q with
       | None -> `Idle
       | Some (_, v) when Mtime.compare v.time limit > 0 -> `Past_limit
       | Some (_, v) ->
-          set_time t v.time;
+          set_time t (if Mtime.compare v.time t.now > 0 then v.time else t.now);
           `Advanced (Mtime.span v.since v.time)
   end
 

@@ -430,13 +430,19 @@ module Crash : sig
     ?trigger:trigger ->
     ?outside:outside ->
     ?block_size:int ->
+    ?pause:(unit -> unit) ->
     unit ->
     t
-  (** [v ~policy ~trigger ~outside ~block_size ()] is a fresh controller that
-      rebuilds the post-crash image by [policy] (defaults to {!Drop_unsynced}, a
-      single state) and [outside] (defaults to {!Dropped}), and crashes on
-      [trigger] (defaults to {!Manual}). [block_size] (defaults to [4096]) is
-      the byte size of the blocks {!Reorder_unsynced} writes back.
+  (** [v ~policy ~trigger ~outside ~block_size ~pause ()] is a fresh controller
+      that rebuilds the post-crash image by [policy] (defaults to
+      {!Drop_unsynced}, a single state) and [outside] (defaults to {!Dropped}),
+      and crashes on [trigger] (defaults to {!Manual}). [block_size] (defaults
+      to [4096]) is the byte size of the blocks {!Reorder_unsynced} writes back.
+
+      A sync of a file or a directory covers the changes made before it, runs
+      [pause ()] (defaults to doing nothing), then makes them durable. A change
+      made during [pause], by another fiber, stays pending, as Linux's fsync(2)
+      makes no promise about a write made while it runs.
 
       @raise Stdlib.Invalid_argument if [block_size] is not positive. *)
 

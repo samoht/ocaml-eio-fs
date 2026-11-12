@@ -1367,6 +1367,8 @@ module Crash = struct
            modes opens met, so far: with [seq], what tells a sync or an open
            that changed nothing a cut leaves. *)
     mutable ops : int;
+    pause : unit -> unit;
+        (* The time a sync takes, after it took what it covers. *)
     mutable crashed : bool;
     mutable image :
       (string * int64 * [ `File of string | `Dir | `Link of string ]) list;
@@ -2500,13 +2502,15 @@ module Crash = struct
 
   (* Hold a barrier on the directory [ino] for the entries that changed it,
      then commit what it can. *)
-  let commit_dir_ino ctl ino =
+  let commit_dir_ino ?(upto = max_int) ctl ino =
     (match Hashtbl.find_opt ctl.by_dir ino with
     | None -> ()
     | Some m ->
         Ids.iter
           (fun _ e ->
-            if not (List.exists (Int64.equal ino) e.barred) then begin
+            if
+              e.meta.seq <= upto && not (List.exists (Int64.equal ino) e.barred)
+            then begin
               ctl.effects <- ctl.effects + 1;
               e.barred <- ino :: e.barred;
               refresh ctl e
@@ -2514,10 +2518,10 @@ module Crash = struct
           m);
     settle ctl
 
-  let commit_dir ctl ~dir =
+  let commit_dir ?upto ctl ~dir =
     let owner, _ = root ctl in
     match ino_at owner dir with
-    | Some ino -> commit_dir_ino ctl ino
+    | Some ino -> commit_dir_ino ?upto ctl ino
     | None -> ()
 
   (* fsync(2) of a file commits its inode, attributes included: they hold
@@ -3522,9 +3526,31 @@ module Crash = struct
       ctl.logged <- ctl.pending_changes
     end
 
+  (* The pending changes made after [upto] leave [fs.pending], for
+     [keep_young] to log again once the older ones went: a sync covers
+     the changes made before it, not those made while it runs. *)
+  let split_young ctl fs ~upto =
+    let young, old =
+      List.partition (fun (e : entry) -> e.seq > upto) fs.pending
+    in
+    fs.pending <- old;
+    ctl.pending_changes <- ctl.pending_changes - List.length young;
+    young
+
+  let keep_young ctl fs young =
+    List.iter
+      (fun e ->
+        let e = { e with egen = fs.gen } in
+        ctl.log <- e :: ctl.log;
+        fs.pending <- e :: fs.pending;
+        ctl.logged <- ctl.logged + 1;
+        ctl.pending_changes <- ctl.pending_changes + 1)
+      (List.rev young)
+
   (* A failed barrier loses the pending writes, which the page cache keeps:
      a later change that dirties one of their blocks writes it whole. *)
-  let fail_sync ctl fs =
+  let fail_sync ?(upto = max_int) ctl fs =
+    let young = split_young ctl fs ~upto in
     ctl.effects <- ctl.effects + 1;
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
     let pending = List.rev fs.pending in
@@ -3585,15 +3611,17 @@ module Crash = struct
             ctl.logged <- ctl.logged + 1;
             ctl.pending_changes <- ctl.pending_changes + 1
         | Write _ -> ())
-      pending
+      pending;
+    keep_young ctl fs young
 
   (* A barrier makes the file's pending changes durable, replayed over its
      durable bytes, with the lost bytes in the blocks they dirty: a change
      lost to a failed barrier, or made around the wrapper, never becomes
      durable by itself. *)
-  let barrier ctl fs ~stat sync =
+  let barrier ?(upto = max_int) ctl fs ~stat sync =
     match sync () with
     | () ->
+        let young = split_young ctl fs ~upto in
         if
           fs.pending <> [] || fs.partial <> [] || Option.is_some fs.cache
           || Option.is_some fs.evicted
@@ -3669,12 +3697,13 @@ module Crash = struct
             done)
           held;
         lose ctl fs;
+        keep_young ctl fs young;
         let st = stat () in
         fs.synced <- Some st;
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
-        fail_sync ctl fs;
+        fail_sync ~upto ctl fs;
         raise e
 
   let fstate_of cf = match cf.cfs with Some fs -> fs | None -> assert false
@@ -3706,12 +3735,21 @@ module Crash = struct
      the wrapper and is durable already. *)
   let file_ino cf () = (Eio.File.stat cf.cro).ino
 
-  let sync_ro cf fs =
+  (* A sync covers the changes made before it: it takes them, then takes
+     its time, while other fibers run, then makes them durable. *)
+  let paused cf =
     guard cf;
+    let upto = cf.ctl.seq in
+    cf.ctl.pause ();
+    guard cf;
+    upto
+
+  let sync_ro cf fs =
+    let upto = paused cf in
     match fs with
     | None -> commit_attrs cf.ctl ~ino:(file_ino cf)
     | Some fs ->
-        barrier cf.ctl fs
+        barrier ~upto cf.ctl fs
           ~stat:(fun () -> Eio.File.stat cf.cro)
           (fun () -> sync_base cf.cro)
 
@@ -3724,8 +3762,8 @@ module Crash = struct
     let sync cf =
       match dir with
       | Some dir ->
-          guard cf;
-          commit_dir_ino ctl dir
+          let upto = paused cf in
+          commit_dir_ino ~upto ctl dir
       | None -> sync_ro cf fs
     in
     Eio.Resource.T
@@ -3799,9 +3837,9 @@ module Crash = struct
        entries a name lives in are the metadata journal's business, committed by
        [sync_metadata] or a registered [Dir_sync], as fsync(2) divides them. *)
     let sync cf =
-      guard cf;
+      let upto = paused cf in
       let fs = fstate_of cf in
-      barrier cf.ctl fs
+      barrier ~upto cf.ctl fs
         ~stat:(fun () -> Eio.File.stat cf.cro)
         (fun () -> Eio.File.sync (writable cf))
 
@@ -4209,12 +4247,15 @@ module Crash = struct
        operation. *)
     let sync_dir d path =
       if d.dctl.crashed then raise_power_lost ();
+      let upto = d.dctl.seq in
+      d.dctl.pause ();
+      if d.dctl.crashed then raise_power_lost ();
       (* The base's barrier first: it refuses a directory that is missing or
          that the caller cannot read. *)
       Eio_fs_sync.sync_dir (d.dbase, path);
       match (d.dino, path_segments path) with
-      | Some ino, [] -> commit_dir_ino d.dctl ino
-      | _ -> commit_dir d.dctl ~dir:(resolve d (at d.dplace.prefix path))
+      | Some ino, [] -> commit_dir_ino ~upto d.dctl ino
+      | _ -> commit_dir ~upto d.dctl ~dir:(resolve d (at d.dplace.prefix path))
 
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -4267,7 +4308,7 @@ module Crash = struct
       fun ctl ~ino ~root ~prefix ~base -> wrap_cdir ctl ~ino ~root ~prefix ~base
 
   let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(outside = Dropped)
-      ?(block_size = 4096) () =
+      ?(block_size = 4096) ?(pause = ignore) () =
     if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
     {
       policy;
@@ -4301,6 +4342,7 @@ module Crash = struct
       logged = 0;
       pending_changes = 0;
       ops = 0;
+      pause;
       crashed = false;
       image = [];
     }
