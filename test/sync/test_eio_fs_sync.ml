@@ -817,9 +817,40 @@ let test_error_backtrace generation () =
         (contains ~affix:"raise_publication_origin"
            (Printexc.raw_backtrace_to_string trace))
 
+(* A small value is copied through a small buffer: a 128 KiB bigarray for
+   each save drives the major collector, which counts its bytes. *)
+let test_small_copy_buffer () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let sizes = ref [] in
+  let module Src = struct
+    type t = { mutable left : string }
+
+    let read_methods = []
+
+    let single_read t buf =
+      sizes := Cstruct.length buf :: !sizes;
+      if t.left = "" then raise End_of_file;
+      let n = min (Cstruct.length buf) (String.length t.left) in
+      Cstruct.blit_from_string t.left 0 buf 0 n;
+      t.left <- String.sub t.left n (String.length t.left - n);
+      n
+  end in
+  let src =
+    Eio.Resource.T ({ Src.left = "v" }, Eio.Flow.Pi.source (module Src))
+  in
+  Eio_fs_sync.publish ~config:(config 3L) (env#fs / "cfg") (fun f ->
+      Eio.Flow.copy src f);
+  Alcotest.(check string) "published" "v" (Eio.Path.load (env#fs / "cfg"));
+  Alcotest.(check bool)
+    "no read buffer above 4 KiB" true
+    (List.for_all (fun n -> n <= 4096) !sizes)
+
 let suite =
   ( "eio_fs_sync",
     [
+      Alcotest.test_case "a small value is copied through a small buffer" `Quick
+        test_small_copy_buffer;
       Alcotest.test_case "sparse 8 MiB extents and cost" `Quick (fun () ->
           test_sparse_cost (8 * 1024 * 1024));
       Alcotest.test_case "sparse 80 MiB extents and cost" `Quick (fun () ->
