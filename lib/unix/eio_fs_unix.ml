@@ -16,6 +16,11 @@ external flock_native : Unix.file_descr -> flock_mode -> bool -> unit
 external flock_unlock_native : Unix.file_descr -> unit
   = "caml_eio_fs_flock_unlock"
 
+external flock_wait_start : Unix.file_descr -> bool -> Unix.file_descr
+  = "caml_eio_fs_flock_wait_start"
+
+external flock_wait_failed : int -> 'a = "caml_eio_fs_flock_wait_failed"
+
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
 
@@ -1225,27 +1230,26 @@ module Flock = struct
         acquire ~shared fd ~nonblocking)
 
   (* The kernel's blocking [flock], which answers when the holder lets go, on a
-     thread of its own: a request in the kernel cannot be withdrawn, so a
-     cancelled caller leaves it to that thread and answers at once. The thread
-     asks through a duplicate of [fd], which shares its open file description
-     and so the lock the kernel grants, and closes it once answered: a lock
-     granted after the cancel goes when the caller's [fd] closes too. *)
+     thread of its own that runs no OCaml and that nothing joins
+     (flock_wait_start): a request in the kernel cannot be withdrawn, so a
+     cancelled caller leaves it to that thread and answers at once, and the
+     thread holds no exit. A lock granted after the cancel goes when the
+     caller's [fd] closes, since the thread asked through a duplicate. *)
   let await_release ~shared fd =
-    let copy = Unix.dup ~cloexec:true fd in
-    let answer, set_answer = Eio.Promise.create () in
-    let _ : Thread.t =
-      Thread.create
-        (fun () ->
-          let granted =
-            match acquire ~shared copy ~nonblocking:false with
-            | () -> Ok ()
-            | exception (Unix.Unix_error _ as e) -> Error e
-          in
-          Unix.close copy;
-          Eio.Promise.resolve set_answer granted)
-        ()
+    let answer = flock_wait_start fd shared in
+    Fun.protect ~finally:(fun () -> Unix.close answer) @@ fun () ->
+    Eio_unix.await_readable answer;
+    let b = Bytes.create 4 in
+    let rec read off =
+      if off < 4 then
+        match Unix.read answer b off (4 - off) with
+        | 0 -> failwith "Eio_fs_unix.Flock: the wait ended with no answer"
+        | n -> read (off + n)
     in
-    match Eio.Promise.await answer with Ok () -> () | Error e -> raise e
+    read 0;
+    match Int32.to_int (Bytes.get_int32_ne b 0) with
+    | 0 -> ()
+    | err -> flock_wait_failed err
 
   let use_os_lock ~shared ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in
