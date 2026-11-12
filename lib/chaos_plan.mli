@@ -69,8 +69,9 @@ val spread : int -> 'a list -> 'a list
 
 val sampled_share : budget:int -> linear:int -> classes:int -> int
 (** [sampled_share ~budget ~linear ~classes] is the runs of the sampled tier for
-    each of its [classes]: in all at most half of [linear], the runs the linear
-    tier took, and at least 500, within [budget]. *)
+    each of its [classes]: in all at least a fortieth of [budget], 500 runs by
+    default, and up to half of [linear], the runs the linear tier took, within
+    [budget]. *)
 
 (** {1 check} *)
 
@@ -116,9 +117,51 @@ val check_floor : space:bool -> sure:bool -> Op.t -> int
     be structural: none if it is not. Their sum over a run so far is a floor of
     the tier's size. *)
 
-val check_seconds : pos * Fault.t -> after:trace -> check list
-(** [check_seconds f ~after] is the pairs of faults whose first is [f] and whose
-    second lands after it in [after], the run [f] alone made. *)
+(** The changes a run made to the disk. *)
+module Disk : sig
+  type t
+  (** The type for the writes, truncations, syncs, directory changes and opens
+      that may write of a run, in order. *)
+
+  val v : trace -> t
+  (** [v first] is those of [first]. *)
+end
+
+val check_seconds :
+  ?limit:int ->
+  pos * Fault.t ->
+  first:Disk.t ->
+  after:trace ->
+  check list * check list
+(** [check_seconds ~limit f ~first ~after] is the pairs of faults whose first is
+    [f] and whose second lands after it in [after], the run [f] alone made, best
+    first, at most [limit] (defaults to all). If [f] changed what the run does
+    to the disk, past [f], from [first], the run with no fault, they are the
+    first list, which aims at the path [f] sent the run down: the operations
+    that change the disk, then the others, each nearest [f] first. Else they are
+    the second list, in an order each prefix of which is evenly spread. *)
+
+(** The pairs of faults the sampled tier tries: those of each first fault, best
+    first, round by round. *)
+module Pairs : sig
+  type 'a t
+  (** The type for pairs kept. *)
+
+  val v : int -> 'a t
+  (** [v n] keeps at most [n] pairs. *)
+
+  val add : 'a t -> 'a list * 'a list -> unit
+  (** [add t (changed, others)] adds the pairs of one first fault, best first:
+      those on an operation it changed, and the others. Past [n], it drops one
+      of the others of the largest rank, else one of the changed of the largest
+      rank, the latest added first: each first fault keeps as many as the
+      others, but for those that have fewer, those on what they changed first.
+  *)
+
+  val to_list : 'a t -> 'a list
+  (** [to_list t] is the pairs kept: on a changed operation by rank, then the
+      others by rank, each rank in the order added. *)
+end
 
 val faults_text : ?at:(pos -> Op.t option) -> (pos * Fault.t) list -> string
 (** [faults_text fs] says what [fs] do, for a report. *)
@@ -188,9 +231,14 @@ val rcuts : changed:(Op.t -> bool) -> crash -> recover:trace -> crash list
     of [recover], the trace of its recovery, and at its end. *)
 
 val crash_seconds :
-  tears:(Op.t -> int list) -> pos * Fault.t -> after:trace -> crash list
-(** [crash_seconds ~tears f ~after] is the pairs of faults whose first is [f]
-    and whose second lands after it in [after]. *)
+  ?limit:int ->
+  tears:(Op.t -> int list) ->
+  pos * Fault.t ->
+  first:Disk.t ->
+  after:trace ->
+  crash list * crash list
+(** [crash_seconds ~limit ~tears f ~first ~after] is, likewise, the pairs of
+    faults whose first is [f] and whose second lands after it in [after]. *)
 
 val next_choices : (int * int) list -> int list option
 (** [next_choices trail] is the draws of the next state a cut allows, after the

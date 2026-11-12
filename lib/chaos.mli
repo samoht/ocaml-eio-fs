@@ -16,10 +16,12 @@
       other operation: it grows with the structure of the workload, not with its
       bytes. There it tries each fault alone, and each power cut in its two
       simplest states;
-    - the sampled tier spends the rest, at most half as much as the linear tier
-      and at least 500 runs: the other positions, pairs of faults, the second at
-      a position of the run the first one changed, and the other states a power
-      cut may leave.
+    - the sampled tier spends a fortieth of the budget, 500 runs by default, or
+      half as much as the linear tier if that is more: the other positions,
+      pairs of faults, and the other states a power cut may leave. A first fault
+      that changes what the run writes gets its second faults first, on the
+      operations that follow it, those that change the disk first: that is where
+      a retry or a recovery path lives. A larger budget tries more.
 
     A check never passes on a partial linear tier. One that needs more runs than
     its budget fails and says so: shrink the workload or raise [~budget]. The
@@ -136,8 +138,8 @@ val check :
       access: each operation that can meet that error then fails with it, as
       above, and a write to a file already open is still allowed under the last.
 
-    The sampled tier adds the other operations, and a second fault on the
-    operations the first one caused, which is where a retry path lives.
+    The sampled tier adds the other operations, and a second fault on the path
+    the first one sent the run down, which is where a retry path lives.
 
     {!Fault.Swap_symlink} is not among them: it fails ordinary code that stats
     then opens a path in a directory no attacker can write. Security-sensitive

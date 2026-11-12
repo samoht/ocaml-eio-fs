@@ -188,6 +188,8 @@ let files d =
     | _ -> ());
   List.rev !l
 
+let take n l = List.filteri (fun i _ -> i < n) l
+
 (* {1 Reports, budget, replay} *)
 
 let fail name fmt = Fmt.kstr (fun s -> failwith (name ^ ": " ^ s)) fmt
@@ -745,6 +747,7 @@ let check ?budget ?replay ?(setup = ignore) run =
        must be deterministic"
       (diverge first again);
   let hash = digest first in
+  let disk = Plan.Disk.v first in
   (* A scenario whose fault the operation never meets is none. *)
   let meets (s : Plan.check) =
     List.for_all
@@ -761,7 +764,7 @@ let check ?budget ?replay ?(setup = ignore) run =
       report name ~title:"the workload failed under a fault." ~tier ~hash
         ~key:(Plan.check_key s) ~matched ~trace ~error:(outcome_text out)
         [ ("faults", Plan.check_text ~at:(found trace) s) ];
-    kept trace
+    trace
   in
   match replay with
   | Some ((h, k) as r) -> (
@@ -781,17 +784,20 @@ let check ?budget ?replay ?(setup = ignore) run =
                     | [ one ]
                       when String.starts_with ~prefix:(Plan.check_key s ^ "+") k
                       ->
-                        let after = kept (fst (exec s)) in
+                        let r = fst (exec s) in
+                        let changed, rest =
+                          Plan.check_seconds one ~first:disk ~after:(kept r)
+                        in
                         Option.map
                           (fun s -> (s, Sampled))
-                          (find (Plan.check_seconds one ~after))
+                          (find (changed @ rest))
                     | _ -> None)
                   linear)
       in
       match found with
       | Some (s, tier) ->
           let matched = if h = hash then None else Some h in
-          ignore (attempt ?matched tier s : Plan.trace)
+          ignore (attempt ?matched tier s : record)
       | None -> no_longer name ~hash r)
   | None ->
       let n = List.length linear in
@@ -803,34 +809,31 @@ let check ?budget ?replay ?(setup = ignore) run =
           n budget;
       let others = List.filter meets (Plan.check_others first) in
       let share classes = Plan.sampled_share ~budget ~linear:n ~classes in
-      (* The second faults each run allows, spread as it ends, so no run's
-         operations outlive it: a share of the tier's, evenly. *)
-      let singles =
-        List.length
-          (List.filter
-             (fun (s : Plan.check) -> List.length s.faults = 1)
-             linear)
+      (* The second faults each run allows, drawn as it ends, so no run's
+         operations outlive it: the best of each, round by round. *)
+      let sh = share (if others = [] then 1 else 2) in
+      let best = Plan.Pairs.v sh in
+      List.iter
+        (fun (s : Plan.check) ->
+          let r = attempt Linear s in
+          match s.faults with
+          | [ one ] ->
+              Plan.Pairs.add best
+                (Plan.check_seconds ~limit:sh one ~first:disk ~after:(kept r))
+          | _ -> ())
+        linear;
+      let pairs = Plan.Pairs.to_list best in
+      let classes =
+        List.filter
+          (fun (c, _) -> c <> [])
+          [ (others, Plan.spread); (pairs, take) ]
       in
-      let quota =
-        let sh = share (if others = [] then 1 else 2) in
-        (sh + singles - 1) / max 1 singles
-      in
-      let pairs =
-        List.concat_map
-          (fun (s : Plan.check) ->
-            let after = attempt Linear s in
-            match s.faults with
-            | [ one ] -> Plan.spread quota (Plan.check_seconds one ~after)
-            | _ -> [])
-          linear
-      in
-      let classes = List.filter (( <> ) []) [ others; pairs ] in
       let share = share (List.length classes) in
       List.iter
-        (fun c ->
+        (fun (c, pick) ->
           List.iter
-            (fun s -> ignore (attempt Sampled s : Plan.trace))
-            (Plan.spread share c))
+            (fun s -> ignore (attempt Sampled s : record))
+            (pick share c))
         classes
 
 (* {1 Crash} *)
@@ -1239,6 +1242,7 @@ module Crash = struct
          must be deterministic"
         (diverge first_ops again);
     let hash = digest first_ops in
+    let disk = Plan.Disk.v first_ops in
     let sizes =
       match
         in_loop (fun clock mono ->
@@ -1309,7 +1313,11 @@ module Crash = struct
                 find_after faults (fun (s : Plan.crash) r ->
                     match s.cfaults with
                     | [ one ] when s.state = Drop ->
-                        Plan.crash_seconds ~tears one ~after:(kept r.trace)
+                        let changed, rest =
+                          Plan.crash_seconds ~tears one ~first:disk
+                            ~after:(kept r.trace)
+                        in
+                        changed @ rest
                     | _ -> []) );
             (Sampled, fun () -> find_after faults rcuts);
           ]
@@ -1378,24 +1386,24 @@ module Crash = struct
         (* The second faults and the cuts during recover each fault allows,
            spread as each run ends, so no run's operations outlive it: an
            even share of what the sampled tier can spend. *)
+        let total = Plan.sampled_share ~budget ~linear ~classes:1 in
         let quota =
-          let total = Plan.sampled_share ~budget ~linear ~classes:1 in
           let k = List.length faults in
           (total + k - 1) / max 1 k
         in
-        let after_faults =
-          List.map
+        let best = Plan.Pairs.v total in
+        let recovery =
+          List.concat_map
             (fun (s : Plan.crash) ->
               let r = attempt Linear s in
-              let pairs =
-                match s.cfaults with
-                | [ one ] when s.state = Drop ->
-                    Plan.crash_seconds ~tears one ~after:(kept r.trace)
-                | _ -> []
-              in
-              ( Plan.spread quota pairs,
-                Plan.spread quota
-                  (Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace) ))
+              (match s.cfaults with
+              | [ one ] when s.state = Drop ->
+                  Plan.Pairs.add best
+                    (Plan.crash_seconds ~limit:total ~tears one ~first:disk
+                       ~after:(kept r.trace))
+              | _ -> ());
+              Plan.spread quota
+                (Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace))
             faults
         in
         if linear > budget then over linear;
@@ -1403,8 +1411,8 @@ module Crash = struct
         (* Sampled tier. *)
         let thunks = List.map (fun s () -> ignore (attempt Sampled s)) in
         let others = thunks (Plan.crash_others ~changed ~tears trace) in
-        let pairs = List.concat_map (fun (p, _) -> thunks p) after_faults in
-        let recovery = List.concat_map (fun (_, r) -> thunks r) after_faults in
+        let pairs = thunks (Plan.Pairs.to_list best) in
+        let recovery = thunks recovery in
         (* Every state each cut allows, enumerated while the draws met so
            far allow no more than the cut's share, and drawn at random past
            that. Each cut gets an even share of what is left: first every cut
@@ -1485,12 +1493,15 @@ module Crash = struct
           in
           share_out left large
         in
-        let classes = List.filter (( <> ) []) [ others; pairs; recovery ] in
-        let total = Plan.sampled_share ~budget ~linear ~classes:1 in
+        let classes =
+          List.filter
+            (fun (c, _) -> c <> [])
+            [ (others, Plan.spread); (pairs, take); (recovery, Plan.spread) ]
+        in
         let before = !runs in
         let share = total / 2 / max 1 (List.length classes) in
         List.iter
-          (fun c -> List.iter (fun run -> run ()) (Plan.spread share c))
+          (fun (c, pick) -> List.iter (fun run -> run ()) (pick share c))
           classes;
         states (total - (!runs - before));
         if not !reads then

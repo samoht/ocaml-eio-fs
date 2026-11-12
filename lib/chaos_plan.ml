@@ -191,7 +191,7 @@ let spread n l =
     List.init n (fun i -> a.(i * len / n))
 
 let sampled_share ~budget ~linear ~classes =
-  let spend = min (budget - linear) (max 500 (linear / 2)) in
+  let spend = min (budget - linear) (max (budget / 40) (linear / 2)) in
   max 0 spend / max 1 classes
 
 (* {1 check} *)
@@ -257,15 +257,118 @@ let check_floor ~space ~sure op =
              s.faults)
          (of_singles [ op ]))
 
-(* Second faults, at the operations of [after], the run [first] made, past
-   the one it landed on. *)
-let check_seconds first ~(after : trace) =
-  match index_of after (fst first) with
-  | None -> []
+let disk_kind (op : Op.t) =
+  match op.kind with
+  | `Write | `Truncate | `Change | `Open_write | `Sync -> true
+  | _ -> false
+
+(* The changes to the disk a run made, in order: what tells whether a
+   fault changed its course. *)
+module Disk = struct
+  type t = Op.t array
+
+  let v trace = Array.of_list (List.filter disk_kind trace)
+
+  let same (a : Op.t) (b : Op.t) =
+    a.kind = b.kind && a.path = b.path
+    && a.file_offset = b.file_offset
+    && a.length = b.length && a.dest = b.dest
+
+  (* Whether the changes of [after] past [op1] differ from those of the
+     first run past the same place. *)
+  let diverge (t : t) (later : Op.t list) (op1 : Op.t) =
+    let rec start i =
+      if i < Array.length t && t.(i).index <= op1.index then start (i + 1)
+      else i
+    in
+    let rec go i = function
+      | [] -> i < Array.length t
+      | (op : Op.t) :: rest ->
+          i >= Array.length t || (not (same op t.(i))) || go (i + 1) rest
+    in
+    go (start 0) (List.filter disk_kind later)
+end
+
+(* The operations of [after] past [op1], where the first fault landed: if
+   the fault changed what the run writes, those that change the disk, then
+   the others, each nearest the fault first; else none, and all of them. *)
+let aimed ~first ~(after : trace) (op1 : Op.t) =
+  let later = List.filter (fun (op : Op.t) -> op.index > op1.index) after in
+  if Disk.diverge first later op1 then
+    let disk, other = List.partition disk_kind later in
+    (disk @ other, [])
+  else ([], later)
+
+(* [l] in an order each prefix of which is spread evenly over it: by the
+   bits of each place reversed. *)
+let interleave l =
+  let a = Array.of_list l in
+  let n = Array.length a in
+  let rec bits b = if 1 lsl b >= n then b else bits (b + 1) in
+  let b = bits 0 in
+  let rev i =
+    let r = ref 0 in
+    for k = 0 to b - 1 do
+      if i land (1 lsl k) <> 0 then r := !r lor (1 lsl (b - 1 - k))
+    done;
+    !r
+  in
+  List.filter_map
+    (fun i ->
+      let j = rev i in
+      if j < n then Some a.(j) else None)
+    (List.init (1 lsl b) Fun.id)
+
+(* At most [limit] of [changed] in order, and of [rest], evenly. *)
+let aim limit (changed, rest) =
+  (List.filteri (fun i _ -> i < limit) changed, interleave (spread limit rest))
+
+module Pairs = struct
+  type 'a t = {
+    cap : int;
+    ranks : 'a list array;
+        (* by rank, latest first: those on a changed operation, then the
+           others *)
+    mutable size : int;
+    mutable top : int; (* no rank above holds one *)
+  }
+
+  let v cap =
+    let cap = max 0 cap in
+    { cap; ranks = Array.make (2 * cap) []; size = 0; top = 0 }
+
+  let add_at t r x =
+    if r < Array.length t.ranks then begin
+      t.ranks.(r) <- x :: t.ranks.(r);
+      t.size <- t.size + 1;
+      t.top <- max t.top r;
+      while t.size > t.cap do
+        while t.ranks.(t.top) = [] do
+          t.top <- t.top - 1
+        done;
+        t.ranks.(t.top) <- List.tl t.ranks.(t.top);
+        t.size <- t.size - 1
+      done
+    end
+
+  let add t (changed, rest) =
+    List.iteri (fun r x -> add_at t r x) changed;
+    List.iteri (fun r x -> add_at t (t.cap + r) x) rest
+
+  let to_list t = List.concat_map List.rev (Array.to_list t.ranks)
+end
+
+let check_seconds ?(limit = max_int) one ~first ~(after : trace) =
+  match index_of after (fst one) with
+  | None -> ([], [])
   | Some (op1 : Op.t) ->
-      List.filter (fun (op : Op.t) -> op.index > op1.index) after
-      |> singles
-      |> List.map (fun two -> { faults = [ first; two ]; lasting = None })
+      let changed, rest = aimed ~first ~after op1 in
+      let pairs ops =
+        List.map
+          (fun two -> { faults = [ one; two ]; lasting = None })
+          (singles ops)
+      in
+      aim limit (pairs changed, pairs rest)
 
 let faults_key = function
   | [] -> "none"
@@ -436,14 +539,17 @@ let rcuts ~changed s ~(recover : trace) =
       List.map (fun st -> { s with rcut = Some (j, st) }) [ Drop; Keep ])
     (cut_points ~changed recover (structural recover))
 
-let crash_seconds ~tears first ~(after : trace) =
-  match index_of after (fst first) with
-  | None -> []
+let crash_seconds ?(limit = max_int) ~tears one ~first ~(after : trace) =
+  match index_of after (fst one) with
+  | None -> ([], [])
   | Some (op1 : Op.t) ->
-      List.filter (fun (op : Op.t) -> op.index > op1.index) (structural after)
-      |> durable_faults ~tears
-      |> List.concat_map (fun two ->
-          both { base with cfaults = [ first; two ] })
+      let changed, rest = aimed ~first ~after:(structural after) op1 in
+      let pairs ops =
+        List.concat_map
+          (fun two -> both { base with cfaults = [ one; two ] })
+          (durable_faults ~tears ops)
+      in
+      aim limit (pairs changed, pairs rest)
 
 let next_choices trail =
   let rec go = function
