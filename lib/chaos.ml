@@ -86,6 +86,7 @@ type outcome =
   | Deadlock
   | Time_limit
   | Busy
+  | Too_long
   | Kept_going
   | Too_many
   | Livelock of [ `Path | `Dir ] * string * int
@@ -99,6 +100,9 @@ let outcome_text = function
       "the run hangs: it is still running after an hour of its clock"
   | Busy ->
       "the run woke 10,000,000 times without waiting 1 ms or more: a busy loop"
+  | Too_long ->
+      "the run took 10,000,000 turns, more than a check can repeat: a busy \
+       loop, or a workload too large for a check"
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"
@@ -142,6 +146,7 @@ let in_loop ?idle ?(halted = ref None) main =
   | exception Quiet_mock.Deadlock_detected -> Error Deadlock
   | exception Quiet_mock.Time_limit -> Error Time_limit
   | exception Quiet_mock.Busy -> Error Busy
+  | exception Quiet_mock.Too_long -> Error Too_long
 
 (* Park the fiber where no cancel reaches, so even a loop that catches
    everything stops; the loop then reports a deadlock. *)

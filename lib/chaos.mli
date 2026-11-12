@@ -93,10 +93,13 @@
     - a run that makes 100000 filesystem operations fails as a busy loop, or as
       too large for a check, so a run's operations stay bounded: a poll that
       never yields stops there;
-    - a run that wakes fibers 10 million times in a row with no fiber waiting 1
-      ms or more for a timer fails as a busy loop: a poll by yields, or by
-      sleeps shorter than 1 ms, that never ends. Fibers on longer timers are no
-      busy loop, however many turns they take;
+    - a run stops at 10 million turns. If no fiber waited 1 ms or more for a
+      timer in the last 10 million, it fails as a busy loop: a poll by yields,
+      or by sleeps shorter than 1 ms, that never ends. Otherwise it fails as too
+      large for a check: a check repeats the run hundreds of times, so it
+      refuses a longer one, as it refuses one past its budget. Fibers on timers
+      take turns too: a thousand on a heartbeat of 100 ms reach 10 million in
+      1000 s of clock;
     - a run still going after an hour of its clock fails as a hang: a poll that
       sleeps 1 ms or more between its tries and never ends.
 

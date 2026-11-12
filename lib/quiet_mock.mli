@@ -13,6 +13,10 @@ exception Busy
 (** Raised by {!run} when it resumes fibers 10 million times in a row with no
     fiber waiting 1 ms or more for a timer while every fiber waited. *)
 
+exception Too_long
+(** Raised by {!run} when it resumes fibers 10 million times, some fiber having
+    waited 1 ms or more for a timer in between. *)
+
 exception Stopped
 (** Raised by {!run} when its [stop] holds. *)
 
@@ -38,4 +42,5 @@ val run :
     @raise Time_limit if the clock would move past [limit].
     @raise Busy
       if it resumes fibers 10 million times in a row with no fiber waiting 1 ms
-      or more for a timer while every fiber waited. *)
+      or more for a timer while every fiber waited.
+    @raise Too_long if it resumes fibers 10 million times otherwise. *)

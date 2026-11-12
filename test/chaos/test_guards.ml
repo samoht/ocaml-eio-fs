@@ -419,15 +419,15 @@ let test_too_many_turns () =
     ()
 
 (* A thousand fibers on a heartbeat of 100 ms and three polling every 1 ms,
-   for 1000 s of clock: far more than 10 million turns in all, each fiber
-   waiting on its timer between two, and no busy loop. *)
+   for 500 s of clock: more than 6 million turns in all, each fiber waiting
+   on its timer between two, and no busy loop. *)
 let test_timers_are_not_busy () =
   Eio_fs.Chaos.check (fun env ->
       match P.mkdir ~perm:0o755 P.(env#fs / "d") with
       | exception Eio.Io _ -> ()
       | () ->
           let ticker period () =
-            while Eio.Time.now env#clock < 1000. do
+            while Eio.Time.now env#clock < 500. do
               Eio.Time.sleep env#clock period
             done
           in

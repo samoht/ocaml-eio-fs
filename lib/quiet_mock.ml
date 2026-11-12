@@ -15,8 +15,9 @@ open! Hermetic
      run must end, whatever its fibers do;
    - each turn, a fiber resumed by a yield, another fiber or a timer,
      charges [turn] of clock, as a program's CPU time passes between two,
-     and a run of [max_turns] turns in a row in which no fiber waited
-     [min_wait] or more for a timer stops as a busy loop.
+     and a run stops at [max_turns] turns: as a busy loop if no fiber
+     waited [min_wait] or more for a timer in the last [max_turns], and as
+     too long otherwise.
 
    Hang detection and deterministic virtual time need a loop the check owns.
    eio-net carries the same copy. This one needs no eio.mock.
@@ -44,6 +45,7 @@ module Suspended = Eio_utils.Suspended
 exception Deadlock_detected
 exception Time_limit
 exception Busy
+exception Too_long
 exception Stopped
 
 (* {1 Clock} *)
@@ -128,6 +130,7 @@ type t = {
   limit : Mtime.t;
   mutable past_limit : bool;
   mutable turns : int; (* since a fiber last waited [min_wait] or more *)
+  mutable total : int;
   mutable busy : bool;
   idle : unit -> bool;
   stop : unit -> bool;
@@ -144,7 +147,8 @@ let rec schedule t : exit =
   | _ when t.stop () -> `Exit_scheduler
   | Some f ->
       t.turns <- t.turns + 1;
-      if t.turns > max_turns then begin
+      t.total <- t.total + 1;
+      if t.total > max_turns then begin
         t.busy <- true;
         `Exit_scheduler
       end
@@ -188,6 +192,7 @@ let run ?(idle = fun () -> false) ?(stop = fun () -> false) ~limit main =
       limit = Wall.wall_to_mtime limit;
       past_limit = false;
       turns = 0;
+      total = 0;
       busy = false;
       idle;
       stop;
@@ -247,6 +252,7 @@ let run ?(idle = fun () -> false) ?(stop = fun () -> false) ~limit main =
   | Some x -> x
   | None ->
       if t.stop () then raise Stopped
-      else if t.busy then raise Busy
+      else if t.busy && t.turns >= max_turns then raise Busy
+      else if t.busy then raise Too_long
       else if t.past_limit then raise Time_limit
       else raise Deadlock_detected
