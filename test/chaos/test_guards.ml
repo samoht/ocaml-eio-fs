@@ -62,6 +62,40 @@ let test_replay_state () =
            ~recover:(App.Log.recover ~bug:`Marker_only)
            ()))
 
+(* A replay of a state the cut does not allow is refused: a choice past
+   those of its draw, or a draw the cut does not make. *)
+let test_replay_unknown_state () =
+  let marker replay =
+    After.test_b ?replay
+      ~append:(fun f r -> App.Log.append f r)
+      ~recover:(App.Log.recover ~bug:`Marker_only)
+      ()
+  in
+  let replay = replay_of (Expect.report (fun () -> marker None)) in
+  let cut = String.sub replay 0 (String.rindex replay '|') in
+  let state =
+    String.sub replay
+      (String.length cut + 1)
+      (String.length replay - String.length cut - 1)
+  in
+  List.iter
+    (fun st ->
+      let key =
+        String.concat "/" (List.tl (List.tl (String.split_on_char '/' cut)))
+      in
+      Expect.refused
+        (Fmt.str
+           "Eio_fs.Chaos.Crash.check: the replay names %s|%s, a scenario this \
+            check no longer has"
+           key st)
+        (fun () -> marker (Some (cut ^ "|" ^ st)))
+        ())
+    [
+      "e999";
+      state
+      ^ ".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1";
+    ]
+
 (* A save of [n] bytes that does not sync: the fix changes the size of what
    it writes, and so the workload's first run. *)
 let config ?replay ~value ~sync () =
@@ -651,6 +685,8 @@ let suite =
       Alcotest.test_case "replay" `Quick test_replay;
       Alcotest.test_case "a replay of a state a cut allows" `Quick
         test_replay_state;
+      Alcotest.test_case "a replay of a state the cut does not allow" `Quick
+        test_replay_unknown_state;
       Alcotest.test_case "a replay after a fix is re-matched" `Quick
         test_rematched_replay;
       Alcotest.test_case "a stale replay is refused" `Quick test_stale_replay;
