@@ -11,18 +11,12 @@ open! Hermetic
    - the scheduler stops instead of moving the clock past [limit], so a run
      that every fiber waits in reports as a hang, and one that keeps a timer
      going reports as a run past its time limit;
-   - real time passes while a program polls: after [polls] turns at one
-     instant in which every runnable fiber had just yielded, the clock moves
-     on by 10 ms, or to the next timer if that comes first, as eio_posix
-     fires a timer that is due between two rounds of its run queue. Once a
-     fiber has yielded for 5 seconds, with no wait in between, the step is a
-     tenth of how long it has, so that a program that polls for ever reaches
-     the time limit.
+   - each turn, a fiber resumed by a yield, another fiber or a timer,
+     charges [turn] of clock, as a program's CPU time passes between two,
+     and a run of more than [max_turns] stops as a busy loop.
 
    Hang detection and deterministic virtual time need a loop the check owns.
-   eio-net carries the same copy, with a [wait_io] that an in-memory
-   filesystem, which never yields, does not need. This one needs no
-   eio.mock.
+   eio-net carries the same copy. This one needs no eio.mock.
 
    Copyright (C) 2021 Anil Madhavapeddy
    Copyright (C) 2022 Thomas Leonard
@@ -46,6 +40,7 @@ module Suspended = Eio_utils.Suspended
 
 exception Deadlock_detected
 exception Time_limit
+exception Busy
 
 (* {1 Clock} *)
 
@@ -93,24 +88,6 @@ module Mono = struct
       drain ();
       t.now <- time
 
-    (* Moves on by [step], or to the next timer if that comes first, never
-       past [limit]. *)
-    let poll t ~step ~limit =
-      let target =
-        Option.value (Mtime.add_span t.now step) ~default:Mtime.max_stamp
-      in
-      match Q.min t.q with
-      | Some (_, v) when Mtime.compare v.time target <= 0 ->
-          if Mtime.compare v.time limit > 0 then `Past_limit
-          else (
-            set_time t v.time;
-            `Timer)
-      | _ ->
-          if Mtime.compare target limit > 0 then `Past_limit
-          else (
-            set_time t target;
-            `Moved)
-
     (* Eio_mock's [try_advance], which does not move past [limit]. *)
     let try_advance t ~limit =
       match Q.min t.q with
@@ -140,98 +117,43 @@ let wall_handler = Eio.Time.Pi.clock (module Wall)
 
 type exit = [ `Exit_scheduler ]
 
-(* [queued] counts what [run_q] holds, and [polling] the fibers among them
-   that yielded. [polls] counts the turns at [polled_at] that found nothing
-   else runnable. [pollers] holds, for each fiber whose last suspension was a
-   yield, when it began to yield with no wait in between. *)
 type t = {
   run_q : (unit -> exit) Lf_queue.t;
   clock : Mono.Impl.t;
   limit : Mtime.t;
   mutable past_limit : bool;
-  queued : int Atomic.t;
-  polling : int Atomic.t;
-  mutable polls : int;
-  mutable polled_at : Mtime.t;
-  pollers : (Trace.id, Mtime.t) Hashtbl.t;
+  mutable turns : int;
+  mutable busy : bool;
   idle : unit -> bool;
 }
 
-let polls = 1_000
-
-(* A yield costs tens of nanoseconds on eio_posix, and a program that yields
-   works between two: 10 us a turn. Faster, a client that polls for a
-   datagram while its peer stalls for 50 ms would send more of them than a
-   spin. *)
-let step = Mtime.Span.(10 * ms)
-
-(* How long a fiber yields at [step] before the step grows. *)
-let patience = Mtime.Span.(5 * s)
-
-(* How long the fiber that has yielded the longest has. *)
-let longest_poll t now =
-  Hashtbl.fold
-    (fun _ start acc ->
-      let d = Mtime.span start now in
-      if Mtime.Span.compare d acc > 0 then d else acc)
-    t.pollers Mtime.Span.zero
-
-(* A fiber that waits or ends no longer polls. *)
-let stopped t fiber = Hashtbl.remove t.pollers (Fiber_context.tid fiber)
-
-let yielded t fiber =
-  let id = Fiber_context.tid fiber in
-  if not (Hashtbl.mem t.pollers id) then
-    Hashtbl.add t.pollers id (Mono.Impl.now t.clock)
-
-let push t ~yielded f =
-  Atomic.incr t.queued;
-  if yielded then Atomic.incr t.polling;
-  Lf_queue.push t.run_q (fun () ->
-      Atomic.decr t.queued;
-      if yielded then Atomic.decr t.polling;
-      f ())
-
-let push_head t f =
-  Atomic.incr t.queued;
-  Lf_queue.push_head t.run_q (fun () ->
-      Atomic.decr t.queued;
-      f ())
-
-(* Whether the run polls: every runnable fiber yielded, [polls] times at the
-   clock's instant. *)
-let polled t =
-  let n = Atomic.get t.polling in
-  n > 0
-  && n = Atomic.get t.queued
-  &&
-  let now = Mono.Impl.now t.clock in
-  if not (Mtime.equal now t.polled_at) then begin
-    t.polled_at <- now;
-    t.polls <- 0
-  end;
-  t.polls <- t.polls + 1;
-  t.polls >= polls
+(* A turn costs about 0.1 us on eio_posix on Linux, and up to 20 us on a
+   loaded Mac: 1 us, fixed. *)
+let turn = Mtime.Span.(1 * us)
+let max_turns = 10_000_000
 
 let rec schedule t : exit =
-  if polled t then begin
-    let polled = longest_poll t (Mono.Impl.now t.clock) in
-    let step =
-      if Mtime.Span.compare polled patience < 0 then step
-      else
-        Mtime.Span.of_uint64_ns (Int64.div (Mtime.Span.to_uint64_ns polled) 10L)
-    in
-    match Mono.Impl.poll t.clock ~step ~limit:t.limit with
-    | `Timer | `Moved -> next t
-    | `Past_limit ->
-        t.past_limit <- true;
-        `Exit_scheduler
-  end
-  else next t
-
-and next t =
   match Lf_queue.pop t.run_q with
-  | Some f -> f ()
+  | Some f ->
+      t.turns <- t.turns + 1;
+      if t.turns > max_turns then begin
+        t.busy <- true;
+        `Exit_scheduler
+      end
+      else
+        let now =
+          Option.value
+            (Mtime.add_span (Mono.Impl.now t.clock) turn)
+            ~default:Mtime.max_stamp
+        in
+        if Mtime.compare now t.limit > 0 then begin
+          t.past_limit <- true;
+          `Exit_scheduler
+        end
+        else begin
+          Mono.Impl.set_time t.clock now;
+          f ()
+        end
   | None when t.idle () -> schedule t
   | None -> (
       match Mono.Impl.try_advance t.clock ~limit:t.limit with
@@ -255,11 +177,8 @@ let run ?(idle = fun () -> false) ~limit main =
       clock;
       limit = Wall.wall_to_mtime limit;
       past_limit = false;
-      queued = Atomic.make 0;
-      polling = Atomic.make 0;
-      polls = 0;
-      polled_at = Mtime.of_uint64_ns 0L;
-      pollers = Hashtbl.create 7;
+      turns = 0;
+      busy = false;
       idle;
     }
   in
@@ -269,13 +188,11 @@ let run ?(idle = fun () -> false) ~limit main =
       {
         retc =
           (fun () ->
-            stopped t fiber;
             Fiber_context.destroy fiber;
             schedule t);
         exnc =
           (fun ex ->
             let bt = Printexc.get_raw_backtrace () in
-            stopped t fiber;
             Fiber_context.destroy fiber;
             Printexc.raise_with_backtrace ex bt);
         effc =
@@ -289,24 +206,19 @@ let run ?(idle = fun () -> false) ~limit main =
                 Some
                   (fun k ->
                     let k = { Suspended.k; fiber } in
-                    (* A fiber resumed before [f] returns yielded. *)
-                    let entering = ref true in
-                    let resumed = ref false in
                     f fiber (fun result ->
-                        if !entering then resumed := true;
-                        push t ~yielded:!entering (fun () ->
+                        Lf_queue.push t.run_q (fun () ->
                             Fiber_context.clear_cancel_fn fiber;
                             match result with
                             | Ok v -> Suspended.continue k v
                             | Error ex -> Suspended.discontinue k ex));
-                    entering := false;
-                    if !resumed then yielded t fiber else stopped t fiber;
                     schedule t)
             | Eio.Private.Effects.Fork (new_fiber, f) ->
                 Some
                   (fun k ->
                     let k = { Suspended.k; fiber } in
-                    push_head t (fun () -> Suspended.continue k ());
+                    Lf_queue.push_head t.run_q (fun () ->
+                        Suspended.continue k ());
                     fork ~new_fiber f)
             | Eio.Private.Effects.Get_context ->
                 Some (fun k -> Effect.Deep.continue k fiber)
@@ -322,4 +234,7 @@ let run ?(idle = fun () -> false) ~limit main =
   in
   match !result with
   | Some x -> x
-  | None -> if t.past_limit then raise Time_limit else raise Deadlock_detected
+  | None ->
+      if t.busy then raise Busy
+      else if t.past_limit then raise Time_limit
+      else raise Deadlock_detected

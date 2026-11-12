@@ -79,15 +79,14 @@
 
     {2 Runs}
 
-    Each run's clocks start at [0.] and move when every fiber waits, so a sleep
-    takes no time, or when the run polls, as real time passes while a program
-    does: after 1000 turns at one instant in which every runnable fiber had just
-    yielded, they move by 10 ms, or to the next timer if that comes first. Once
-    a fiber has yielded for 5 seconds of the clock with no wait in between, each
-    move is a tenth of how long it has, so a poll with a timeout ends, and one
-    with none reaches the hour below in bounded time. A run in which every fiber
-    waits and no timer is due fails as a hang, and so does one still running
-    after an hour of its clock. *)
+    Each run's clocks start at [0.] and move to the next timer when every fiber
+    waits, so a sleep takes no time. Each turn, a fiber resumed by a yield,
+    another fiber or a timer, also moves them by 1 us, as CPU time passes
+    between two. A run in which every fiber waits and no timer is due fails as a
+    hang, and so does one still running after an hour of its clock, and one of
+    more than 10 million turns, as a busy loop: a poll that never ends, or a
+    loop of tiny sleeps. A retry that never yields meets the spin guard above,
+    and one that yields between its tries meets this bound. *)
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t

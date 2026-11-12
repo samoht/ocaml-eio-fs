@@ -9,6 +9,9 @@ exception Deadlock_detected
 exception Time_limit
 (** Raised by {!run} when its clock would move past the limit. *)
 
+exception Busy
+(** Raised by {!run} when it resumes fibers more than 10 million times. *)
+
 val run :
   ?idle:(unit -> bool) ->
   limit:float ->
@@ -17,14 +20,12 @@ val run :
   'a) ->
   'a
 (** [run ~idle ~limit main] calls [main clock mono_clock] in a fresh event loop
-    whose clocks start at [0.] and move up to [limit] seconds: to the next timer
-    when every fiber waits, and, as real time passes while a program polls,
-    after 1000 turns at one instant in which every runnable fiber had just
-    yielded, by 10 ms, or to the next timer if that comes first. Once a fiber
-    has yielded for 5 seconds with no wait in between, the step is a tenth of
-    how long it has. When every fiber waits, [idle ()] runs first (defaults to
-    doing nothing); if it is [true], it woke a fiber, and the clock stays. It
-    returns what [main] returns, and raises what [main] raises.
+    whose clocks start at [0.] and move up to [limit] seconds: by 1 us each time
+    a fiber resumes, from a yield, another fiber or a timer, and to the next
+    timer when every fiber waits. When every fiber waits, [idle ()] runs first
+    (defaults to doing nothing); if it is [true], it woke a fiber, and the clock
+    stays. It returns what [main] returns, and raises what [main] raises.
 
     @raise Deadlock_detected if every fiber waits and no timer is due.
-    @raise Time_limit if the clock would move past [limit]. *)
+    @raise Time_limit if the clock would move past [limit].
+    @raise Busy if it resumes fibers more than 10 million times. *)

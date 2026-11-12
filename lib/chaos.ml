@@ -81,6 +81,7 @@ type outcome =
   | Raised of exn
   | Deadlock
   | Time_limit
+  | Busy
   | Kept_going
   | Livelock of [ `Path | `Dir ] * string * int
 
@@ -90,6 +91,7 @@ let outcome_text = function
   | Deadlock -> "the run hangs: every fiber waits and no timer is due"
   | Time_limit ->
       "the run hangs: it is still running after an hour of its clock"
+  | Busy -> "the run is a busy loop: it kept the CPU busy for 10 s of clock"
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"
@@ -120,6 +122,7 @@ let in_loop ?idle main =
   | v -> Ok v
   | exception Quiet_mock.Deadlock_detected -> Error Deadlock
   | exception Quiet_mock.Time_limit -> Error Time_limit
+  | exception Quiet_mock.Busy -> Error Busy
 
 (* Park the fiber where no cancel reaches, so even a loop that catches
    everything stops; the loop then reports a deadlock. *)
