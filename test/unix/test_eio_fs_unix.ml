@@ -1083,7 +1083,7 @@ let record_free ~env lock =
    descriptor's offset where it was (POSIX fcntl F_SETLK with SEEK_SET), so a
    lock taken through a descriptor another reader seeks moves none of its
    reads. Another process meets the lock, and the lock is gone once let go;
-   [range_locked] answers about another process's lock and never this
+   [range_holder] answers about another process's lock and never this
    one's. *)
 let test_lock_range () =
   with_real_dir_env @@ fun env dir ->
@@ -1097,10 +1097,7 @@ let test_lock_range () =
     "the lock leaves the offset" 7
     (Unix.lseek fd 0 Unix.SEEK_CUR);
   Alcotest.(check bool)
-    "this process's own lock is not another's" false
-    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
-  Alcotest.(check bool)
-    "nor does it name a holder" true
+    "this process's own lock is not another's" true
     (Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 = `Free);
   let manager = Eio.Stdenv.process_mgr env in
   let self = Sys.executable_name in
@@ -1117,9 +1114,6 @@ let test_lock_range () =
     (try_lock ());
   Eio.Switch.run @@ fun sw ->
   with_held_lock ~sw ~env ~lock @@ fun () ->
-  Alcotest.(check bool)
-    "another process's lock is seen" true
-    (Eio_fs_unix.range_locked fd ~file_offset:10 ~length:5);
   (match Eio_fs_unix.range_holder fd ~file_offset:10 ~length:5 with
   | `Held (Some pid) ->
       Alcotest.(check bool)

@@ -31,18 +31,12 @@ external record_lock_holder : Unix.file_descr -> int
 external lock_range_native : Unix.file_descr -> int -> int -> int -> unit
   = "caml_eio_fs_lock_range"
 
-external range_locked_native : Unix.file_descr -> int -> int -> bool
-  = "caml_eio_fs_range_locked"
-
 external range_holder_native : Unix.file_descr -> int -> int -> int
   = "caml_eio_fs_range_holder"
 
 let lock_range fd kind ~file_offset ~length =
   let kind = match kind with `Read -> 0 | `Write -> 1 | `Unlock -> 2 in
   lock_range_native fd kind file_offset length
-
-let range_locked fd ~file_offset ~length =
-  range_locked_native fd file_offset length
 
 let range_holder fd ~file_offset ~length =
   match range_holder_native fd file_offset length with

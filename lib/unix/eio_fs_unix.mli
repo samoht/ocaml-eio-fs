@@ -304,12 +304,6 @@ val lock_range :
       with [EAGAIN] or [EACCES] where another process holds a lock that
       conflicts. *)
 
-val range_locked : Unix.file_descr -> file_offset:int -> length:int -> bool
-(** [range_locked fd ~file_offset ~length] is [true] iff another process holds a
-    record lock that would refuse a write lock on the [length] bytes of [fd]'s
-    file from byte [file_offset] (fcntl [F_GETLK]). This process's own locks
-    never count. *)
-
 val range_holder :
   Unix.file_descr ->
   file_offset:int ->
