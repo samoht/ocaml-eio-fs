@@ -176,18 +176,18 @@ val check :
     commits. A 4096-byte page the disk held nothing of, past the durable length
     or in a hole, that a write put bytes in is written whole, as ext4 allocates
     it: each of its sectors within the length may instead hold stale data. That
-    is what the disk held there before, at the same place in a page a synced
-    truncation of the file freed, or in a file the workload removed, its
-    unsynced bytes included, as writeback may have written them before the
-    removal, and else the byte ['7']. Only a freed block holds stale data: a
-    file the cut lost and the workload never removed frees none. The check takes
-    a removed file's blocks as freed even while it is open, though ext4 frees
-    them only at its last close. ext4 may give a freed block to any offset of
-    any file; the check tries only the same offset. Of the uncommitted directory
-    changes, a prefix survives. A failed sync loses the file's unsynced writes,
-    as Linux does, though some of their sectors may already be on disk; the page
-    cache may keep them or evict them. Before the cut, a read after a failed
-    sync sees them as kept: neither check tries them evicted. *)
+    is what a freed block held: a page a synced truncation freed, or one of a
+    file the workload removed, its unsynced bytes included, as writeback may
+    have written them before the removal. ext4 may give a freed block to any
+    offset of any file: the check draws the page at the same place first, then
+    the others, up to eight distinct ones; and else the byte ['7']. Only a freed
+    block holds stale data: a file the cut lost and the workload never removed
+    frees none. The check takes a removed file's blocks as freed even while it
+    is open, though ext4 frees them only at its last close. Of the uncommitted
+    directory changes, a prefix survives. A failed sync loses the file's
+    unsynced writes, as Linux does, though some of their sectors may already be
+    on disk; the page cache may keep them or evict them. Before the cut, a read
+    after a failed sync sees them as kept: neither check tries them evicted. *)
 module Crash : sig
   val check :
     ?budget:int ->

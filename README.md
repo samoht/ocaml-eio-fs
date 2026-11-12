@@ -226,10 +226,8 @@ owner or the directory's.
 
 - A read after a failed sync. The check keeps the lost writes in the page
   cache, where Linux may evict them. Do not trust a read after a failed sync.
-- Stale data from another offset. A new block gets stale data only from the
-  same offset of a freed block, and a removed file frees its blocks while
-  still open. ext4 may use any offset, and waits for the last close. Checksum
-  what you read back.
+- Stale data from a removed file still open. The check frees its blocks at
+  once, where ext4 waits for the last close. Checksum what you read back.
 - A bug that needs two faults. Some pairs of faults lie past the default
   budget of 20,000 runs. Raise `~budget` in a nightly run, as the
   `CHAOS_BUDGET` example in `Eio_fs.Chaos` does.

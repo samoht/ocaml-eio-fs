@@ -2750,6 +2750,10 @@ module Crash = struct
      parses a number. *)
   let stale = '7'
 
+  (* The most distinct freed pages a stale sector draws from: past it, the
+     draws would rarely try the sector's other versions. *)
+  let max_stale = 8
+
   (* Writeback in blocks of [bs] bytes. For each block a pending change
      dirtied, a crash keeps the block as it was durable or as it stood after
      any one of those changes, drawn from [rng]; the length is one a change
@@ -3108,11 +3112,19 @@ module Crash = struct
                (min page (Cstruct.length c - (p * page))))
         else None
       in
+      let pages c =
+        List.init
+          ((Cstruct.length c + page - 1) / page)
+          (fun p -> (p, Option.get (page_of c p)))
+      in
       (* What a block the page [p] of [fs] may have been given held: a page
          a shrink of [fs] freed, else the first removed file that had one
          there; and the pages a removed file held unsynced, which writeback
-         may have put on disk before the removal. *)
-      let old fs p =
+         may have put on disk before the removal. Then, as ext4 may give a
+         freed block to any offset of any file, the pages of [elsewhere]:
+         those other shrinks freed, and those of removed files. Each content
+         comes once, and no more than [max_stale] of them. *)
+      let same fs p =
         (match List.assoc_opt p fs.freed with
           | Some pg -> [ (pg, fs.rel ^ " held there before its truncation") ]
           | None ->
@@ -3131,6 +3143,63 @@ module Crash = struct
                   Some (pg, "the removed " ^ path ^ " held there unsynced")
               | None, _ -> None)
             !unsynced_removed
+      in
+      let elsewhere =
+        lazy
+          (let freed =
+             Hashtbl.fold (fun _ (fs : fstate) acc -> fs :: acc) ctl.known []
+             |> List.sort (fun (a : fstate) b -> Int.compare b.id a.id)
+             |> List.concat_map (fun (fs : fstate) ->
+                 List.map
+                   (fun (p, pg) ->
+                     ( pg,
+                       Fmt.str "%s held at %d before its truncation" fs.rel
+                         (p * page) ))
+                   fs.freed)
+           and gone =
+             List.concat_map
+               (fun (path, c) ->
+                 List.map
+                   (fun (p, pg) ->
+                     (pg, Fmt.str "the removed %s held at %d" path (p * page)))
+                   (pages c))
+               !removed
+           and unsynced =
+             List.concat_map
+               (fun (path, durable, live) ->
+                 List.filter_map
+                   (fun (p, pg) ->
+                     match page_of durable p with
+                     | Some d when Cstruct.equal pg d -> None
+                     | _ ->
+                         Some
+                           ( pg,
+                             Fmt.str "the removed %s held at %d unsynced" path
+                               (p * page) ))
+                   (pages live))
+               !unsynced_removed
+           in
+           gone @ unsynced @ freed)
+      in
+      let distinct l =
+        let rec go n acc = function
+          | _ when n = max_stale -> List.rev acc
+          | [] -> List.rev acc
+          | ((pg, _) as c) :: rest ->
+              if List.exists (fun (q, _) -> Cstruct.equal pg q) acc then
+                go n acc rest
+              else go (n + 1) (c :: acc) rest
+        in
+        go 0 [] l
+      in
+      let olds = Hashtbl.create 8 in
+      let old fs p =
+        match Hashtbl.find_opt olds (fs.id, p) with
+        | Some l -> l
+        | None ->
+            let l = distinct (same fs p @ Lazy.force elsewhere) in
+            Hashtbl.replace olds (fs.id, p) l;
+            l
       in
       (* What the crash left of each file's unsynced writes. *)
       let left = ref [] in
