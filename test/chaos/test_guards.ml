@@ -96,6 +96,30 @@ let test_replay_unknown_state () =
       ^ ".0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1";
     ]
 
+(* A seed a larger budget draws: its replay says the budget it needs. *)
+let test_replay_seed_budget () =
+  let marker ?budget replay =
+    After.test_b ?budget ?replay
+      ~append:(fun f r -> App.Log.append f r)
+      ~recover:(App.Log.recover ~bug:`Marker_only)
+      ()
+  in
+  let replay = replay_of (Expect.report (fun () -> marker None)) in
+  let cut = String.sub replay 0 (String.rindex replay '|') in
+  let key =
+    String.concat "/" (List.tl (List.tl (String.split_on_char '/' cut)))
+  in
+  Expect.refused
+    (Fmt.str
+       "Eio_fs.Chaos.Crash.check: the replay names %s|s7000, a state drawn at \
+        random under a budget of 28004 or more: pass ~budget:28004."
+       key)
+    (fun () -> marker (Some (cut ^ "|s7000")))
+    ();
+  match marker ~budget:28004 (Some (cut ^ "|s7000")) with
+  | () -> ()
+  | exception Failure m when Expect.field "cut" m <> "" -> ()
+
 (* A cut that allows two states, which the check tries one by one: a
    replay of a state drawn at random there, or of a malformed seed, is
    refused. *)
@@ -861,6 +885,55 @@ let test_syncs_count_in_the_floor () =
     ();
   Alcotest.(check int) "runs" 1 !runs
 
+(* A first run that polls for ever stops at the budget, and its report
+   shows the poll. *)
+let test_budget_refusal_shows_the_trace () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            let rec go () =
+              match P.load P.(env#fs / "ready") with
+              | _ -> ()
+              | exception Eio.Io _ ->
+                  Eio.Time.sleep env#clock 0.01;
+                  go ()
+            in
+            go ()))
+  in
+  if
+    not
+      (String.starts_with ~prefix:"Eio_fs.Chaos.check: the linear tier needs"
+         report)
+  then Alcotest.failf "not refused by the budget: %s" report;
+  let lines = String.split_on_char '\n' report in
+  if not (List.mem "  trace:" lines) then Alcotest.failf "no trace: %s" report;
+  if
+    not
+      (List.exists
+         (fun l -> String.starts_with ~prefix:"    ... the 1 operation above" l)
+         lines)
+  then Alcotest.failf "the poll is not collapsed: %s" report
+
+(* A check that fails inside another: the outer report holds the inner
+   one as text. *)
+let test_nested_report () =
+  let report =
+    Expect.report (fun () ->
+        Eio_fs.Chaos.check (fun env ->
+            (try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "outer") "x"
+             with Eio.Io _ -> ());
+            Eio_fs.Chaos.check ~budget:200 (fun env ->
+                P.save ~create:(`Or_truncate 0o644) P.(env#fs / "inner") "y")))
+  in
+  let first = List.hd (String.split_on_char '\n' report) in
+  Alcotest.(check string)
+    "first line"
+    "Eio_fs.Chaos.check: the run with no fault failed: Eio_fs.Chaos.check: the \
+     workload failed under a fault."
+    first;
+  if String.contains report '\\' then
+    Alcotest.failf "the inner report is escaped: %s" report
+
 (* A poll that reads an open file until it changes, with no yield: no turn
    passes and nothing fails, so only the run's operations stop it. Its own
    bound, past that, fails the run when nothing stops it. *)
@@ -1149,6 +1222,8 @@ let suite =
         test_replay_drawn_state;
       Alcotest.test_case "a replay of a malformed state is refused" `Quick
         test_replay_malformed_state;
+      Alcotest.test_case "a replay of a seed says the budget it needs" `Quick
+        test_replay_seed_budget;
       Alcotest.test_case "a replay after a fix is re-matched" `Quick
         test_rematched_replay;
       Alcotest.test_case "a stale replay is refused" `Quick test_stale_replay;
@@ -1213,6 +1288,9 @@ let suite =
       Alcotest.test_case "what a sync changes" `Quick test_stamp;
       Alcotest.test_case "the syncs that commit count in the floor" `Quick
         test_syncs_count_in_the_floor;
+      Alcotest.test_case "a refusal by the budget shows the trace" `Quick
+        test_budget_refusal_shows_the_trace;
+      Alcotest.test_case "a nested report is text" `Quick test_nested_report;
       Alcotest.test_case "a read poll with no yield stops" `Quick
         test_read_poll_stops;
       Alcotest.test_case "a stat poll under power cuts stops" `Quick
