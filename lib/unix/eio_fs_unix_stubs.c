@@ -16,6 +16,7 @@
 #include <caml/threads.h>
 #include <caml/unixsupport.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -1322,4 +1323,35 @@ CAMLprim value caml_eio_fs_inline_openat(value path_v, value flags_v,
   if (fd == -1)
     caml_unix_error(saved_errno, "openat", path_v);
   CAMLreturn(Val_int(fd));
+}
+
+/* Eio.unix's reading of a directory entry's type, which eio_posix's own
+   readdir uses: eio_unix_stubs.c exports it and installs no header. */
+CAMLprim value eio_unix_file_type_of_dtype(int d_type);
+
+/* The next entry of the open directory [dir_v], its kind and its name, as
+   eio_posix's readdir reads one; End_of_file past the last. */
+CAMLprim value caml_eio_fs_inline_readdir(value dir_v)
+{
+  CAMLparam1(dir_v);
+  CAMLlocal1(entry_v);
+  DIR *dir = DIR_Val(dir_v);
+  struct dirent *ent;
+  int saved_errno;
+  if (!dir)
+    caml_unix_error(EBADF, "readdir", Nothing);
+  errno = 0;
+  caml_release_runtime_system();
+  ent = readdir(dir);
+  saved_errno = errno;
+  caml_acquire_runtime_system();
+  if (!ent) {
+    if (saved_errno == 0)
+      caml_raise_end_of_file();
+    caml_unix_error(saved_errno, "readdir", Nothing);
+  }
+  entry_v = caml_alloc(2, 0);
+  Store_field(entry_v, 0, eio_unix_file_type_of_dtype(ent->d_type));
+  Store_field(entry_v, 1, caml_copy_string(ent->d_name));
+  CAMLreturn(entry_v);
 }

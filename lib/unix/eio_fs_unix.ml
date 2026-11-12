@@ -371,6 +371,9 @@ external inline_stat_native : string -> bool -> At.stat
 external inline_openat : string -> int -> int -> Unix.file_descr
   = "caml_eio_fs_inline_openat"
 
+external inline_readdir : Unix.dir_handle -> Eio.File.Stat.kind * string
+  = "caml_eio_fs_inline_readdir"
+
 let inline_stat ~follow path =
   At.to_stat (eio_unix_errors (fun () -> inline_stat_native path follow))
 
@@ -449,6 +452,21 @@ module Inline = struct
           | exception End_of_file -> acc
         in
         Fun.protect ~finally:(fun () -> Unix.closedir h) (fun () -> names [])
+
+      (* [fn] of the entries but [.] and [..], each with the kind the
+         directory records for it, read as [fn] takes them. *)
+      let with_dir_entries _ path fn =
+        let path = match resolve path with "" -> "." | p -> p in
+        let h = eio_unix_errors (fun () -> Unix.opendir path) in
+        let rec next () =
+          match eio_unix_errors (fun () -> inline_readdir h) with
+          | _, ("." | "..") -> next ()
+          | entry -> Some entry
+          | exception End_of_file -> None
+        in
+        Fun.protect
+          ~finally:(fun () -> Unix.closedir h)
+          (fun () -> fn (Seq.of_dispenser next))
     end in
     let ops =
       Eio.Resource.handler
