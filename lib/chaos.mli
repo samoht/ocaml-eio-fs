@@ -58,9 +58,14 @@
     also says after which operation each value was acknowledged, and, for a
     state drawn among those the cut allows, what each file holds: its length,
     and each run of sectors that holds a write, zeros or stale data, with where
-    the stale data comes from. When the workload's first run has changed, a
-    replay finds its scenario again by its operations, and its report says so. A
-    replay fails if the check no longer has that scenario.
+    the stale data comes from. A block of up to eight operations repeated three
+    times or more, in the same directories each time, as a retry makes them,
+    shows its first and last instances, and a trace longer than that keeps its
+    first and last hundred lines and those around its first fault, so a report's
+    size is bounded by the workload's structure rather than by how long it spun.
+    When the workload's first run has changed, a replay finds its scenario again
+    by its operations, and its report says so. A replay fails if the check no
+    longer has that scenario.
 
     A check reads no environment variable and prints nothing. A test that wants
     a larger budget at night reads its own:

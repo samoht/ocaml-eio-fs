@@ -179,6 +179,116 @@ type tier = Linear | Sampled
 
 let tier_name = function Linear -> "linear" | Sampled -> "sampled"
 
+let parent path =
+  match String.rindex_opt path '/' with
+  | Some 0 -> "/"
+  | Some i -> String.sub path 0 i
+  | None -> "."
+
+(* What a repeated operation keeps: its kind, the directory it is in and
+   its fault, so a retry under one name or under fresh ones repeats. *)
+let shape ((op : Op.t), fault) = (op.kind, parent op.path, fault)
+
+(* The lines of a trace: an operation, or a block of [period] operations
+   repeated, of which the first and the last are shown. *)
+type line =
+  | Line of (Op.t * Fault.t option)
+  | Repeated of { period : int; times : int; first : int; last : int }
+
+let max_period = 8
+let min_times = 3
+
+(* The times the block of [p] operations at [i] repeats from [i]. *)
+let times a i p =
+  let n = Array.length a in
+  let rec same j k =
+    k = p || (shape a.(j + k) = shape a.(j + k - p) && same j (k + 1))
+  in
+  let rec go r =
+    let j = i + (r * p) in
+    if j + p <= n && same j 0 then go (r + 1) else r
+  in
+  go 1
+
+(* Runs of a repeated block collapse to its first and last instances. *)
+let collapse trace =
+  let a = Array.of_list trace in
+  let n = Array.length a in
+  let rec go i acc =
+    if i >= n then List.rev acc
+    else
+      let best =
+        List.fold_left
+          (fun (bp, br) p ->
+            let r = times a i p in
+            if r >= min_times && r * p > bp * br then (p, r) else (bp, br))
+          (1, 1)
+          (List.init max_period (fun k -> k + 1))
+      in
+      match best with
+      | p, r when r >= min_times ->
+          let block j = List.init p (fun k -> Line a.(j + k)) in
+          let last = i + ((r - 1) * p) in
+          let repeated =
+            Repeated
+              {
+                period = p;
+                times = r - 2;
+                first = (fst a.(i + p)).index;
+                last = (fst a.(last - 1)).index;
+              }
+          in
+          go
+            (i + (r * p))
+            (List.rev_append (block i @ (repeated :: block last)) acc)
+      | _ -> go (i + 1) (Line a.(i) :: acc)
+  in
+  go 0 []
+
+(* A trace shows at most [keep] lines at each end, and those around the
+   first fault. *)
+let keep = 100
+let context = 10
+
+let pp_trace b (trace : run_trace) =
+  let lines = Array.of_list (collapse trace) in
+  let n = Array.length lines in
+  let first_fault =
+    let rec find i =
+      if i >= n then None
+      else match lines.(i) with Line (_, Some _) -> Some i | _ -> find (i + 1)
+    in
+    find 0
+  in
+  let shown i =
+    n <= (2 * keep) + (2 * context) + 1
+    || i < keep
+    || i >= n - keep
+    || match first_fault with Some f -> abs (i - f) <= context | None -> false
+  in
+  let plural k = if k = 1 then "" else "s" in
+  let rec pp i =
+    if i < n then (
+      if shown i then begin
+        (match lines.(i) with
+        | Line (op, None) -> Printf.bprintf b "    %s\n" (Fmt.str "%a" Op.pp op)
+        | Line (op, Some f) ->
+            Printf.bprintf b "    %s  <- %s\n" (Fmt.str "%a" Op.pp op)
+              (Fmt.str "%a" Fault.pp f)
+        | Repeated { period; times; first; last } ->
+            Printf.bprintf b
+              "    ... the %d operation%s above, %d more time%s, #%d to #%d\n"
+              period (plural period) times (plural times) first last);
+        pp (i + 1)
+      end
+      else
+        let rec skip j = if j < n && not (shown j) then skip (j + 1) else j in
+        let j = skip i in
+        Printf.bprintf b "    ... %d more line%s\n" (j - i) (plural (j - i));
+        pp j)
+  in
+  pp 0
+
 (* The report of a failing run: the scenario's lines, the trace, and the
    replay that runs it alone. *)
 let report name ~title ~tier ~hash ~key ~matched ~(trace : run_trace) ~error
@@ -196,14 +306,7 @@ let report name ~title ~tier ~hash ~key ~matched ~(trace : run_trace) ~error
     matched;
   line "error" error;
   Printf.bprintf b "  trace:\n";
-  List.iter
-    (fun (op, fault) ->
-      match fault with
-      | None -> Printf.bprintf b "    %s\n" (Fmt.str "%a" Op.pp op)
-      | Some f ->
-          Printf.bprintf b "    %s  <- %s\n" (Fmt.str "%a" Op.pp op)
-            (Fmt.str "%a" Fault.pp f))
-    trace;
+  pp_trace b trace;
   Printf.bprintf b "  replay:   ~replay:%S" (Fmt.str "fs/%s/%s" hash key);
   failwith (Buffer.contents b)
 
@@ -223,12 +326,6 @@ let check_name = "Eio_fs.Chaos.check"
 (* An operation: its kind and the path it names, or the directory that
    path is in. *)
 type target = Op.kind * [ `Path | `Dir ] * string
-
-let parent path =
-  match String.rindex_opt path '/' with
-  | Some 0 -> "/"
-  | Some i -> String.sub path 0 i
-  | None -> "."
 
 let targets (op : Op.t) =
   [ (op.kind, `Path, op.path); (op.kind, `Dir, parent op.path) ]
