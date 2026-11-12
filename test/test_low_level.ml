@@ -772,6 +772,50 @@ let test_linux_eisdir () =
       errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/q"));
     ]
 
+(* A creating open of a name in directory syntax, given or reached through a
+   link, is EISDIR on Linux, whether that name exists or not: after the walk
+   to it, and before O_EXCL looks at it. A last [.] is the directory itself. *)
+let test_linux_create_slash () =
+  Eio_mock.Backend.run @@ fun () ->
+  let _, a = linux_tree () in
+  Eio.Path.symlink ~link_to:"y/" (a / "w/lm");
+  Eio.Path.symlink ~link_to:"p/f/" (a / "w/lf");
+  let open_ create p () =
+    Eio.Switch.run @@ fun sw -> ignore (Eio.Path.open_out ~sw ~create (a / p))
+  in
+  let c = `If_missing 0o644 and x = `Exclusive 0o644 in
+  Alcotest.(check (list string))
+    "create"
+    [
+      "EISDIR";
+      "EISDIR";
+      "EISDIR";
+      "EISDIR";
+      "EISDIR";
+      "EISDIR";
+      "EISDIR";
+      "EEXIST";
+      "EACCES";
+      "ENOENT";
+      "EEXIST";
+      "EISDIR";
+    ]
+    (List.map errno
+       [
+         open_ c "w/zz/";
+         open_ c "w/p/f/";
+         open_ (`Or_truncate 0o644) "w/zz/";
+         open_ x "w/zz/";
+         open_ x "w/p/";
+         open_ c "w/lm";
+         open_ c "w/lf";
+         open_ x "w/lm";
+         open_ c "w/nx/zz/";
+         open_ c "w/nope/zz/";
+         open_ x "w/./";
+         open_ c "w/.";
+       ])
+
 (* rename answers EBUSY for a last [.] or [..], or EEXIST for the target's
    when it must not replace it. *)
 let test_linux_rename_dots () =
@@ -1395,6 +1439,8 @@ let suite =
         test_linux_eisdir;
       Alcotest.test_case "Linux: rename of a last . or .. is EBUSY" `Quick
         test_linux_rename_dots;
+      Alcotest.test_case "Linux: a creating open in directory syntax is EISDIR"
+        `Quick test_linux_create_slash;
       Alcotest.test_case "Linux: permission before kind" `Quick
         test_linux_permission_first;
       Alcotest.test_case "permissions: setgid directories and privilege bits"
