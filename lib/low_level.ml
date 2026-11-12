@@ -485,14 +485,14 @@ module Filesystem = struct
       | None -> { w with dirs = [ root w.tree ] }
 
   (* A lookup in a directory needs its search (x) bit: EACCES. *)
-  let search w name =
+  let search_in w name =
     if not (User.can w.user (Resource.stat !(here w)) User.x) then
       Error.permission_denied name
 
   (* The entry [name] names in the directory [w] is in, [.] and [..] included,
      or [None]. *)
   let child w name =
-    search w name;
+    search_in w name;
     match name with
     | "." -> Some (here w)
     | ".." -> Some (here (up w []))
@@ -514,7 +514,7 @@ module Filesystem = struct
     | [] -> w
     | "." :: rest -> walk ~after w rest
     | ".." :: rest ->
-        search w "..";
+        search_in w "..";
         walk ~after (up w (rest @ after)) rest
     | name :: rest -> walk ~after (into w name) rest
 
@@ -533,8 +533,11 @@ module Filesystem = struct
   (* [locate w path] is the walk into the directory holding [path]'s last
      component, that component (["."] when [path] has none) and whether
      [path] ends in a separator. A confined walk checks by the tree's own
-     parent links that the directory it reached is below its base. *)
-  let locate w path =
+     parent links that the directory it reached is below its base. The walk
+     needs search permission on that directory before anything looks at the
+     last component, [.] and [..] included, as path_resolution(7) checks it
+     for each component; [~search:false] leaves that to the caller. *)
+  let locate ?(search = true) w path =
     (* NUL ends a C path: ENOENT. A name holds at most NAME_MAX bytes. *)
     if String.exists (Char.equal '\000') path then Error.not_found path;
     if List.exists (fun n -> String.length n > 255) (names path) then
@@ -552,6 +555,7 @@ module Filesystem = struct
     | Some _ when String.equal name ".." && List.length w.dirs = 1 ->
         Error.outside_sandbox name
     | _ -> ());
+    if search && names path <> [] then search_in w name;
     let len = String.length path in
     (w, name, len > 0 && path.[len - 1] = '/')
 
@@ -608,7 +612,7 @@ module Filesystem = struct
         let r = resource_of fd in
         { at_root with base = Some (Resource.stat !r).ino; dirs = [ r ] }
 
-  let locate_from dir_fd path = locate (start dir_fd path) path
+  let locate_from ?search dir_fd path = locate ?search (start dir_fd path) path
 
   let lookup ~follow dir_fd path =
     let w, name, slash = locate_from dir_fd path in
@@ -892,8 +896,12 @@ let embed dir_fd ~perm path ~contents =
 
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  (* Linux makes no link to the empty path: ENOENT. *)
-  if String.equal link_to "" then Error.not_found path;
+  (* Linux makes no link to the empty path: ENOENT, once eio_posix has
+     walked to the directory that would hold it. *)
+  if String.equal link_to "" then begin
+    ignore (Filesystem.locate_from ~search:false dir_fd path);
+    Error.not_found path
+  end;
   let fs = Dir.fs dir_fd in
   let symlink r name =
     let new_stat =
@@ -1042,8 +1050,6 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   if is_dot old_name then busy old_path;
   if is_dot new_name then
     if replace then busy new_path else Error.already_exists new_path;
-  (* Both lookups need search permission before the source must exist. *)
-  Filesystem.search new_w new_name;
   (* Rename the directory entry itself. In particular, a symlink's target need
      not exist and must not be followed while moving the link. *)
   let old_res =
