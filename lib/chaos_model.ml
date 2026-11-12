@@ -1235,6 +1235,7 @@ module Crash = struct
         (* Those of [dirs] a barrier has reached since: the entry is durable
            once one of them is. *)
     delta : delta;
+    paths : string list list; (* the paths it names, below the root *)
     mutable recorded : location list;
     attrs_ino : int64 option;
         (* For a chmod or a chown, the node it changed: it holds once that
@@ -1272,6 +1273,9 @@ module Crash = struct
     | Nth_op of int
     | After_dir_op of { kind : op_kind; path : string }
 
+  (* Documented in chaos.mli. *)
+  type outside = Dropped | Kept
+
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The backing store handed back after a crash. *)
 
@@ -1283,6 +1287,7 @@ module Crash = struct
   type t = {
     policy : policy;
     trigger : trigger;
+    outside : outside;
     block_size : int;
     mutable base : base_dir option;
     files : (string, fstate) Hashtbl.t;
@@ -2056,6 +2061,7 @@ module Crash = struct
         dirs;
         barred = [];
         delta;
+        paths = List.filter_map (tree_path ~root) resolved;
         recorded;
         attrs_ino;
         nodes;
@@ -2096,6 +2102,159 @@ module Crash = struct
     in
     snap ctl st;
     reset_journal ctl
+
+  (* Whether the model holds a change at a path below the root: an entry of
+     the journal names it ([~committed] counts the committed ones, which a
+     crash replays over the snapshot too), or a file there has unsynced
+     writes. *)
+  let touched ?(committed = false) ctl =
+    let root = root_segs ctl in
+    let paths = Hashtbl.create 16 in
+    Ids.iter
+      (fun _ e ->
+        if committed || not e.committed then
+          List.iter (fun segs -> Hashtbl.replace paths segs ()) e.paths)
+      ctl.journal;
+    Hashtbl.iter
+      (fun _ (fs : fstate) ->
+        if fs.pending <> [] then
+          Option.iter
+            (fun segs -> Hashtbl.replace paths segs ())
+            (tree_path ~root fs.rel))
+      ctl.files;
+    Hashtbl.mem paths
+
+  (* The proper prefixes of [segs], outermost first: the directories above
+     the entry it names. *)
+  let above segs =
+    let rec go acc pre = function
+      | [] | [ _ ] -> List.rev acc
+      | s :: rest ->
+          let pre = pre @ [ s ] in
+          go (pre :: acc) pre rest
+    in
+    go [] [] segs
+
+  (* [node], read from the store at [segs], with what the model holds at each
+     path below it that it holds a change for. *)
+  let rec prune ~touched ~model segs node =
+    match node with
+    | File _ | Link _ -> Some node
+    | Dir d ->
+        let entries =
+          Paths.fold
+            (fun name child acc ->
+              let segs = segs @ [ name ] in
+              let child =
+                if touched segs then tree_find model segs
+                else prune ~touched ~model segs child
+              in
+              match child with
+              | Some c -> Paths.add name c acc
+              | None -> Paths.remove name acc)
+            d.entries d.entries
+        in
+        Some (Dir { d with entries })
+
+  (* Under [Kept], the store at a path the model holds no change for is the
+     outside writers', durable as they leave it. [adopt ctl paths] runs
+     before the wrapper changes [paths]: the entry the store holds at each
+     such path, and each directory above it the snapshot lacks, enter the
+     snapshot, so that the wrapper's own change starts from what the store
+     held there, and a barrier on a directory an outside writer made commits
+     what the wrapper put in it. *)
+  let adopt ctl paths =
+    match (ctl.outside, ctl.snapshot) with
+    | Dropped, _ | Kept, None -> ()
+    | Kept, Some _ ->
+        let owner, root_path = root ctl in
+        let root = path_segments root_path in
+        let touched = touched ~committed:true ctl in
+        let (Base_dir ((module B), bv)) = owner in
+        let at segs = Eio_fs_path.append root_path (String.concat "/" segs) in
+        List.iter
+          (fun path ->
+            match tree_path ~root path with
+            | None | Some [] -> ()
+            | Some segs when touched segs -> ()
+            | Some segs ->
+                let st = Option.get ctl.snapshot in
+                let dir st pre =
+                  match tree_find st.tree pre with
+                  | Some _ -> st
+                  | None -> (
+                      if touched pre then st
+                      else
+                        match B.stat bv ~follow:false (at pre) with
+                        | { kind = `Directory; perm; uid; gid; ino; _ } ->
+                            set_node st pre
+                              (Some
+                                 (Dir
+                                    {
+                                      perm;
+                                      uid;
+                                      gid;
+                                      ino;
+                                      entries = Paths.empty;
+                                    }))
+                        | _ | (exception Eio.Io _) -> st)
+                in
+                let st = List.fold_left dir st (above segs) in
+                let node =
+                  match snapshot_at owner path with
+                  | node -> prune ~touched ~model:st.tree segs node
+                  | exception e when is_gone e -> None
+                in
+                let st = set_node st segs node in
+                ctl.snapshot <- Some st;
+                ctl.durable <- None;
+                Option.iter
+                  (fun node ->
+                    ctl.snapped <-
+                      fold_nodes
+                        (fun segs n acc ->
+                          match n with
+                          | File f ->
+                              Inos.add f.ino
+                                ("/" ^ String.concat "/" segs, f.data)
+                                acc
+                          | _ -> acc)
+                        segs node ctl.snapped)
+                  node)
+          paths
+
+  (* The image under [Kept]: at a path the model holds a change for, what
+     [model] holds there; at any other, what the store holds once the outside
+     writers have stopped. *)
+  let rec kept_entry ~touched ~model segs store =
+    if touched segs then tree_find model segs
+    else
+      match store with
+      | None | Some (File _ | Link _) -> store
+      | Some (Dir _ as d) -> Some (kept_dir ~touched ~model segs d)
+
+  and kept_dir ~touched ~model segs = function
+    | File _ | Link _ -> invalid_arg "Chaos.Crash: not a directory"
+    | Dir d ->
+        let names m = Paths.fold (fun name _ acc -> name :: acc) m [] in
+        let model_names =
+          match tree_find model segs with
+          | Some (Dir m) -> names m.entries
+          | Some (File _ | Link _) | None -> []
+        in
+        let entries =
+          List.sort_uniq String.compare (names d.entries @ model_names)
+          |> List.fold_left
+               (fun acc name ->
+                 match
+                   kept_entry ~touched ~model (segs @ [ name ])
+                     (Paths.find_opt name d.entries)
+                 with
+                 | Some tree -> Paths.add name tree acc
+                 | None -> acc)
+               Paths.empty
+        in
+        Dir { d with entries }
 
   (* How the entry that made [ino] put it: where, as what, and the files it
      recorded below it. *)
@@ -2259,6 +2418,7 @@ module Crash = struct
             ~seq:ctl.seq;
         dirs = [];
         barred = [];
+        paths = [ segs ];
         delta =
           [
             ( segs,
@@ -3087,6 +3247,18 @@ module Crash = struct
                in
                (fs.rel, durable, live) :: acc)
            ctl.known []);
+      let tree, rewrites =
+        match ctl.outside with
+        | Dropped -> (tree, fun _ -> true)
+        | Kept -> (
+            let touched = touched ctl in
+            match snapshot_at owner root_path with
+            | Dir _ as d ->
+                ( kept_dir ~touched ~model:tree [] d,
+                  fun key -> touched (path_segments key) )
+            | File _ | Link _ ->
+                invalid_arg "Chaos.Crash: wrapped root is not a directory")
+      in
       restore_root owner root_path tree;
       (* Each tracked file is rewritten where the image holds it, which a
          rename may have made another name than the one it was met at. *)
@@ -3098,7 +3270,7 @@ module Crash = struct
       let proot = Option.get ctl.root_box in
       Paths.iter
         (fun key ls ->
-          if not (in_limbo (path_segments key)) then
+          if (not (in_limbo (path_segments key))) && rewrites key then
             let rel = rel_of key in
             List.iter
               (fun (fs, _, _) ->
@@ -3651,6 +3823,7 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let spelt = at d.dplace.prefix path in
       let rel = resolve d spelt in
+      adopt d.dctl [ rel ];
       let key = file_key d.dplace.proot rel in
       (* A dangling link names a file the open creates. *)
       let found =
@@ -3724,9 +3897,10 @@ module Crash = struct
     let mkdir d ~perm path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.mkdir bv ~perm path;
       let rel = at d.dplace.prefix path in
       let resolved = [ resolve ~follow_last:false d rel ] in
+      adopt d.dctl resolved;
+      B.mkdir bv ~perm path;
       record_metadata d.dctl ~path:rel ~kind:Mkdir ~resolved;
       bump_metadata d.dctl ~path:rel ~kind:Mkdir
 
@@ -3745,6 +3919,7 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = at d.dplace.prefix path in
       let resolved = resolve ~follow_last:false d rel in
+      adopt d.dctl [ resolved ];
       let gone = gone d resolved in
       B.unlink bv path;
       Option.iter (untrack d.dctl)
@@ -3757,6 +3932,7 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let rel = at d.dplace.prefix path in
       let p = resolve ~follow_last:false d rel in
+      adopt d.dctl [ p ];
       let gone = gone d p in
       B.rmdir bv path;
       record_metadata d.dctl ~gone ~path:rel ~kind:Rmdir ~resolved:[ p ];
@@ -3776,7 +3952,6 @@ module Crash = struct
       let (Base_dir ((module B), bv)) = d.dboxed in
       let spelt = at d.dplace.prefix old_path in
       let old_rel = resolve ~follow_last:false d spelt in
-      let gone = gone d old_rel in
       (* A crash-wrapped target rehomes the file root-relative, so its rewrite
          does not depend on the target subtree staying open. *)
       let owner, dest, rel =
@@ -3786,6 +3961,11 @@ module Crash = struct
             (cd.dplace.proot, dest, resolve ~follow_last:false cd dest)
         | None -> (box_dir target, new_path, new_path)
       in
+      adopt d.dctl
+        (match target_cdir with
+        | Some _ -> [ old_rel; rel ]
+        | None -> [ old_rel ]);
+      let gone = gone d old_rel in
       (* The node the rename replaces, if any. *)
       let victim = ino_at (as_admin d.dctl owner) rel in
       (match exclusive with
@@ -3820,10 +4000,11 @@ module Crash = struct
     let symlink ~link_to d path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
-      B.symlink ~link_to bv path;
       let rel = at d.dplace.prefix path in
-      let kind = Symlink { target = link_to } in
       let resolved = [ resolve ~follow_last:false d rel ] in
+      adopt d.dctl resolved;
+      B.symlink ~link_to bv path;
+      let kind = Symlink { target = link_to } in
       record_metadata d.dctl ~path:rel ~kind ~resolved;
       bump_metadata d.dctl ~path:rel ~kind
 
@@ -3838,6 +4019,7 @@ module Crash = struct
     let chmod d ~follow ~perm path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
+      adopt d.dctl [ resolve ~follow_last:follow d (at d.dplace.prefix path) ];
       B.chmod bv ~follow ~perm path;
       (* A tracked file's mode, to tell when a write clears setuid. *)
       (match
@@ -3852,6 +4034,7 @@ module Crash = struct
     let chown ~follow ?uid ?gid d path =
       live d;
       let (Base_dir ((module B), bv)) = d.dboxed in
+      adopt d.dctl [ resolve ~follow_last:follow d (at d.dplace.prefix path) ];
       B.chown ~follow ?uid ?gid bv path;
       let st = B.stat bv ~follow path in
       attrs d ~follow path (Chown { uid = st.uid; gid = st.gid })
@@ -3922,11 +4105,13 @@ module Crash = struct
     crash_dir_hook :=
       fun ctl ~ino ~root ~prefix ~base -> wrap_cdir ctl ~ino ~root ~prefix ~base
 
-  let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(block_size = 4096) () =
+  let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(outside = Dropped)
+      ?(block_size = 4096) () =
     if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
     {
       policy;
       trigger;
+      outside;
       block_size;
       base = None;
       files = Hashtbl.create 8;
