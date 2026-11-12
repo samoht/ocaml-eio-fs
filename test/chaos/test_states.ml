@@ -100,6 +100,25 @@ let freed_unsynced () =
           failwith "an aborted record replayed"
       | _ | (exception Eio.Io _) -> ())
 
+(* A file written with no sync and never removed: a cut that loses its
+   creation frees no block of it, so no page of another file holds its
+   bytes. *)
+let lost_not_freed () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env -> Eio_fs_sync.save P.(env#fs / "f") "")
+    (fun ~ack:_ env ->
+      try
+        P.save ~create:(`Exclusive 0o644)
+          P.(env#fs / "g")
+          (String.make 4096 'G');
+        P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+        Eio.Flow.copy_string (String.make 4096 'F') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      let f = P.load P.(env#fs / "f") in
+      if (not (P.is_file P.(env#fs / "g"))) && String.contains f 'G' then
+        failwith "f holds what the lost g had")
+
 (* A new page with no sync: its first sector stale under the written ones.
    The cut's first state drops the file, and the states that vary the first
    sector come last one by one, past what the check enumerates. *)
@@ -215,6 +234,9 @@ let suite =
           Alcotest.(check string)
             "error" "Failure(\"an aborted record replayed\")"
             (Expect.field "error" m));
+      Alcotest.test_case "a file whose creation a cut lost frees no block"
+        `Quick
+        (Expect.passes lost_not_freed);
       Alcotest.test_case "a stale first sector of a large new page is reached"
         `Quick (fun () ->
           let m = Expect.report stale_first in
