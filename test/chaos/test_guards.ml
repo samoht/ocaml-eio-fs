@@ -723,6 +723,65 @@ let test_first_run_stops_at_the_budget () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
+let too_many_ops =
+  "the run made 100,000 filesystem operations, more than a check plans from: a \
+   busy loop, or a workload too large for a check"
+
+(* A poll that reads an open file until it changes, with no yield: no turn
+   passes and nothing fails, so only the run's operations stop it. Its own
+   bound, past that, fails the run when nothing stops it. *)
+let test_read_poll_stops () =
+  Expect.refused
+    ("Eio_fs.Chaos.check: the run with no fault failed: " ^ too_many_ops)
+    (fun () ->
+      Eio_fs.Chaos.check
+        ~setup:(fun env ->
+          P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "x")
+        (fun env ->
+          try
+            P.with_open_in P.(env#fs / "f") @@ fun f ->
+            let buf = Cstruct.create 1 and reads = ref 0 in
+            while
+              incr reads;
+              if !reads > 1_000_000 then failwith "the poll was not stopped";
+              Eio.File.pread_exact f ~file_offset:Optint.Int63.zero [ buf ];
+              Cstruct.to_string buf = "x"
+            do
+              ()
+            done
+          with Eio.Io _ -> ()))
+    ()
+
+(* Three fibers that stat a file every 1 ms for 300 s of clock, under power
+   cuts: a stat changes nothing, so the linear tier stays small, and the
+   run stops at its operations. The heap stays flat. Its own bound, past
+   that, fails the check when nothing stops the runs. *)
+let test_crash_stat_poll_stops () =
+  Gc.compact ();
+  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let stats = ref 0 in
+  Expect.refused
+    ("Eio_fs.Chaos.Crash.check: the run with no cut failed: " ^ too_many_ops)
+    (fun () ->
+      Eio_fs.Chaos.Crash.check
+        (fun ~ack:_ env ->
+          Eio.Fiber.all
+            (List.init 3 (fun _ () ->
+                 while Eio.Time.now env#clock < 300. do
+                   incr stats;
+                   if !stats > 3_000_000 then
+                     failwith "the runs were not stopped";
+                   if !stats mod 1000 = 0 then
+                     top := max !top (Gc.quick_stat ()).heap_words;
+                   (try ignore (P.kind ~follow:true P.(env#fs / "x"))
+                    with Eio.Io _ -> ());
+                   Eio.Time.sleep env#clock 0.001
+                 done)))
+        ~recover:(fun ~acked:_ env -> ignore (P.read_dir env#fs)))
+    ();
+  let grown = !top - base in
+  if grown > 4_000_000 then Alcotest.failf "the heap grew by %d words" grown
+
 (* The same for power cuts: a check keeps no run's operations once it has
    drawn from them, so the heap stays flat as runs go, and does not grow
    with the number of runs, nor, as it draws states, with the number of cuts
@@ -1011,6 +1070,10 @@ let suite =
         test_busy_heap_stays_flat;
       Alcotest.test_case "a first run stops at the budget" `Quick
         test_first_run_stops_at_the_budget;
+      Alcotest.test_case "a read poll with no yield stops" `Quick
+        test_read_poll_stops;
+      Alcotest.test_case "a stat poll under power cuts stops" `Quick
+        test_crash_stat_poll_stops;
       Alcotest.test_case "the heap stays flat under power cuts" `Quick
         test_crash_heap_stays_flat;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
