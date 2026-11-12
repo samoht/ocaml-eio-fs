@@ -13,8 +13,13 @@ val cwd :
   [ `Close | Eio.Fs.dir_ty ] Eio.Resource.t
 (** [cwd ~user t] is access to [t] confined to its current directory. *)
 
-val v : ?user:Low_level.User.t -> unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-(** [v ~user ()] is the root of a fresh, empty filesystem. *)
+val v :
+  ?clock:_ Eio.Time.clock ->
+  ?user:Low_level.User.t ->
+  unit ->
+  [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+(** [v ~clock ~user ()] is the root of a fresh, empty filesystem whose times
+    [clock] gives. *)
 
 val as_user :
   Low_level.User.t -> 'a Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
@@ -28,6 +33,7 @@ val held : _ Eio.Path.t -> (int * int) list option
     [path] is not one. *)
 
 val load :
+  ?clock:_ Eio.Time.clock ->
   ?filter:('a Eio.Path.t -> bool) ->
   'a Eio.Path.t ->
   [ `Close | Eio.Fs.dir_ty ] Eio.Path.t

@@ -156,10 +156,17 @@ val root : user
 
 (** An in-memory filesystem for {!Eio}.
 
-    An entry's stat carries its kind, mode, size and inode, and the owner
-    {!Eio.Path.chown} gives it. It keeps no times, no block count and no link
-    count: [atime], [mtime] and [ctime] are [0.], [blocks] is [0], so
-    {!Path.val-usage} counts no allocated bytes, and [nlink] is [0].
+    An entry's stat carries what Linux gives on tmpfs. Its times come from the
+    clock given to {!Fs.v}, and stay at [0.] without one; under {!Chaos.check}
+    they come from the run's clock. A write, a truncation and an open that
+    truncates move a file's [mtime] and [ctime]. A chmod, a chown and a rename
+    move the entry's [ctime]. Making, removing or renaming an entry moves its
+    directory's [mtime] and [ctime]. [atime] follows relatime, Linux's default:
+    a read, a listing or a link read moves it when it is not past [mtime] or
+    [ctime], or a day after it last moved. [nlink] is [2] plus the number of
+    subdirectories for a directory, [1] for anything else, and [0] once its last
+    name is gone. [blocks] counts the 512-byte blocks of the 4096-byte pages
+    writes put bytes in: a hole, a directory and a link hold none.
 
     A file's bytes live in memory, holes included, and a file holds at most 4
     GiB: a write or a truncation past that raises {!Eio.Fs.File_too_large}.
@@ -203,10 +210,15 @@ val root : user
     Linux, so a test that runs as {!root}, the default, misses the bugs a user
     meets: a directory it cannot create in, a file it cannot open. *)
 module Fs : sig
-  val v : ?user:user -> unit -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [v ~user ()] is the root of a fresh, empty in-memory filesystem whose
-      operations run as [user] (defaults to {!root}), who owns its root
-      directory. Closing this capability prevents further operations through its
+  val v :
+    ?clock:_ Eio.Time.clock ->
+    ?user:user ->
+    unit ->
+    [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [v ~clock ~user ()] is the root of a fresh, empty in-memory filesystem
+      whose operations run as [user] (defaults to {!root}), who owns its root
+      directory. Its times are read from [clock]; without one, they stay at
+      [0.]. Closing this capability prevents further operations through its
       aliases. Directories already opened from it keep their own lifetimes. *)
 
   val as_user : user -> 'a Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
@@ -218,18 +230,20 @@ module Fs : sig
       @raise Stdlib.Invalid_argument if [path] is not an in-memory directory. *)
 
   val load :
+    ?clock:_ Eio.Time.clock ->
     ?filter:('a Eio.Path.t -> bool) ->
     'a Eio.Path.t ->
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [load ~filter path] is the root of a new in-memory filesystem holding a
-      copy of the directory tree at [path], at the same path from its root:
-      [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a symbolic
-      link; the entries below it are copied as they are, a link kept a link.
-      [filter] (defaults to [fun _ -> true]) is called on [path], then on every
-      path below it, before anything of it is copied: a path for which it is
-      [false] is not copied, nor anything under it, so a refused [path] is an
+  (** [load ~clock ~filter path] is the root of a new in-memory filesystem
+      holding a copy of the directory tree at [path], at the same path from its
+      root: [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a
+      symbolic link; the entries below it are copied as they are, a link kept a
+      link. [filter] (defaults to [fun _ -> true]) is called on [path], then on
+      every path below it, before anything of it is copied: a path for which it
+      is [false] is not copied, nor anything under it, so a refused [path] is an
       empty filesystem. [path] can be on any filesystem, an in-memory one
-      included.
+      included. Its times are read from [clock], as {!v} reads them: a copy is a
+      new file, made now.
 
       An entry that is neither a regular file, a directory nor a symbolic link
       is not copied; it is traced with [Eio.traceln].
@@ -277,11 +291,13 @@ module Crunch : sig
       not followed. A program that embeds fixtures reads them with it and needs
       no filesystem. *)
 
-  val load : t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [load entries] is the root of a new in-memory filesystem holding
-      [entries], with their permissions and symbolic links. A {!Dir} creates its
-      missing ancestors; a {!File} or {!Symlink} needs its parent directory to
-      exist already, as the root or from an earlier entry.
+  val load :
+    ?clock:_ Eio.Time.clock -> t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [load ~clock entries] is the root of a new in-memory filesystem holding
+      [entries], with their permissions and symbolic links. Its times are read
+      from [clock], as {!Fs.v} reads them. A {!Dir} creates its missing
+      ancestors; a {!File} or {!Symlink} needs its parent directory to exist
+      already, as the root or from an earlier entry.
 
       @raise Eio.Io
         with {!Eio.Fs.Not_found} if the parent of a {!File} or {!Symlink} is
@@ -306,10 +322,12 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 (** The type for the standard environment {!run} passes on: an in-memory
     filesystem and current directory. *)
 
-val run : ?cwd:string -> ?user:user -> (stdenv -> 'a) -> 'a
-(** [run ~cwd ~user fn] calls [fn] with a new in-memory filesystem in place of
-    the host's. Unlike [Eio_main.run], it starts no event loop and installs no
-    effect handler: call it inside one, such as [Eio_main.run] or
+val run :
+  ?clock:_ Eio.Time.clock -> ?cwd:string -> ?user:user -> (stdenv -> 'a) -> 'a
+(** [run ~clock ~cwd ~user fn] calls [fn] with a new in-memory filesystem in
+    place of the host's, whose times are read from [clock], as {!Fs.v} reads
+    them. Unlike [Eio_main.run], it starts no event loop and installs no effect
+    handler: call it inside one, such as [Eio_main.run] or
     [Eio_mock.Backend.run]. [env] holds the root and the current directory of
     the new filesystem. The current directory is the directory at the absolute
     path [cwd] (defaults to ["/"]), made with its missing ancestors, mode

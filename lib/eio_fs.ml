@@ -285,8 +285,8 @@ module Crunch = struct
         | File f when String.equal f.path path -> Some f.contents | _ -> None)
       entries
 
-  let load entries =
-    let t = Low_level.v () in
+  let load ?clock entries =
+    let t = Low_level.v ?clock () in
     let fs = Fs.fs t in
     let mem path = (fs, path) in
     List.iter
@@ -337,10 +337,10 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
 
 (* Root owns the tree and makes the current directory, which it gives to
    [user]. *)
-let run ?(cwd = "/") ?(user = root) fn =
+let run ?clock ?(cwd = "/") ?(user = root) fn =
   if not (Eio_fs_path.is_abs cwd) then
     Fmt.invalid_arg "Eio_fs.run: the cwd %S is not an absolute path" cwd;
-  let t = Low_level.v ~cwd () in
+  let t = Low_level.v ?clock ~cwd () in
   let admin = (Eio.Path.of_dir (Fs.fs t) :> Eio.Fs.dir_ty Eio.Path.t) in
   Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 Eio.Path.(admin / cwd);
   if user.uid <> 0 then

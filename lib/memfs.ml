@@ -218,8 +218,8 @@ let fs ?(user = Low_level.User.root) t =
 let cwd ?(user = Low_level.User.root) t =
   dir ~label:"cwd" ~path:"." { at = Cwd t; user }
 
-let v ?(user = Low_level.User.root) () =
-  (fs ~user (Low_level.v ~owner:user ()), "/")
+let v ?clock ?(user = Low_level.User.root) () =
+  (fs ~user (Low_level.v ?clock ~owner:user ()), "/")
 
 let as_user user ((d, path) : _ Eio.Path.t) =
   match as_memfs_dir d with
@@ -236,11 +236,11 @@ let held ((d, path) : _ Eio.Path.t) =
 (* The root is followed and must be a directory; the filter is asked about
    it before anything is made, and every entry below it is copied as it is,
    a link kept a link. *)
-let load ?(filter = fun _ -> true) path =
+let load ?clock ?(filter = fun _ -> true) path =
   let stat = Eio.Path.stat ~follow:true path in
   if stat.kind <> `Directory then
     Fmt.invalid_arg "Eio_fs.Fs.load: %a is not a directory" Eio.Path.pp path;
-  let t = Low_level.v () in
+  let t = Low_level.v ?clock () in
   let fs = fs t in
   let switch_filesystem (_, path) = (fs, path) in
   (* The copy keeps each mode, which the umask narrowed. *)

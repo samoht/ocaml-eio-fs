@@ -255,8 +255,6 @@ Code that runs on both should avoid these:
   ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)).
 - Absolute symbolic links. Through the root `Eio_fs.Fs.v` returns, one is
   followed where eio_posix refuses it. Use relative targets.
-- Times, block counts and link counts. An in-memory stat sets them all to
-  zero. Test code that compares modification times on a disk.
 
 ## Licence
 

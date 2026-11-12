@@ -206,6 +206,19 @@ module File = struct
 
   let size f = Optint.Int63.to_int f.stat.size
 
+  (* The 512-byte blocks of the 4096-byte pages a write put bytes in, as
+     tmpfs counts them: a hole holds none. *)
+  let blocks f =
+    let page = 4096 in
+    let _, n =
+      List.fold_left
+        (fun (last, n) (x, y) ->
+          let a = max (x / page) (last + 1) and b = (y - 1) / page in
+          if y <= x || b < a then (last, n) else (b, n + b - a + 1))
+        (-1, 0) f.held
+    in
+    Int64.of_int (n * (page / 512))
+
   let blit t ~src_off dst ~dst_off ~len =
     match t with
     | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
@@ -281,7 +294,7 @@ module Resource = struct
   type t = File of File.t | Dir of Dir_node.t | Symlink of Symlink.t
 
   let stat = function
-    | File f -> f.stat
+    | File f -> { f.stat with blocks = File.blocks f }
     | Dir dir -> dir.stat
     | Symlink s -> s.stat
 
@@ -290,7 +303,31 @@ module Resource = struct
     | File f -> File { f with stat }
     | Dir d -> Dir { d with stat }
     | Symlink s -> Symlink { s with stat }
+
+  let update r f = r := set_stat !r (f (stat !r))
 end
+
+(* Times as Linux keeps them: a change to what an entry holds moves its mtime
+   and ctime, a change to its inode alone its ctime. *)
+let changed ~now (s : Eio.File.Stat.t) = { s with mtime = now; ctime = now }
+let inode_changed ~now (s : Eio.File.Stat.t) = { s with ctime = now }
+
+(* relatime, Linux's default: a read moves atime when it is not past mtime
+   or ctime, or a day after it last moved. *)
+let accessed ~now (s : Eio.File.Stat.t) =
+  if s.atime <= s.mtime || s.atime <= s.ctime || now -. s.atime >= 86400. then
+    { s with atime = now }
+  else s
+
+(* A directory's entries changed, and its subdirectories by [subdirs]: each
+   one's [..] links it. *)
+let entries_changed ~now ?(subdirs = 0) r =
+  Resource.update r (fun s ->
+      { (changed ~now s) with nlink = Int64.add s.nlink (Int64.of_int subdirs) })
+
+(* An inode that lost its only name: an open descriptor still stats it. *)
+let unlinked ~now r =
+  Resource.update r (fun s -> { (inode_changed ~now s) with nlink = 0L })
 
 type resource = Resource.t
 
@@ -299,10 +336,11 @@ let as_dir ~path = function
   | Resource.Dir dir -> dir
   | _ -> Error.not_a_directory path
 
-let truncate_file r =
+(* O_TRUNC moves mtime and ctime, even on an empty file. *)
+let truncate_file ~now r =
   match !r with
   | Resource.File f ->
-      let stat = { f.stat with size = Optint.Int63.zero } in
+      let stat = changed ~now { f.stat with size = Optint.Int63.zero } in
       r := File { contents = File.Buffer Cstruct.empty; stat; held = [] }
   | _ -> ()
 
@@ -330,6 +368,7 @@ type fs = {
       (* The directory [cwd] named when first used: it follows that
          directory, as a descriptor does, whatever later takes the path. *)
   lock : Mutex.t;
+  now : unit -> float; (* the clock its times are read from *)
 }
 
 type t = fs
@@ -399,6 +438,7 @@ let default_stat =
    create (mode_strip_sgid). *)
 let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
   fs.last_ino <- Int64.succ fs.last_ino;
+  let now = fs.now () in
   let kind = Option.value ~default:default_stat.kind kind in
   let perm = Option.value ~default:default_stat.perm perm in
   let gid, perm =
@@ -423,6 +463,10 @@ let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
     perm;
     uid = User.id user.uid;
     gid;
+    nlink = (if kind = `Directory then 2L else 1L);
+    atime = now;
+    mtime = now;
+    ctime = now;
   }
 
 module Filesystem = struct
@@ -430,7 +474,7 @@ module Filesystem = struct
 
   (* A function, not a value: the root is a [ref] mutated in place as entries
      are added, so each empty filesystem needs its own fresh root ref. *)
-  let empty ~(owner : User.t) () : t =
+  let empty ~(owner : User.t) ~now : t =
     let root =
       Resource.Dir
         {
@@ -443,6 +487,10 @@ module Filesystem = struct
               perm = 0o755;
               uid = User.id owner.uid;
               gid = User.id owner.gid;
+              nlink = 2L;
+              atime = now;
+              mtime = now;
+              ctime = now;
             };
           parent = 0L;
           entries = Names.empty;
@@ -671,14 +719,18 @@ module Filesystem = struct
     final ~follow w name ~slash
 end
 
-let v ?(cwd = "/") ?(owner = User.root) () =
+let v ?clock ?(cwd = "/") ?(owner = User.root) () =
+  let now =
+    match clock with Some c -> fun () -> Eio.Time.now c | None -> Fun.const 0.
+  in
   {
-    tree = Filesystem.empty ~owner ();
+    tree = Filesystem.empty ~owner ~now:(now ());
     fds = Fd_table.empty;
     last_ino = 0L;
     cwd;
     cwd_dir = None;
     lock = Mutex.create ();
+    now;
   }
 
 (* Closing an already-closed handle does nothing, as [Eio.Resource.close]
@@ -761,8 +813,8 @@ let new_file ~mode fs (w : Filesystem.walk) name =
       ()
   in
   let f = File.v ~stat in
-  let dir = Dir_node.add name f.stat.ino dir in
-  rdir := Resource.Dir dir;
+  rdir := Resource.Dir (Dir_node.add name f.stat.ino dir);
+  entries_changed ~now:stat.ctime rdir;
   let file = ref (Resource.File f) in
   Filesystem.add_file fs f.stat.ino file;
   file
@@ -787,7 +839,7 @@ let open_locked ~mode dir_fd path flags =
     | _ when directory -> Error.err ("open: not a directory: " ^ path)
     | _ -> ());
     check_access ~user:dir_fd.user path flags r;
-    if truncate then truncate_file r;
+    if truncate then truncate_file ~now:(fs.now ()) r;
     r
   in
   let r =
@@ -867,7 +919,9 @@ let chmod ~follow dir_fd ~perm path =
       perm land lnot 0o2000
     else perm
   in
-  r := Resource.set_stat !r { s with perm }
+  r :=
+    Resource.set_stat !r
+      (inode_changed ~now:((Dir.fs dir_fd).now ()) { s with perm })
 
 (* chown(2): root gives a file to anyone; its owner only moves it to a group
    of their own. EPERM otherwise. *)
@@ -885,16 +939,29 @@ let chown ~follow ?uid ?gid dir_fd path =
     user.uid <> 0
     && not (User.owns user s && uid = s.uid && (gid = s.gid || mine gid))
   then Error.permission_denied path;
-  r := Resource.set_stat !r (User.without_privileges { s with uid; gid })
+  r :=
+    Resource.set_stat !r
+      (inode_changed ~now:((Dir.fs dir_fd).now ())
+         (User.without_privileges { s with uid; gid }))
 
 (* The directory [w] is in, without its entry [name]. The entry's inode leaves
    the tree with its only name, and is freed once no descriptor holds it. *)
 let remove_entry fs (w : Filesystem.walk) name =
+  let now = fs.now () in
   let r = Filesystem.here w in
   let d = as_dir ~path:name !r in
   r := Resource.Dir (Dir_node.remove name d);
   Option.iter
-    (fun ino -> fs.tree <- Entries.remove ino fs.tree)
+    (fun ino ->
+      let subdirs =
+        match Entries.find_opt ino fs.tree with
+        | Some victim ->
+            unlinked ~now victim;
+            if (Resource.stat !victim).kind = `Directory then -1 else 0
+        | None -> 0
+      in
+      entries_changed ~now ~subdirs r;
+      fs.tree <- Entries.remove ino fs.tree)
     (Dir_node.find name d)
 
 let unlink dir_fd path =
@@ -932,7 +999,8 @@ let mkdirat dir_fd ~perm path =
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Dir dir));
-    r := Dir (Dir_node.add name ino d)
+    r := Dir (Dir_node.add name ino d);
+    entries_changed ~now:new_stat.ctime ~subdirs:1 r
   in
   new_entry ~dir:true dir_fd path mkdir
 
@@ -949,7 +1017,8 @@ let embed dir_fd ~perm path ~contents =
     let d = as_dir ~path !r in
     let f = File.literal ~stat contents in
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
-    r := Dir (Dir_node.add name stat.ino d)
+    r := Dir (Dir_node.add name stat.ino d);
+    entries_changed ~now:stat.ctime r
   in
   new_entry dir_fd path add
 
@@ -975,14 +1044,18 @@ let symlinkat ~link_to dir_fd path =
     let dir = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Symlink dir));
-    r := Dir (Dir_node.add name ino d)
+    r := Dir (Dir_node.add name ino d);
+    entries_changed ~now:new_stat.ctime r
   in
   new_entry dir_fd path symlink
 
 let read_link dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  match !(Filesystem.lookup ~follow:false dir_fd path) with
-  | Symlink s -> s.link_to
+  let r = Filesystem.lookup ~follow:false dir_fd path in
+  match !r with
+  | Symlink s ->
+      Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
+      s.link_to
   | _ -> Error.err ("readlink: invalid argument: " ^ path)
 
 (* Listing a directory needs its read bit: EACCES. *)
@@ -998,6 +1071,7 @@ let read_dir dir_fd path =
   check_read ~user:dir_fd.user path r;
   match !r with
   | Resource.Dir dir ->
+      Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
       Names.fold (fun name _ acc -> name :: acc) dir.entries [] |> List.rev
   | _ -> Error.err "Not a directory"
 
@@ -1007,6 +1081,7 @@ let read_dir_entries dir_fd path =
   check_read ~user:dir_fd.user path r;
   match !r with
   | Resource.Dir dir ->
+      Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
       Names.fold
         (fun name ino acc ->
           let kind =
@@ -1166,10 +1241,26 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
       reparent old_res ~new_parent;
+      let fs = Dir.fs dir_fd in
+      let now = fs.now () in
+      let is_dir r = (Resource.stat !r).kind = `Directory in
+      (* A directory moved takes its [..] link along, and one replaced
+         gives its own up. *)
+      let moved = if is_dir old_res then 1 else 0 in
+      let replaced =
+        match dst with Some d when is_dir d -> 1 | Some _ | None -> 0
+      in
+      Resource.update old_res (inode_changed ~now);
+      if old_parent == new_parent then
+        entries_changed ~now ~subdirs:(-replaced) new_parent
+      else begin
+        entries_changed ~now ~subdirs:(-moved) old_parent;
+        entries_changed ~now ~subdirs:(moved - replaced) new_parent
+      end;
       (* The replaced entry lost its only name. *)
       Option.iter
         (fun (dst_ino, _) ->
-          let fs = Dir.fs dir_fd in
+          Option.iter (unlinked ~now) dst;
           fs.tree <- Entries.remove dst_ino fs.tree)
         existing
 
@@ -1180,8 +1271,6 @@ let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
 let check_offset op off =
   if Optint.Int63.compare off Optint.Int63.zero < 0 then
     Fmt.kstr Error.err "%s: invalid offset %a" op Optint.Int63.pp off
-
-(* TODO: update access times *)
 
 (* EISDIR, naming the operation and never the contents. *)
 let not_a_file op r =
@@ -1197,6 +1286,15 @@ let not_a_file op r =
 let written (t : Fd.t) (f : File.t) =
   if t.user.uid = 0 then f else { f with stat = User.without_privileges f.stat }
 
+(* A write of [n] bytes moves mtime and ctime, one of none neither. *)
+let written_at (t : Fd.t) (f : File.t) n =
+  let f = written t f in
+  if n = 0 then f else { f with stat = changed ~now:(t.fs.now ()) f.stat }
+
+(* A read that asks for bytes, at the end of the file included. *)
+let read_from (t : Fd.t) r bufs =
+  if Cstruct.lenv bufs > 0 then Resource.update r (accessed ~now:(t.fs.now ()))
+
 let writev t bufs =
   locked t.Fd.fs @@ fun () ->
   let r = resource_of t in
@@ -1206,15 +1304,21 @@ let writev t bufs =
          append descriptor, at the end. *)
       let src = Cstruct.concat bufs in
       if t.append then t.pos <- e.stat.size;
-      r := File (written t (File.write e ~off:(Optint.Int63.to_int t.pos) src));
+      r :=
+        File
+          (written_at t
+             (File.write e ~off:(Optint.Int63.to_int t.pos) src)
+             (Cstruct.length src));
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
       Cstruct.length src
   | r -> not_a_file "writev" r
 
 let readv t bufs =
   locked t.Fd.fs @@ fun () ->
-  match !(resource_of t) with
+  let r = resource_of t in
+  match !r with
   | File e ->
+      read_from t r bufs;
       let read = ref 0 in
       let pos = ref t.pos in
       let size = Optint.Int63.to_int e.stat.size in
@@ -1238,8 +1342,10 @@ let readv t bufs =
 let preadv t ~file_offset bufs =
   locked t.Fd.fs @@ fun () ->
   check_offset "pread" file_offset;
-  match !(resource_of t) with
+  let r = resource_of t in
+  match !r with
   | Resource.File e ->
+      read_from t r bufs;
       let size = File.size e in
       let start = Optint.Int63.to_int file_offset in
       if start >= size then raise End_of_file
@@ -1269,7 +1375,9 @@ let pwritev t ~file_offset bufs =
       let off =
         if t.append then File.size e else Optint.Int63.to_int file_offset
       in
-      r := Resource.File (written t (File.write e ~off src));
+      r :=
+        Resource.File
+          (written_at t (File.write e ~off src) (Cstruct.length src));
       Cstruct.length src
   | r -> not_a_file "pwrite" r
 
@@ -1297,7 +1405,8 @@ let truncate_fd t len =
   let r = resource_of t in
   match !r with
   | Resource.File e ->
-      r := Resource.File (written t (File.truncate e (Optint.Int63.to_int len)))
+      let f = written t (File.truncate e (Optint.Int63.to_int len)) in
+      r := Resource.File { f with stat = changed ~now:(t.fs.now ()) f.stat }
   | r -> not_a_file "truncate" r
 
 module Flow = struct

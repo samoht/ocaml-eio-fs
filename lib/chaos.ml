@@ -176,7 +176,7 @@ let add_floor halted ~budget ~floor ~at n =
       if !floor > b then halt halted (Over_budget at)
   | None -> ()
 
-let fresh () = (Memfs.v () :> Eio.Fs.dir_ty Eio.Path.t)
+let fresh clock = (Memfs.v ~clock () :> Eio.Fs.dir_ty Eio.Path.t)
 
 let rec walk (d : _ Eio.Path.t) prefix f =
   List.iter
@@ -713,7 +713,7 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
     match
       in_loop ~halted @@ fun clock mono ->
       st.clock <- Some clock;
-      let base = fresh () in
+      let base = fresh clock in
       setup (env_of clock mono base);
       let fs = M.wrap (M.Schedule.hook hook) base in
       match run (env_of clock mono fs) with
@@ -1046,7 +1046,7 @@ module Crash = struct
     let error =
       match
         in_loop ~idle ~halted @@ fun clock mono ->
-        let base = fresh () in
+        let base = fresh clock in
         setup (env_of clock mono base);
         let ctl =
           M.Crash.v ~policy:(policy_of trail s.state) ~block_size:512 ()
@@ -1261,7 +1261,7 @@ module Crash = struct
     let sizes =
       match
         in_loop (fun clock mono ->
-            let d = fresh () in
+            let d = fresh clock in
             setup (env_of clock mono d);
             files d)
       with
