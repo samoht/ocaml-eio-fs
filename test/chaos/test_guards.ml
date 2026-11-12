@@ -836,6 +836,31 @@ let test_stamp () =
   Alcotest.(check bool) "data" true (moved f);
   Alcotest.(check bool) "synced file" false (moved f)
 
+(* Durable saves: each sync commits, so each is a cut, and the first run
+   stops as soon as the cuts it made need more runs than the budget. *)
+let test_syncs_count_in_the_floor () =
+  let runs = ref 0 in
+  Expect.refused
+    "Eio_fs.Chaos.Crash.check: the linear tier needs more than the budget of \
+     1000 runs by operation #"
+    (fun () ->
+      Eio_fs.Chaos.Crash.check ~budget:1000
+        (fun ~ack env ->
+          incr runs;
+          for i = 1 to 50 do
+            try
+              Eio_fs_sync.save P.(env#fs / Fmt.str "f%d" i) "x";
+              Eio_fs_sync.sync_dir env#fs;
+              ack i
+            with Eio.Io _ -> ()
+          done)
+        ~recover:(fun ~acked env ->
+          List.iter
+            (fun i -> ignore (P.load P.(env#fs / Fmt.str "f%d" i)))
+            acked))
+    ();
+  Alcotest.(check int) "runs" 1 !runs
+
 (* A poll that reads an open file until it changes, with no yield: no turn
    passes and nothing fails, so only the run's operations stop it. Its own
    bound, past that, fails the run when nothing stops it. *)
@@ -1186,6 +1211,8 @@ let suite =
       Alcotest.test_case "a sync that commits nothing is no cut" `Quick
         test_idle_syncs_are_no_cut;
       Alcotest.test_case "what a sync changes" `Quick test_stamp;
+      Alcotest.test_case "the syncs that commit count in the floor" `Quick
+        test_syncs_count_in_the_floor;
       Alcotest.test_case "a read poll with no yield stops" `Quick
         test_read_poll_stops;
       Alcotest.test_case "a stat poll under power cuts stops" `Quick
