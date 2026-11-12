@@ -765,13 +765,24 @@ let test_linux_search_final_dir_first () =
     (errno (fun () -> Eio.Path.symlink ~link_to:"" (p / "../c//")))
 
 (* rename refuses a target above its source with ENOTEMPTY, before it
-   compares kinds. *)
+   compares kinds, and before a trailing slash on a file is ENOTDIR. *)
 let test_linux_rename_above () =
   Eio_mock.Backend.run @@ fun () ->
   let _, a = linux_tree () in
+  Alcotest.(check (list string))
+    "rename"
+    [ "ENOTEMPTY"; "ENOTEMPTY"; "ENOTEMPTY"; "ENOTEMPTY"; "ENOTDIR"; "ENOTDIR" ]
+    [
+      errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/p"));
+      errno (fun () -> Eio.Path.rename (a / "w/p/f/") (a / "w/p"));
+      errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/p/"));
+      errno (fun () -> Eio.Path.rename (a / "w/p/f/") (a / "w"));
+      errno (fun () -> Eio.Path.rename (a / "w/p/f/") (a / "w/q"));
+      errno (fun () -> Eio.Path.rename (a / "w/p/f/") (a / "w/p/f"));
+    ];
   Alcotest.(check string)
-    "rename" "ENOTEMPTY"
-    (errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/p")))
+    "rmdir" "ENOTEMPTY"
+    (errno (fun () -> Eio.Path.rmdir (a / "w/p")))
 
 (* readlink of anything but a link is EINVAL. *)
 let test_linux_readlink () =
