@@ -73,6 +73,33 @@ let freed_by_unlink () =
           failwith "a removed record replayed"
       | _ | (exception Eio.Io _) -> ())
 
+(* A temporary file written with no sync, then abandoned and removed, the
+   removal committed: writeback may have put its records on disk before the
+   removal, and an unsynced append to [new] that lands in its freed block
+   may show them. *)
+let freed_unsynced () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save P.(env#fs / "new") (String.make 4096 'n'))
+    (fun ~ack env ->
+      try
+        P.save ~create:(`Exclusive 0o644)
+          P.(env#fs / "tmp")
+          (sectors [ 'A'; 'B'; 'C'; 'D'; 'E'; 'F'; 'G'; 'H'; 'I'; 'J' ]);
+        P.unlink P.(env#fs / "tmp");
+        Eio_fs_sync.sync_dir env#fs;
+        ack ();
+        P.with_open_out ~append:true ~create:`Never P.(env#fs / "new")
+        @@ fun f -> Eio.Flow.copy_string (String.make 512 'x') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      match P.load P.(env#fs / "new") with
+      | s when String.length s > 4096 && s.[4096] = 'I' ->
+          failwith "an aborted record replayed"
+      | _ | (exception Eio.Io _) -> ())
+
 (* A new page with no sync: its first sector stale under the written ones.
    The cut's first state drops the file, and the states that vary the first
    sector come last one by one, past what the check enumerates. *)
@@ -127,6 +154,13 @@ let suite =
           let m = Expect.report freed_by_unlink in
           Alcotest.(check string)
             "error" "Failure(\"a removed record replayed\")"
+            (Expect.field "error" m));
+      Alcotest.test_case
+        "a fresh sector may hold what an unsynced removed file had" `Quick
+        (fun () ->
+          let m = Expect.report freed_unsynced in
+          Alcotest.(check string)
+            "error" "Failure(\"an aborted record replayed\")"
             (Expect.field "error" m));
       Alcotest.test_case "a stale first sector of a large new page is reached"
         `Quick (fun () ->

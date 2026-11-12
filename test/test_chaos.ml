@@ -3284,6 +3284,23 @@ let test_crash_removed_before_snapshot () =
     "new holds what old held" true
     (List.mem (String.make 512 'o') images)
 
+(* A write into a hole: ext4 allocates the whole page and writes it whole,
+   so a sector of it the write did not reach, within the length, may hold
+   stale data too. *)
+let test_crash_hole_page_stale () =
+  let images =
+    chosen_images ~grow:5632 ~init:"pq" [ (4096, String.make 512 'A') ]
+  in
+  let sector k s = String.sub s (512 * k) 512 in
+  Alcotest.(check bool)
+    "a sector of the page the write did not reach is stale" true
+    (List.exists
+       (fun s ->
+         String.length s = 5632
+         && sector 8 s = String.make 512 'A'
+         && sector 9 s = String.make 512 '7')
+       images)
+
 (* The images [Choose] draws at random for [steps] over a durable [init],
    each a write or a truncation, with no sync. *)
 let sampled_images ~init steps =
@@ -3866,6 +3883,8 @@ let suite =
         `Quick test_crash_each_failure_may_land;
       Alcotest.test_case "crash: lengths and sectors as ext4 leaves them" `Quick
         test_crash_choose_as_ext4;
+      Alcotest.test_case "crash: a hole's page may be stale where not written"
+        `Quick test_crash_hole_page_stale;
       Alcotest.test_case "crash: no freed page reused before its truncation"
         `Quick test_crash_truncation_then_reuse;
       Alcotest.test_case "crash: a removal a snapshot folded frees its blocks"
