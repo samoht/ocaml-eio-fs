@@ -76,6 +76,10 @@ let wrap f base =
 let streak_limit tag first =
   10_000 + (first * match tag with `Path -> 3 | `Dir -> 1000)
 
+(* A run that makes more operations spins, or is more than a check plans
+   from: it stops there, so its operations stay bounded. *)
+let max_ops = 100_000
+
 type outcome =
   | Passed
   | Raised of exn
@@ -83,6 +87,7 @@ type outcome =
   | Time_limit
   | Busy
   | Kept_going
+  | Too_many
   | Livelock of [ `Path | `Dir ] * string * int
   | Over_budget of int (* the operation the first run stopped at *)
 
@@ -97,6 +102,9 @@ let outcome_text = function
   | Kept_going ->
       "the run hangs: it kept going for 1000 operations after the power cut, \
        so it catches Eio.Cancel.Cancelled"
+  | Too_many ->
+      "the run made 100,000 filesystem operations, more than a check plans \
+       from: a busy loop, or a workload too large for a check"
   | Livelock (`Path, path, n) ->
       Fmt.str
         "the run hangs: the same operation on %s failed %d times while its \
@@ -146,6 +154,10 @@ let halt halted o =
 (* The first run stops once the linear tier needs more runs than the
    budget: past that, the check cannot pass, and the run's operations need
    not grow. *)
+let count_op halted ops =
+  incr ops;
+  if !ops > max_ops then halt halted Too_many
+
 let add_floor halted ~budget ~floor ~at n =
   match budget with
   | Some b ->
@@ -630,9 +642,10 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
   in
   let trace = record ?cap ~marked () and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
-  let halted = ref None and floor = ref 0 in
+  let halted = ref None and floor = ref 0 and ops = ref 0 in
   let hook (mop : M.Op.t) =
     let op = num mop in
+    count_op halted ops;
     add_floor halted ~budget ~floor ~at:op.index
       (Plan.check_floor ~space:mop.space op);
     Option.iter
@@ -969,7 +982,7 @@ module Crash = struct
     let cut_op = ref None and seqs = ref [] in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
-    let halted = ref None and floor = ref 0 in
+    let halted = ref None and floor = ref 0 and ops = ref 0 in
     (* A cut stops the run, as nothing runs after a power cut: once every
        fiber waits, the phase's switch fails, so a fiber that waits on a
        timer or another fiber stops too. *)
@@ -994,6 +1007,7 @@ module Crash = struct
         let out, l =
           phase
             ~guard:(fun op ->
+              count_op halted ops;
               add_floor halted ~budget ~floor ~at:op.index (Plan.crash_floor op))
             ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
             ~cut_op ~seqs ~stop fs
@@ -1024,9 +1038,11 @@ module Crash = struct
             let rfs = M.Crash.wrap rctl base in
             recovering := true;
             let rout, _ =
-              phase ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
-                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~stop rfs (fun fs ->
-                  recover ~acked (env_of clock mono fs))
+              phase
+                ~guard:(fun _ -> count_op halted ops)
+                ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
+                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~stop rfs
+                (fun fs -> recover ~acked (env_of clock mono fs))
             in
             match (rout, s.rcut) with
             | Passed, None -> None

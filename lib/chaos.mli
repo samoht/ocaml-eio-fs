@@ -86,10 +86,13 @@
     Each run's clocks start at [0.] and move to the next timer when every fiber
     waits, so a sleep takes no time. Each turn, a fiber resumed by a yield,
     another fiber or a timer, also moves them by 1 us, as CPU time passes
-    between two. Four guards stop a run that does not end:
+    between two. Five guards stop a run that does not end:
 
     - a run in which every fiber waits and no timer is due fails as a hang;
     - a retry that never yields meets the spin guard above;
+    - a run that makes 100000 filesystem operations fails as a busy loop, or as
+      too large for a check, so a run's operations stay bounded: a poll that
+      never yields stops there;
     - a run that wakes fibers 10 million times in a row with no fiber waiting 1
       ms or more for a timer fails as a busy loop: a poll by yields, or by
       sleeps shorter than 1 ms, that never ends. Fibers on longer timers are no

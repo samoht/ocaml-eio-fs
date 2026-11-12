@@ -345,6 +345,10 @@ let test_hang () =
 let busy =
   "the run woke 10,000,000 times without waiting 1 ms or more: a busy loop"
 
+let too_many_ops =
+  "the run made 100,000 filesystem operations, more than a check plans from: a \
+   busy loop, or a workload too large for a check"
+
 (* A fiber that polls with a yield for a file another fiber failed to
    write: each turn of the loop takes time, and the run is a busy loop. Its
    own bound, past that, fails the run when nothing stops it. *)
@@ -663,10 +667,9 @@ let test_heap_stays_flat () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
-(* A save retried after a yield on a read-only filesystem: ten million
-   operations before the run is a busy loop. The check keeps only what the
-   report shows, so the heap stays flat as the run goes, and the report
-   is short. *)
+(* A save retried after a yield on a read-only filesystem: the run stops at
+   100,000 operations. The check keeps only what the report shows, so the
+   heap stays flat as the run goes, and the report is short. *)
 let test_busy_heap_stays_flat () =
   Gc.compact ();
   let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
@@ -687,7 +690,7 @@ let test_busy_heap_stays_flat () =
             in
             save 0))
   in
-  Alcotest.(check string) "error" busy (Expect.field "error" report);
+  Alcotest.(check string) "error" too_many_ops (Expect.field "error" report);
   let lines = List.length (String.split_on_char '\n' report) in
   if lines > 20 then Alcotest.failf "the report has %d lines" lines;
   let grown = !top - base in
@@ -722,10 +725,6 @@ let test_first_run_stops_at_the_budget () =
   then Alcotest.failf "not refused by the budget: %s" report;
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
-
-let too_many_ops =
-  "the run made 100,000 filesystem operations, more than a check plans from: a \
-   busy loop, or a workload too large for a check"
 
 (* A poll that reads an open file until it changes, with no yield: no turn
    passes and nothing fails, so only the run's operations stop it. Its own
