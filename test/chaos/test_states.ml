@@ -122,6 +122,39 @@ let freed_elsewhere () =
           failwith "a removed record replayed"
       | _ | (exception Eio.Io _) -> ())
 
+(* The same, where [old] is still open when [new] grows: ext4 frees its
+   blocks at its last close, so a cut before that shows none of them. *)
+let freed_open () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save
+        P.(env#fs / "old")
+        (sectors [ 'A'; 'B'; 'C'; 'D'; 'E'; 'F'; 'G'; 'H'; 'I'; 'J' ]);
+      Eio_fs_sync.save P.(env#fs / "new") (String.make 4096 'n'))
+    (fun ~ack env ->
+      try
+        Eio.Switch.run (fun sw ->
+            let _old = P.open_in ~sw P.(env#fs / "old") in
+            P.unlink P.(env#fs / "old");
+            Eio_fs_sync.sync_dir env#fs;
+            P.with_open_out ~append:true ~create:`Never
+              P.(env#fs / "new")
+              (fun f -> Eio.Flow.copy_string (String.make 512 'x') f);
+            ack `Open;
+            ignore (P.stat ~follow:false P.(env#fs / "new")));
+        ack `Closed
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      keep env;
+      match P.load P.(env#fs / "new") with
+      | s
+        when String.length s > 4096
+             && s.[4096] = 'I'
+             && not (List.mem `Closed acked) ->
+          failwith "a record of an open file replayed"
+      | _ | (exception Eio.Io _) -> ())
+
 (* A temporary file written with no sync, then abandoned and removed, the
    removal committed: writeback may have put its records on disk before the
    removal, and an unsynced append to [new] that lands in its freed block
@@ -349,6 +382,8 @@ let suite =
           Alcotest.(check string)
             "error" "Failure(\"a removed record replayed\")"
             (Expect.field "error" m));
+      Alcotest.test_case "a removed file still open frees no block" `Quick
+        (Expect.passes freed_open);
       Alcotest.test_case
         "a fresh sector may hold what an unsynced removed file had" `Quick
         (fun () ->
