@@ -879,12 +879,13 @@ module Crash = struct
     (* Whether recover looked at the directory in some run. *)
     let reads = ref (first.rtrace <> []) in
     let tears = Plan.tears ~sizes first_ops in
-    let runs = ref 0 and results = Hashtbl.create 64 in
+    (* A run's result is dropped once the scenarios it leads to are drawn
+       from it, so memory stays that of one run. *)
+    let runs = ref 0 in
     let attempt ?matched tier s =
       incr runs;
       let r = exec s in
       if r.rtrace <> [] then reads := true;
-      Hashtbl.replace results (Plan.crash_key s) r;
       (match r.error with
       | None -> ()
       | Some e ->
@@ -901,11 +902,6 @@ module Crash = struct
             ~trace:r.trace ~error:err (lines s r));
       r
     in
-    let result s =
-      match Hashtbl.find_opt results (Plan.crash_key s) with
-      | Some r -> r
-      | None -> exec s
-    in
     let trace = first_ops in
     let cuts = Plan.crash_cuts trace in
     let faults = Plan.crash_faults ~tears trace in
@@ -913,31 +909,28 @@ module Crash = struct
     | Some ((h, k) as r) -> (
         let matched = if h = hash then None else Some h in
         let find l = List.find_opt (fun s -> Plan.crash_key s = k) l in
-        let rcuts_of l =
-          List.concat_map (fun s -> Plan.rcuts s ~recover:(result s).rtrace) l
-        in
-        let candidates () =
+        (* The scenarios each run of [l] leads to, one run at a time. *)
+        let find_after l f = List.find_map (fun s -> find (f s (exec s))) l in
+        let rcuts s r = Plan.rcuts s ~recover:r.rtrace in
+        let candidates =
           [
-            (Linear, fun () -> cuts @ faults);
-            (Linear, fun () -> rcuts_of cuts);
-            (Sampled, fun () -> Plan.crash_others ~tears trace);
+            (Linear, fun () -> find (cuts @ faults));
+            (Linear, fun () -> find_after cuts rcuts);
+            (Sampled, fun () -> find (Plan.crash_others ~tears trace));
             ( Sampled,
               fun () ->
-                List.concat_map
-                  (fun (s : Plan.crash) ->
+                find_after faults (fun (s : Plan.crash) r ->
                     match s.cfaults with
                     | [ one ] when s.state = Drop ->
-                        Plan.crash_seconds ~tears one
-                          ~after:(ops (result s).trace)
-                    | _ -> [])
-                  faults );
-            (Sampled, fun () -> rcuts_of faults);
+                        Plan.crash_seconds ~tears one ~after:(ops r.trace)
+                    | _ -> []) );
+            (Sampled, fun () -> find_after faults rcuts);
           ]
         in
         let found =
           List.find_map
-            (fun (tier, l) -> Option.map (fun s -> (s, tier)) (find (l ())))
-            (candidates ())
+            (fun (tier, f) -> Option.map (fun s -> (s, tier)) (f ()))
+            candidates
         in
         let found =
           match found with
@@ -966,35 +959,47 @@ module Crash = struct
         let lin = cuts @ faults in
         if List.length lin > budget then over (List.length lin);
         (* The cuts during recover come from the traces of the cuts, so the
-           tier's size is known once those ran. *)
-        List.iter (fun s -> ignore (attempt Linear s)) lin;
+           tier's size is known once those ran; past the budget, only their
+           number is kept. *)
+        let nrcuts = ref 0 in
         let rcuts =
           List.concat_map
-            (fun s -> Plan.rcuts s ~recover:(result s).rtrace)
+            (fun s ->
+              let l = Plan.rcuts s ~recover:(attempt Linear s).rtrace in
+              nrcuts := !nrcuts + List.length l;
+              if List.length lin + !nrcuts > budget then [] else l)
             cuts
         in
-        let n = List.length lin + List.length rcuts in
-        if n > budget then over n;
+        let linear = List.length lin + !nrcuts in
+        (* The second faults and the cuts during recover each fault allows,
+           spread as each run ends, so no run's operations outlive it: an
+           even share of what the sampled tier can spend. *)
+        let quota =
+          let total = Plan.sampled_share ~budget ~linear ~classes:1 in
+          let k = List.length faults in
+          (total + k - 1) / max 1 k
+        in
+        let after_faults =
+          List.map
+            (fun (s : Plan.crash) ->
+              let r = attempt Linear s in
+              let pairs =
+                match s.cfaults with
+                | [ one ] when s.state = Drop ->
+                    Plan.crash_seconds ~tears one ~after:(ops r.trace)
+                | _ -> []
+              in
+              ( Plan.spread quota pairs,
+                Plan.spread quota (Plan.rcuts s ~recover:r.rtrace) ))
+            faults
+        in
+        if linear > budget then over linear;
         List.iter (fun r -> ignore (attempt Linear r)) rcuts;
-        let linear = !runs in
         (* Sampled tier. *)
         let thunks = List.map (fun s () -> ignore (attempt Sampled s)) in
         let others = thunks (Plan.crash_others ~tears trace) in
-        let pairs =
-          List.concat_map
-            (fun (s : Plan.crash) ->
-              match s.cfaults with
-              | [ one ] when s.state = Drop ->
-                  thunks
-                    (Plan.crash_seconds ~tears one ~after:(ops (result s).trace))
-              | _ -> [])
-            faults
-        in
-        let recovery =
-          List.concat_map
-            (fun s -> thunks (Plan.rcuts s ~recover:(result s).rtrace))
-            faults
-        in
+        let pairs = List.concat_map (fun (p, _) -> thunks p) after_faults in
+        let recovery = List.concat_map (fun (_, r) -> thunks r) after_faults in
         (* Every state each cut allows, enumerated while the draws met so
            far allow no more than the cut's share, and drawn at random past
            that. Each cut gets an even share of what is left: first every cut
