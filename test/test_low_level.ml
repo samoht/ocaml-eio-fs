@@ -741,6 +741,29 @@ let test_linux_rename_search_first () =
     "rename" "EACCES"
     (errno (fun () -> Eio.Path.rename (a / "w/missing") (a / "w/nx/y")))
 
+(* The walk to the directory that holds a path's last component needs
+   search permission on it before anything looks at that component: [.] and
+   [..], its kind or whether it exists, on either side of a rename. A [..]
+   out of a confined directory is refused before a symbolic link's empty
+   target. *)
+let test_linux_search_final_dir_first () =
+  Eio_mock.Backend.run @@ fun () ->
+  let _, a = linux_tree () in
+  Alcotest.(check (list string))
+    "rename, rmdir, unlink"
+    [ "EACCES"; "EACCES"; "EACCES"; "EACCES" ]
+    [
+      errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/nx/."));
+      errno (fun () -> Eio.Path.rename (a / "w/nx/t/") (a / "w/missing/b/"));
+      errno (fun () -> Eio.Path.rmdir (a / "w/nx/."));
+      errno (fun () -> Eio.Path.unlink (a / "w/nx/."));
+    ];
+  Eio.Switch.run @@ fun sw ->
+  let p = Eio.Path.open_dir ~sw (a / "w/p") in
+  Alcotest.(check string)
+    "symlink" "EACCES"
+    (errno (fun () -> Eio.Path.symlink ~link_to:"" (p / "../c//")))
+
 (* rename refuses a target above its source with ENOTEMPTY, before it
    compares kinds. *)
 let test_linux_rename_above () =
@@ -1431,6 +1454,8 @@ let suite =
         `Quick test_linux_mkdir_modes;
       Alcotest.test_case "Linux: rename searches before the source must exist"
         `Quick test_linux_rename_search_first;
+      Alcotest.test_case "Linux: search on the last directory first" `Quick
+        test_linux_search_final_dir_first;
       Alcotest.test_case "Linux: rename over a directory above is ENOTEMPTY"
         `Quick test_linux_rename_above;
       Alcotest.test_case "Linux: readlink of a non-link is EINVAL" `Quick
