@@ -1,4 +1,4 @@
-(* Each call through [Eio_fs_unix.Inline.fs env] against the same call
+(* Each call through [Eio_fs_unix.inline_fs env] against the same call
    through [Eio.Stdenv.fs env]: the same answer, or the same error as eio-fs
    promises one, which says the operation that failed, on which path, and
    why. *)
@@ -9,8 +9,8 @@ let err fmt = Fmt.kstr (fun s -> Error s) fmt
    context Eio.Path adds, the kind of error and its errno. The system call a
    backend names and its argument are not part of the promise: eio_linux
    names statx and openat2, with an empty argument, where eio_posix and
-   Inline.fs name fstatat, openat and opendir, with the path. A comparison
-   of the printed exception would catch Inline.fs reporting another errno
+   inline_fs name fstatat, openat and opendir, with the path. A comparison
+   of the printed exception would catch inline_fs reporting another errno
    or another operation, and not a backend's choice of call. *)
 let promised = function
   | Eio.Io (err, context) ->
@@ -43,7 +43,7 @@ let unit_r = Alcotest.(result unit string)
 let with_tree fn =
   Eio_main.run @@ fun env ->
   let base = Filename.temp_dir "eio-fs-inline" "" in
-  let fs = Eio.Stdenv.fs env and inline = Eio_fs_unix.Inline.fs env in
+  let fs = Eio.Stdenv.fs env and inline = Eio_fs_unix.inline_fs env in
   Fun.protect
     ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true Eio.Path.(fs / base))
     (fun () ->
@@ -207,7 +207,7 @@ let test_no_hop () =
          (fun () -> ran := true))
   in
   Alcotest.(check bool) "the root hands off (control)" true (hops fs);
-  Alcotest.(check bool) "Inline.fs does not" false (hops inline)
+  Alcotest.(check bool) "inline_fs does not" false (hops inline)
 
 let suite =
   ( "inline",

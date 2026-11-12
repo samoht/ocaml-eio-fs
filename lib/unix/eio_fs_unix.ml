@@ -466,7 +466,7 @@ module Inline = struct
     let resolve path =
       match B.native bv path with
       | Some p -> p
-      | None -> invalid_arg "Eio_fs_unix.Inline.fs: a path with no native form"
+      | None -> invalid_arg "Eio_fs_unix.inline_fs: a path with no native form"
     in
     let module O = struct
       include B
@@ -533,6 +533,8 @@ module Inline = struct
     in
     ((Eio.Resource.T (bv, ops) :> Eio.Fs.dir_ty Eio.Resource.t), root)
 end
+
+let inline_fs = Inline.fs
 
 (* Why a [with_parent] refused a path: it names nothing beneath its
    directory, or a parent on the way is not a directory it may descend. *)

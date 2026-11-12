@@ -205,7 +205,7 @@ assert (
 - `eio-fs.unix` binds POSIX calls that Eio and `Unix` lack, such as advisory
   locks and extended attributes, and has a root whose stats, opens and
   directory listings run on the calling thread rather than a system thread
-  (`Eio_fs_unix.Inline.fs`).
+  (`Eio_fs_unix.inline_fs`).
 - `eio-fs.path` does lexical operations on path strings.
 
 ## Limitations
