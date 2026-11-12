@@ -695,10 +695,7 @@ let new_entry ?(dir = false) dir_fd path add =
 
 (* Create [name] in the directory [w] is in, register the new file in the
    filesystem, and return its resource. *)
-let new_file ~mode fs (w : Filesystem.walk) name ~slash =
-  (* A path in directory syntax names a directory, which O_CREAT never makes:
-     macOS answers ENOENT, Linux EISDIR. *)
-  if slash then Error.not_found name;
+let new_file ~mode fs (w : Filesystem.walk) name =
   let rdir = Filesystem.here w in
   check_live fs rdir name;
   check_dir_write ~user:w.user rdir name;
@@ -747,26 +744,28 @@ let open_locked ~mode dir_fd path flags =
         | _ -> opened r)
     | true ->
         (* O_CREAT looks at the last component without following it. A
-           symbolic link there, dangling or not, makes O_EXCL fail with EEXIST
-           and O_NOFOLLOW with ELOOP; otherwise the open follows it and, when
-           its target is missing, creates that target, resolved from the
-           directory holding the link. *)
+           name in directory syntax there, given or a link's target, is
+           EISDIR, as Linux answers whether it exists or not; a last [.] is
+           the directory itself. A symbolic link there, dangling or not,
+           makes O_EXCL fail with EEXIST and O_NOFOLLOW with ELOOP; otherwise
+           the open follows it and opens its target, or creates it, resolved
+           from the directory holding the link. *)
         let rec create (w : Filesystem.walk) name ~slash =
-          match Filesystem.child w name with
-          | None -> new_file ~mode fs w name ~slash
+          let child = Filesystem.child w name in
+          if slash && not (is_dot name) then
+            Error.err ("open: is a directory: " ^ path);
+          match child with
+          | None -> new_file ~mode fs w name
           | Some _ when is_excl -> Error.already_exists path
           | Some r -> (
               match !r with
               | Resource.Symlink _ when nofollow -> Error.symlink_loop ()
-              | Resource.Symlink s -> (
-                  match Filesystem.final ~follow:true w name ~slash with
-                  | r -> opened r
-                  | exception Eio.Io (Eio.Fs.E (Not_found _), _) ->
-                      Filesystem.follow_link w.follows;
-                      let w, name, slash =
-                        Filesystem.locate w (Filesystem.link_target name s)
-                      in
-                      create w name ~slash)
+              | Resource.Symlink s ->
+                  Filesystem.follow_link w.follows;
+                  let w, name, slash =
+                    Filesystem.locate w (Filesystem.link_target name s)
+                  in
+                  create w name ~slash
               | _ -> opened r)
         in
         let w, name, slash = Filesystem.locate_from dir_fd path in
