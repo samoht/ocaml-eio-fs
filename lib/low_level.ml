@@ -977,7 +977,7 @@ let rmdir dir_fd path =
       check_sticky ~user:dir_fd.user rdir victim path;
       match !victim with
       | Resource.Dir d when not (Dir_node.is_empty d) ->
-          Error.err "Directory is not empty"
+          Error.err ("rmdir: directory not empty: " ^ path)
       | Resource.Dir _ -> remove_entry (Dir.fs dir_fd) w name
       | _ -> Error.err ("rmdir: not a directory: " ^ path))
 
@@ -1057,10 +1057,20 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
     | Some r -> r
     | None -> Error.not_found old_path
   in
-  (* A trailing slash on either name requires a directory, never followed. *)
+  (* A trailing slash on either name requires a directory, never followed:
+     ENOTDIR, once a target above the source is ENOTEMPTY. *)
   (match !old_res with
   | Resource.Dir _ -> ()
-  | _ when old_slash || new_slash -> Error.not_a_directory old_path
+  | _ when old_slash || new_slash ->
+      let dst =
+        Option.bind
+          (Dir_node.find new_name
+             (as_dir ~path:new_path !(Filesystem.here new_w)))
+          (fun ino -> Entries.find_opt ino tree)
+      in
+      check_rename_tree tree ~src:old_res ~old_parent:(Filesystem.here old_w)
+        ~new_parent:(Filesystem.here new_w) ~dst new_path;
+      Error.not_a_directory old_path
   | _ -> ());
   let ino = Resource.(stat !old_res).ino in
   let old_parent = Filesystem.here old_w in
