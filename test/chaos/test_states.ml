@@ -96,6 +96,32 @@ let freed_by_unlink () =
           failwith "a removed record replayed"
       | _ | (exception Eio.Io _) -> ())
 
+(* The same, where [new] holds two pages and [old] two: the append lands in
+   the third page of [new], a block the removal freed at another offset,
+   which ext4 may give it as well. *)
+let freed_elsewhere () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save
+        P.(env#fs / "old")
+        (sectors [ 'A'; 'B'; 'C'; 'D'; 'E'; 'F'; 'G'; 'H'; 'I'; 'J' ]);
+      Eio_fs_sync.save P.(env#fs / "new") (String.make 8192 'n'))
+    (fun ~ack env ->
+      try
+        P.unlink P.(env#fs / "old");
+        Eio_fs_sync.sync_dir env#fs;
+        ack ();
+        P.with_open_out ~append:true ~create:`Never P.(env#fs / "new")
+        @@ fun f -> Eio.Flow.copy_string (String.make 512 'x') f
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      match P.load P.(env#fs / "new") with
+      | s when String.length s > 8192 && (s.[8192] = 'A' || s.[8192] = 'I') ->
+          failwith "a removed record replayed"
+      | _ | (exception Eio.Io _) -> ())
+
 (* A temporary file written with no sync, then abandoned and removed, the
    removal committed: writeback may have put its records on disk before the
    removal, and an unsynced append to [new] that lands in its freed block
@@ -272,6 +298,13 @@ let suite =
       Alcotest.test_case "a fresh sector may hold what a removal freed" `Quick
         (fun () ->
           let m = Expect.report freed_by_unlink in
+          Alcotest.(check string)
+            "error" "Failure(\"a removed record replayed\")"
+            (Expect.field "error" m));
+      Alcotest.test_case
+        "a fresh sector may hold what a removal freed elsewhere" `Quick
+        (fun () ->
+          let m = Expect.report freed_elsewhere in
           Alcotest.(check string)
             "error" "Failure(\"a removed record replayed\")"
             (Expect.field "error" m));
