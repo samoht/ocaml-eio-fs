@@ -204,14 +204,15 @@ let budget_of name = function
   | Some b when b < 1 -> Fmt.invalid_arg "%s: the budget is %d" name b
   | Some b -> b
 
-let parse_replay name r =
+let parse_replay ?(well_formed = fun _ -> true) name r =
   let bad () = fail name "~replay:%S is not a replay of eio-fs" r in
   if not (String.starts_with ~prefix:"fs/" r) then bad ()
   else
     let r' = String.sub r 3 (String.length r - 3) in
     match String.index_opt r' '/' with
     | Some i when i > 0 && i < String.length r' - 1 ->
-        (String.sub r' 0 i, String.sub r' (i + 1) (String.length r' - i - 1))
+        let key = String.sub r' (i + 1) (String.length r' - i - 1) in
+        if well_formed key then (String.sub r' 0 i, key) else bad ()
     | _ -> bad ()
 
 let digest (trace : Plan.trace) =
@@ -882,7 +883,7 @@ module Crash = struct
             let c = if !pos < Array.length v then v.(!pos) else 0 in
             incr pos;
             trail := (c, n) :: !trail;
-            if c < n then c else 0)
+            if 0 <= c && c < n then c else 0)
     | Seed s ->
         let rng = Random.State.make [| s |] in
         Choose
@@ -896,7 +897,7 @@ module Crash = struct
   let allows (st : Plan.state) trail =
     match st with
     | Enum v | Shape v ->
-        List.for_all (fun (c, n) -> c < n) trail
+        List.for_all (fun (c, n) -> 0 <= c && c < n) trail
         && List.length v <= List.length trail
     | Drop | Keep | Seed _ -> true
 
@@ -1171,7 +1172,9 @@ module Crash = struct
 
   let check ?budget ?replay ?(setup = ignore) run ~recover =
     let budget = budget_of name budget in
-    let replay = Option.map (parse_replay name) replay in
+    let replay =
+      Option.map (parse_replay ~well_formed:Plan.well_formed name) replay
+    in
     let exec ?cap ?budget s = exec ?cap ?budget ~setup run ~recover s in
     (* A replay runs one scenario, whatever the budget. *)
     let first =

@@ -468,26 +468,36 @@ let state_key = function
   | Seed s -> Fmt.str "s%d" s
   | Shape v -> "p" ^ String.concat "." (List.map string_of_int (trim v))
 
+(* Only the key [state_key] makes names a state: no negative choice, no
+   leading zero or sign, no trailing zero. *)
 let state_of_key k =
-  let choices k mk =
-    let body = String.sub k 1 (String.length k - 1) in
+  let body = if k = "" then "" else String.sub k 1 (String.length k - 1) in
+  let choice s =
+    match int_of_string_opt s with Some c when c >= 0 -> Some c | _ -> None
+  in
+  let choices mk =
     if body = "" then Some (mk [])
     else
-      match List.map int_of_string (String.split_on_char '.' body) with
-      | v -> Some (mk v)
-      | exception Failure _ -> None
+      List.fold_right
+        (fun s acc ->
+          match (acc, choice s) with
+          | Some l, Some c -> Some (c :: l)
+          | _ -> None)
+        (String.split_on_char '.' body)
+        (Some [])
+      |> Option.map mk
   in
-  match k with
-  | "drop" -> Some Drop
-  | "keep" -> Some Keep
-  | _ when String.length k > 0 && k.[0] = 'e' -> choices k (fun v -> Enum v)
-  | _ when String.length k > 0 && k.[0] = 'p' -> choices k (fun v -> Shape v)
-  | _ when String.length k > 0 && k.[0] = 's' -> (
-      let body = String.sub k 1 (String.length k - 1) in
-      match int_of_string_opt body with
-      | Some s when string_of_int s = body -> Some (Seed s)
-      | Some _ | None -> None)
-  | _ -> None
+  let st =
+    match k with
+    | "drop" -> Some Drop
+    | "keep" -> Some Keep
+    | _ when k = "" -> None
+    | _ when k.[0] = 'e' -> choices (fun v -> Enum v)
+    | _ when k.[0] = 'p' -> choices (fun v -> Shape v)
+    | _ when k.[0] = 's' -> Option.map (fun s -> Seed s) (choice body)
+    | _ -> None
+  in
+  match st with Some st when state_key st = k -> Some st | _ -> None
 
 let cut_key = function None -> "end" | Some p -> "before:" ^ pos_key p
 
@@ -499,6 +509,35 @@ let crash_key s =
   in
   Fmt.str "%s|%s|%s%s" (faults_key s.cfaults) (cut_key s.cut)
     (state_key s.state) r
+
+let cut_last s =
+  match String.rindex_opt s '|' with
+  | Some i ->
+      Some (String.sub s 0 i, String.sub s (i + 1) (String.length s - i - 1))
+  | None -> None
+
+(* The key before the last [|r|] in [s], if any. *)
+let before_rcut s =
+  let rec go i =
+    if i < 0 then None
+    else if String.sub s i 3 = "|r|" then Some (String.sub s 0 i)
+    else go (i - 1)
+  in
+  go (String.length s - 3)
+
+let well_formed k =
+  let state s = Option.is_some (state_of_key s) in
+  match cut_last k with
+  | None -> false
+  | Some (rest, st) -> (
+      state st
+      &&
+      match before_rcut rest with
+      | None -> String.contains rest '|'
+      | Some main -> (
+          match cut_last main with
+          | Some (rest, st) -> state st && String.contains rest '|'
+          | None -> false))
 
 (* The key of [s] with its state left out, and the state. *)
 let split_state_key k =

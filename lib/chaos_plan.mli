@@ -200,6 +200,10 @@ val state_key : state -> string
 val crash_key : crash -> string
 (** [crash_key s] names [s] in a replay. *)
 
+val well_formed : string -> bool
+(** [well_formed k] is [true] iff [k] has the shape of a key {!crash_key} makes,
+    its states as {!state_key} names them. *)
+
 val split_state_key : string -> (string * state) option
 (** [split_state_key k] is the key of the scenario [k] names with its state
     replaced by [Drop], and that state. *)
