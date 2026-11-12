@@ -1939,6 +1939,31 @@ let test_crash_closed_subtree_real () =
         "real fs: mode preserved" 0o444
         (Eio.Path.stat ~follow:true (post / "stage" / "img")).perm)
 
+(* A file the crash spared keeps its inode and modification time, as on a
+   disk: the image is restored in place, and an entry that already holds what
+   the image says is left as it stands. *)
+let test_crash_spared_identity_real () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  let before = ref None in
+  let identity (st : Eio.File.Stat.t) = (st.ino, st.mtime) in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "kept")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "data" ];
+          Eio.File.sync file);
+      Crash.sync_metadata ctl;
+      before := Some (identity (Eio.Path.stat ~follow:false (fs / "kept")));
+      Eio.Path.save ~create:(`Exclusive 0o644) (fs / "lost") "junk")
+    ~check:(fun post ->
+      Alcotest.(check bool)
+        "real fs: the unsynced file is gone" true
+        (absent (post / "lost"));
+      Alcotest.(check (option (pair int64 (float 0.))))
+        "real fs: the spared file's inode and mtime" !before
+        (Some (identity (Eio.Path.stat ~follow:false (post / "kept")))))
+
 (* The kernel-side variant of the reverted tmp-rename: the rollback must
    physically undo a rename on the real filesystem. *)
 let test_crash_rename_revert_real () =
@@ -3938,6 +3963,8 @@ let suite =
         test_crash_readonly_real;
       Alcotest.test_case "crash: closed subtree (real fs)" `Quick
         test_crash_closed_subtree_real;
+      Alcotest.test_case "crash: a spared file keeps its identity (real fs)"
+        `Quick test_crash_spared_identity_real;
       Alcotest.test_case "crash: committed unlink stays deleted" `Quick
         test_crash_committed_unlink_stays_deleted;
       Alcotest.test_case "crash: uncommitted unlink rolls back" `Quick
