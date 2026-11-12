@@ -219,8 +219,8 @@ let test_read_regular () =
   Eio.Path.mkdir ~perm:0o755 (root / "packages");
   Eio.Path.save ~create:(`Exclusive 0o640) (root / "packages/library") "bytes";
   (match get (read root "packages/library") with
-  | Some { Link.content; perm } ->
-      Alcotest.(check string) "the file's bytes" "bytes" content;
+  | Some { Link.contents; perm } ->
+      Alcotest.(check string) "the file's bytes" "bytes" contents;
       Alcotest.(check int) "the descriptor's permission bits" 0o640 perm
   | None -> Alcotest.fail "a present regular file read as absent");
   Alcotest.(check bool)
@@ -259,7 +259,7 @@ let test_read_too_large () =
       Alcotest.(check (option string))
         "at the bound" (Some "12345")
         (Option.map
-           (fun (r : Link.regular) -> r.content)
+           (fun (r : Link.regular) -> r.contents)
            (get (read ~max_bytes:5 root "library")))
 
 (* The bound is Nofollow's: a negative one or max_int is refused. *)

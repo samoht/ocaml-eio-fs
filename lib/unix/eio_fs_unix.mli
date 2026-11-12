@@ -751,7 +751,7 @@ module Link : sig
       byte and a failed call are [Error msg], and nothing is replaced; [msg]
       names the original path and the action needed to retry. *)
 
-  type regular = { content : string; perm : int }
+  type regular = { contents : string; perm : Eio.File.Unix_perm.t }
   (** The type for a regular file read: its bytes and its permission bits, both
       from the one descriptor. *)
 

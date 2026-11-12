@@ -655,7 +655,7 @@ module Link = struct
 
   (* The leaf is opened, weighed and read on system threads, one per call, so
      a cancel is seen between reads; it is closed before the result. *)
-  type regular = { content : string; perm : int }
+  type regular = { contents : string; perm : Eio.File.Unix_perm.t }
 
   let read_regular ~max_bytes t =
     if max_bytes < 0 || max_bytes = max_int then
@@ -696,7 +696,7 @@ module Link = struct
               ~read:(fun buffer -> in_systhread (fun () -> read_into fd buffer))
           with
           | Ok bytes ->
-              Ok (Some { content = Cstruct.to_string bytes; perm = stat.perm })
+              Ok (Some { contents = Cstruct.to_string bytes; perm = stat.perm })
           | Error `Too_large -> err_read "%s changed size while read" t.path
           | Error (`Invalid reason) -> err_read "%s: %s" t.path reason)
 end
