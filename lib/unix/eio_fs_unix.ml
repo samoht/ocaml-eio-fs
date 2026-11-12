@@ -1368,7 +1368,7 @@ let take_lease_lock ~shared ~patience ~on_wait ~name file =
         name
 
 let rec acquire ~sw ?lease
-    ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes)
+    ?(block : [ `Yes | `No | `Fibers | `For of float ] = `Yes) ?patience
     ?(create : [ `Never | `If_missing of Eio.File.Unix_perm.t ] =
       `If_missing 0o600) ?contents ?(on_wait = ignore) path =
   let name = lock_name path in
@@ -1382,7 +1382,11 @@ let rec acquire ~sw ?lease
   match
     eio_unix_errors @@ fun () ->
     Eio.Switch.run @@ fun budget_sw ->
-    let fibers, processes = block_patience ~sw:budget_sw block in
+    let fibers, processes =
+      match patience with
+      | Some patience -> patience
+      | None -> block_patience ~sw:budget_sw block
+    in
     let key, opened_first = key_of_name ~taken ~name path open_rendezvous in
     let local = shared_mutex local_locks key in
     taken (fun () -> done_with_shared_mutex local_locks key local);
@@ -1412,7 +1416,7 @@ let rec acquire ~sw ?lease
   | file, release_reader -> (file, (fun () -> let_go steps), release_reader)
   | exception Renamed ->
       let_go steps;
-      acquire ~sw ?lease ~block ~create ?contents ~on_wait path
+      acquire ~sw ?lease ~block ?patience ~create ?contents ~on_wait path
   | exception e ->
       let bt = Printexc.get_raw_backtrace () in
       let_go steps;
@@ -1604,9 +1608,9 @@ module Lease = struct
 
   let release t = t.let_go ()
 
-  let taken ~sw ~lease ?block ?create ?contents ?on_wait path =
+  let taken ~sw ~lease ?patience ?block ?create ?contents ?on_wait path =
     let file, let_go, release_reader =
-      acquire ~sw ~lease ?block ?create ?contents ?on_wait path
+      acquire ~sw ~lease ?patience ?block ?create ?contents ?on_wait path
     in
     match file_fd file with
     | Some fd ->
@@ -1617,44 +1621,130 @@ module Lease = struct
         let_go ();
         invalid_arg "Eio_fs_unix.Lease: acquired descriptor is unavailable"
 
-  (* Whether only shared holders hold [path]: a shared lease tried without
-     waiting and let go at once is granted beside them, and refused by an
-     exclusive holder. An absent rendezvous has none. *)
-  let only_shared path =
+  (* The refusal an exclusive holder of [path] gives: a shared lease tried
+     without waiting and let go at once is granted beside shared holders, and
+     refused by an exclusive one. [None] when only shared holders hold it,
+     none does or it is absent. *)
+  let exclusive_refusal path =
     match
       Eio.Switch.run @@ fun sw ->
       release (taken ~sw ~lease:`Shared ~block:`No ~create:`Never path)
     with
-    | () -> true
-    | exception Lock_unavailable _ -> false
-    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> true
+    | () -> None
+    | exception (Lock_unavailable _ as refused) -> Some refused
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
 
-  let take_mode ~sw ~lease ?block ?create ?contents ?on_wait path =
-    match block with
-    | Some `Readers -> (
-        match taken ~sw ~lease ~block:`No ?create ?contents path with
-        | t -> t
-        | exception (Lock_unavailable _ as refused) ->
-            if only_shared path then
-              taken ~sw ~lease ~block:`Yes ?create ?contents ?on_wait path
-            else raise refused)
-    | Some (#block as block) ->
-        taken ~sw ~lease ~block ?create ?contents ?on_wait path
-    | None -> taken ~sw ~lease ?create ?contents ?on_wait path
+  (* A gate is taken as any exclusive lease is, and taken again when the file
+     it locked is no longer the one its name holds: a remover of the lease
+     unlinks the gate it holds, and a take that waited on it takes the file
+     its name holds now. *)
+  let rec take_gate ~sw ~patience ~on_wait ~create ~contents gate =
+    match
+      taken ~sw ~lease:`Exclusive ~patience ~on_wait ~create ~contents gate
+    with
+    | t -> t
+    | exception
+        (Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied (Not_a_lock_file _)), _) as
+         e) -> (
+        match Eio.Path.kind ~follow:false gate with
+        | `Not_found | `Regular_file ->
+            take_gate ~sw ~patience ~on_wait ~create ~contents gate
+        | _ -> raise e)
 
-  let take ~sw ?block ?create ?contents ?on_wait path =
-    take_mode ~sw ~lease:`Exclusive ?block ?create ?contents ?on_wait path
+  let once f =
+    let called = ref false in
+    fun () ->
+      if not !called then begin
+        called := true;
+        f ()
+      end
 
-  let with_mode ~lease ?block ?create ?contents ?on_wait path fn =
+  let remove_file p =
+    try Eio.Path.unlink p with Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
+
+  (* The exclusive lease on [path] taken holding [gate], which every
+     exclusive take of [path] holds, so none is made between this take's look
+     at the holders and its blocking take: with [`Readers], the gate tried
+     without waiting, the wait is for the shared holders alone. One budget
+     covers both waits, and [on_wait] is called once. The gate is let go
+     after the lease. *)
+  let gated ~sw ~gate ~block ?create ?contents ?on_wait path =
+    let on_wait = once (Option.value on_wait ~default:ignore) in
+    Eio.Switch.run @@ fun budget_sw ->
+    let wait = match block with `Readers -> `No | #block as b -> b in
+    let patience = block_patience ~sw:budget_sw wait in
+    let gate_create =
+      match create with
+      | Some (`If_missing _ as c) -> c
+      | Some `Never | None -> `If_missing 0o600
+    in
+    let held =
+      match
+        take_gate ~sw ~patience ~on_wait ~create:gate_create
+          ~contents:(Option.value contents ~default:"")
+          gate
+      with
+      | held -> held
+      | exception (Lock_unavailable _ as refused) ->
+          raise (Option.value (exclusive_refusal path) ~default:refused)
+    in
+    let lease () =
+      match block with
+      | `Readers -> (
+          match
+            taken ~sw ~lease:`Exclusive ~block:`No ?create ?contents path
+          with
+          | t -> t
+          | exception (Lock_unavailable _ as refused) -> (
+              match exclusive_refusal path with
+              | None ->
+                  taken ~sw ~lease:`Exclusive ~block:`Yes ?create ?contents
+                    ~on_wait path
+              | Some _ -> raise refused))
+      | #block ->
+          taken ~sw ~lease:`Exclusive ~patience ?create ?contents ~on_wait path
+    in
+    match lease () with
+    | t ->
+        {
+          t with
+          let_go =
+            (fun () ->
+              t.let_go ();
+              release held);
+        }
+    | exception (Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) as e) ->
+        (* An absent lease keeps no gate. *)
+        let bt = Printexc.get_raw_backtrace () in
+        remove_file gate;
+        release held;
+        Printexc.raise_with_backtrace e bt
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        release held;
+        Printexc.raise_with_backtrace e bt
+
+  let take ~sw ?gate ?block ?create ?contents ?on_wait path =
+    match (gate, block) with
+    | Some gate, _ ->
+        gated ~sw ~gate
+          ~block:(Option.value block ~default:`Yes)
+          ?create ?contents ?on_wait path
+    | None, Some `Readers ->
+        invalid_arg "Eio_fs_unix.Lease: a take with block `Readers needs a gate"
+    | None, Some (#block as block) ->
+        taken ~sw ~lease:`Exclusive ~block ?create ?contents ?on_wait path
+    | None, None -> taken ~sw ~lease:`Exclusive ?create ?contents ?on_wait path
+
+  let with_exclusive ?gate ?block ?create ?contents ?on_wait path fn =
     Eio.Switch.run @@ fun sw ->
-    let t = take_mode ~sw ~lease ?block ?create ?contents ?on_wait path in
+    let t = take ~sw ?gate ?block ?create ?contents ?on_wait path in
     Fun.protect ~finally:(fun () -> release t) (fun () -> fn t)
 
-  let with_exclusive ?block ?create ?contents ?on_wait path fn =
-    with_mode ~lease:`Exclusive ?block ?create ?contents ?on_wait path fn
-
   let with_shared ?block ?create ?on_wait path fn =
-    with_mode ~lease:`Shared ?block ?create ?on_wait path fn
+    Eio.Switch.run @@ fun sw ->
+    let t = taken ~sw ~lease:`Shared ?block ?create ?on_wait path in
+    Fun.protect ~finally:(fun () -> release t) (fun () -> fn t)
 end
 
 (* A backend-free component takes its critical section as an
