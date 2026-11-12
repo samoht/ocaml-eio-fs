@@ -11,6 +11,8 @@ open! Hermetic
    - the scheduler stops instead of moving the clock past [limit], so a run
      that every fiber waits in reports as a hang, and one that keeps a timer
      going reports as a run past its time limit;
+   - the scheduler stops once [stop ()] holds, which the check sets when a
+     run must end, whatever its fibers do;
    - each turn, a fiber resumed by a yield, another fiber or a timer,
      charges [turn] of clock, as a program's CPU time passes between two,
      and a run of [max_turns] turns in a row in which no fiber waited
@@ -42,6 +44,7 @@ module Suspended = Eio_utils.Suspended
 exception Deadlock_detected
 exception Time_limit
 exception Busy
+exception Stopped
 
 (* {1 Clock} *)
 
@@ -127,6 +130,7 @@ type t = {
   mutable turns : int; (* since a fiber last waited [min_wait] or more *)
   mutable busy : bool;
   idle : unit -> bool;
+  stop : unit -> bool;
 }
 
 (* A turn costs about 0.1 us on eio_posix on Linux, and up to 20 us on a
@@ -137,6 +141,7 @@ let min_wait = Mtime.Span.(1 * ms)
 
 let rec schedule t : exit =
   match Lf_queue.pop t.run_q with
+  | _ when t.stop () -> `Exit_scheduler
   | Some f ->
       t.turns <- t.turns + 1;
       if t.turns > max_turns then begin
@@ -168,7 +173,7 @@ let rec schedule t : exit =
           t.past_limit <- true;
           `Exit_scheduler)
 
-let run ?(idle = fun () -> false) ~limit main =
+let run ?(idle = fun () -> false) ?(stop = fun () -> false) ~limit main =
   let clock = { Mono.Impl.now = Mtime.of_uint64_ns 0L; q = Mono.Q.empty } in
   let wall : float Eio.Time.clock_ty Eio.Resource.t =
     Eio.Resource.T (clock, wall_handler)
@@ -185,6 +190,7 @@ let run ?(idle = fun () -> false) ~limit main =
       turns = 0;
       busy = false;
       idle;
+      stop;
     }
   in
   let rec fork ~new_fiber:fiber fn =
@@ -240,6 +246,7 @@ let run ?(idle = fun () -> false) ~limit main =
   match !result with
   | Some x -> x
   | None ->
-      if t.busy then raise Busy
+      if t.stop () then raise Stopped
+      else if t.busy then raise Busy
       else if t.past_limit then raise Time_limit
       else raise Deadlock_detected

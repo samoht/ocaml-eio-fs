@@ -22,7 +22,9 @@
       cut may leave.
 
     A check never passes on a partial linear tier. One that needs more runs than
-    its budget fails and says so: shrink the workload or raise [~budget].
+    its budget fails and says so: shrink the workload or raise [~budget]. The
+    first run stops as soon as the tier needs more, so a workload that polls for
+    ever costs no more than the budget allows.
 
     {2 Contracts}
 

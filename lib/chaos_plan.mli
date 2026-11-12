@@ -97,6 +97,13 @@ val check_linear : trace -> check list
 val check_others : trace -> check list
 (** [check_others first] is the same at the other operations. *)
 
+val check_floor : space:bool -> Op.t -> int
+(** [check_floor ~space op] is the scenarios {!check_linear} has at [op] in
+    every trace that has [op], given whether [op] needs room: those at an
+    operation every trace makes structural, all but a read, a write and a sync,
+    and none at those. Their sum over a run so far is a floor of the tier's
+    size. *)
+
 val check_seconds : pos * Fault.t -> after:trace -> check list
 (** [check_seconds f ~after] is the pairs of faults whose first is [f] and whose
     second lands after it in [after], the run [f] alone made. *)
@@ -144,6 +151,11 @@ val tears : sizes:(string * int) list -> trace -> Op.t -> int list
 val crash_cuts : trace -> crash list
 (** [crash_cuts first] is a cut after each structural operation of [first] that
     changes the disk, and at its end, in both simplest states. *)
+
+val crash_floor : Op.t -> int
+(** [crash_floor op] is, likewise, the cuts {!crash_cuts} has for [op] in every
+    trace that has [op]: two after an open that may write, a truncation or a
+    directory change, and none after the others. *)
 
 val crash_faults : tears:(Op.t -> int list) -> trace -> crash list
 (** [crash_faults ~tears first] is each structural sync failed and each

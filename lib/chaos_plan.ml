@@ -215,6 +215,22 @@ let of_singles ops =
 let check_linear trace = of_singles (structural trace)
 let check_others trace = of_singles (rest trace (structural trace))
 
+(* Every trace makes an operation structural but a read, a write or a sync,
+   which only some do. *)
+let always (op : Op.t) =
+  match op.kind with `Read | `Write | `Sync -> false | _ -> true
+
+let check_floor ~space op =
+  if not (always op) then 0
+  else
+    List.length
+      (List.filter
+         (fun s ->
+           List.for_all
+             (fun (_, f) -> space || f <> Fault.Fail `Enospc)
+             s.faults)
+         (of_singles [ op ]))
+
 (* Second faults, at the operations of [after], the run [first] made, past
    the one it landed on. *)
 let check_seconds first ~(after : trace) =
@@ -359,6 +375,9 @@ let crash_cuts trace =
   List.concat_map
     (fun cut -> both { base with cut })
     (cut_points trace (structural trace))
+
+let crash_floor op =
+  if always op && changes op then List.length (both base) else 0
 
 let crash_faults ~tears trace =
   List.concat_map

@@ -84,6 +84,7 @@ type outcome =
   | Busy
   | Kept_going
   | Livelock of [ `Path | `Dir ] * string * int
+  | Over_budget of int (* the operation the first run stopped at *)
 
 let outcome_text = function
   | Passed -> "none"
@@ -106,6 +107,9 @@ let outcome_text = function
         "the run hangs: one kind of operation in %s failed %d times while its \
          clock stood still"
         dir n
+  | Over_budget at ->
+      Fmt.str "the linear tier needs more runs than the budget by operation #%d"
+        at
 
 (* A cut fails the run's switch with it, which cancels every fiber of the
    run. *)
@@ -118,9 +122,15 @@ let env_of clock mono (d : _ Eio.Path.t) : env =
     method mono_clock = mono
   end
 
-let in_loop ?idle main =
-  match Quiet_mock.run ?idle ~limit:3600. main with
+(* A run ends once [halted] holds why. *)
+let in_loop ?idle ?(halted = ref None) main =
+  match
+    Quiet_mock.run ?idle
+      ~stop:(fun () -> Option.is_some !halted)
+      ~limit:3600. main
+  with
   | v -> Ok v
+  | exception Quiet_mock.Stopped -> Error (Option.get !halted)
   | exception Quiet_mock.Deadlock_detected -> Error Deadlock
   | exception Quiet_mock.Time_limit -> Error Time_limit
   | exception Quiet_mock.Busy -> Error Busy
@@ -128,6 +138,21 @@ let in_loop ?idle main =
 (* Park the fiber where no cancel reaches, so even a loop that catches
    everything stops; the loop then reports a deadlock. *)
 let park () = Eio.Cancel.protect Eio.Fiber.await_cancel
+
+let halt halted o =
+  halted := Some o;
+  park ()
+
+(* The first run stops once the linear tier needs more runs than the
+   budget: past that, the check cannot pass, and the run's operations need
+   not grow. *)
+let add_floor halted ~budget ~floor ~at n =
+  match budget with
+  | Some b ->
+      floor := !floor + n;
+      if !floor > b then halt halted (Over_budget at)
+  | None -> ()
+
 let fresh () = (Memfs.v () :> Eio.Fs.dir_ty Eio.Path.t)
 
 let rec walk (d : _ Eio.Path.t) prefix f =
@@ -149,6 +174,13 @@ let files d =
 (* {1 Reports, budget, replay} *)
 
 let fail name fmt = Fmt.kstr (fun s -> failwith (name ^ ": " ^ s)) fmt
+
+let refuse_budget name ~budget at =
+  fail name
+    "the linear tier needs more than the budget of %d runs by operation #%d of \
+     the first run, which stopped there, and a check never passes on a partial \
+     one. Shrink the workload, or raise ~budget."
+    budget at
 
 let budget_of name = function
   | None -> 20_000
@@ -591,15 +623,18 @@ let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
     List.iter (Hashtbl.remove st.counts) (targets op)
 
-let exec_check ?spaces ?cap ~first ~setup run (s : Plan.check) =
+let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
   let marked op =
     List.exists (fun (p, _) -> Plan.at p op) s.faults
     || match s.lasting with Some (_, p) -> Plan.at p op | None -> false
   in
   let trace = record ?cap ~marked () and num = numberer () in
   let pending = ref s.faults and on = ref false and st = streak first in
+  let halted = ref None and floor = ref 0 in
   let hook (mop : M.Op.t) =
     let op = num mop in
+    add_floor halted ~budget ~floor ~at:op.index
+      (Plan.check_floor ~space:mop.space op);
     Option.iter
       (fun t ->
         Hashtbl.replace t
@@ -637,7 +672,7 @@ let exec_check ?spaces ?cap ~first ~setup run (s : Plan.check) =
   in
   let outcome =
     match
-      in_loop @@ fun clock mono ->
+      in_loop ~halted @@ fun clock mono ->
       st.clock <- Some clock;
       let base = fresh () in
       setup (env_of clock mono base);
@@ -650,7 +685,10 @@ let exec_check ?spaces ?cap ~first ~setup run (s : Plan.check) =
     | Error o -> o
   in
   let outcome =
-    match st.hit with Some (t, p, n) -> Livelock (t, p, n) | None -> outcome
+    match (!halted, st.hit) with
+    | Some o, _ -> o
+    | None, Some (t, p, n) -> Livelock (t, p, n)
+    | None, None -> outcome
   in
   (trace, outcome)
 
@@ -659,11 +697,16 @@ let check ?budget ?replay ?(setup = ignore) run =
   let budget = budget_of name budget in
   let replay = Option.map (parse_replay name) replay in
   let spaces = Hashtbl.create 16 in
+  (* A replay runs one scenario, whatever the budget. *)
   let first, out =
-    exec_check ~spaces ~first:(Hashtbl.create 1) ~setup run Plan.none
+    exec_check ~spaces
+      ?budget:(if replay = None then Some budget else None)
+      ~first:(Hashtbl.create 1) ~setup run Plan.none
   in
-  if out <> Passed then
-    fail name "the run with no fault failed: %s" (outcome_text out);
+  (match out with
+  | Passed -> ()
+  | Over_budget at -> refuse_budget name ~budget at
+  | _ -> fail name "the run with no fault failed: %s" (outcome_text out));
   let first = kept first in
   if first = [] then
     fail name "the workload makes no filesystem operation, so it tests nothing";
@@ -858,11 +901,13 @@ module Crash = struct
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
      outcome, and the unsynced changes the cut lost. *)
-  let phase ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs ~stop fs f =
+  let phase ?(guard = ignore) ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs
+      ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
     let hook (mop : M.Op.t) =
       let op = num mop in
+      guard op;
       if not (M.Crash.is_crashed ctl) then begin
         (seqs :=
            match !seqs with
@@ -915,7 +960,7 @@ module Crash = struct
     let outcome = if !kept_going then Kept_going else outcome in
     (outcome, !lost)
 
-  let exec ?cap ~setup run ~recover (s : Plan.crash) =
+  let exec ?cap ?budget ~setup run ~recover (s : Plan.crash) =
     let trail = ref [] and rtrail = ref [] in
     let acked = ref [] and acked_at = ref [] in
     let marked op = List.exists (fun (p, _) -> Plan.at p op) s.cfaults in
@@ -924,6 +969,7 @@ module Crash = struct
     let cut_op = ref None and seqs = ref [] in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
+    let halted = ref None and floor = ref 0 in
     (* A cut stops the run, as nothing runs after a power cut: once every
        fiber waits, the phase's switch fails, so a fiber that waits on a
        timer or another fiber stops too. *)
@@ -938,7 +984,7 @@ module Crash = struct
     in
     let error =
       match
-        in_loop ~idle @@ fun clock mono ->
+        in_loop ~idle ~halted @@ fun clock mono ->
         let base = fresh () in
         setup (env_of clock mono base);
         let ctl =
@@ -946,8 +992,12 @@ module Crash = struct
         in
         let fs = M.Crash.wrap ctl base in
         let out, l =
-          phase ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
-            ~cut_op ~seqs ~stop fs (fun fs ->
+          phase
+            ~guard:(fun op ->
+              add_floor halted ~budget ~floor ~at:op.index (Plan.crash_floor op))
+            ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
+            ~cut_op ~seqs ~stop fs
+            (fun fs ->
               run
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then begin
@@ -1101,9 +1151,13 @@ module Crash = struct
   let check ?budget ?replay ?(setup = ignore) run ~recover =
     let budget = budget_of name budget in
     let replay = Option.map (parse_replay name) replay in
-    let exec ?cap s = exec ?cap ~setup run ~recover s in
-    let first = exec Plan.base in
+    let exec ?cap ?budget s = exec ?cap ?budget ~setup run ~recover s in
+    (* A replay runs one scenario, whatever the budget. *)
+    let first =
+      exec ?budget:(if replay = None then Some budget else None) Plan.base
+    in
     (match first.error with
+    | Some (Workload (Over_budget at)) -> refuse_budget name ~budget at
     | Some (Workload o) ->
         fail name "the run with no cut failed: %s" (outcome_text o)
     | _ -> ());
