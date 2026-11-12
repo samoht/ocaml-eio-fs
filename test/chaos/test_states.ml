@@ -73,6 +73,24 @@ let freed_by_unlink () =
           failwith "a removed record replayed"
       | _ | (exception Eio.Io _) -> ())
 
+(* A new page with no sync: its first sector stale under the written ones.
+   The cut's first state drops the file, and the states that vary the first
+   sector come last one by one, past what the check enumerates. *)
+let stale_first () =
+  Eio_fs.Chaos.Crash.check ~setup
+    (fun ~ack:_ env ->
+      try
+        P.save ~create:(`Exclusive 0o644)
+          P.(env#fs / "f")
+          (String.make 4096 'A')
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      match P.load P.(env#fs / "f") with
+      | s when String.length s = 4096 && s.[0] = '7' && s.[4095] = 'A' ->
+          failwith "stale first sector"
+      | _ | (exception Eio.Io _) -> ())
+
 let suite =
   ( "states",
     [
@@ -93,4 +111,9 @@ let suite =
           Alcotest.(check string)
             "error" "Failure(\"a removed record replayed\")"
             (Expect.field "error" m));
+      Alcotest.test_case "a stale first sector of a large new page is reached"
+        `Quick (fun () ->
+          let m = Expect.report stale_first in
+          Alcotest.(check string)
+            "error" "Failure(\"stale first sector\")" (Expect.field "error" m));
     ] )
