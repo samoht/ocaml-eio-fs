@@ -69,9 +69,9 @@ let wrap f base =
 (* A program that retries a failed operation at once, with no time passing,
    spins for ever under a lasting condition. Once one operation on one path,
    or one kind of operation in one directory, as a retry under a fresh name
-   makes, has failed this many times more than three tries of each the first
-   run made, while the clock stands still, it raises [Failure] instead, and
-   after twice as many it waits for ever. *)
+   makes, has failed this many times for each time the first run made it,
+   while the clock stands still, it raises [Failure] instead, and after twice
+   as many it waits for ever. *)
 let streak_limit = 10_000
 
 type outcome =
@@ -276,7 +276,7 @@ let failed st (op : Op.t) =
       Hashtbl.replace st.counts key n;
       let limit =
         streak_limit
-        + (3 * Option.value ~default:0 (Hashtbl.find_opt st.first key))
+        * max 1 (Option.value ~default:0 (Hashtbl.find_opt st.first key))
       in
       if n >= limit then begin
         st.hit <- Some (tag, at, limit);

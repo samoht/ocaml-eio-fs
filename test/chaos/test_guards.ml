@@ -320,7 +320,7 @@ let test_livelock () =
   in
   Alcotest.(check string)
     "error"
-    "the run hangs: the same operation on /f failed 10003 times while its \
+    "the run hangs: the same operation on /f failed 10000 times while its \
      clock stood still"
     (Expect.field "error" report)
 
@@ -344,7 +344,7 @@ let test_livelock_fresh_names () =
   in
   Alcotest.(check string)
     "error"
-    "the run hangs: one kind of operation in / failed 10003 times while its \
+    "the run hangs: one kind of operation in / failed 10000 times while its \
      clock stood still"
     (Expect.field "error" report)
 
