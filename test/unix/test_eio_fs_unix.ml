@@ -447,8 +447,9 @@ let test_statvfs_reports_raw_block_capacity () =
 
 (* POSIX pread: the bytes at the offset asked, the count read, 0 at the end of
    the file, and the descriptor's own offset where it was. A pread written as a
-   seek and a read passes the first three and fails the last. *)
-let test_pread_leaves_the_offset () =
+   seek and a read passes the first three and fails the last. [pread_cached]
+   keeps the same contract with the runtime lock held. *)
+let pread_leaves_the_offset name pread () =
   with_real_dir @@ fun dir ->
   let path = Eio.Path.native_exn (dir / "pread.bin") in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
@@ -458,21 +459,40 @@ let test_pread_leaves_the_offset () =
   Alcotest.(check int) "the whole text was written" (String.length text) n;
   ignore (Unix.lseek fd 3 Unix.SEEK_SET : int);
   let buf = Bytes.make 8 '.' in
-  let got = Eio_fs_unix.pread fd ~file_offset:10 buf ~pos:2 ~len:4 in
+  let got = pread fd ~file_offset:10 buf ~pos:2 ~len:4 in
   Alcotest.(check int) "four bytes read" 4 got;
   Alcotest.(check string)
     "the bytes at offset 10, at pos 2" "..abcd.." (Bytes.to_string buf);
   Alcotest.(check int)
     "the descriptor's offset is untouched" 3
     (Unix.lseek fd 0 Unix.SEEK_CUR);
-  let got = Eio_fs_unix.pread fd ~file_offset:14 buf ~pos:0 ~len:8 in
+  let got = pread fd ~file_offset:14 buf ~pos:0 ~len:8 in
   Alcotest.(check int) "a read across the end takes what is there" 2 got;
   Alcotest.(check int)
     "a read at the end is 0" 0
-    (Eio_fs_unix.pread fd ~file_offset:16 buf ~pos:0 ~len:8);
+    (pread fd ~file_offset:16 buf ~pos:0 ~len:8);
   Alcotest.check_raises "a range past the buffer is refused"
-    (Invalid_argument "Eio_fs_unix.pread") (fun () ->
-      ignore (Eio_fs_unix.pread fd ~file_offset:0 buf ~pos:6 ~len:4 : int))
+    (Invalid_argument ("Eio_fs_unix." ^ name))
+    (fun () -> ignore (pread fd ~file_offset:0 buf ~pos:6 ~len:4 : int))
+
+(* A read longer than the 65536 bytes [pread_cached] reads with the lock held
+   is {!Eio_fs_unix.pread}'s, which takes at most 65536 bytes a call: the count
+   says so, and the bytes are the file's. A read that kept the lock past the
+   bound would answer 70000. *)
+let test_pread_cached_bound () =
+  with_real_dir_env @@ fun _env dir ->
+  let path = Eio.Path.native_exn (dir / "pread_long.bin") in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let text = String.init 70000 (fun i -> Char.chr (i mod 251)) in
+  let n = Unix.write_substring fd text 0 (String.length text) in
+  Alcotest.(check int) "the whole text was written" (String.length text) n;
+  let buf = Bytes.make 70000 '.' in
+  let got = Eio_fs_unix.pread_cached fd ~file_offset:0 buf ~pos:0 ~len:70000 in
+  Alcotest.(check int) "one call reads 65536 bytes" 65536 got;
+  Alcotest.(check string)
+    "they are the file's" (String.sub text 0 65536)
+    (Bytes.sub_string buf 0 65536)
 
 (* POSIX pwrite: the bytes of the span asked land at the offset asked, the
    count written, and the descriptor's own offset where it was. A pwrite
@@ -3163,7 +3183,11 @@ let suite =
       Alcotest.test_case "path calls stay in their directory" `Quick
         test_path_calls_stay_in_their_directory;
       Alcotest.test_case "pread leaves the descriptor's offset" `Quick
-        test_pread_leaves_the_offset;
+        (pread_leaves_the_offset "pread" Eio_fs_unix.pread);
+      Alcotest.test_case "pread_cached leaves the descriptor's offset" `Quick
+        (pread_leaves_the_offset "pread_cached" Eio_fs_unix.pread_cached);
+      Alcotest.test_case "pread_cached hands a long read to pread" `Quick
+        test_pread_cached_bound;
       Alcotest.test_case "pwrite leaves the descriptor's offset" `Quick
         test_pwrite_leaves_the_offset;
       Alcotest.test_case "seek_data and seek_hole walk a sparse file" `Quick

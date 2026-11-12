@@ -38,6 +38,7 @@
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #endif
 
 CAMLprim value caml_eio_fs_is_darwin(value unit)
@@ -229,6 +230,44 @@ CAMLprim value caml_eio_fs_pread(value fd_v, value off_v, value buf_v,
     caml_unix_error(errno, "pread", Nothing);
   memcpy(&Byte(buf_v, Long_val(pos_v)), stack, n);
   CAMLreturn(Val_long(n));
+}
+
+/* Up to [len] bytes of [fd] from byte [off] into [buf] at [pos], as
+   [caml_eio_fs_pread] reads them, for a read the operating system's page cache
+   answers: the bytes go straight into [buf] with the runtime lock kept, since
+   nothing moves the heap while this thread holds it, and a page-sized read
+   from the cache costs less than releasing and taking the lock back. Linux asks
+   with RWF_NOWAIT, which refuses a read that would wait on the device, and only
+   that read is made in a blocking section; elsewhere a read of up to
+   [EIO_FS_PREAD_CACHED_MAX] bytes keeps the lock whatever it waits on. A longer
+   read is [caml_eio_fs_pread]'s. */
+#define EIO_FS_PREAD_CACHED_MAX 65536
+
+CAMLprim value caml_eio_fs_pread_cached(value fd_v, value off_v, value buf_v,
+                                        value pos_v, value len_v)
+{
+  int fd = Int_val(fd_v);
+  off_t off = (off_t)Long_val(off_v);
+  size_t len = Long_val(len_v);
+  char *dst = (char *)&Byte(buf_v, Long_val(pos_v));
+  ssize_t n;
+  if (len > EIO_FS_PREAD_CACHED_MAX)
+    return caml_eio_fs_pread(fd_v, off_v, buf_v, pos_v, len_v);
+#if defined(__linux__) && defined(RWF_NOWAIT)
+  struct iovec iov = {dst, len};
+  do {
+    n = preadv2(fd, &iov, 1, off, RWF_NOWAIT);
+  } while (n == -1 && errno == EINTR);
+  if (n == -1 && (errno == EAGAIN || errno == EOPNOTSUPP || errno == ENOSYS))
+    return caml_eio_fs_pread(fd_v, off_v, buf_v, pos_v, len_v);
+#else
+  do {
+    n = pread(fd, dst, len, off);
+  } while (n == -1 && errno == EINTR);
+#endif
+  if (n == -1)
+    caml_unix_error(errno, "pread", Nothing);
+  return Val_long(n);
 }
 
 /* Up to [len] bytes of [buf] from [pos] written to [fd] at byte [off], with
