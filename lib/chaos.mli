@@ -274,7 +274,7 @@ module Crash : sig
   val wrap : t -> _ Eio.Path.t -> Eio.Fs.dir_ty Eio.Path.t
   (** [wrap t base] is [base] with its writes and directory changes tracked by
       [t]. What [base] holds when [wrap] is called is durable. [base] may be in
-      memory or on disk.
+      memory or on disk; a hole in a file on disk counts as written zeros.
 
       @raise Invalid_argument if [t] is already wrapped. *)
 

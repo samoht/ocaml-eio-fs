@@ -1052,7 +1052,7 @@ module Crash = struct
 
   let next_id = Atomic.make 0
 
-  let fresh_file ~owner ~rel ~perm ~durable =
+  let fresh_file ?held ~owner ~rel ~perm ~durable () =
     {
       id = Atomic.fetch_and_add next_id 1;
       owner;
@@ -1067,8 +1067,13 @@ module Crash = struct
       evicted = None;
       partial = [];
       held =
-        (if Cstruct.length durable > 0 then [ (0, Cstruct.length durable) ]
-         else []);
+        (let n = Cstruct.length durable in
+         match held with
+         | Some l ->
+             List.filter_map
+               (fun (x, y) -> if x >= n then None else Some (x, min y n))
+               l
+         | None -> if n > 0 then [ (0, n) ] else []);
       freed = [];
     }
 
@@ -1306,6 +1311,9 @@ module Crash = struct
            the tree through: the code under test may run as a user who cannot
            read all of it. *)
     mutable by_rel : fstate list Paths.t; (* the files of [files] by path *)
+    mutable held : string -> (int * int) list option;
+        (* The byte ranges writes covered in a file of an in-memory base, by
+           path: the rest of it is a hole the disk does not hold. *)
     mutable seq : int;
     mutable ops : int;
     mutable crashed : bool;
@@ -3628,7 +3636,9 @@ module Crash = struct
             fs
         | None ->
             let fs =
-              fresh_file ~owner:d.dplace.proot ~rel ~perm ~durable:prev
+              fresh_file
+                ?held:(if known then None else d.dctl.held rel)
+                ~owner:d.dplace.proot ~rel ~perm ~durable:prev ()
             in
             track d.dctl fs;
             Option.iter
@@ -3886,6 +3896,7 @@ module Crash = struct
       left = [];
       durable = None;
       by_rel = Paths.empty;
+      held = (fun _ -> None);
       root_box = None;
       admin = None;
       subtrees = [];
@@ -3912,6 +3923,7 @@ module Crash = struct
     in
     ctl.root_box <- Some proot;
     ctl.admin <- Some admin;
+    ctl.held <- (fun rel -> Memfs.held (base, rel));
     snap ctl (state_of (snapshot_at admin path) no_locs);
     (wrap_cdir ctl ~ino:None ~root:proot ~prefix:"" ~base, path)
 

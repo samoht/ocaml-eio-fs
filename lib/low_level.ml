@@ -170,10 +170,40 @@ module File = struct
      whose length is the stat's size, and grows by doubling, so a run of writes
      costs linear time. *)
   type contents = Literal of string | Buffer of Cstruct.t
-  type t = { stat : Eio.File.Stat.t; contents : contents }
 
-  let v ~stat = { stat; contents = Buffer Cstruct.empty }
-  let literal ~stat contents = { stat; contents = Literal contents }
+  (* [held] is the byte ranges a write covered, disjoint and in order: the
+     rest of the file is a hole. *)
+  type t = {
+    stat : Eio.File.Stat.t;
+    contents : contents;
+    held : (int * int) list;
+  }
+
+  let v ~stat = { stat; contents = Buffer Cstruct.empty; held = [] }
+
+  let literal ~stat contents =
+    let n = String.length contents in
+    {
+      stat;
+      contents = Literal contents;
+      held = (if n > 0 then [ (0, n) ] else []);
+    }
+
+  let hold held a b =
+    if b <= a then held
+    else
+      let before = List.filter (fun (_, y) -> y < a) held
+      and after = List.filter (fun (x, _) -> x > b) held
+      and over = List.filter (fun (x, y) -> y >= a && x <= b) held in
+      let a = List.fold_left (fun a (x, _) -> min a x) a over
+      and b = List.fold_left (fun b (_, y) -> max b y) b over in
+      before @ ((a, b) :: after)
+
+  let cut held n =
+    List.filter_map
+      (fun (x, y) -> if x >= n then None else Some (x, min y n))
+      held
+
   let size f = Optint.Int63.to_int f.stat.size
 
   let blit t ~src_off dst ~dst_off ~len =
@@ -214,7 +244,11 @@ module File = struct
     let buf = reserve f (off + len) in
     Cstruct.blit src 0 buf off len;
     let size = Optint.Int63.of_int (max (size f) (off + len)) in
-    { stat = { f.stat with size }; contents = Buffer buf }
+    {
+      stat = { f.stat with size };
+      contents = Buffer buf;
+      held = hold f.held off (off + len);
+    }
 
   (* [f] cut or zero-extended to [n] bytes. *)
   (* A buffer cut below a quarter of its capacity is reallocated, so a file
@@ -230,7 +264,11 @@ module File = struct
       | contents when n <= size f -> contents
       | _ -> Buffer (reserve f n)
     in
-    { stat = { f.stat with size = Optint.Int63.of_int n }; contents }
+    {
+      stat = { f.stat with size = Optint.Int63.of_int n };
+      contents;
+      held = cut f.held n;
+    }
 end
 
 module Fd_table = Map.Make (Num)
@@ -264,7 +302,7 @@ let truncate_file r =
   match !r with
   | Resource.File f ->
       let stat = { f.stat with size = Optint.Int63.zero } in
-      r := File { contents = File.Buffer Cstruct.empty; stat }
+      r := File { contents = File.Buffer Cstruct.empty; stat; held = [] }
   | _ -> ()
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
@@ -789,6 +827,12 @@ let openat ~mode ~sw dir_fd path flags =
 let statat ~follow dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   Resource.stat !(Filesystem.lookup ~follow dir_fd path)
+
+let held dir_fd path =
+  locked (Dir.fs dir_fd) @@ fun () ->
+  match !(Filesystem.lookup ~follow:true dir_fd path) with
+  | Resource.File f -> Some f.held
+  | Dir _ | Symlink _ -> None
 
 (* chmod(2): only the owner or root: EPERM. *)
 let chmod ~follow dir_fd ~perm path =

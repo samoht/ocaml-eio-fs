@@ -22,6 +22,11 @@ val as_user :
 
     @raise Invalid_argument if [path] is not an in-memory directory. *)
 
+val held : _ Eio.Path.t -> (int * int) list option
+(** [held path] is the byte ranges writes covered in the regular file [path] of
+    an in-memory filesystem, in order: the rest of it is a hole. It is [None] if
+    [path] is not one. *)
+
 val load :
   ?filter:('a Eio.Path.t -> bool) ->
   'a Eio.Path.t ->

@@ -228,6 +228,11 @@ let as_user user ((d, path) : _ Eio.Path.t) =
       let label = Fmt.str "%a" Eio.Path.pp (d, "") in
       (dir ~label ~path:"." { fd with user }, path)
 
+let held ((d, path) : _ Eio.Path.t) =
+  match as_memfs_dir d with
+  | None -> None
+  | Some fd -> ( try Low_level.held fd path with Eio.Io _ -> None)
+
 (* The root is followed and must be a directory; the filter is asked about
    it before anything is made, and every entry below it is copied as it is,
    a link kept a link. *)
