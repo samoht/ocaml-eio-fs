@@ -556,6 +556,32 @@ let test_heap_stays_flat () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
+(* The same for power cuts: a check keeps no run's operations once it has
+   drawn from them, so the heap stays flat as runs go, and does not grow
+   with the number of runs. *)
+let test_crash_heap_stays_flat () =
+  Gc.compact ();
+  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let n = 40 in
+  Eio_fs.Chaos.Crash.check
+    (fun ~ack env ->
+      top := max !top (Gc.quick_stat ()).heap_words;
+      for i = 1 to n do
+        try
+          Eio_fs_sync.save P.(env#fs / Fmt.str "f%d" i) "x";
+          ack i
+        with Eio.Io _ -> ()
+      done)
+    ~recover:(fun ~acked env ->
+      top := max !top (Gc.quick_stat ()).heap_words;
+      List.iter
+        (fun i ->
+          if P.load P.(env#fs / Fmt.str "f%d" i) <> "x" then
+            Fmt.failwith "f%d lost" i)
+        acked);
+  let grown = !top - base in
+  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+
 (* A workload that catches the cut's cancellation keeps going. *)
 let test_kept_going () =
   let report =
@@ -732,6 +758,8 @@ let suite =
       Alcotest.test_case "only the errors Linux returns" `Quick
         test_errors_linux_returns;
       Alcotest.test_case "the heap stays flat" `Quick test_heap_stays_flat;
+      Alcotest.test_case "the heap stays flat under power cuts" `Quick
+        test_crash_heap_stays_flat;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
         test_kept_going;
       Alcotest.test_case "a cut stops a supervisor that retries" `Quick
