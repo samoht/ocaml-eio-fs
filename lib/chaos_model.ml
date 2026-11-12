@@ -1386,6 +1386,10 @@ module Crash = struct
            modes opens met, so far: with [seq], what tells a sync or an open
            that changed nothing a cut leaves. *)
     mutable ops : int;
+    opened : (int64, int) Hashtbl.t;
+        (* The handles open on each inode: ext4 frees a removed file's blocks
+           at its last close. *)
+    file_inos : (int, int64) Hashtbl.t; (* the inode of each file, by id *)
     pause : unit -> unit;
         (* The time a sync takes, after it took what it covers. *)
     mutable crashed : bool;
@@ -3459,7 +3463,14 @@ module Crash = struct
        Hashtbl.iter
          (fun _ (fs : fstate) -> Hashtbl.replace live fs.id ())
          ctl.files;
-       let kept id = Hashtbl.mem located id || Hashtbl.mem live id in
+       (* Nor does a removed file still open: ext4 frees its blocks at its
+          last close. *)
+       let is_open ino = Hashtbl.mem ctl.opened ino in
+       let kept id =
+         Hashtbl.mem located id || Hashtbl.mem live id
+         || Option.fold ~none:false ~some:is_open
+              (Hashtbl.find_opt ctl.file_inos id)
+       in
        let gone_files =
          Hashtbl.fold
            (fun id (fs : fstate) acc ->
@@ -3468,7 +3479,8 @@ module Crash = struct
        and gone_nodes =
          Inos.fold
            (fun ino (path, data) acc ->
-             if Inos.mem ino inos then acc else (path, data) :: acc)
+             if Inos.mem ino inos || is_open ino then acc
+             else (path, data) :: acc)
            ctl.snapped []
        in
        removed := gone_files @ gone_nodes;
@@ -3598,9 +3610,31 @@ module Crash = struct
     crw : Eio.File.rw_ty r option;
     cappend : bool;
     cpos : int ref;
+    cino : int64;
+    mutable closed : bool;
   }
 
   let guard cf = if cf.ctl.crashed then raise_power_lost ()
+
+  let open_ino ctl base =
+    let ino = (Eio.File.stat base).ino in
+    Hashtbl.replace ctl.opened ino
+      (1 + Option.value ~default:0 (Hashtbl.find_opt ctl.opened ino));
+    ino
+
+  (* A handle closes by its own close, or with the switch the base file
+     beneath it was opened in. *)
+  let release cf =
+    if not cf.closed then begin
+      cf.closed <- true;
+      match Hashtbl.find_opt cf.ctl.opened cf.cino with
+      | Some n when n > 1 -> Hashtbl.replace cf.ctl.opened cf.cino (n - 1)
+      | Some _ | None -> Hashtbl.remove cf.ctl.opened cf.cino
+    end
+
+  let close_cfile cf =
+    release cf;
+    close_resource cf.cro
 
   (* fsyncgate: a failed fsync(2) marks the file's dirty pages clean without
      writing them, so they are lost whatever a later sync reports. *)
@@ -3837,7 +3871,7 @@ module Crash = struct
 
     let stat cf = Eio.File.stat cf.cro
     let seek cf off cmd = do_seek ~pos:cf.cpos cf.cro off cmd
-    let close cf = close_resource cf.cro
+    let close cf = close_cfile cf
   end
 
   (* fsync(2) flushes the file, whichever descriptor names it, so a barrier
@@ -3880,10 +3914,23 @@ module Crash = struct
 
   (* A directory opened as a file syncs as that directory's barrier, on the
      inode it opened. *)
-  let wrap_cfile_ro ?fs ?dir ctl base : Eio.File.ro_ty r =
+  let wrap_cfile_ro ~sw ?fs ?dir ctl base : Eio.File.ro_ty r =
     let cf =
-      { ctl; cfs = None; cro = base; crw = None; cappend = false; cpos = ref 0 }
+      {
+        ctl;
+        cfs = None;
+        cro = base;
+        crw = None;
+        cappend = false;
+        cpos = ref 0;
+        cino = open_ino ctl base;
+        closed = false;
+      }
     in
+    Option.iter
+      (fun (fs : fstate) -> Hashtbl.replace ctl.file_inos fs.id cf.cino)
+      fs;
+    Switch.on_release sw (fun () -> release cf);
     let sync cf =
       match dir with
       | Some dir ->
@@ -3924,7 +3971,7 @@ module Crash = struct
 
     let stat cf = Eio.File.stat cf.cro
     let seek cf off cmd = do_seek ~pos:cf.cpos cf.cro off cmd
-    let close cf = close_resource cf.cro
+    let close cf = close_cfile cf
 
     (* A write that cleared setuid or setgid, as a user's does. *)
     let note_clear cf fs =
@@ -3983,7 +4030,7 @@ module Crash = struct
       bump cf.ctl fs ~kind:`Write ~offset:0 ~len:0
   end
 
-  let wrap_cfile_rw ctl fs ~append base : Eio.File.rw_ty r =
+  let wrap_cfile_rw ~sw ctl fs ~append base : Eio.File.rw_ty r =
     let state =
       {
         ctl;
@@ -3992,8 +4039,12 @@ module Crash = struct
         crw = Some base;
         cappend = append;
         cpos = ref 0;
+        cino = open_ino ctl (base :> Eio.File.ro_ty r);
+        closed = false;
       }
     in
+    Hashtbl.replace ctl.file_inos fs.id state.cino;
+    Switch.on_release sw (fun () -> release state);
     rw_boxed
       ~extra:
         [
@@ -4152,7 +4203,7 @@ module Crash = struct
         | { kind = `Directory; ino; _ } -> Some ino
         | _ -> None
       in
-      wrap_cfile_ro ?fs ?dir d.dctl file
+      wrap_cfile_ro ~sw ?fs ?dir d.dctl file
 
     let open_out d ~sw ~follow ~append ~create path =
       live d;
@@ -4214,7 +4265,7 @@ module Crash = struct
         record_metadata d.dctl ~path:spelt ~kind:Create ~resolved:[ rel ];
         bump_metadata d.dctl ~path:spelt ~kind:Create
       end;
-      wrap_cfile_rw d.dctl fs ~append base
+      wrap_cfile_rw ~sw d.dctl fs ~append base
 
     let open_subtree d ~sw path =
       live d;
@@ -4479,6 +4530,8 @@ module Crash = struct
       logged = 0;
       pending_changes = 0;
       ops = 0;
+      opened = Hashtbl.create 8;
+      file_inos = Hashtbl.create 8;
       pause;
       crashed = false;
       image = [];

@@ -185,13 +185,12 @@ val check :
     offset of any file: the check draws the page at the same place first, then
     the others, up to eight distinct ones; and else the byte ['7']. Only a freed
     block holds stale data: a file the cut lost and the workload never removed
-    frees none. The check takes a removed file's blocks as freed even while it
-    is open, though ext4 frees them only at its last close. Of the uncommitted
-    directory changes, a prefix survives. A failed sync loses the file's
-    unsynced writes, as Linux does, though some of their sectors may already be
-    on disk; the page cache may keep them or evict them. Before the cut, a read
-    after a failed sync sees them as kept, or, in a scenario of its own, as the
-    disk holds them. *)
+    frees none, and a removed file still open at the cut none either, as ext4
+    frees its blocks at its last close. Of the uncommitted directory changes, a
+    prefix survives. A failed sync loses the file's unsynced writes, as Linux
+    does, though some of their sectors may already be on disk; the page cache
+    may keep them or evict them. Before the cut, a read after a failed sync sees
+    them as kept, or, in a scenario of its own, as the disk holds them. *)
 module Crash : sig
   val check :
     ?budget:int ->

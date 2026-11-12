@@ -224,8 +224,6 @@ owner or the directory's.
 
 ### What a check can miss
 
-- Stale data from a removed file still open. The check frees its blocks at
-  once, where ext4 waits for the last close. Checksum what you read back.
 - A bug that needs two faults. Some pairs of faults lie past the default
   budget of 20,000 runs. Raise `~budget` in a nightly run, as the
   `CHAOS_BUDGET` example in `Eio_fs.Chaos` does.
