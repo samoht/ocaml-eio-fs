@@ -873,11 +873,12 @@ module Crash = struct
   let pp_unsynced = M.Crash.pp_unsynced
 
   type policy = Drop_unsynced | Survive of (unsynced -> bool)
+  type outside = M.Crash.outside = Dropped | Kept
   type t = M.Crash.t
 
-  let v = function
-    | Drop_unsynced -> M.Crash.v ~policy:Drop_unsynced ()
-    | Survive p -> M.Crash.v ~policy:(Survive p) ()
+  let v ?outside = function
+    | Drop_unsynced -> M.Crash.v ~policy:Drop_unsynced ?outside ()
+    | Survive p -> M.Crash.v ~policy:(Survive p) ?outside ()
 
   let wrap t base = (M.Crash.wrap t base :> Eio.Fs.dir_ty Eio.Path.t)
   let unsynced = M.Crash.unsynced

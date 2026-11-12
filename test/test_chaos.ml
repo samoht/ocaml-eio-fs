@@ -3674,6 +3674,70 @@ let test_crash_drops_an_entry_planted_by_native_name () =
         "an entry planted by name after the wrap is not in the image" true
         (absent (post / "device.img")))
 
+(* The same plant under [Kept]: a workload whose processes write the tree
+   beside the wrapper keeps their writes, as a disk keeps what a process that
+   syncs its own writes left there. *)
+let test_crash_keeps_an_entry_planted_by_native_name () =
+  let ctl = Crash.v ~policy:Drop_unsynced ~outside:Kept () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o600) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file);
+      Crash.sync_metadata ctl;
+      Eio.Path.with_open_out ~create:(`Or_truncate 0o600) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "BBBB" ]);
+      Out_channel.with_open_bin
+        (Eio.Path.native_exn (fs / "device.img"))
+        (fun oc -> output_string oc "DEVICE"))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "the wrapper's unsynced rewrite is the policy's to drop" "AAAA"
+        (Eio.Path.load (post / "img"));
+      Alcotest.(check string)
+        "the planted entry is in the image" "DEVICE"
+        (Eio.Path.load (post / "device.img")))
+
+(* A child makes a directory and a file in it by name, and the run then
+   replaces the file through the wrapper with a lock renamed over it. A
+   barrier on the directory the child made commits the rename; with no
+   barrier the rename is lost, and the image holds the child's file, never no
+   file. *)
+let rename_over_a_childs_file ~barrier =
+  let ctl = Crash.v ~policy:Drop_unsynced ~outside:Kept () in
+  with_real_crash ctl
+    (fun fs ->
+      let dir = Eio.Path.native_exn fs ^ "/made" in
+      Unix.mkdir dir 0o755;
+      Out_channel.with_open_bin (dir ^ "/ref") (fun oc ->
+          output_string oc "child");
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644)
+        (fs / "made" / "ref.lock")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "run" ];
+          Eio.File.sync file);
+      Eio.Path.rename (fs / "made" / "ref.lock") (fs / "made" / "ref");
+      if barrier then Eio_fs_sync.sync_dir (fs / "made"))
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "the file the image holds"
+        (if barrier then "run" else "child")
+        (Eio.Path.load (post / "made" / "ref"));
+      Alcotest.(check bool)
+        "no lock is left" true
+        (absent (post / "made" / "ref.lock")))
+
+let test_crash_kept_barrier_on_a_childs_directory () =
+  rename_over_a_childs_file ~barrier:true
+
+let test_crash_kept_rename_over_a_childs_file_lost () =
+  rename_over_a_childs_file ~barrier:false
+
 (* A snapshot reads the tree while the run's other processes write it: a
    file a child rewrites between the snapshot's stat and its read is read as
    it stands, one of the images the rewrite passes through, and a snapshot is
@@ -4125,6 +4189,12 @@ let suite =
         `Quick test_crash_ignores_a_barrier_through_a_bare_descriptor;
       Alcotest.test_case "crash: an entry planted by name is not in the image"
         `Quick test_crash_drops_an_entry_planted_by_native_name;
+      Alcotest.test_case "crash: kept, an entry planted by name is in the image"
+        `Quick test_crash_keeps_an_entry_planted_by_native_name;
+      Alcotest.test_case "crash: kept, a barrier on a child's directory" `Quick
+        test_crash_kept_barrier_on_a_childs_directory;
+      Alcotest.test_case "crash: kept, a lost rename over a child's file" `Quick
+        test_crash_kept_rename_over_a_childs_file_lost;
       Alcotest.test_case "crash: a snapshot reads a file being rewritten" `Quick
         test_crash_snapshot_reads_a_file_being_rewritten;
     ] )

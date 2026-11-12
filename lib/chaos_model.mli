@@ -417,12 +417,26 @@ module Crash : sig
   type base_dir = Eio.Fs.dir_ty Eio.Path.t
   (** The type for the backing store handed back after a crash. *)
 
-  val v : ?policy:policy -> ?trigger:trigger -> ?block_size:int -> unit -> t
-  (** [v ~policy ~trigger ~block_size ()] is a fresh controller that rebuilds
-      the post-crash image by [policy] (defaults to {!Drop_unsynced}, a single
-      state) and crashes on [trigger] (defaults to {!Manual}). [block_size]
-      (defaults to [4096]) is the byte size of the blocks {!Reorder_unsynced}
-      writes back.
+  (** The type for what a crash image holds of a change that reached the store
+      other than through the wrapper. *)
+  type outside =
+    | Dropped  (** Nothing: the image is rebuilt from the model alone. *)
+    | Kept
+        (** All of it, as durable, where the model holds no change; see
+            [Chaos.Crash.v]. *)
+
+  val v :
+    ?policy:policy ->
+    ?trigger:trigger ->
+    ?outside:outside ->
+    ?block_size:int ->
+    unit ->
+    t
+  (** [v ~policy ~trigger ~outside ~block_size ()] is a fresh controller that
+      rebuilds the post-crash image by [policy] (defaults to {!Drop_unsynced}, a
+      single state) and [outside] (defaults to {!Dropped}), and crashes on
+      [trigger] (defaults to {!Manual}). [block_size] (defaults to [4096]) is
+      the byte size of the blocks {!Reorder_unsynced} writes back.
 
       @raise Stdlib.Invalid_argument if [block_size] is not positive. *)
 
@@ -434,10 +448,10 @@ module Crash : sig
       As for {!Chaos.wrap}, the wrapper and what it opens hold [base] out of
       reach, so every write that reaches [base] through them enters the journal.
       A file's writes stay un-synced until {!Eio.File.sync} or
-      {!Eio_fs_sync.sync_file} reaches it through the wrapper. A crash rebuilds
-      the tree from the model, so a change made outside the wrapper, by name or
-      on the host descriptor [eio-fs.unix] locks, is gone from the post-crash
-      image.
+      {!Eio_fs_sync.sync_file} reaches it through the wrapper. Under {!Dropped}
+      a crash rebuilds the tree from the model, so a change made outside the
+      wrapper, by name or on the host descriptor [eio-fs.unix] locks, is gone
+      from the post-crash image; under {!Kept} it stays.
 
       The model reads and rebuilds the tree with root's rights, whatever user
       [base] runs as: on an in-memory directory of {!Eio_fs.Fs} it does so
