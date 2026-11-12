@@ -747,6 +747,27 @@ let test_heap_stays_flat () =
   let grown = !top - base in
   if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
+(* Ten thousand reads of one file: most are no structure, and the sampled
+   tier spreads its runs over them. It builds only the scenarios it runs,
+   so what is live grows with the trace, not with the scenarios it could
+   run. *)
+let test_sampled_heap () =
+  let runs = ref 0 and top = ref 0 in
+  Eio_fs.Chaos.check
+    ~setup:(fun env -> P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "x")
+    (fun env ->
+      incr runs;
+      if !runs mod 20 = 0 then top := max !top (Gc.stat ()).live_words;
+      try
+        P.with_open_in P.(env#fs / "f") @@ fun f ->
+        let buf = Cstruct.create 1 in
+        for _ = 1 to 10_000 do
+          try Eio.File.pread_exact f ~file_offset:Optint.Int63.zero [ buf ]
+          with Eio.Io _ -> ()
+        done
+      with Eio.Io _ -> ());
+  if !top > 600_000 then Alcotest.failf "%d words live" !top
+
 (* A save retried after a yield on a read-only filesystem: the run stops at
    100,000 operations. The check keeps only what the report shows, so the
    heap stays flat as the run goes, and the report is short. *)
@@ -1279,6 +1300,8 @@ let suite =
       Alcotest.test_case "only the errors Linux returns" `Quick
         test_errors_linux_returns;
       Alcotest.test_case "the heap stays flat" `Quick test_heap_stays_flat;
+      Alcotest.test_case "the sampled tier builds what it runs" `Quick
+        test_sampled_heap;
       Alcotest.test_case "the heap stays flat in a busy loop" `Quick
         test_busy_heap_stays_flat;
       Alcotest.test_case "a first run stops at the budget" `Quick
