@@ -211,8 +211,9 @@ module File = struct
     | Literal s -> Cstruct.blit_from_string s src_off dst dst_off len
     | Buffer b -> Cstruct.blit b src_off dst dst_off len
 
-  (* The largest file, 4 GiB: the bytes live in memory, holes included. *)
-  let max_size = 1 lsl 32
+  (* The largest file, 4 GiB, or [max_int] where an [int] cannot hold it:
+     the bytes live in memory, holes included. *)
+  let max_size = if Sys.int_size > 33 then 1 lsl 32 else max_int
 
   (* A buffer holding [f]'s bytes with room for [need], and every byte from
      [f]'s size to [need] zero: a truncation leaves stale bytes past the end. *)
