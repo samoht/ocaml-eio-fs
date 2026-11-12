@@ -217,13 +217,15 @@ let read_refused ~kind root path =
 let test_read_regular () =
   with_dir @@ fun root ->
   Eio.Path.mkdir ~perm:0o755 (root / "packages");
-  Eio.Path.save ~create:(`Exclusive 0o600) (root / "packages/library") "bytes";
-  Alcotest.(check (option string))
-    "the file's bytes" (Some "bytes")
-    (get (read root "packages/library"));
-  Alcotest.(check (option string))
-    "an absent entry" None
-    (get (read root "packages/absent"))
+  Eio.Path.save ~create:(`Exclusive 0o640) (root / "packages/library") "bytes";
+  (match get (read root "packages/library") with
+  | Some { Link.content; perm } ->
+      Alcotest.(check string) "the file's bytes" "bytes" content;
+      Alcotest.(check int) "the descriptor's permission bits" 0o640 perm
+  | None -> Alcotest.fail "a present regular file read as absent");
+  Alcotest.(check bool)
+    "an absent entry" true
+    (Option.is_none (get (read root "packages/absent")))
 
 let test_read_symlink_leaf () =
   with_dir @@ fun root ->
@@ -256,7 +258,9 @@ let test_read_too_large () =
       Alcotest.(check bool) "too large" true (contains "too large" message);
       Alcotest.(check (option string))
         "at the bound" (Some "12345")
-        (get (read ~max_bytes:5 root "library"))
+        (Option.map
+           (fun (r : Link.regular) -> r.content)
+           (get (read ~max_bytes:5 root "library")))
 
 (* The bound is Nofollow's: a negative one or max_int is refused. *)
 let test_read_bound () =

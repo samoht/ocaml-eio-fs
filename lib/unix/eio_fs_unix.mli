@@ -683,7 +683,7 @@ module Link : sig
       applied to the held parent and final basename. [path]'s name must be
       non-empty, canonical and relative, with no empty, dot, dot-dot or NUL
       components. [create] (defaults to [`Never]) says what a missing parent
-      does: [`If_missing perm] creates it with mode [perm] less the umask, and
+      does: [`If_missing mode] creates it with [mode] less the umask, and
       [`Never] refuses it. Created parents survive a later refusal.
 
       The handle is closed when [fn] returns and must not escape its scope. A
@@ -707,16 +707,20 @@ module Link : sig
       byte and a failed call are [Error msg], and nothing is replaced; [msg]
       names the original path and the action needed to retry. *)
 
-  val read_regular : max_bytes:int -> t -> (string option, string) result
+  type regular = { content : string; perm : int }
+  (** The type for a regular file read: its bytes and its permission bits, both
+      from the one descriptor. *)
+
+  val read_regular : max_bytes:int -> t -> (regular option, string) result
   (** [read_regular ~max_bytes parent] opens the final entry beneath the held
-      parent with [O_NOFOLLOW | O_NONBLOCK | O_NOCTTY] and is [Ok (Some s)], [s]
-      the bytes read from that descriptor, or [Ok None] if the entry is absent.
-      It is [Error msg] for a symbolic link or another non-regular entry (a FIFO
-      is refused without waiting for a writer, and a terminal never becomes the
-      controlling one), a file of more than [max_bytes] bytes or one that grows
-      beyond its size at open, and a failed open. The descriptor is closed
-      before the result. The enclosing {!val-with_parent} refuses symbolic links
-      at every parent component.
+      parent with [O_NOFOLLOW | O_NONBLOCK | O_NOCTTY] and is [Ok (Some r)], [r]
+      the bytes read from that descriptor and its permission bits by [fstat], or
+      [Ok None] if the entry is absent. It is [Error msg] for a symbolic link or
+      another non-regular entry (a FIFO is refused without waiting for a writer,
+      and a terminal never becomes the controlling one), a file of more than
+      [max_bytes] bytes or one that grows beyond its size at open, and a failed
+      open. The descriptor is closed before the result. The enclosing
+      {!val-with_parent} refuses symbolic links at every parent component.
 
       {b Warning.} A hard link is the file it names, wherever its other names
       are: a regular file linked beneath the parent from outside the root is
