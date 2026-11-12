@@ -665,11 +665,12 @@ let test_heap_stays_flat () =
 
 (* The same for power cuts: a check keeps no run's operations once it has
    drawn from them, so the heap stays flat as runs go, and does not grow
-   with the number of runs. *)
+   with the number of runs, nor, as it draws states, with the number of cuts
+   times the draws each makes. *)
 let test_crash_heap_stays_flat () =
   Gc.compact ();
   let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
-  let n = 40 in
+  let n = 200 in
   Eio_fs.Chaos.Crash.check
     (fun ~ack env ->
       top := max !top (Gc.quick_stat ()).heap_words;
@@ -687,7 +688,7 @@ let test_crash_heap_stays_flat () =
             Fmt.failwith "f%d lost" i)
         acked);
   let grown = !top - base in
-  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  if grown > 2_000_000 then Alcotest.failf "the heap grew by %d words" grown
 
 (* A workload that catches the cut's cancellation keeps going. *)
 let test_kept_going () =
