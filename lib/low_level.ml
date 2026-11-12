@@ -843,14 +843,18 @@ let unlink dir_fd path =
   if is_dot name then is_a_directory ();
   match Filesystem.child w name with
   | None -> Error.not_found path
-  | Some { contents = Resource.Dir _ } -> is_a_directory ()
-  (* A trailing slash on anything else, a link to a directory included. *)
+  (* A trailing slash is refused before permission: EISDIR on a directory,
+     ENOTDIR on anything else, a link to a directory included. *)
+  | Some { contents = Resource.Dir _ } when slash -> is_a_directory ()
   | Some _ when slash -> Error.not_a_directory path
-  | Some victim ->
+  | Some victim -> (
+      (* Permission before kind. *)
       let rdir = Filesystem.here w in
       check_dir_write ~user:dir_fd.user rdir path;
       check_sticky ~user:dir_fd.user rdir victim path;
-      remove_entry (Dir.fs dir_fd) w name
+      match !victim with
+      | Resource.Dir _ -> is_a_directory ()
+      | _ -> remove_entry (Dir.fs dir_fd) w name)
 
 let mkdirat dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
@@ -956,24 +960,24 @@ let rmdir dir_fd path =
   if String.equal name "." then Error.err ("rmdir: invalid argument: " ^ path);
   if String.equal name ".." then
     Error.err ("rmdir: directory not empty: " ^ path);
-  (* A final symbolic link is not followed: ENOTDIR. *)
   match Filesystem.child w name with
   | None -> Error.not_found path
-  | Some ({ contents = Resource.Dir d } as victim) ->
+  | Some victim -> (
+      (* Permission before kind; a final symbolic link is not followed:
+         ENOTDIR. *)
       let rdir = Filesystem.here w in
       check_dir_write ~user:dir_fd.user rdir path;
       check_sticky ~user:dir_fd.user rdir victim path;
-      if not (Dir_node.is_empty d) then Error.err "Directory is not empty"
-      else remove_entry (Dir.fs dir_fd) w name
-  | Some _ -> Error.err ("rmdir: not a directory: " ^ path)
+      match !victim with
+      | Resource.Dir d when not (Dir_node.is_empty d) ->
+          Error.err "Directory is not empty"
+      | Resource.Dir _ -> remove_entry (Dir.fs dir_fd) w name
+      | _ -> Error.err ("rmdir: not a directory: " ^ path))
 
-(* rename(2) refuses to move a directory below itself (EINVAL), anything over
-   a directory above it (ENOTEMPTY, before the kinds are compared), a
-   directory over a non-empty directory (ENOTEMPTY) or over a non-directory
-   (ENOTDIR), and a non-directory over a directory (EISDIR). Eio.Fs has no
-   constructor for these, which eio_posix raises as a bare [Eio.Io]. *)
-
-let check_rename tree ~src ~old_parent ~new_parent ~dst new_path =
+(* rename(2) refuses to move a directory below itself (EINVAL) and anything
+   over a directory above it (ENOTEMPTY), before it checks permissions. Eio.Fs
+   has no constructor for these, which eio_posix raises as a bare [Eio.Io]. *)
+let check_rename_tree tree ~src ~old_parent ~new_parent ~dst new_path =
   let ino = (Resource.stat !src).ino in
   match (!src, Option.map ( ! ) dst) with
   | Resource.Dir _, _ when Filesystem.within tree new_parent ino ->
@@ -981,12 +985,23 @@ let check_rename tree ~src ~old_parent ~new_parent ~dst new_path =
   | _, Some (Resource.Dir d) when Filesystem.within tree old_parent d.stat.ino
     ->
       Error.err ("rename: directory not empty: " ^ new_path)
-  | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
-      Error.err ("rename: directory not empty: " ^ new_path)
-  | Resource.Dir _, Some (File _ | Symlink _) ->
+  | _ -> ()
+
+(* After them, a directory over a non-directory (ENOTDIR), a non-directory
+   over a directory (EISDIR), and last a directory over a non-empty one
+   (ENOTEMPTY). *)
+let check_rename_kinds ~src ~dst new_path =
+  match (!src, Option.map ( ! ) dst) with
+  | Resource.Dir _, Some (Resource.File _ | Symlink _) ->
       Error.err ("rename: not a directory: " ^ new_path)
   | (File _ | Symlink _), Some (Resource.Dir _) ->
       Error.err ("rename: is a directory: " ^ new_path)
+  | _ -> ()
+
+let check_rename_empty ~src ~dst new_path =
+  match (!src, Option.map ( ! ) dst) with
+  | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
+      Error.err ("rename: directory not empty: " ^ new_path)
   | _ -> ()
 
 (* A rename MOVES: the source loses [old_name] and the target gains [new_name]
@@ -1060,18 +1075,20 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
       let dst =
         Option.bind existing (fun (dst_ino, _) -> Entries.find_opt dst_ino tree)
       in
-      check_rename tree ~src:old_res ~old_parent ~new_parent ~dst new_path;
+      check_rename_tree tree ~src:old_res ~old_parent ~new_parent ~dst new_path;
       let user = dir_fd.user in
       check_dir_write ~user old_parent old_path;
       check_sticky ~user old_parent old_res old_path;
       check_dir_write ~user new_parent new_path;
       Option.iter (fun dst -> check_sticky ~user new_parent dst new_path) dst;
+      check_rename_kinds ~src:old_res ~dst new_path;
       (* A directory moved to another parent has its [..] rewritten. *)
       (match !old_res with
       | Resource.Dir _ when old_parent != new_parent ->
           if not (User.can user (Resource.stat !old_res) User.w) then
             Error.permission_denied old_path
       | _ -> ());
+      check_rename_empty ~src:old_res ~dst new_path;
       move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
       reparent old_res ~new_parent;
