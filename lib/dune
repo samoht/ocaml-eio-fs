@@ -14,4 +14,6 @@
   optint
   mtime
   psq
-  domain-local-await))
+  domain-local-await
+  uucp
+  uunf))

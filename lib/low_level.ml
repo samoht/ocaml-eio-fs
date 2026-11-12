@@ -140,21 +140,99 @@ end
 
 module Names = Map.Make (String)
 
+type os = [ `Linux | `Macos ]
+
+(* How [os] compares names. Linux compares bytes. APFS's default volume on
+   macOS compares a name by its key: decomposed (NFD), case-folded, decomposed
+   again, Unicode's canonical caseless match; it keeps the spelling a name
+   was made with. A name that is not UTF-8, which APFS never stores, is its
+   own key. *)
+module Name = struct
+  let fold_uchars u acc =
+    match Uucp.Case.Fold.fold u with
+    | `Self -> u :: acc
+    | `Uchars us -> List.rev_append us acc
+
+  let nfd us =
+    let n = Uunf.create `NFD in
+    let out = ref [] in
+    let rec add v =
+      match Uunf.add n v with
+      | `Uchar u ->
+          out := u :: !out;
+          add `Await
+      | `Await | `End -> ()
+    in
+    List.iter (fun u -> add (`Uchar u)) us;
+    add `End;
+    List.rev !out
+
+  let uchars s =
+    let rec go i acc =
+      if i >= String.length s then List.rev acc
+      else
+        let d = String.get_utf_8_uchar s i in
+        go (i + Uchar.utf_decode_length d) (Uchar.utf_decode_uchar d :: acc)
+    in
+    go 0 []
+
+  let key (os : os) name =
+    match os with
+    | `Linux -> name
+    | `Macos when not (String.is_valid_utf_8 name) -> name
+    | `Macos ->
+        let folded =
+          List.rev
+            (List.fold_left
+               (fun acc u -> fold_uchars u acc)
+               []
+               (nfd (uchars name)))
+        in
+        let b = Buffer.create (String.length name) in
+        List.iter (Buffer.add_utf_8_uchar b) (nfd folded);
+        Buffer.contents b
+
+  (* NAME_MAX: 255 bytes on Linux, 255 UTF-16 code units on APFS. *)
+  let too_long (os : os) name =
+    match os with
+    | `Macos when String.is_valid_utf_8 name ->
+        List.fold_left
+          (fun n u -> n + (Uchar.utf_16_byte_length u / 2))
+          0 (uchars name)
+        > 255
+    | `Linux | `Macos -> String.length name > 255
+end
+
 module Dir_node = struct
   (* A node holds no name of its own: its names are the entries of the
-     directories that hold it. [entries] maps each name but [.] and [..] to
-     its inode, so a lookup costs the log of the directory's size. *)
+     directories that hold it. [entries] maps each name's key, but [.] and
+     [..], to the spelling it was made with and its inode, so a lookup costs
+     the log of the directory's size. *)
   type t = {
     stat : Eio.File.Stat.t;
     parent : Inode.t;
-    entries : Inode.t Names.t;
+    entries : (string * Inode.t) Names.t;
   }
 
   let v ~parent stat = { stat; parent; entries = Names.empty }
   let is_empty dir = Names.is_empty dir.entries
-  let find name dir = Names.find_opt name dir.entries
-  let add name ino dir = { dir with entries = Names.add name ino dir.entries }
-  let remove name dir = { dir with entries = Names.remove name dir.entries }
+
+  let find os name dir =
+    Option.map snd (Names.find_opt (Name.key os name) dir.entries)
+
+  (* The spelling of the entry [name] matches. *)
+  let spelling os name dir =
+    Option.map fst (Names.find_opt (Name.key os name) dir.entries)
+
+  let add os name ino dir =
+    { dir with entries = Names.add (Name.key os name) (name, ino) dir.entries }
+
+  let remove os name dir =
+    { dir with entries = Names.remove (Name.key os name) dir.entries }
+
+  let names dir =
+    Names.fold (fun _ (name, ino) acc -> (name, ino) :: acc) dir.entries []
+    |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 end
 
 module Symlink = struct
@@ -360,6 +438,7 @@ module Entries = Map.Make (Inode)
    Nothing is shared between two of them. [lock] serialises the operations on
    it, so fibers of several domains may share one. *)
 type fs = {
+  os : os;
   mutable tree : resource ref Entries.t;
   mutable fds : resource ref Fd_table.t;
   mutable last_ino : Inode.t;
@@ -442,10 +521,12 @@ let new_stat fs ~(user : User.t) ?parent ?kind ?perm () =
   let kind = Option.value ~default:default_stat.kind kind in
   let perm = Option.value ~default:default_stat.perm perm in
   let gid, perm =
-    match parent with
-    | Some (p : Eio.File.Stat.t) when p.perm land 0o2000 <> 0 ->
+    match (fs.os, parent) with
+    (* macOS, as BSD, gives every new entry its directory's group. *)
+    | `Macos, Some (p : Eio.File.Stat.t) -> (p.gid, perm)
+    | `Linux, Some (p : Eio.File.Stat.t) when p.perm land 0o2000 <> 0 ->
         (p.gid, if kind = `Directory then perm lor 0o2000 else perm)
-    | Some _ | None -> (User.id user.gid, perm)
+    | _, (Some _ | None) -> (User.id user.gid, perm)
   in
   let perm =
     if
@@ -520,9 +601,9 @@ module Filesystem = struct
            | None -> false)
     | _ -> false
 
-  (* path_resolution(7): a resolution follows at most [max_follows] symbolic
-     links, as Linux and eio_posix do, and then fails with ELOOP. *)
-  let max_follows = 40
+  (* path_resolution(7): a resolution follows at most 40 symbolic links on
+     Linux, MAXSYMLINKS, 32, on macOS, and then fails with ELOOP. *)
+  let max_follows : os -> int = function `Linux -> 40 | `Macos -> 32
 
   let follow_link follows =
     if !follows <= 0 then Error.symlink_loop ();
@@ -536,6 +617,7 @@ module Filesystem = struct
      walk with full access keeps only the directory it is in and climbs to
      its parent, the root being its own. *)
   type walk = {
+    os : os;
     tree : t;
     user : User.t;
     base : Inode.t option;
@@ -585,7 +667,7 @@ module Filesystem = struct
     | ".." -> Some (here (up w []))
     | name -> (
         let d = as_dir ~path:name !(here w) in
-        match Dir_node.find name d with
+        match Dir_node.find w.os name d with
         | None -> None
         | Some ino -> Entries.find_opt ino w.tree)
 
@@ -596,7 +678,8 @@ module Filesystem = struct
   let may_follow w name (s : Symlink.t) =
     let dir = Resource.stat !(here w) in
     if
-      dir.perm land 0o1002 = 0o1002
+      w.os = `Linux
+      && dir.perm land 0o1002 = 0o1002
       && (not (Int64.equal s.stat.uid (User.id w.user.uid)))
       && not (Int64.equal s.stat.uid dir.uid)
     then Error.permission_denied name
@@ -639,7 +722,7 @@ module Filesystem = struct
   let locate ?(search = true) w path =
     (* NUL ends a C path: ENOENT. A name holds at most NAME_MAX bytes. *)
     if String.exists (Char.equal '\000') path then Error.not_found path;
-    if List.exists (fun n -> String.length n > 255) (names path) then
+    if List.exists (Name.too_long w.os) (names path) then
       Error.err ("file name too long: " ^ path);
     let w = enter w path in
     let w, name =
@@ -684,10 +767,11 @@ module Filesystem = struct
     let tree = fs.tree in
     let at_root =
       {
+        os = fs.os;
         tree;
         user = dir_fd.Dir.user;
         base = None;
-        follows = ref max_follows;
+        follows = ref (max_follows fs.os);
         dirs = [ root tree ];
       }
     in
@@ -719,11 +803,15 @@ module Filesystem = struct
     final ~follow w name ~slash
 end
 
-let v ?clock ?(cwd = "/") ?(owner = User.root) ?os:_ () =
+let v ?clock ?(cwd = "/") ?(owner = User.root) ?os () =
   let now =
     match clock with Some c -> fun () -> Eio.Time.now c | None -> Fun.const 0.
   in
+  let os =
+    match os with Some `Macos -> `Macos | Some `Linux | None -> `Linux
+  in
   {
+    os;
     tree = Filesystem.empty ~owner ~now:(now ());
     fds = Fd_table.empty;
     last_ino = 0L;
@@ -747,15 +835,16 @@ let close (fd : Fd.t) =
    mode asks for; the mode given at creation does not restrict the creating
    open itself. This backend opens files O_RDONLY or O_RDWR, so the read bit
    is always required and the write bit with o_rdwr. A directory opened to be
-   read needs its read bit too; one opened with O_DIRECTORY needs none, as
-   eio_posix opens it O_PATH. *)
-let check_access ~user path flags r =
+   read needs its read bit too; one opened with O_DIRECTORY needs none on
+   Linux, as eio_posix opens it O_PATH, and its read bit on macOS, which has
+   no O_PATH. *)
+let check_access ~os ~user path flags r =
   let want = if Open_flags.(mem o_rdwr flags) then User.(r lor w) else User.r in
   match !r with
   | Resource.File f when not (User.can user f.stat want) ->
       Error.permission_denied path
   | Resource.Dir d
-    when (not Open_flags.(mem o_directory flags))
+    when ((not Open_flags.(mem o_directory flags)) || os = `Macos)
          && not (User.can user d.stat want) ->
       Error.permission_denied path
   | _ -> ()
@@ -787,16 +876,40 @@ let check_live fs rdir path =
    remove or move. *)
 let is_dot name = String.equal name "." || String.equal name ".."
 
+(* APFS stores only UTF-8 names: EILSEQ. *)
+let check_name fs name =
+  if fs.os = `Macos && not (String.is_valid_utf_8 name) then
+    Error.err ("illegal byte sequence: " ^ name)
+
+(* On macOS a last component in directory syntax that is a symbolic link is
+   followed to the entry it names, even to make, remove or move it: [w] and
+   [name] then name that entry. *)
+let rec through_link ~slash (w : Filesystem.walk) name =
+  if w.os = `Linux || not slash then (w, name)
+  else
+    match Filesystem.child w name with
+    | Some { contents = Resource.Symlink s } ->
+        Filesystem.follow_link w.follows;
+        let w, name, _ = Filesystem.locate w (Filesystem.link_target name s) in
+        through_link ~slash w name
+    | _ -> (w, name)
+
 (* Create the entry [path] with [add parent name] unless its name is taken,
    by a dangling symbolic link included: EEXIST, as mkdir(2) and symlink(2)
    answer. Only a directory is made under a name with a trailing slash: ENOENT
    otherwise. *)
 let new_entry ?(dir = false) dir_fd path add =
   let w, name, slash = Filesystem.locate_from dir_fd path in
+  let w, name = if dir then through_link ~slash w name else (w, name) in
   match Filesystem.child w name with
+  (* macOS looks a name in directory syntax up as a directory first. *)
+  | Some { contents = Resource.File _ | Symlink _ } when slash && w.os = `Macos
+    ->
+      Error.not_a_directory path
   | Some _ -> Error.already_exists path
   | None when slash && not dir -> Error.not_found path
   | None ->
+      check_name (Dir.fs dir_fd) name;
       check_live (Dir.fs dir_fd) (Filesystem.here w) path;
       check_dir_write ~user:dir_fd.user (Filesystem.here w) path;
       add (Filesystem.here w) name
@@ -813,7 +926,8 @@ let new_file ~mode fs (w : Filesystem.walk) name =
       ()
   in
   let f = File.v ~stat in
-  rdir := Resource.Dir (Dir_node.add name f.stat.ino dir);
+  check_name fs name;
+  rdir := Resource.Dir (Dir_node.add fs.os name f.stat.ino dir);
   entries_changed ~now:stat.ctime rdir;
   let file = ref (Resource.File f) in
   Filesystem.add_file fs f.stat.ino file;
@@ -838,7 +952,7 @@ let open_locked ~mode dir_fd path flags =
     (* O_DIRECTORY on anything else: ENOTDIR. *)
     | _ when directory -> Error.err ("open: not a directory: " ^ path)
     | _ -> ());
-    check_access ~user:dir_fd.user path flags r;
+    check_access ~os:fs.os ~user:dir_fd.user path flags r;
     if truncate then truncate_file ~now:(fs.now ()) r;
     r
   in
@@ -857,9 +971,15 @@ let open_locked ~mode dir_fd path flags =
            the directory itself. A symbolic link there, dangling or not,
            makes O_EXCL fail with EEXIST and O_NOFOLLOW with ELOOP; otherwise
            the open follows it and opens its target, or creates it, resolved
-           from the directory holding the link. *)
+           from the directory holding the link. macOS looks a name in
+           directory syntax up instead: ENOENT if it is missing, ENOTDIR if
+           it is not a directory, EISDIR if it is. *)
         let rec create (w : Filesystem.walk) name ~slash =
           let child = Filesystem.child w name in
+          if slash && (not (is_dot name)) && w.os = `Macos then begin
+            if Option.is_none child then Error.not_found path;
+            ignore (Filesystem.final ~follow:true w name ~slash)
+          end;
           if slash && not (is_dot name) then
             Error.err ("open: is a directory: " ^ path);
           match child with
@@ -911,9 +1031,10 @@ let set_times dir_fd path ~atime ~mtime ~ctime =
 let chmod ~follow dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let r = Filesystem.lookup ~follow dir_fd path in
-  (* Linux keeps no mode on a link: EOPNOTSUPP. *)
+  (* Linux keeps no mode on a link: EOPNOTSUPP. macOS does. *)
   (match !r with
-  | Resource.Symlink _ -> Error.err ("chmod: not supported on a link: " ^ path)
+  | Resource.Symlink _ when (Dir.fs dir_fd).os = `Linux ->
+      Error.err ("chmod: not supported on a link: " ^ path)
   | _ -> ());
   if not (User.owns dir_fd.user (Resource.stat !r)) then
     Error.permission_denied path;
@@ -956,7 +1077,7 @@ let remove_entry fs (w : Filesystem.walk) name =
   let now = fs.now () in
   let r = Filesystem.here w in
   let d = as_dir ~path:name !r in
-  r := Resource.Dir (Dir_node.remove name d);
+  r := Resource.Dir (Dir_node.remove fs.os name d);
   Option.iter
     (fun ino ->
       let subdirs =
@@ -968,16 +1089,23 @@ let remove_entry fs (w : Filesystem.walk) name =
       in
       entries_changed ~now ~subdirs r;
       fs.tree <- Entries.remove ino fs.tree)
-    (Dir_node.find name d)
+    (Dir_node.find fs.os name d)
 
 let unlink dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let w, name, slash = Filesystem.locate_from dir_fd path in
   (* EISDIR, as Linux answers; macOS answers EPERM. *)
-  let is_a_directory () = Error.err ("unlink: is a directory: " ^ path) in
+  let is_a_directory () =
+    if w.os = `Macos then Error.permission_denied path
+    else Error.err ("unlink: is a directory: " ^ path)
+  in
   if is_dot name then is_a_directory ();
   match Filesystem.child w name with
   | None -> Error.not_found path
+  (* macOS follows a link in directory syntax: to a directory, EPERM. *)
+  | Some { contents = Resource.Symlink _ } when slash && w.os = `Macos ->
+      ignore (Filesystem.final ~follow:true w name ~slash);
+      is_a_directory ()
   (* A trailing slash is refused before permission: EISDIR on a directory,
      ENOTDIR on anything else, a link to a directory included. *)
   | Some { contents = Resource.Dir _ } when slash -> is_a_directory ()
@@ -991,6 +1119,10 @@ let unlink dir_fd path =
       | Resource.Dir _ -> is_a_directory ()
       | _ -> remove_entry (Dir.fs dir_fd) w name)
 
+(* The mode bits a new directory keeps: Linux keeps the sticky bit, macOS
+   only the permission bits. *)
+let dir_bits : os -> int = function `Linux -> 0o1777 | `Macos -> 0o777
+
 let mkdirat dir_fd ~perm path =
   locked (Dir.fs dir_fd) @@ fun () ->
   let fs = Dir.fs dir_fd in
@@ -999,13 +1131,13 @@ let mkdirat dir_fd ~perm path =
     let d = as_dir ~path !r in
     let new_stat =
       new_stat fs ~user ~parent:d.stat ~kind:`Directory
-        ~perm:(masked ~user perm land 0o1777)
+        ~perm:(masked ~user perm land dir_bits fs.os)
         ()
     in
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Dir dir));
-    r := Dir (Dir_node.add name ino d);
+    r := Dir (Dir_node.add fs.os name ino d);
     entries_changed ~now:new_stat.ctime ~subdirs:1 r
   in
   new_entry ~dir:true dir_fd path mkdir
@@ -1023,7 +1155,7 @@ let embed dir_fd ~perm path ~contents =
     let d = as_dir ~path !r in
     let f = File.literal ~stat contents in
     Filesystem.add_file fs stat.ino (ref (Resource.File f));
-    r := Dir (Dir_node.add name stat.ino d);
+    r := Dir (Dir_node.add fs.os name stat.ino d);
     entries_changed ~now:stat.ctime r
   in
   new_entry dir_fd path add
@@ -1031,8 +1163,8 @@ let embed dir_fd ~perm path ~contents =
 let symlinkat ~link_to dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   (* Linux makes no link to the empty path: ENOENT, once eio_posix has
-     walked to the directory that would hold it. *)
-  if String.equal link_to "" then begin
+     walked to the directory that would hold it. macOS does. *)
+  if String.equal link_to "" && (Dir.fs dir_fd).os = `Linux then begin
     ignore (Filesystem.locate_from ~search:false dir_fd path);
     Error.not_found path
   end;
@@ -1050,7 +1182,7 @@ let symlinkat ~link_to dir_fd path =
     let dir = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
     Filesystem.add_file fs ino (ref (Resource.Symlink dir));
-    r := Dir (Dir_node.add name ino d);
+    r := Dir (Dir_node.add fs.os name ino d);
     entries_changed ~now:new_stat.ctime r
   in
   new_entry dir_fd path symlink
@@ -1078,7 +1210,7 @@ let read_dir dir_fd path =
   match !r with
   | Resource.Dir dir ->
       Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
-      Names.fold (fun name _ acc -> name :: acc) dir.entries [] |> List.rev
+      List.map fst (Dir_node.names dir)
   | _ -> Error.err "Not a directory"
 
 let read_dir_entries dir_fd path =
@@ -1088,25 +1220,27 @@ let read_dir_entries dir_fd path =
   match !r with
   | Resource.Dir dir ->
       Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
-      Names.fold
-        (fun name ino acc ->
+      List.map
+        (fun (name, ino) ->
           let kind =
             match Entries.find_opt ino (Dir.fs dir_fd).tree with
             | Some res -> (Resource.stat !res).kind
             | None -> `Unknown
           in
-          (kind, name) :: acc)
-        dir.entries []
-      |> List.rev
+          (kind, name))
+        (Dir_node.names dir)
   | _ -> Error.err "Not a directory"
 
 let rmdir dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  let w, name, _ = Filesystem.locate_from dir_fd path in
-  (* rmdir(2) refuses a last [.] with EINVAL and a last [..] with ENOTEMPTY. *)
-  if String.equal name "." then Error.err ("rmdir: invalid argument: " ^ path);
+  let w, name, slash = Filesystem.locate_from dir_fd path in
+  (* rmdir(2) refuses a last [.] with EINVAL and a last [..] with ENOTEMPTY,
+     or EINVAL on macOS. *)
+  if String.equal name "." || (String.equal name ".." && w.os = `Macos) then
+    Error.err ("rmdir: invalid argument: " ^ path);
   if String.equal name ".." then
     Error.err ("rmdir: directory not empty: " ^ path);
+  let w, name = through_link ~slash w name in
   match Filesystem.child w name with
   | None -> Error.not_found path
   | Some victim -> (
@@ -1154,18 +1288,19 @@ let check_rename_empty ~src ~dst new_path =
 (* A rename MOVES: the source loses [old_name] and the target gains [new_name]
    pointing at [ino]. Same-parent edits go to one entries list, so the move is
    atomic. *)
-let move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name new_path
-    =
+let move_entry os ino ~old_parent ~old_name old_path ~new_parent ~new_name
+    new_path =
   if old_parent == new_parent then begin
     let d = as_dir ~path:new_path !new_parent in
     new_parent :=
-      Resource.Dir (Dir_node.add new_name ino (Dir_node.remove old_name d))
+      Resource.Dir
+        (Dir_node.add os new_name ino (Dir_node.remove os old_name d))
   end
   else begin
     let dst = as_dir ~path:new_path !new_parent in
-    new_parent := Resource.Dir (Dir_node.add new_name ino dst);
+    new_parent := Resource.Dir (Dir_node.add os new_name ino dst);
     let src = as_dir ~path:old_path !old_parent in
-    old_parent := Resource.Dir (Dir_node.remove old_name src)
+    old_parent := Resource.Dir (Dir_node.remove os old_name src)
   end
 
 (* A directory's [..] names its new parent. *)
@@ -1181,15 +1316,22 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
      Eio.Fs has no constructor for. *)
   if Dir.fs dir_fd != Dir.fs new_dir then
     Error.err ("rename: invalid cross-device link: " ^ new_path);
-  let tree = (Dir.fs dir_fd).tree in
+  let fs = Dir.fs dir_fd in
+  let os = fs.os in
+  let tree = fs.tree in
   let old_w, old_name, old_slash = Filesystem.locate_from dir_fd old_path in
   let new_w, new_name, new_slash = Filesystem.locate_from new_dir new_path in
   (* rename(2) answers EBUSY for a last [.] or [..], or EEXIST for the
-     target's when it must not replace it. *)
-  let busy path = Error.err ("rename: device or resource busy: " ^ path) in
+     target's when it must not replace it; macOS answers EINVAL. *)
+  let busy path =
+    if os = `Macos then Error.err ("rename: invalid argument: " ^ path)
+    else Error.err ("rename: device or resource busy: " ^ path)
+  in
   if is_dot old_name then busy old_path;
   if is_dot new_name then
-    if replace then busy new_path else Error.already_exists new_path;
+    if replace || os = `Macos then busy new_path
+    else Error.already_exists new_path;
+  let old_w, old_name = through_link ~slash:old_slash old_w old_name in
   (* Rename the directory entry itself. In particular, a symlink's target need
      not exist and must not be followed while moving the link. *)
   let old_res =
@@ -1198,16 +1340,20 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
     | None -> Error.not_found old_path
   in
   (* A trailing slash on either name requires a directory, never followed:
-     ENOTDIR, once a target above the source is ENOTEMPTY. *)
+     ENOTDIR, once a target above the source is ENOTEMPTY. macOS follows a
+     source link in directory syntax, and answers ENOENT for a missing target
+     in directory syntax. *)
   (match !old_res with
   | Resource.Dir _ -> ()
   | _ when old_slash || new_slash ->
       let dst =
         Option.bind
-          (Dir_node.find new_name
+          (Dir_node.find os new_name
              (as_dir ~path:new_path !(Filesystem.here new_w)))
           (fun ino -> Entries.find_opt ino tree)
       in
+      if os = `Macos && (not old_slash) && Option.is_none dst then
+        Error.not_found new_path;
       check_rename_tree tree ~src:old_res ~old_parent:(Filesystem.here old_w)
         ~new_parent:(Filesystem.here new_w) ~dst new_path;
       Error.not_a_directory old_path
@@ -1216,15 +1362,27 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let old_parent = Filesystem.here old_w in
   let new_parent = Filesystem.here new_w in
   check_live (Dir.fs new_dir) new_parent new_path;
+  let new_dir_node = as_dir ~path:new_path !new_parent in
   let existing =
     Option.map
       (fun ino -> (ino, new_name))
-      (Dir_node.find new_name (as_dir ~path:new_path !new_parent))
+      (Dir_node.find os new_name new_dir_node)
   in
   match existing with
-  (* Two names of one entry: rename(2) does nothing. *)
-  | Some (dst_ino, _) when Inode.equal dst_ino ino -> ()
+  (* Two names of one entry: rename(2) does nothing; on macOS, one that
+     differs only in case or normalisation respells it. *)
+  | Some (dst_ino, _) when Inode.equal dst_ino ino ->
+      if os = `Macos && old_parent == new_parent then begin
+        check_dir_write ~user:dir_fd.user old_parent old_path;
+        move_entry os ino ~old_parent ~old_name old_path ~new_parent ~new_name
+          new_path
+      end
   | _ ->
+      (* macOS keeps the spelling of the entry it replaces. *)
+      let new_name =
+        Option.value ~default:new_name
+          (Dir_node.spelling os new_name new_dir_node)
+      in
       if (not replace) && Option.is_some existing then
         Error.already_exists new_path;
       let dst =
@@ -1244,7 +1402,8 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
             Error.permission_denied old_path
       | _ -> ());
       check_rename_empty ~src:old_res ~dst new_path;
-      move_entry ino ~old_parent ~old_name old_path ~new_parent ~new_name
+      check_name fs new_name;
+      move_entry os ino ~old_parent ~old_name old_path ~new_parent ~new_name
         new_path;
       reparent old_res ~new_parent;
       let fs = Dir.fs dir_fd in
@@ -1377,9 +1536,11 @@ let pwritev t ~file_offset bufs =
   match !r with
   | Resource.File e ->
       let src = Cstruct.concat bufs in
-      (* On an O_APPEND descriptor Linux appends, whatever the offset. *)
+      (* On an O_APPEND descriptor Linux appends, whatever the offset;
+         macOS writes at the offset. *)
       let off =
-        if t.append then File.size e else Optint.Int63.to_int file_offset
+        if t.append && t.fs.os = `Linux then File.size e
+        else Optint.Int63.to_int file_offset
       in
       r :=
         Resource.File

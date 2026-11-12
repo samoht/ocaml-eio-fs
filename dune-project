@@ -35,6 +35,8 @@ adapted from Patrick Ferris's eio_mem (https://git.sirref.org/eio_mem).")
   mtime
   psq
   domain-local-await
+  uucp
+  uunf
   (cmdliner (>= 1.1.0))
   eio_main
   (conf-linux-libc-dev (= :os linux))
