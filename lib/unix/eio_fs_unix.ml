@@ -19,7 +19,8 @@ external flock_unlock_native : Unix.file_descr -> unit
 external flock_wait_start : Unix.file_descr -> bool -> Unix.file_descr
   = "caml_eio_fs_flock_wait_start"
 
-external flock_wait_failed : int -> 'a = "caml_eio_fs_flock_wait_failed"
+external flock_wait_answer : Unix.file_descr -> unit
+  = "caml_eio_fs_flock_wait_answer"
 
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
@@ -1091,17 +1092,7 @@ module Flock = struct
     let answer = flock_wait_start fd shared in
     Fun.protect ~finally:(fun () -> Unix.close answer) @@ fun () ->
     Eio_unix.await_readable answer;
-    let b = Bytes.create 4 in
-    let rec read off =
-      if off < 4 then
-        match Unix.read answer b off (4 - off) with
-        | 0 -> failwith "Eio_fs_unix.Flock: the wait ended with no answer"
-        | n -> read (off + n)
-    in
-    read 0;
-    match Int32.to_int (Bytes.get_int32_ne b 0) with
-    | 0 -> ()
-    | err -> flock_wait_failed err
+    flock_wait_answer answer
 
   let use_os_lock ~shared ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in

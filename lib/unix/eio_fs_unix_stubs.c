@@ -144,10 +144,22 @@ CAMLprim value caml_eio_fs_flock_wait_start(value fd_v, value shared_v)
   return Val_int(fds[0]);
 }
 
-/* Raises the errno a flock wait answered as the Unix error it names. */
-CAMLprim value caml_eio_fs_flock_wait_failed(value err_v)
+/* Reads the answer of a flock wait whose pipe is readable: returns once the
+   lock is granted, raises the Unix error the request ended with otherwise.
+   The thread writes its answer whole, under PIPE_BUF, so one read takes it. */
+CAMLprim value caml_eio_fs_flock_wait_answer(value fd_v)
 {
-  caml_unix_error(Int_val(err_v), "flock", Nothing);
+  int err;
+  ssize_t n;
+  do
+    n = read(Int_val(fd_v), &err, sizeof err);
+  while (n == -1 && errno == EINTR);
+  if (n == -1)
+    caml_uerror("read", Nothing);
+  if (n != sizeof err)
+    caml_unix_error(EIO, "flock", Nothing);
+  if (err != 0)
+    caml_unix_error(err, "flock", Nothing);
   return Val_unit;
 }
 
