@@ -986,6 +986,37 @@ let test_lock_range () =
 let lease_free ~env:_ lock =
   Eio_fs_unix.Lease.with_exclusive ~block:`Yes lock (fun _ -> ())
 
+(* A lease wait cancelled in a domain of its own lets that domain end while
+   the holder still holds: the kernel's request it leaves behind holds no
+   join, so a reader whose wait was cancelled exits at once. *)
+let test_cancelled_lease_wait_ends_its_domain () =
+  with_real_dir_env @@ fun env dir ->
+  let clock = Eio.Stdenv.clock env in
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let _, release = holding_process ~sw ~env ~clock ~kind:"lease" ~lock in
+  let ended =
+    Eio.Fiber.first
+      (fun () ->
+        Eio.Domain_manager.run (Eio.Stdenv.domain_mgr env) (fun () ->
+            let waiting, now_waiting = Eio.Promise.create () in
+            Eio.Fiber.first
+              (fun () ->
+                take_lease
+                  ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+                  lock
+                  (fun () -> Alcotest.fail "a held lease was granted"))
+              (fun () -> Eio.Promise.await waiting));
+        `Ended)
+      (fun () ->
+        Eio.Time.sleep clock 5.0;
+        ignore (release ());
+        `Held)
+  in
+  Alcotest.(check bool)
+    "the domain ended while the lease was held" true (ended = `Ended);
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ())
+
 let test_lease_survives_owner_close_until_inherited_descriptor_closes () =
   with_real_dir_env @@ fun _env dir ->
   let lock = dir / "lease" in
@@ -3186,6 +3217,8 @@ let suite =
         (a_wait_is_cancellable ~kind:"record" take_record ~free:record_free);
       Alcotest.test_case "a lease wait answers at the release" `Quick
         (a_wait_answers_at_the_release ~kind:"lease" take_lease);
+      Alcotest.test_case "a cancelled lease wait ends its domain" `Quick
+        test_cancelled_lease_wait_ends_its_domain;
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
       Alcotest.test_case "a bounded record lock wait answers at the release"
