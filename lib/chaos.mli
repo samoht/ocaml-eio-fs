@@ -137,6 +137,9 @@ val check :
       one that makes a file or an entry, [EACCES] or [EIO] on an open for
       reading or a stat, [ENOSPC] or [EIO] on a write, [EIO] on a read, a
       truncation or a sync;
+    - a sync fails with [EIO] and the page cache drops the pages it could not
+      write: a later read of them sees what the disk holds, as Linux may show
+      after a failed fsync(2);
     - a read or a write moves a single byte;
     - a write is torn: half its bytes land, then it fails with [ENOSPC];
     - from that operation on, the filesystem is read-only, full, or denies every
@@ -187,7 +190,8 @@ val check :
     directory changes, a prefix survives. A failed sync loses the file's
     unsynced writes, as Linux does, though some of their sectors may already be
     on disk; the page cache may keep them or evict them. Before the cut, a read
-    after a failed sync sees them as kept: neither check tries them evicted. *)
+    after a failed sync sees them as kept, or, in a scenario of its own, as the
+    disk holds them. *)
 module Crash : sig
   val check :
     ?budget:int ->
@@ -211,7 +215,8 @@ module Crash : sig
       The linear tier cuts the power after each structural operation of [run]
       that changes the disk, and at its end. Each cut is tried in two states:
       every unsynced change lost, and every change kept, as when only the
-      process is killed. Each structural sync is also made to fail, and each
+      process is killed. Each structural sync is also made to fail, with the
+      pages it lost kept in the page cache and evicted from it, and each
       structural write to tear, alone, with a cut at the end. Then, from each
       cut, the power is cut again after each structural change [recover] makes,
       and at its end, and [recover] runs once more on what that cut left.
@@ -398,6 +403,10 @@ module Fault : sig
     | Fail of code
         (** The operation fails with that error. [ENOSPC] applies to a write,
             and to an open or a change that makes a file or an entry only. *)
+    | Evict of code
+        (** A sync fails with that error, and the page cache drops the pages it
+            could not write: under {!Crash.wrap}, a later read of them sees the
+            bytes the disk holds. Elsewhere it is {!constructor-Fail}. *)
     | Short of int  (** A read or a write moves at most [max 1 n] bytes. *)
     | Torn of int
         (** A write stores its first [n] bytes, then fails with [ENOSPC]. *)

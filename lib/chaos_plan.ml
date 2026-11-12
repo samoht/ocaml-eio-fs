@@ -47,7 +47,13 @@ end
 
 module Fault = struct
   type code = [ `Enoent | `Eacces | `Eperm | `Erofs | `Enospc | `Eio ]
-  type t = Fail of code | Short of int | Torn of int | Swap_symlink of string
+
+  type t =
+    | Fail of code
+    | Evict of code
+    | Short of int
+    | Torn of int
+    | Swap_symlink of string
 
   let code_name : code -> string = function
     | `Enoent -> "ENOENT"
@@ -59,12 +65,14 @@ module Fault = struct
 
   let pp ppf = function
     | Fail c -> Fmt.pf ppf "fails with %s" (code_name c)
+    | Evict c -> Fmt.pf ppf "fails with %s, its pages evicted" (code_name c)
     | Short n -> Fmt.pf ppf "moves %d byte(s)" (max 1 n)
     | Torn n -> Fmt.pf ppf "is torn after %d byte(s)" n
     | Swap_symlink t -> Fmt.pf ppf "is swapped for a link to %s" t
 
   let key = function
     | Fail c -> String.lowercase_ascii (code_name c)
+    | Evict c -> "evict-" ^ String.lowercase_ascii (code_name c)
     | Short n -> Fmt.str "short%d" n
     | Torn n -> Fmt.str "torn%d" n
     | Swap_symlink t -> "swap:" ^ t
@@ -246,7 +254,21 @@ let of_singles ops =
   List.map (fun one -> { faults = [ one ]; lasting = None }) (singles ops)
   @ List.map (fun l -> { faults = []; lasting = Some l }) (lastings ops)
 
-let check_linear trace = of_singles (structural trace)
+(* A failed sync that evicts the pages it lost: in the linear tier only,
+   so the sampled tier spends its runs as before. *)
+let is_evict = function _, Fault.Evict _ -> true | _ -> false
+
+let evicts ops =
+  List.filter_map
+    (fun (op : Op.t) ->
+      if op.kind = `Sync then Some (pos_of op, Fault.Evict `Eio) else None)
+    ops
+
+let check_linear trace =
+  let ops = structural trace in
+  of_singles ops
+  @ List.map (fun one -> { faults = [ one ]; lasting = None }) (evicts ops)
+
 let check_others trace = of_singles (rest trace (structural trace))
 
 (* Spread as [spread] spreads [check_others], but the scenarios are counted
@@ -286,6 +308,7 @@ let check_floor ~space ~sure op =
              (fun (_, f) -> space || f <> Fault.Fail `Enospc)
              s.faults)
          (of_singles [ op ]))
+    + List.length (evicts [ op ])
 
 let disk_kind (op : Op.t) =
   match op.kind with
@@ -546,12 +569,13 @@ let crash_floor ~sure ~changed (op : Op.t) =
   if not sure then 0
   else
     (if changes ~changed:(fun _ -> changed) op then 6 else 0)
-    + if op.kind = `Sync then List.length (both base) else 0
+    + if op.kind = `Sync then 2 * List.length (both base) else 0
 
 let crash_faults ~tears trace =
+  let ops = structural trace in
   List.concat_map
     (fun one -> both { base with cfaults = [ one ] })
-    (durable_faults ~tears (structural trace))
+    (durable_faults ~tears ops @ evicts ops)
 
 let crash_others ~changed ~tears trace =
   let sel = structural trace in

@@ -35,6 +35,7 @@ module Fault : sig
     | `Torn_write
     | `Write_error
     | `Sync_error
+    | `Sync_evict
     | `Open_error
     | `Stat_error
     | `Change_error
@@ -61,6 +62,11 @@ module Fault : sig
             bytes reach the store but the operation reports failure. *)
     | Write_error of code  (** Commit nothing and raise {!type-code}. *)
     | Sync_error of code  (** Fail a sync with {!type-code}. *)
+    | Sync_evict of code
+        (** As {!Sync_error}, and the page cache drops the pages the sync could
+            not write. Over a {!Crash} controller, a later read of them sees the
+            bytes the disk holds, as Linux may show after a failed fsync(2);
+            elsewhere it is {!Sync_error}. *)
     | Open_error of code
         (** Fail an open or a directory open with {!type-code}. *)
     | Stat_error of code  (** Fail a stat with {!type-code}. *)
@@ -200,9 +206,9 @@ module Schedule : sig
       faults. On each operation it fires a fault with probability [probability]
       (defaults to [0.5]; never at [0.] or below, always at [1.] or above),
       choosing uniformly among the kinds in [kinds] (defaults to every kind but
-      [`Swap]) that apply to that operation, and firing nothing when none does.
-      [`Swap] in [kinds] is ignored. The same [seed] and operation sequence
-      always yield the same fault sequence. *)
+      [`Swap] and [`Sync_evict]) that apply to that operation, and firing
+      nothing when none does. [`Swap] in [kinds] is ignored. The same [seed] and
+      operation sequence always yield the same fault sequence. *)
 
   val pp : t Fmt.t
   (** [pp] formats a schedule for logs. A seeded schedule prints as the OCaml

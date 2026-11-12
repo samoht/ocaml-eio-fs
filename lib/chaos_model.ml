@@ -48,6 +48,7 @@ module Fault = struct
     | `Torn_write
     | `Write_error
     | `Sync_error
+    | `Sync_evict
     | `Open_error
     | `Stat_error
     | `Change_error
@@ -63,6 +64,8 @@ module Fault = struct
         (** Commit [n] bytes to the base, then raise: the durability hazard. *)
     | Write_error of code  (** Commit nothing, raise a write error. *)
     | Sync_error of code  (** Fail a flush/sync. *)
+    | Sync_evict of code
+        (** Fail a sync, and evict the pages it could not write. *)
     | Open_error of code  (** Fail an open/open_dir. *)
     | Stat_error of code  (** Fail a stat. *)
     | Change_error of code  (** Fail a directory change. *)
@@ -83,6 +86,7 @@ module Fault = struct
     | Read_error x, Read_error y
     | Write_error x, Write_error y
     | Sync_error x, Sync_error y
+    | Sync_evict x, Sync_evict y
     | Open_error x, Open_error y
     | Stat_error x, Stat_error y
     | Change_error x, Change_error y ->
@@ -109,6 +113,7 @@ module Fault = struct
     | Stat_error _ -> 7
     | Change_error _ -> 8
     | Swap_symlink _ -> 9
+    | Sync_evict _ -> 10
 
   let compare a b =
     match (a, b) with
@@ -119,6 +124,7 @@ module Fault = struct
     | Read_error x, Read_error y
     | Write_error x, Write_error y
     | Sync_error x, Sync_error y
+    | Sync_evict x, Sync_evict y
     | Open_error x, Open_error y
     | Stat_error x, Stat_error y
     | Change_error x, Change_error y ->
@@ -133,6 +139,7 @@ module Fault = struct
     | Torn_write n -> Fmt.pf ppf "torn-write(%d)" n
     | Write_error c -> Fmt.pf ppf "write-error(%s)" (code_name c)
     | Sync_error c -> Fmt.pf ppf "sync-error(%s)" (code_name c)
+    | Sync_evict c -> Fmt.pf ppf "sync-evict(%s)" (code_name c)
     | Open_error c -> Fmt.pf ppf "open-error(%s)" (code_name c)
     | Stat_error c -> Fmt.pf ppf "stat-error(%s)" (code_name c)
     | Change_error c -> Fmt.pf ppf "change-error(%s)" (code_name c)
@@ -266,7 +273,7 @@ module Schedule = struct
     | `Read, (`Short_read | `Read_error) -> true
     | `Read_dir, `Read_error -> true
     | `Write, (`Short_write | `Torn_write | `Write_error) -> true
-    | `Sync, `Sync_error -> true
+    | `Sync, (`Sync_error | `Sync_evict) -> true
     | (`Open_read | `Open_write), `Open_error -> true
     | `Stat, `Stat_error -> true
     | `Change, `Change_error -> true
@@ -286,6 +293,7 @@ module Schedule = struct
     | `Torn_write -> Torn_write (split_count rng op.length)
     | `Write_error -> Write_error `Enospc
     | `Sync_error -> Sync_error `Eio
+    | `Sync_evict -> Sync_evict `Eio
     | `Open_error -> Open_error (some_code rng)
     | `Stat_error -> Stat_error (some_code rng)
     | `Change_error ->
@@ -341,6 +349,7 @@ module Schedule = struct
     | `Torn_write -> "`Torn_write"
     | `Write_error -> "`Write_error"
     | `Sync_error -> "`Sync_error"
+    | `Sync_evict -> "`Sync_evict"
     | `Open_error -> "`Open_error"
     | `Stat_error -> "`Stat_error"
     | `Change_error -> "`Change_error"
@@ -438,10 +447,13 @@ let rw_boxed (type s) ?(extra = [])
 (* A sync the wrapper failed on purpose, told to the file beneath it, so a
    power-loss model there loses what that sync would have written. *)
 type (_, _, _) Eio.Resource.pi +=
-  | Sync_failed : ('t, 't -> unit, [> `Sync_failed ]) Eio.Resource.pi
+  | Sync_failed :
+      ('t, 't -> evict:bool -> unit, [> `Sync_failed ]) Eio.Resource.pi
 
-let sync_failed (Eio.Resource.T (v, ops)) =
-  match Eio.Resource.get_opt ops Sync_failed with Some f -> f v | None -> ()
+let sync_failed ~evict (Eio.Resource.T (v, ops)) =
+  match Eio.Resource.get_opt ops Sync_failed with
+  | Some f -> f v ~evict
+  | None -> ()
 
 (* {2 File wrappers} *)
 
@@ -523,7 +535,10 @@ let do_pwrite sched path ~append (base : Eio.File.rw_ty r) ~file_offset bufs =
 let do_sync sched path (base : Eio.File.rw_ty r) =
   match Schedule.next sched (Op.sync path) with
   | Some (Fault.Sync_error c) ->
-      sync_failed base;
+      sync_failed ~evict:false base;
+      raise_io c path
+  | Some (Fault.Sync_evict c) ->
+      sync_failed ~evict:true base;
       raise_io c path
   | _ -> Eio.File.sync base
 
@@ -573,7 +588,10 @@ let sync_base (Eio.Resource.T (v, ops) as base) =
 let sync_ro t =
   match Schedule.next t.sched (Op.sync t.path) with
   | Some (Fault.Sync_error c) ->
-      sync_failed t.ro;
+      sync_failed ~evict:false t.ro;
+      raise_io c t.path
+  | Some (Fault.Sync_evict c) ->
+      sync_failed ~evict:true t.ro;
       raise_io c t.path
   | _ -> sync_base t.ro
 
@@ -584,7 +602,7 @@ let ro_handler =
     (Eio.Resource.bindings (Eio.File.Pi.ro (module Ro_impl))
     @ [
         Eio.Resource.H (Eio_fs_sync.File_sync, sync_ro);
-        Eio.Resource.H (Sync_failed, fun t -> sync_failed t.ro);
+        Eio.Resource.H (Sync_failed, fun t ~evict -> sync_failed ~evict t.ro);
       ])
 
 let wrap_ro sched ~path base : Eio.File.ro_ty r =
@@ -632,7 +650,8 @@ let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =
     }
   in
   rw_boxed
-    ~extra:[ Eio.Resource.H (Sync_failed, fun t -> sync_failed t.ro) ]
+    ~extra:
+      [ Eio.Resource.H (Sync_failed, fun t ~evict -> sync_failed ~evict t.ro) ]
     (module Rw_impl)
     state ~base
 
@@ -818,7 +837,7 @@ module Dir_impl = struct
 
   let sync_dir t path =
     (match Schedule.next t.sched (Op.sync path) with
-    | Some (Fault.Sync_error c) -> raise_io c path
+    | Some (Fault.Sync_error c | Fault.Sync_evict c) -> raise_io c path
     | _ -> ());
     Eio_fs_sync.sync_dir (t.base, path)
 
@@ -3618,7 +3637,7 @@ module Crash = struct
 
   (* A failed barrier loses the pending writes, which the page cache keeps:
      a later change that dirties one of their blocks writes it whole. *)
-  let fail_sync ?(upto = max_int) ctl fs =
+  let fail_sync ?(upto = max_int) ?(evict = false) ?(relive = ignore) ctl fs =
     let young = split_young ctl fs ~upto in
     ctl.effects <- ctl.effects + 1;
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
@@ -3640,6 +3659,28 @@ module Crash = struct
             (replay_changes
                (Option.value ~default:(bytes_of fs.durable) e)
                (List.map (fun e -> e.change) pending))
+    in
+    (* Evicted, the pages that failed read as the disk holds them: the
+       durable bytes, with the truncations kept, at the length the file
+       has. None of their writeback landed. *)
+    let live =
+      if not evict then live
+      else
+        let e =
+          replay_changes (bytes_of fs.durable)
+            (List.filter_map
+               (fun e ->
+                 match e.change with
+                 | Resize _ -> Some e.change
+                 | Write _ -> None)
+               pending)
+        in
+        let n = Cstruct.length live in
+        let img = Cstruct.create n in
+        Cstruct.blit e 0 img 0 (min n (Cstruct.length e));
+        relive img;
+        fs.evicted <- None;
+        img
     in
     fs.cache <- Some live;
     (* The pages that failed are clean and unwritten; those that did not
@@ -3666,7 +3707,8 @@ module Crash = struct
           Option.to_list v @ Option.to_list w
       | _ -> Option.to_list v
     in
-    fs.partial <- List.concat_map versions written @ fs.partial;
+    if not evict then
+      fs.partial <- List.concat_map versions written @ fs.partial;
     lose ctl fs;
     (* A truncation is metadata, journaled apart from the data: the failure
        does not lose it, and it stays pending in program order. *)
@@ -3804,6 +3846,20 @@ module Crash = struct
      the wrapper and is durable already. *)
   let file_ino cf () = (Eio.File.stat cf.cro).ino
 
+  (* The bytes a read of the file now sees, after its pages were evicted:
+     through the handle, or by the path that still names it. *)
+  let relive_by_handle cf img =
+    let rw = writable cf in
+    Eio.File.truncate rw (Optint.Int63.of_int (Cstruct.length img));
+    Eio.File.pwrite_all rw ~file_offset:Optint.Int63.zero [ img ]
+
+  let relive_by_path cf fs img =
+    let (Base_dir ((module B), bv)) = as_admin cf.ctl fs.owner in
+    match B.stat bv ~follow:false fs.rel with
+    | { kind = `Regular_file; ino; _ } when ino = (Eio.File.stat cf.cro).ino ->
+        rewrite cf.ctl fs img
+    | _ | (exception Eio.Io _) -> ()
+
   (* A sync covers the changes made before it: it takes them, then takes
      its time, while other fibers run, then makes them durable. *)
   let paused cf =
@@ -3842,7 +3898,13 @@ module Crash = struct
           @ [
               Eio.Resource.H (Eio_fs_sync.File_sync, sync);
               Eio.Resource.H
-                (Sync_failed, fun cf -> Option.iter (fail_sync cf.ctl) fs);
+                ( Sync_failed,
+                  fun cf ~evict ->
+                    Option.iter
+                      (fun fs ->
+                        fail_sync ~evict ~relive:(relive_by_path cf fs) cf.ctl
+                          fs)
+                      fs );
             ]) )
 
   module Crw_impl = struct
@@ -3933,7 +3995,13 @@ module Crash = struct
       }
     in
     rw_boxed
-      ~extra:[ Eio.Resource.H (Sync_failed, fun cf -> fail_sync cf.ctl fs) ]
+      ~extra:
+        [
+          Eio.Resource.H
+            ( Sync_failed,
+              fun cf ~evict ->
+                fail_sync ~evict ~relive:(relive_by_handle cf) cf.ctl fs );
+        ]
       (module Crw_impl)
       state ~base
 

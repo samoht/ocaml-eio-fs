@@ -33,7 +33,13 @@ end
 (** The faults a wrapper injects. *)
 module Fault : sig
   type code = [ `Enoent | `Eacces | `Eperm | `Erofs | `Enospc | `Eio ]
-  type t = Fail of code | Short of int | Torn of int | Swap_symlink of string
+
+  type t =
+    | Fail of code
+    | Evict of code
+    | Short of int
+    | Torn of int
+    | Swap_symlink of string
 
   val pp : t Fmt.t
   (** [pp] formats a fault. *)
@@ -93,7 +99,12 @@ val lasting_code : lasting -> Op.t -> Fault.code option
 
 val check_linear : trace -> check list
 (** [check_linear first] is each fault alone at each structural operation of
-    [first], and each lasting condition from each. *)
+    [first], and each lasting condition from each; then each structural sync
+    failed with its pages evicted. *)
+
+val is_evict : pos * Fault.t -> bool
+(** [is_evict f] is [true] iff [f] fails a sync and evicts its pages. The linear
+    tier alone tries it, so no second fault follows it. *)
 
 val check_others : trace -> check list
 (** [check_others first] is the same at the other operations. *)
@@ -227,7 +238,8 @@ val crash_floor : sure:bool -> changed:bool -> Op.t -> int
 
 val crash_faults : tears:(Op.t -> int list) -> trace -> crash list
 (** [crash_faults ~tears first] is each structural sync failed and each
-    structural write torn, alone, with a cut at the end. *)
+    structural write torn, alone, with a cut at the end; then each structural
+    sync failed with its pages evicted. *)
 
 val crash_others :
   changed:(Op.t -> bool) -> tears:(Op.t -> int list) -> trace -> crash list

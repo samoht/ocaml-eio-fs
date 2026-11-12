@@ -46,6 +46,7 @@ let model_fault ~space (op : Op.t) : Fault.t -> M.Fault.t option = function
         | `Open_read | `Open_write -> Open_error c
         | `Stat -> Stat_error c
         | `Change -> Change_error c)
+  | Evict c -> ( match op.kind with `Sync -> Some (Sync_evict c) | _ -> None)
   | Short n -> (
       match op.kind with
       | `Read -> Some (Short_read n)
@@ -740,6 +741,16 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
       st.mono <- Some mono;
       let base = fresh clock in
       setup (env_of clock mono base);
+      (* Pages a failed sync evicts read as the disk holds them, which the
+         model of the disk knows. *)
+      let base =
+        if
+          List.exists
+            (function _, Fault.Evict _ -> true | _ -> false)
+            s.faults
+        then (M.Crash.wrap (M.Crash.v ()) base :> Eio.Fs.dir_ty Eio.Path.t)
+        else base
+      in
       let fs = M.wrap (M.Schedule.hook hook) base in
       match run (env_of clock mono fs) with
       | () -> Passed
@@ -839,6 +850,13 @@ let check ?budget ?replay ?(setup = ignore) run =
       | None -> no_longer name ~hash r)
   | None ->
       let n = List.length linear in
+      (* Evictions are linear runs the sampled tier does not grow with. *)
+      let n_share =
+        List.length
+          (List.filter
+             (fun (s : Plan.check) -> not (List.exists Plan.is_evict s.faults))
+             linear)
+      in
       if n > budget then
         fail name
           "the linear tier needs %d runs, more than the budget of %d, and a \
@@ -846,7 +864,7 @@ let check ?budget ?replay ?(setup = ignore) run =
            ~budget."
           n budget;
       let others, pick_others = Plan.check_others_spread ~keep:meets first in
-      let share classes = Plan.sampled_share ~budget ~linear:n ~classes in
+      let share classes = Plan.sampled_share ~budget ~linear:n_share ~classes in
       (* The second faults each run allows, drawn as it ends, so no run's
          operations outlive it: the best of each, round by round. *)
       let sh = share (if others = 0 then 1 else 2) in
@@ -855,7 +873,7 @@ let check ?budget ?replay ?(setup = ignore) run =
         (fun (s : Plan.check) ->
           let r = attempt Linear s in
           match s.faults with
-          | [ one ] ->
+          | [ one ] when not (Plan.is_evict one) ->
               Plan.Pairs.add best
                 (Plan.check_seconds ~limit:sh one ~first:disk ~after:(kept r))
           | _ -> ())
@@ -1461,10 +1479,18 @@ module Crash = struct
             cuts
         in
         let linear = List.length lin + !nrcuts in
+        (* Evictions are linear runs the sampled tier does not grow with, and
+           no second fault or cut in recover follows them. *)
+        let evicted (s : Plan.crash) = List.exists Plan.is_evict s.cfaults in
+        let evicts, faults = List.partition evicted faults in
         (* The second faults and the cuts during recover each fault allows,
            spread as each run ends, so no run's operations outlive it: an
            even share of what the sampled tier can spend. *)
-        let total = Plan.sampled_share ~budget ~linear ~classes:1 in
+        let total =
+          Plan.sampled_share ~budget
+            ~linear:(linear - List.length evicts)
+            ~classes:1
+        in
         let quota =
           let k = List.length faults in
           (total + k - 1) / max 1 k
@@ -1484,6 +1510,7 @@ module Crash = struct
                 (Plan.rcuts ~changed:(rchanged r) s ~recover:r.rtrace))
             faults
         in
+        List.iter (fun s -> ignore (attempt Linear s)) evicts;
         if linear > budget then over linear;
         List.iter (fun r -> ignore (attempt Linear r)) rcuts;
         (* Sampled tier. *)
