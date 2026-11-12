@@ -138,4 +138,20 @@ let suite =
           let m = Expect.report mix in
           Alcotest.(check string)
             "error" "Failure(\"a planted mix\")" (Expect.field "error" m));
+      Alcotest.test_case "a report says where a stale sector came from" `Quick
+        (fun () ->
+          let field f m = Expect.field m (Expect.report f) in
+          Alcotest.(check string)
+            "truncated"
+            "/wal, 512 bytes: @0+512 stale (what /wal held there before its \
+             truncation)"
+            (field old_frame "left");
+          Alcotest.(check string)
+            "removed"
+            "/new, 4608 bytes: @4096+512 stale (what the removed /old held \
+             there)"
+            (field freed_by_unlink "left");
+          Alcotest.(check string)
+            "acked" "1 value, after #2"
+            (field freed_by_unlink "acked"));
     ] )
