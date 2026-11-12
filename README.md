@@ -208,45 +208,55 @@ assert (
   (`Eio_fs_unix.inline_fs`).
 - `eio-fs.path` does lexical operations on path strings.
 
-## Limitations
+## What a test covers
 
-- The crash model is ext4 with `data=writeback`, not APFS: on macOS, sync
-  through `Eio_fs_unix.barrier`, which uses `F_FULLFSYNC`.
-- Stale data in a new block comes only from the same offset of a freed block,
-  where ext4 may use any offset: checksum what you read back.
-- A removed file that is still open frees its blocks at once, where ext4 waits
-  for its last close: a failure that needs its bytes in another file before
-  then may not happen on ext4.
-- A power cut built by hand with `Eio_fs.Chaos.Crash.wrap` keeps every change
-  another process made beside the wrapper, synced or not: check that
-  process's own durability in a test of its own.
-- A filesystem operation takes no time and no other fiber runs during it: to
-  test a race during a slow sync, force it with an `Eio_fs.Chaos.wrap` hook.
-- After a failed sync, a read sees the lost writes as still cached, never
-  evicted: do not trust a read after a failed sync.
-- Some two-fault bugs lie past the default budget: raise `~budget` in a longer
-  run, for instance from `CHAOS_BUDGET`.
-- A run of more than 10,000,000 scheduler turns or 100,000 filesystem
-  operations is refused as too large for a check, and so is a workload whose
-  linear tier needs more runs than the budget: shrink the workload, or raise
-  `~budget` for the last.
-- `Eio_fs.Chaos.check` never swaps a path for a symbolic link between a check
-  and its use: test that attack with `Eio_fs.Chaos.wrap` and
-  `Eio_fs.Chaos.Fault.Swap_symlink`.
-- An in-memory stat keeps no times, block count or link count: test code that
-  compares modification times on a disk.
-- The in-memory filesystem resolves paths as Linux does, while eio_posix
-  rewrites `x/.` and `x/d/..` lexically
-  ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)) and fails a
+### What a pass tells you
+
+A power-cut check models ext4 with `data=writeback`: unsynced writes may be
+lost, and directory changes reach the disk in program order. A pass holds for
+that model, not for APFS. On macOS, `fsync` stops at the drive's cache: pass
+`Eio_fs_unix.barrier` to `Eio_fs_sync` so that a sync reaches the disk.
+
+Where POSIX systems differ, the in-memory filesystem answers as Linux does. It
+has `fs.protected_symlinks` on, as most distributions do: in a sticky
+directory others may write, such as `/tmp`, a link is followed only by its
+owner or the directory's.
+
+### What a check can miss
+
+- A race during a slow sync. A filesystem operation takes no time, and no
+  other fiber runs during it. Force the interleaving with an
+  `Eio_fs.Chaos.wrap` hook.
+- A read after a failed sync. The check keeps the lost writes in the page
+  cache, where Linux may evict them. Do not trust a read after a failed sync.
+- Stale data from another offset. A new block gets stale data only from the
+  same offset of a freed block, and a removed file frees its blocks while
+  still open. ext4 may use any offset, and waits for the last close. Checksum
+  what you read back.
+- A bug that needs two faults. Some pairs of faults lie past the default
+  budget of 20,000 runs. Raise `~budget` in a nightly run, as the
+  `CHAOS_BUDGET` example in `Eio_fs.Chaos` does.
+
+### How big a test can be
+
+A run that makes 100,000 filesystem operations, or 10 million scheduler
+turns, fails as a busy loop or as too large for a check. The budget also has a
+floor: the linear tier always runs whole, so a check that needs more runs than
+its budget fails and says so. Shrink the workload, or raise `~budget`.
+
+### Where it differs from eio_posix
+
+Code that runs on both should avoid these:
+
+- `x/.`, `x/d/..` and trailing slashes. The in-memory filesystem resolves them
+  as Linux does. eio_posix rewrites the first two lexically
+  ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)), and fails a
   creating open with a trailing slash differently
-  ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)): avoid such
-  paths in code that runs on both.
-- An absolute symbolic link is followed through the root `Eio_fs.Fs.v`
-  returns, where eio_posix refuses it: use relative link targets.
-- `fs.protected_symlinks` is modelled as on, as systemd sets it: in a sticky
-  directory others may write, such as `/tmp`, a link is followed only by its
-  owner or the directory's. Code that relies on following such a link fails
-  here, as it does on most Linux systems.
+  ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)).
+- Absolute symbolic links. Through the root `Eio_fs.Fs.v` returns, one is
+  followed where eio_posix refuses it. Use relative targets.
+- Times, block counts and link counts. An in-memory stat sets them all to
+  zero. Test code that compares modification times on a disk.
 
 ## Licence
 
