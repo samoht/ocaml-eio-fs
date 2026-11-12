@@ -1964,6 +1964,32 @@ let test_crash_spared_identity_real () =
         "real fs: the spared file's inode and mtime" !before
         (Some (identity (Eio.Path.stat ~follow:false (post / "kept")))))
 
+(* A crash an operation fires in a fiber being cancelled, as the operation
+   that cuts the power is when a sibling fails, restores its whole image:
+   the synced bytes come back under the unsynced ones. *)
+let test_crash_cancelled_real () =
+  let ctl = Crash.v ~policy:Drop_unsynced () in
+  with_real_crash ctl
+    (fun fs ->
+      Eio.Path.with_open_out ~create:(`Exclusive 0o644) (fs / "img")
+        (fun file ->
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "AAAA" ];
+          Eio.File.sync file;
+          Eio.File.pwrite_all file ~file_offset:(i63 0)
+            [ Cstruct.of_string "BBBB" ]);
+      Crash.sync_metadata ctl;
+      match
+        Eio.Cancel.sub (fun cc ->
+            Eio.Cancel.cancel cc Exit;
+            Crash.crash ctl)
+      with
+      | () | (exception Eio.Cancel.Cancelled _) -> ())
+    ~check:(fun post ->
+      Alcotest.(check string)
+        "real fs: the synced bytes, restored under a cancel" "AAAA"
+        (Eio.Path.load (post / "img")))
+
 (* The kernel-side variant of the reverted tmp-rename: the rollback must
    physically undo a rename on the real filesystem. *)
 let test_crash_rename_revert_real () =
@@ -3965,6 +3991,8 @@ let suite =
         test_crash_closed_subtree_real;
       Alcotest.test_case "crash: a spared file keeps its identity (real fs)"
         `Quick test_crash_spared_identity_real;
+      Alcotest.test_case "crash: a cancelled crash restores its image (real fs)"
+        `Quick test_crash_cancelled_real;
       Alcotest.test_case "crash: committed unlink stays deleted" `Quick
         test_crash_committed_unlink_stays_deleted;
       Alcotest.test_case "crash: uncommitted unlink rolls back" `Quick
