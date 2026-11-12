@@ -203,7 +203,8 @@ assert (
   for `eio-fs-crunch`.
 - `eio-fs.sync` writes a file atomically and durably on any backend.
 - `eio-fs.unix` binds POSIX calls that Eio and `Unix` lack, such as advisory
-  locks and extended attributes.
+  locks and extended attributes, and has a root whose stats and opens run on
+  the calling thread rather than a system thread (`Eio_fs_unix.Inline.fs`).
 - `eio-fs.path` does lexical operations on path strings.
 
 ## Limitations

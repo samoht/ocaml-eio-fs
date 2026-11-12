@@ -1327,3 +1327,67 @@ CAMLprim value caml_eio_fs_readlinkat(value dirfd_v, value name_v)
     size *= 4;
   }
 }
+
+/* The calls of Eio_fs_unix.Inline.fs, made on the calling thread. Each
+   names itself as eio_posix's own call does, so an error reads the same
+   whichever made it. */
+
+CAMLprim value caml_eio_fs_inline_fstatat(value path_v, value follow_v)
+{
+  CAMLparam2(path_v, follow_v);
+  struct stat st;
+  int r, saved_errno;
+  caml_unix_check_path(path_v, "fstatat");
+  char *path = caml_stat_strdup(String_val(path_v));
+  int flags = Bool_val(follow_v) ? 0 : AT_SYMLINK_NOFOLLOW;
+  caml_release_runtime_system();
+  do {
+    r = fstatat(AT_FDCWD, path, &st, flags);
+  } while (r == -1 && errno == EINTR);
+  saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(path);
+  if (r == -1)
+    caml_unix_error(saved_errno, "fstatat", path_v);
+  CAMLreturn(eio_fs_stat_value(&st, eio_fs_timestamp(EIO_FS_ATIME(st)),
+                               eio_fs_timestamp(EIO_FS_MTIME(st)),
+                               eio_fs_timestamp(EIO_FS_CTIME(st))));
+}
+
+/* The bits of [flags_v], as Eio_fs_unix.Inline.fs sets them. */
+#define INLINE_WRITE 1
+#define INLINE_APPEND 2
+#define INLINE_CREAT 4
+#define INLINE_TRUNC 8
+#define INLINE_EXCL 16
+#define INLINE_NOFOLLOW 32
+
+CAMLprim value caml_eio_fs_inline_openat(value path_v, value flags_v,
+                                         value perm_v)
+{
+  CAMLparam3(path_v, flags_v, perm_v);
+  int bits = Int_val(flags_v);
+  int flags = O_CLOEXEC | O_NONBLOCK;
+  int fd, saved_errno;
+  size_t len = caml_string_length(path_v);
+  flags |= (bits & INLINE_WRITE) ? O_RDWR : O_RDONLY;
+  if (bits & INLINE_APPEND) flags |= O_APPEND;
+  if (bits & INLINE_CREAT) flags |= O_CREAT;
+  if (bits & INLINE_TRUNC) flags |= O_TRUNC;
+  if (bits & INLINE_EXCL) flags |= O_EXCL;
+  if (bits & INLINE_NOFOLLOW) flags |= O_NOFOLLOW;
+  /* As eio_posix: a name ending in a slash is a directory. */
+  if (len > 0 && String_val(path_v)[len - 1] == '/') flags |= O_DIRECTORY;
+  caml_unix_check_path(path_v, "openat");
+  char *path = caml_stat_strdup(String_val(path_v));
+  caml_release_runtime_system();
+  do {
+    fd = openat(AT_FDCWD, path, flags, Int_val(perm_v));
+  } while (fd == -1 && errno == EINTR);
+  saved_errno = errno;
+  caml_acquire_runtime_system();
+  caml_stat_free(path);
+  if (fd == -1)
+    caml_unix_error(saved_errno, "openat", path_v);
+  CAMLreturn(Val_int(fd));
+}
