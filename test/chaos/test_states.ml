@@ -22,6 +22,29 @@ let stale_head () =
       | s when s = bad -> failwith "stale head"
       | _ | (exception Eio.Io _) -> ())
 
+(* Two writes to an empty file, the second past the page of the first:
+   ext4 extends its on-disk size as it writes back each page, so the first
+   page's writeback alone leaves the length at its end. *)
+let page_end () =
+  Eio_fs.Chaos.Crash.check
+    ~setup:(fun env ->
+      setup env;
+      Eio_fs_sync.save P.(env#fs / "f") "")
+    (fun ~ack:_ env ->
+      try
+        P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+        let pw off c =
+          Eio.File.pwrite_all f ~file_offset:(Optint.Int63.of_int off)
+            [ Cstruct.of_string (String.make 100 c) ]
+        in
+        pw 0 'A';
+        pw 6000 'B'
+      with Eio.Io _ -> ())
+    ~recover:(fun ~acked:_ env ->
+      keep env;
+      if String.length (P.load P.(env#fs / "f")) = 4096 then
+        failwith "the first page's end")
+
 (* A log reset by a synced truncation, acknowledged, then a new frame with
    no sync: the page the frame lands in may hold the old frame the truncation
    freed, which a log with no checksum replays. *)
@@ -297,6 +320,11 @@ let suite =
           Alcotest.(check string)
             "acked" "1 value, after #2"
             (field freed_by_unlink "acked"));
+      Alcotest.test_case "a length may end the page an earlier write filled"
+        `Quick (fun () ->
+          let m = Expect.report page_end in
+          Alcotest.(check string)
+            "error" "Failure(\"the first page's end\")" (Expect.field "error" m));
       Alcotest.test_case "a report's trace holds the truncation" `Quick
         (fun () ->
           let m = Expect.report old_frame in
