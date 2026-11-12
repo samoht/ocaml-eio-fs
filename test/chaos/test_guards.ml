@@ -366,6 +366,36 @@ let test_busy_is_not_a_spin () =
        with Eio.Io _ -> processed := 12_000);
       if !processed <> 12_000 then failwith "the batch is incomplete")
 
+(* Linux needs no room to remove an entry, change a mode, or open a file
+   that exists, and checks access at the open, not at each write: a program
+   that frees space on a full disk, or writes to a file it opened, never
+   meets those errors there. *)
+let test_errors_linux_returns () =
+  let contains s sub =
+    let n = String.length s and m = String.length sub in
+    let rec go i = i + m <= n && (String.sub s i m = sub || go (i + 1)) in
+    go 0
+  in
+  let never codes f =
+    try f ()
+    with Eio.Io _ as e ->
+      let s = Printexc.to_string e in
+      List.iter
+        (fun c -> if contains s c then Fmt.failwith "%s from %s" c s)
+        codes
+  in
+  Eio_fs.Chaos.check
+    ~setup:(fun env ->
+      P.save ~create:(`Exclusive 0o644) P.(env#fs / "old") "o";
+      P.save ~create:(`Exclusive 0o644) P.(env#fs / "f") "f")
+    (fun env ->
+      never [ "ENOSPC" ] (fun () ->
+          P.chmod ~follow:false ~perm:0o600 P.(env#fs / "f"));
+      never [ "ENOSPC" ] (fun () -> P.unlink P.(env#fs / "old"));
+      never [ "ENOSPC" ] (fun () ->
+          P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
+          never [ "EACCES" ] (fun () -> Eio.Flow.copy_string "x" f)))
+
 (* A workload that catches the cut's cancellation keeps going. *)
 let test_kept_going () =
   let report =
@@ -527,6 +557,8 @@ let suite =
         `Quick test_livelock_fresh_names;
       Alcotest.test_case "a batch that drops what fails is not a spin" `Quick
         test_busy_is_not_a_spin;
+      Alcotest.test_case "only the errors Linux returns" `Quick
+        test_errors_linux_returns;
       Alcotest.test_case "a run that catches the cut hangs" `Quick
         test_kept_going;
       Alcotest.test_case "a cut stops a supervisor that retries" `Quick
