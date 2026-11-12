@@ -120,7 +120,42 @@ let test_replay_drawn_state () =
            st)
         (fun () -> mkdir ~replay:(Fmt.str "fs/%s/none|end|%s" h st) ())
         ())
-    [ "s0"; "s1"; "s5"; "s-3"; "p1" ]
+    [ "s0"; "s1"; "s5"; "p1" ]
+
+(* A state named by choices that are not those of a key the check makes is
+   malformed: a negative choice, a trailing zero, a leading zero or sign. *)
+let test_replay_malformed_state () =
+  let save ?replay () =
+    Eio_fs.Chaos.Crash.check ?replay
+      (fun ~ack env ->
+        (try P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
+         with Eio.Io _ -> ());
+        ack ())
+      ~recover:(fun ~acked:_ env ->
+        ignore (P.kind ~follow:false P.(env#fs / "f")))
+  in
+  List.iter
+    (fun st ->
+      let replay = Fmt.str "fs/00000000/none|end|%s" st in
+      Expect.refused
+        (Fmt.str
+           "Eio_fs.Chaos.Crash.check: ~replay:%S is not a replay of eio-fs"
+           replay)
+        (fun () -> save ~replay ())
+        ())
+    [
+      "e0.-2";
+      "e-1.-1";
+      "p-1.-1";
+      "e-1";
+      "p0.0.0";
+      "e0";
+      "e00";
+      "e+1";
+      "s-3";
+      "s007";
+      "x";
+    ]
 
 (* A save of [n] bytes that does not sync: the fix changes the size of what
    it writes, and so the workload's first run. *)
@@ -1033,6 +1068,8 @@ let suite =
         test_replay_unknown_state;
       Alcotest.test_case "a replay of a drawn state where none is drawn" `Quick
         test_replay_drawn_state;
+      Alcotest.test_case "a replay of a malformed state is refused" `Quick
+        test_replay_malformed_state;
       Alcotest.test_case "a replay after a fix is re-matched" `Quick
         test_rematched_replay;
       Alcotest.test_case "a stale replay is refused" `Quick test_stale_replay;
