@@ -61,13 +61,19 @@ type t
     Two file systems share neither. Each operation below runs whole under a lock
     of its file system, so fibers of several domains may share one. *)
 
-val v : ?clock:_ Eio.Time.clock -> ?cwd:string -> ?owner:User.t -> unit -> t
-(** [v ~clock ~cwd ~owner ()] is a new file system holding only an empty root
-    directory, whose current directory is the directory at the absolute path
-    [cwd] (defaults to ["/"]) when first used: it then follows that directory,
-    as a descriptor does. Its root directory, mode [0o755], belongs to [owner]
-    (defaults to {!User.root}). Its times are read from [clock]; without one,
-    they stay at [0.]. *)
+val v :
+  ?clock:_ Eio.Time.clock ->
+  ?cwd:string ->
+  ?owner:User.t ->
+  ?os:[< `Linux | `Macos ] ->
+  unit ->
+  t
+(** [v ~clock ~cwd ~owner ~os ()] is a new file system holding only an empty
+    root directory, whose current directory is the directory at the absolute
+    path [cwd] (defaults to ["/"]) when first used: it then follows that
+    directory, as a descriptor does. Its root directory, mode [0o755], belongs
+    to [owner] (defaults to {!User.root}). Its times are read from [clock];
+    without one, they stay at [0.]. It answers as [os], [`Linux] by default. *)
 
 (** File descriptors. *)
 module Fd : sig

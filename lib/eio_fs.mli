@@ -213,13 +213,15 @@ module Fs : sig
   val v :
     ?clock:_ Eio.Time.clock ->
     ?user:user ->
+    ?os:[< `Linux | `Macos ] ->
     unit ->
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [v ~clock ~user ()] is the root of a fresh, empty in-memory filesystem
+  (** [v ~clock ~user ~os ()] is the root of a fresh, empty in-memory filesystem
       whose operations run as [user] (defaults to {!root}), who owns its root
-      directory. Its times are read from [clock]; without one, they stay at
-      [0.]. Closing this capability prevents further operations through its
-      aliases. Directories already opened from it keep their own lifetimes. *)
+      directory, and answer as [os] (defaults to [`Linux]) does. Its times are
+      read from [clock]; without one, they stay at [0.]. Closing this capability
+      prevents further operations through its aliases. Directories already
+      opened from it keep their own lifetimes. *)
 
   val as_user : user -> 'a Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
   (** [as_user user path] is [path], an in-memory directory, with its operations
@@ -232,15 +234,17 @@ module Fs : sig
   val load :
     ?clock:_ Eio.Time.clock ->
     ?filter:('a Eio.Path.t -> bool) ->
+    ?os:[< `Linux | `Macos ] ->
     'a Eio.Path.t ->
     [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [load ~clock ~filter path] is the root of a new in-memory filesystem
-      holding a copy of the directory tree at [path], at the same path from its
-      root: [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a
-      symbolic link; the entries below it are copied as they are, a link kept a
-      link. [filter] (defaults to [fun _ -> true]) is called on [path], then on
-      every path below it, before anything of it is copied: a path for which it
-      is [false] is not copied, nor anything under it, so a refused [path] is an
+  (** [load ~clock ~filter ~os path] is the root of a new in-memory filesystem
+      that answers as [os] (defaults to [`Linux]) does, holding a copy of the
+      directory tree at [path], at the same path from its root:
+      [load (dir / "a/b")] holds [/a/b]. [path] is followed if it is a symbolic
+      link; the entries below it are copied as they are, a link kept a link.
+      [filter] (defaults to [fun _ -> true]) is called on [path], then on every
+      path below it, before anything of it is copied: a path for which it is
+      [false] is not copied, nor anything under it, so a refused [path] is an
       empty filesystem. [path] can be on any filesystem, an in-memory one
       included. Its times are read from [clock], as {!v} reads them: a copy is a
       new file, made now.
@@ -292,12 +296,16 @@ module Crunch : sig
       no filesystem. *)
 
   val load :
-    ?clock:_ Eio.Time.clock -> t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-  (** [load ~clock entries] is the root of a new in-memory filesystem holding
-      [entries], with their permissions and symbolic links. Its times are read
-      from [clock], as {!Fs.v} reads them. A {!Dir} creates its missing
-      ancestors; a {!File} or {!Symlink} needs its parent directory to exist
-      already, as the root or from an earlier entry.
+    ?clock:_ Eio.Time.clock ->
+    ?os:[< `Linux | `Macos ] ->
+    t ->
+    [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
+  (** [load ~clock ~os entries] is the root of a new in-memory filesystem that
+      answers as [os] (defaults to [`Linux]) does, holding [entries], with their
+      permissions and symbolic links. Its times are read from [clock], as
+      {!Fs.v} reads them. A {!Dir} creates its missing ancestors; a {!File} or
+      {!Symlink} needs its parent directory to exist already, as the root or
+      from an earlier entry.
 
       @raise Eio.Io
         with {!Eio.Fs.Not_found} if the parent of a {!File} or {!Symlink} is
@@ -323,16 +331,21 @@ type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
     filesystem and current directory. *)
 
 val run :
-  ?clock:_ Eio.Time.clock -> ?cwd:string -> ?user:user -> (stdenv -> 'a) -> 'a
-(** [run ~clock ~cwd ~user fn] calls [fn] with a new in-memory filesystem in
-    place of the host's, whose times are read from [clock], as {!Fs.v} reads
-    them. Unlike [Eio_main.run], it starts no event loop and installs no effect
-    handler: call it inside one, such as [Eio_main.run] or
-    [Eio_mock.Backend.run]. [env] holds the root and the current directory of
-    the new filesystem. The current directory is the directory at the absolute
-    path [cwd] (defaults to ["/"]), made with its missing ancestors, mode
-    [0o755], before [fn] runs. Like a process's, it follows that directory
-    through a rename. Both run as [user] (defaults to {!root}). Root owns the
-    tree and gives [user] the current directory.
+  ?clock:_ Eio.Time.clock ->
+  ?cwd:string ->
+  ?user:user ->
+  ?os:[< `Linux | `Macos ] ->
+  (stdenv -> 'a) ->
+  'a
+(** [run ~clock ~cwd ~user ~os fn] calls [fn] with a new in-memory filesystem in
+    place of the host's, that answers as [os] (defaults to [`Linux]) does, whose
+    times are read from [clock], as {!Fs.v} reads them. Unlike [Eio_main.run],
+    it starts no event loop and installs no effect handler: call it inside one,
+    such as [Eio_main.run] or [Eio_mock.Backend.run]. [env] holds the root and
+    the current directory of the new filesystem. The current directory is the
+    directory at the absolute path [cwd] (defaults to ["/"]), made with its
+    missing ancestors, mode [0o755], before [fn] runs. Like a process's, it
+    follows that directory through a rename. Both run as [user] (defaults to
+    {!root}). Root owns the tree and gives [user] the current directory.
 
     @raise Stdlib.Invalid_argument if [cwd] is not an absolute path. *)

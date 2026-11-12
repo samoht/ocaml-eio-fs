@@ -719,7 +719,7 @@ module Filesystem = struct
     final ~follow w name ~slash
 end
 
-let v ?clock ?(cwd = "/") ?(owner = User.root) () =
+let v ?clock ?(cwd = "/") ?(owner = User.root) ?os:_ () =
   let now =
     match clock with Some c -> fun () -> Eio.Time.now c | None -> Fun.const 0.
   in

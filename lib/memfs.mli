@@ -16,10 +16,11 @@ val cwd :
 val v :
   ?clock:_ Eio.Time.clock ->
   ?user:Low_level.User.t ->
+  ?os:[< `Linux | `Macos ] ->
   unit ->
   [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-(** [v ~clock ~user ()] is the root of a fresh, empty filesystem whose times
-    [clock] gives. *)
+(** [v ~clock ~user ~os ()] is the root of a fresh, empty filesystem whose times
+    [clock] gives, that answers as [os] does. *)
 
 val as_user :
   Low_level.User.t -> 'a Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
@@ -41,7 +42,8 @@ val set_times :
 val load :
   ?clock:_ Eio.Time.clock ->
   ?filter:('a Eio.Path.t -> bool) ->
+  ?os:[< `Linux | `Macos ] ->
   'a Eio.Path.t ->
   [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
-(** [load ~filter path] is a new filesystem holding a copy of the tree at
-    [path]. *)
+(** [load ~clock ~filter ~os path] is a new filesystem holding a copy of the
+    tree at [path], that answers as [os] does. *)
