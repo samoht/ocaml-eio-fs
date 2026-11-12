@@ -828,14 +828,14 @@ end
 module Inline : sig
   val fs : < fs : Eio.Fs.dir_ty Eio.Path.t ; .. > -> Eio.Fs.dir_ty Eio.Path.t
   (** [fs env] is [env]'s unconfined root, [Eio.Stdenv.fs env], whose [stat],
-      [open_in], [open_out] and [read_dir] make their system calls on the
-      calling thread, where eio_posix hands each to a system thread and back: a
-      hand-off costs ten to forty microseconds of CPU, the call a few. A file it
-      opens is the root's own kind of file, and every other operation, a
-      directory opened from it included, is the root's. The calls block the
-      calling domain while they run, which on a local disk is microseconds; a
-      filesystem whose calls can block for longer, such as a network mount, is
-      better reached through [env]'s own root. *)
+      [open_in], [open_out], [read_dir] and [with_dir_entries] make their system
+      calls on the calling thread, where eio_posix hands each to a system thread
+      and back: a hand-off costs ten to forty microseconds of CPU, the call a
+      few. A file it opens is the root's own kind of file, and every other
+      operation, a directory opened from it included, is the root's. The calls
+      block the calling domain while they run, which on a local disk is
+      microseconds; a filesystem whose calls can block for longer, such as a
+      network mount, is better reached through [env]'s own root. *)
 end
 
 (**/**)
