@@ -906,23 +906,33 @@ module Crash = struct
     go 0 bufs;
     b
 
+  (* The bytes of [ro] up to its end as the reads find it. Another process may
+     rewrite the file while it is read, so the size [stat] answers sizes the
+     first buffer only: what is read is one of the images the rewrite passes
+     through, whole or torn. *)
   let read_all (ro : Eio.File.ro_ty r) =
     let size = Optint.Int63.to_int (Eio.File.stat ro).size in
-    if size <= 0 then Cstruct.empty
-    else begin
-      let buf = Cstruct.create size in
-      let rec loop off =
-        if off >= size then ()
-        else
-          let got =
-            Eio.File.pread ro ~file_offset:(Optint.Int63.of_int off)
-              [ Cstruct.sub buf off (size - off) ]
-          in
-          loop (off + got)
-      in
-      loop 0;
-      buf
-    end
+    let pread off bufs =
+      Eio.File.pread ro ~file_offset:(Optint.Int63.of_int off) bufs
+    in
+    (* A byte past the buffer tells a file that grew from one that did not,
+       without a larger buffer for the common case. *)
+    let probe = Cstruct.create 1 in
+    let rec loop buf off =
+      if off < Cstruct.length buf then
+        match pread off [ Cstruct.sub buf off (Cstruct.length buf - off) ] with
+        | got -> loop buf (off + got)
+        | exception End_of_file -> Cstruct.sub buf 0 off
+      else
+        match pread off [ probe ] with
+        | exception End_of_file -> buf
+        | _ ->
+            let bigger = Cstruct.create (max 4096 (2 * off)) in
+            Cstruct.blit buf 0 bigger 0 off;
+            Cstruct.blit probe 0 bigger off 1;
+            loop bigger (off + 1)
+    in
+    loop (if size <= 0 then Cstruct.empty else Cstruct.create size) 0
 
   (* The model observes the disk as a disk, not as a user: a file whose mode
      denies reading (a write-only spool) is still bytes on the platter. Grant
@@ -940,7 +950,9 @@ module Crash = struct
     Fun.protect
       ~finally:(fun () ->
         match restore with
-        | Some perm -> B.chmod bv ~follow:true ~perm path
+        | Some perm -> (
+            try B.chmod bv ~follow:true ~perm path
+            with Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ())
         | None -> ())
       fn
 
@@ -1410,6 +1422,13 @@ module Crash = struct
   let box_dir (Eio.Resource.T (v, ops)) =
     Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
 
+  let is_gone = function
+    | Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> true
+    | _ -> false
+
+  (* The tree at [path] as the reads find it. Other processes may write the
+     tree while it is read: an entry one of them removes between the listing
+     and its own read is not in the snapshot, as it is not on the disk. *)
   let rec snapshot_at (Base_dir ((module B), bv) as owner) path =
     match B.stat bv ~follow:false path with
     | { kind = `Regular_file; perm; uid; gid; ino; _ } ->
@@ -1426,7 +1445,9 @@ module Crash = struct
           |> List.fold_left
                (fun m name ->
                  let child = Eio_fs_path.append path name in
-                 Paths.add name (snapshot_at owner child) m)
+                 match snapshot_at owner child with
+                 | tree -> Paths.add name tree m
+                 | exception e when is_gone e -> m)
                Paths.empty
         in
         Dir { perm; uid; gid; ino; entries }
