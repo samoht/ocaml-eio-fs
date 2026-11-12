@@ -126,15 +126,17 @@ let test_sync_dir_refuses_a_relative_link () =
    on Darwin is F_FULLFSYNC, through to the platter and the slowest call the
    process makes. Here one fiber issues a run of barriers while a sibling
    counts its own turns; the sibling gets none at all while the pair runs
-   inline. *)
+   inline. The sibling spins for as long as the barriers take, so the run is
+   short: a directory fsync can take 100 ms (an ext4 on a loop device), and
+   the count separates the two shapes at any length. *)
 let test_sync_dir_lets_a_sibling_fiber_run () =
   with_real_dir @@ fun dir ->
   (* One turn every other barrier is a floor the fixed shape clears with room
      to spare -- it suspends once per barrier -- and the inline pair cannot
      reach at all, having no suspension point between the first barrier and
      the last. ([/] is [Eio.Path.( / )] here, so the floor is spelt out.) *)
-  let barriers = 200 in
-  let floor = 100 in
+  let barriers = 10 in
+  let floor = 5 in
   let started = ref false in
   let finished = ref false in
   let turns = ref 0 in
