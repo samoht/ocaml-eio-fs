@@ -240,7 +240,7 @@ let with_posix fn =
   let root = Eio.Stdenv.fs env / Filename.temp_dir "generation-readonly-" "" in
   Fun.protect
     ~finally:(fun () ->
-      Eio_fs_unix.grant_owner root;
+      Eio_fs.Path.grant_owner root;
       Eio.Path.rmtree root)
     (fun () -> fn root)
 

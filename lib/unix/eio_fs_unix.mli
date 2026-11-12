@@ -109,35 +109,7 @@ val clone_tree : _ Eio.Path.t -> _ Eio.Path.t -> bool
       {!Eio.Fs.Not_native} if a directory has no host descriptor.
     @raise Stdlib.Invalid_argument if a path holds a NUL byte. *)
 
-val clone_trees : _ Eio.Path.t -> _ Eio.Path.t -> string list -> bool
-(** [clone_trees src dst names] clones each [src/name] to [dst/name] with
-    {!clone_tree}, the directories above each made first, all or none: on the
-    first that does not clone, or whose clone raises, each cloned before it is
-    removed and it is [false]. A [name] may hold several segments, as
-    [_build/default]. The directories made above a name are left.
-
-    @raise Stdlib.Invalid_argument if a path holds a NUL byte. *)
-
-(** {1:trees Removable trees} *)
-
-val grant_owner : _ Eio.Path.t -> unit
-(** [grant_owner p] grants its owner read, write and search on the directory [p]
-    and on each directory under it, so that every entry of the tree can be
-    unlinked: a tree that a program made read-only, then left when it was
-    killed, refuses any removal. Symbolic links are not followed, so the walk
-    stays in [p]'s tree. A directory that cannot be granted or read is left as
-    it is, for the removal to name; a [p] that is missing or not a directory is
-    left alone. It costs a stat per entry and a listing per directory. *)
-
-val revoke_writes : _ Eio.Path.t -> unit
-(** [revoke_writes p] removes every write bit from the file or directory [p] and
-    from each file and directory under it. An entry that has none is left as it
-    is, since a chmod moves its change time even to the same mode, and a
-    symbolic link is neither followed nor changed. It costs a stat per entry and
-    a listing per directory.
-
-    @raise Failure naming an entry that is no file, directory or symbolic link.
-    @raise Eio.Io when an entry cannot be read or changed. *)
+(** {1:trees Tree removal} *)
 
 type removed = {
   entries : int;  (** The files, links and directories removed. *)
@@ -159,13 +131,13 @@ val remove_tree : ?grant:bool -> ?last:string -> _ Eio.Path.t -> removed
     outlasts one directory's entries.
 
     With [~grant:true] (defaults to [false]) each directory is granted its
-    owner's read, write and search before it is read, as {!grant_owner} grants
-    it. The entry [last] of [path], if any, is removed only once every other
-    entry is gone, so a removal that fails leaves it. An entry another process
-    removes meanwhile counts nothing, and a [path] that does not exist removes
-    nothing. A refusal stops no other directory's removal, leaves the
-    directories above it and [last], and a later call goes on with what is left.
-*)
+    owner's read, write and search before it is read, as
+    {!Eio_fs.Path.grant_owner} grants it. The entry [last] of [path], if any, is
+    removed only once every other entry is gone, so a removal that fails leaves
+    it. An entry another process removes meanwhile counts nothing, and a [path]
+    that does not exist removes nothing. A refusal stops no other directory's
+    removal, leaves the directories above it and [last], and a later call goes
+    on with what is left. *)
 
 (** {1:files Positioned reads and writes}
 

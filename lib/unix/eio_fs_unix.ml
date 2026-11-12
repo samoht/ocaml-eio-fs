@@ -205,51 +205,6 @@ let clone_tree src dst =
   Eio_unix.run_in_systhread ~label:"eio-fs-clone-tree" @@ fun () ->
   clone_at src_dir src_name dst_dir dst_name
 
-let clone_trees src dst names =
-  let undo =
-    List.iter (fun n ->
-        try Eio.Path.rmtree ~missing_ok:true Eio.Path.(dst / n)
-        with Eio.Io _ -> ())
-  in
-  let rec go cloned = function
-    | [] -> true
-    | n :: rest -> (
-        match
-          Option.iter
-            (fun (parent, _) ->
-              Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 parent)
-            (Eio.Path.split Eio.Path.(dst / n));
-          clone_tree Eio.Path.(src / n) Eio.Path.(dst / n)
-        with
-        | true -> go (n :: cloned) rest
-        | false | (exception Eio.Io _) ->
-            undo (n :: cloned);
-            false)
-  in
-  go [] names
-
-let rec grant_owner p =
-  match Eio.Path.stat ~follow:false p with
-  | { kind = `Directory; perm; _ } -> (
-      (if perm land 0o700 <> 0o700 then
-         try Eio.Path.chmod ~follow:false ~perm:(perm lor 0o700) p
-         with Eio.Io _ -> ());
-      match Eio.Path.read_dir p with
-      | names -> List.iter (fun n -> grant_owner Eio.Path.(p / n)) names
-      | exception Eio.Io _ -> ())
-  | _ | (exception Eio.Io _) -> ()
-
-let rec revoke_writes p =
-  let stat = Eio.Path.stat ~follow:false p in
-  (match stat.kind with
-  | `Symbolic_link | `Regular_file -> ()
-  | `Directory ->
-      List.iter (fun n -> revoke_writes Eio.Path.(p / n)) (Eio.Path.read_dir p)
-  | _ ->
-      Fmt.failwith "%a is not a file, directory or symbolic link" Eio.Path.pp p);
-  if stat.kind <> `Symbolic_link && stat.perm land 0o222 <> 0 then
-    Eio.Path.chmod ~follow:false ~perm:(stat.perm land lnot 0o222) p
-
 type extent = { logical : int; physical : int; length : int }
 
 external seek_data_native : Unix.file_descr -> int -> int option

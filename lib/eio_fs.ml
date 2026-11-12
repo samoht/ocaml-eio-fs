@@ -168,6 +168,24 @@ module Path = struct
     in
     loop [ path ]
 
+  let rec grant_owner p =
+    match Eio.Path.stat ~follow:false p with
+    | { kind = `Directory; perm; _ } -> (
+        (if perm land 0o700 <> 0o700 then
+           try Eio.Path.chmod ~follow:false ~perm:(perm lor 0o700) p
+           with Eio.Io _ -> ());
+        match Eio.Path.read_dir p with
+        | names -> List.iter (fun n -> grant_owner Eio.Path.(p / n)) names
+        | exception Eio.Io _ -> ())
+    | _ | (exception Eio.Io _) -> ()
+
+  let rec revoke_writes p =
+    let stat = Eio.Path.stat ~follow:false p in
+    if stat.kind = `Directory then
+      List.iter (fun n -> revoke_writes Eio.Path.(p / n)) (Eio.Path.read_dir p);
+    if stat.kind <> `Symbolic_link && stat.perm land 0o222 <> 0 then
+      Eio.Path.chmod ~follow:false ~perm:(stat.perm land lnot 0o222) p
+
   let usage ?max_fibers path =
     let total = ref empty in
     iter ?max_fibers (fun _ stat -> total := add !total (own stat)) path;
