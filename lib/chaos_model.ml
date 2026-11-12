@@ -1380,32 +1380,45 @@ module Crash = struct
       (fun (a : unsynced) (b : unsynced) -> Int.compare a.seq b.seq)
       (data @ metadata)
 
-  (* Rewrite the base file to [content]: truncate and re-lay the bytes. A file
-     staged read-only or write-only cannot be reopened O_RDWR, so grant the
-     owner read and write bits for the duration of the rewrite and restore
-     the exact mode after. *)
+  (* The bytes of the regular file [path], read with the owner's read bit. *)
+  let current_data (Base_dir ((module B), bv) as owner) path =
+    with_readable owner path (fun () ->
+        Switch.run (fun sw -> read_all (B.open_in bv ~sw ~follow:false path)))
+
+  (* Rewrite the base file to [content], unless it holds it already: truncate
+     and re-lay the bytes. A file staged read-only or write-only cannot be
+     reopened O_RDWR, so grant the owner read and write bits for the duration
+     of the rewrite and restore the exact mode after. *)
   let rewrite ctl fs content =
-    let (Base_dir ((module B), bv)) = as_admin ctl fs.owner in
-    let restore =
-      match B.stat bv ~follow:true fs.rel with
-      | exception Eio.Io _ -> None
-      | { kind = `Regular_file; perm; _ } when perm land 0o600 <> 0o600 ->
-          B.chmod bv ~follow:true ~perm:(perm lor 0o600) fs.rel;
-          Some perm
-      | _ -> None
+    let (Base_dir ((module B), bv) as owner) = as_admin ctl fs.owner in
+    let holds =
+      match B.stat bv ~follow:false fs.rel with
+      | { kind = `Regular_file; _ } ->
+          Cstruct.equal (current_data owner fs.rel) content
+      | _ | (exception Eio.Io _) -> false
     in
-    Fun.protect ~finally:(fun () ->
-        match restore with
-        | Some perm -> B.chmod bv ~follow:true ~perm fs.rel
-        | None -> ())
-    @@ fun () ->
-    Switch.run @@ fun sw ->
-    let f =
-      B.open_out bv ~sw ~follow:true ~append:false
-        ~create:(`Or_truncate fs.perm) fs.rel
-    in
-    if Cstruct.length content > 0 then
-      Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ content ]
+    if not holds then begin
+      let restore =
+        match B.stat bv ~follow:true fs.rel with
+        | exception Eio.Io _ -> None
+        | { kind = `Regular_file; perm; _ } when perm land 0o600 <> 0o600 ->
+            B.chmod bv ~follow:true ~perm:(perm lor 0o600) fs.rel;
+            Some perm
+        | _ -> None
+      in
+      Fun.protect ~finally:(fun () ->
+          match restore with
+          | Some perm -> B.chmod bv ~follow:true ~perm fs.rel
+          | None -> ())
+      @@ fun () ->
+      Switch.run @@ fun sw ->
+      let f =
+        B.open_out bv ~sw ~follow:true ~append:false
+          ~create:(`Or_truncate fs.perm) fs.rel
+      in
+      if Cstruct.length content > 0 then
+        Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ content ]
+    end
 
   let box_dir (Eio.Resource.T (v, ops)) =
     Base_dir (Eio.Resource.get ops Eio.Fs.Pi.Dir, v)
@@ -1441,51 +1454,95 @@ module Crash = struct
     if not (Int64.equal s.uid uid && Int64.equal s.gid gid) then
       B.chown ~follow:false ~uid ~gid bv path
 
-  let rec restore_at (Base_dir ((module B), bv) as owner) path = function
-    | File { data; perm; uid; gid; _ } ->
-        ( Switch.run @@ fun sw ->
-          let f =
-            B.open_out bv ~sw ~follow:true ~append:false
-              ~create:(`Or_truncate perm) path
-          in
-          if Cstruct.length data > 0 then
-            Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ] );
+  (* [path]'s mode made [perm], unless it is: a chmod moves the change
+     time even to the same mode. *)
+  let restore_perm (Base_dir ((module B), bv)) path perm =
+    if not (Int.equal (B.stat bv ~follow:false path).perm perm) then
+      B.chmod bv ~follow:false ~perm path
+
+  let write_file (Base_dir ((module B), bv)) path ~perm data =
+    Switch.run @@ fun sw ->
+    let f =
+      B.open_out bv ~sw ~follow:false ~append:false ~create:(`Or_truncate perm)
+        path
+    in
+    if Cstruct.length data > 0 then
+      Eio.File.pwrite_all f ~file_offset:Optint.Int63.zero [ data ]
+
+  (* The base at [path] made [tree], in place: an entry that is still the one
+     the image names (its kind and inode, and a file no other name links) is
+     kept, its inode and times with it, as a power cut spares them on a disk,
+     and only what differs is rewritten. Any other entry is replaced. *)
+  let rec restore_at (Base_dir ((module B), bv) as owner) path tree =
+    let now =
+      match B.stat bv ~follow:false path with
+      | st -> Some st
+      | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> None
+    in
+    match (tree, now) with
+    | File { data; perm; uid; gid; ino }, Some st
+      when st.kind = `Regular_file && Int64.equal st.ino ino
+           && Int64.equal st.nlink 1L ->
+        if not (Cstruct.equal (current_data owner path) data) then begin
+          if st.perm land 0o600 <> 0o600 then
+            B.chmod bv ~follow:false ~perm:(st.perm lor 0o600) path;
+          write_file owner path ~perm data
+        end;
         (* The owner first: a chown clears setuid and setgid. *)
         restore_owner owner path ~uid ~gid;
-        B.chmod bv ~follow:true ~perm path
-    | Link { target; uid; gid; _ } ->
+        restore_perm owner path perm
+    | File { data; perm; uid; gid; _ }, _ ->
+        if Option.is_some now then remove_at owner path;
+        write_file owner path ~perm data;
+        restore_owner owner path ~uid ~gid;
+        B.chmod bv ~follow:false ~perm path
+    | Link { target; uid; gid; _ }, Some st
+      when st.kind = `Symbolic_link && String.equal (B.read_link bv path) target
+      ->
+        restore_owner owner path ~uid ~gid
+    | Link { target; uid; gid; _ }, _ ->
+        if Option.is_some now then remove_at owner path;
         B.symlink ~link_to:target bv path;
         restore_owner owner path ~uid ~gid
-    | Dir { perm; uid; gid; entries; _ } ->
-        (* Writable while it fills; the mode, which the umask also
-           narrows, is set after. *)
-        if not (String.equal path "") then
-          B.mkdir bv ~perm:(perm lor 0o700) path;
+    | Dir d, Some st when st.kind = `Directory && Int64.equal st.ino d.ino ->
+        refill owner path st d.entries;
+        restore_owner owner path ~uid:d.uid ~gid:d.gid;
+        restore_perm owner path d.perm
+    | Dir { perm; uid; gid; entries; _ }, _ ->
+        if Option.is_some now then remove_at owner path;
+        (* Writable while it fills; the mode, which the umask also narrows,
+           is set after. *)
+        B.mkdir bv ~perm:(perm lor 0o700) path;
         Paths.iter
           (fun name child ->
-            let child_path = Eio_fs_path.append path name in
-            restore_at owner child_path child)
+            restore_at owner (Eio_fs_path.append path name) child)
           entries;
-        if not (String.equal path "") then begin
-          restore_owner owner path ~uid ~gid;
-          B.chmod bv ~follow:false ~perm path
-        end
+        restore_owner owner path ~uid ~gid;
+        B.chmod bv ~follow:false ~perm path
+
+  (* The directory [path], whose stat is [st], made to hold [entries]: what it
+     holds that they do not name goes, each of them is restored in place. *)
+  and refill (Base_dir ((module B), bv) as owner) path (st : Eio.File.Stat.t)
+      entries =
+    if st.perm land 0o700 <> 0o700 then
+      B.chmod bv ~follow:false ~perm:(st.perm lor 0o700) path;
+    B.read_dir bv path
+    |> List.iter (fun name ->
+        if not (Paths.mem name entries) then
+          remove_at owner (Eio_fs_path.append path name));
+    Paths.iter
+      (fun name child -> restore_at owner (Eio_fs_path.append path name) child)
+      entries
 
   let restore_root (Base_dir ((module B), bv) as owner) path = function
     | Dir { perm; uid; gid; entries; _ } ->
-        B.read_dir bv path
-        |> List.iter (fun name ->
-            let child = Eio_fs_path.append path name in
-            remove_at owner child);
-        if not (String.equal path "") then begin
+        let st = B.stat bv ~follow:true path in
+        refill owner path st entries;
+        if String.equal path "" then restore_perm owner path st.perm
+        else begin
           restore_owner owner path ~uid ~gid;
           B.chmod bv ~follow:true ~perm path
-        end;
-        Paths.iter
-          (fun name child ->
-            let child_path = Eio_fs_path.append path name in
-            restore_at owner child_path child)
-          entries
+        end
     | File _ | Link _ ->
         invalid_arg "Chaos.Crash: wrapped root is not a directory"
 

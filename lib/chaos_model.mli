@@ -455,11 +455,12 @@ module Crash : sig
 
   val crash : t -> unit
   (** [crash t] triggers a crash now: it reconstructs the post-crash image per
-      {!type-policy} and rewrites the base to it. A second call does nothing.
-      After a crash, every operation through the wrapper (a read, a write, a
-      sync, an open, a stat or a directory operation) fails with an {!Eio.Io}
-      exception ("power lost") and leaves the image as it is; re-read through
-      {!post_crash}.
+      {!type-policy} and rewrites the base to it in place: an entry that is
+      still the one the image names keeps its inode and times, as on a disk. A
+      second call does nothing. After a crash, every operation through the
+      wrapper (a read, a write, a sync, an open, a stat or a directory
+      operation) fails with an {!Eio.Io} exception ("power lost") and leaves the
+      image as it is; re-read through {!post_crash}.
 
       @raise Stdlib.Invalid_argument
         if [t] was never {!wrap}ped; [t] is left uncrashed. *)

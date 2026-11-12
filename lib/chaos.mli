@@ -309,7 +309,8 @@ module Crash : sig
 
   val cut : t -> Eio.Fs.dir_ty Eio.Path.t
   (** [cut t] cuts the power, if [t] has not cut it yet, and is the base
-      directory, which now holds what the disk kept. Every operation through the
+      directory, which now holds what the disk kept. An entry the cut spared
+      keeps its inode and times, as on a disk. Every operation through the
       wrapper fails after the cut. Called from a {!Chaos.wrap} hook over the
       wrapper, it cuts the power before that operation, in the middle of a run:
       {[
