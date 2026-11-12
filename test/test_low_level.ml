@@ -772,6 +772,28 @@ let test_linux_eisdir () =
       errno (fun () -> Eio.Path.rename (a / "w/p/f") (a / "w/q"));
     ]
 
+(* rename answers EBUSY for a last [.] or [..], or EEXIST for the target's
+   when it must not replace it. *)
+let test_linux_rename_dots () =
+  Eio_mock.Backend.run @@ fun () ->
+  let _, a = linux_tree () in
+  let rename x y () = Eio.Path.rename (a / x) (a / y) in
+  let exclusive x y () =
+    Eio_fs_sync.Rename.exclusive Eio_fs_sync.Rename.capability (a / x) (a / y)
+  in
+  Alcotest.(check (list string))
+    "rename"
+    [ "EBUSY"; "EBUSY"; "EBUSY"; "EBUSY"; "EEXIST"; "EBUSY" ]
+    (List.map errno
+       [
+         rename "w/p/f" "w/.";
+         rename "w/." "w/z";
+         rename "w/p/f" "w/q/..";
+         rename "w/p/." "w/z";
+         exclusive "w/p/f" "w/.";
+         exclusive "w/p/." "w/z";
+       ])
+
 (* Linux: a setgid directory gives new entries its group, and new
    subdirectories its setgid bit; a chown, or a write by a user, clears the
    setuid and setgid bits of a file; a chmod by a user outside the file's
@@ -1347,6 +1369,8 @@ let suite =
         test_linux_readlink;
       Alcotest.test_case "Linux: a read of a directory is EISDIR" `Quick
         test_linux_eisdir;
+      Alcotest.test_case "Linux: rename of a last . or .. is EBUSY" `Quick
+        test_linux_rename_dots;
       Alcotest.test_case "permissions: setgid directories and privilege bits"
         `Quick test_perm_setgid_and_privileges;
       Alcotest.test_case "a directory barrier opens its directory" `Quick
