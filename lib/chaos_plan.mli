@@ -20,6 +20,7 @@ module Op : sig
     nth : int;
     file_offset : int;
     length : int;
+    dest : string option;
   }
 
   val kind_name : kind -> string
@@ -48,8 +49,10 @@ type pos = { kind : Op.kind; path : string; nth : int }
 val at : pos -> Op.t -> bool
 (** [at p op] is [true] iff [op] is at [p]. *)
 
-val pos_text : pos -> string
-(** [pos_text p] says where [p] is, for a report. *)
+val pos_text : ?at:(pos -> Op.t option) -> pos -> string
+(** [pos_text ~at p] says where [p] is, for a report: as the operation [at p] of
+    the run is shown in its trace, and else by its place among the operations of
+    its kind on its path. *)
 
 type trace = Op.t list
 (** The type for a run's operations, in order. *)
@@ -98,13 +101,13 @@ val check_seconds : pos * Fault.t -> after:trace -> check list
 (** [check_seconds f ~after] is the pairs of faults whose first is [f] and whose
     second lands after it in [after], the run [f] alone made. *)
 
-val faults_text : (pos * Fault.t) list -> string
+val faults_text : ?at:(pos -> Op.t option) -> (pos * Fault.t) list -> string
 (** [faults_text fs] says what [fs] do, for a report. *)
 
 val check_key : check -> string
 (** [check_key s] names [s] in a replay. *)
 
-val check_text : check -> string
+val check_text : ?at:(pos -> Op.t option) -> check -> string
 (** [check_text s] says what [s] does, for a report. *)
 
 (** {1 Crash.check} *)

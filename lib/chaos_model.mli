@@ -128,6 +128,8 @@ module Op : sig
             that makes its file, a [mkdir], a [symlink] or a [rename]. An
             [`Enospc] fault on another open or change injects nothing, as Linux
             never answers it there. *)
+    dest : string option;
+        (** A rename's destination, as given to the directory it lands in. *)
   }
   (** The type for operations. *)
 
@@ -486,6 +488,9 @@ module Crash : sig
   (** [left t] is, file by file, what [t]'s crash left of the unsynced writes
       under a {!Choose} policy: the length, and each run of sectors that holds
       something else than the durable bytes, with what it holds. *)
+
+  val seq : t -> int
+  (** [seq t] is the place in program order of the last change [t] tracked. *)
 
   val unsynced : t -> unsynced list
   (** [unsynced t] are the changes not yet made durable, in program order: every

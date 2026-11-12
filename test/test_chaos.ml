@@ -440,6 +440,7 @@ let test_directory_short_read_inapplicable () =
       file_offset = 0;
       length = 0;
       space = false;
+      dest = None;
     }
   in
   Alcotest.(check bool)
@@ -458,7 +459,14 @@ let test_seeded_short_read_long_op () =
   in
   let length = (1 lsl 30) + 1 in
   let op : Op.t =
-    { kind = `Read; path = "f"; file_offset = 0; length; space = false }
+    {
+      kind = `Read;
+      path = "f";
+      file_offset = 0;
+      length;
+      space = false;
+      dest = None;
+    }
   in
   match Chaos.Internal.next sched op with
   | Some (Short_read n) ->
@@ -733,7 +741,14 @@ let test_scripted_fires_once () =
     Schedule.scripted [ { trigger = Nth_op 2; fault = Short_read 1 } ]
   in
   let op =
-    { Op.kind = `Read; path = "f"; file_offset = 0; length = 10; space = false }
+    {
+      Op.kind = `Read;
+      path = "f";
+      file_offset = 0;
+      length = 10;
+      space = false;
+      dest = None;
+    }
   in
   let check name expected =
     Alcotest.(check bool)
@@ -761,7 +776,7 @@ let test_nth_op_on_path () =
       ]
   in
   let op kind path =
-    { Op.kind; path; file_offset = 0; length = 0; space = false }
+    { Op.kind; path; file_offset = 0; length = 0; space = false; dest = None }
   in
   let faults =
     List.map
@@ -785,7 +800,7 @@ let test_nth_op_on_path () =
 
 let ops_fixture =
   let mk kind path file_offset length : Op.t =
-    { kind; path; file_offset; length; space = false }
+    { kind; path; file_offset; length; space = false; dest = None }
   in
   [
     mk `Open_write "a" 0 0;

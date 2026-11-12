@@ -58,7 +58,9 @@
     also says after which operation each value was acknowledged, and, for a
     state drawn among those the cut allows, what each file holds: its length,
     and each run of sectors that holds a write, zeros or stale data, with where
-    the stale data comes from. A block of up to eight operations repeated three
+    the stale data comes from. A report numbers an operation by its place in the
+    trace, wherever it names one: the cut, the faults, the changes a cut lost
+    and the acknowledgements. A block of up to eight operations repeated three
     times or more, in the same directories each time, as a retry makes them,
     shows its first and last instances, and a trace longer than that keeps its
     first and last hundred lines and those around its first fault, so a report's
@@ -325,6 +327,8 @@ module Op : sig
         (** Where a read or a write starts, a truncation's new length, [0]
             otherwise. *)
     length : int;  (** The bytes a read asks for or a write offers. *)
+    dest : string option;
+        (** A rename's destination, as given to the directory it lands in. *)
   }
   (** The type for operations. *)
 

@@ -159,6 +159,7 @@ module Op = struct
     file_offset : int;  (** byte offset for reads/writes, [0] otherwise *)
     length : int;  (** bytes requested/offered, [0] otherwise *)
     space : bool;
+    dest : string option;  (** a rename's destination *)
   }
 
   let pp_kind ppf = function
@@ -175,8 +176,8 @@ module Op = struct
   let pp ppf t =
     Fmt.pf ppf "%a %s @%d+%d" pp_kind t.kind t.path t.file_offset t.length
 
-  let v ?(space = false) ?(offset = 0) ?(len = 0) kind path =
-    { kind; path; file_offset = offset; length = len; space }
+  let v ?(space = false) ?(offset = 0) ?(len = 0) ?dest kind path =
+    { kind; path; file_offset = offset; length = len; space; dest }
 
   let read path ~offset ~len = v ~offset ~len `Read path
   let write path ~offset ~len = v ~space:true ~offset ~len `Write path
@@ -186,7 +187,7 @@ module Op = struct
   let open_read path = v `Open_read path
   let open_write ~space path = v ~space `Open_write path
   let stat path = v `Stat path
-  let change ~space path = v ~space `Change path
+  let change ?dest ~space path = v ?dest ~space `Change path
 end
 
 module Schedule = struct
@@ -740,8 +741,8 @@ module Dir_impl = struct
 
   (* A change to a directory's entries, named by the entry it makes or
      removes; only one that makes an entry needs room. *)
-  let change ?(space = false) t path =
-    match Schedule.next t.sched (Op.change ~space path) with
+  let change ?(space = false) ?dest t path =
+    match Schedule.next t.sched (Op.change ?dest ~space path) with
     | Some (Fault.Change_error `Enospc) when not space -> ()
     | Some (Fault.Change_error c) -> raise_open c path
     | _ -> ()
@@ -776,7 +777,7 @@ module Dir_impl = struct
     B.rmdir bv path
 
   let rename t old_path new_dir new_path =
-    change ~space:true t old_path;
+    change ~space:true ~dest:new_path t old_path;
     let target =
       match base_dir new_dir with
       | Some base -> base
@@ -786,7 +787,7 @@ module Dir_impl = struct
     B.rename bv old_path target new_path
 
   let rename_exclusive t backend ~source ~target:(new_dir, new_path) =
-    change ~space:true t source;
+    change ~space:true ~dest:new_path t source;
     let target =
       match base_dir new_dir with Some base -> base | None -> new_dir
     in
@@ -2737,6 +2738,12 @@ module Crash = struct
                   Some
                     (Fmt.str "%s as the write @%d+%d left it" at offset
                        (Cstruct.length data))
+              | Resize m when off >= m ->
+                  Some (Fmt.str "%s zeros, from the truncation to %d" at m)
+              | Resize m when m < off + n ->
+                  Some
+                    (Fmt.str "%s as the truncation to %d left it, zeros from %d"
+                       at m m)
               | Resize m ->
                   Some (Fmt.str "%s as the truncation to %d left it" at m))
           | `Over -> Some (at ^ " as a failed sync wrote it")
@@ -3851,6 +3858,7 @@ module Crash = struct
     | None -> invalid_arg "Chaos.Crash.post_crash: controller was never wrapped"
 
   let left ctl = ctl.left
+  let seq ctl = ctl.seq
 
   let pp_unsynced ppf u =
     match u.kind with

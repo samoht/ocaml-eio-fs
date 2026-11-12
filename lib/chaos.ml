@@ -28,6 +28,7 @@ let numberer () =
       nth;
       file_offset = op.file_offset;
       length = op.length;
+      dest = op.dest;
     }
 
 (* An [ENOSPC] on an operation that needs no room is none: Linux never
@@ -483,7 +484,12 @@ let check ?budget ?replay ?(setup = ignore) run =
     if out <> Passed then
       report name ~title:"the workload failed under a fault." ~tier ~hash
         ~key:(Plan.check_key s) ~matched ~trace ~error:(outcome_text out)
-        [ ("faults", Plan.check_text s) ];
+        [
+          ( "faults",
+            Plan.check_text
+              ~at:(fun p -> List.find_opt (Plan.at p) (ops trace))
+              s );
+        ];
     ops trace
   in
   match replay with
@@ -624,6 +630,9 @@ module Crash = struct
 
   type result = {
     trace : run_trace;
+    cut_op : Op.t option; (* the operation the cut fell before *)
+    seqs : (int * int) list;
+        (* for each operation, latest first, the last change before it *)
     rtrace : Plan.trace;
     acked_at : int list; (* the operation each ack came after *)
     lost : unsynced list;
@@ -638,19 +647,21 @@ module Crash = struct
   (* A phase of a run: [f] on a crash-tracked [base] whose power is cut
      before the operation at [cut], if it comes. It returns the trace, the
      outcome, and the unsynced changes the cut lost. *)
-  let phase ~kept_going ~trace ~ctl ~faults ~cut ~stop fs f =
+  let phase ~kept_going ~trace ~ctl ~faults ~cut ~cut_op ~seqs ~stop fs f =
     let num = numberer () and pending = ref faults in
     let after = ref 0 and lost = ref [] and run_sw = ref None in
     let hook (mop : M.Op.t) =
       let op = num mop in
-      if not (M.Crash.is_crashed ctl) then
-        begin match cut with
+      if not (M.Crash.is_crashed ctl) then begin
+        seqs := (M.Crash.seq ctl, op.index) :: !seqs;
+        match cut with
         | Some p when Plan.at p op ->
+            cut_op := Some op;
             lost := M.Crash.unsynced ctl;
             M.Crash.crash ctl;
             stop := !run_sw
         | _ -> ()
-        end;
+      end;
       if M.Crash.is_crashed ctl then begin
         (* The operation the cut falls before, and every one after, is
            cancelled; once every fiber waits, so is the run. One that catches
@@ -695,6 +706,7 @@ module Crash = struct
     let acked = ref [] and acked_at = ref [] in
     let trace = ref [] and rtrace = ref [] in
     let lost = ref [] and left = ref [] in
+    let cut_op = ref None and seqs = ref [] in
     let kept_run = ref false and kept_recover = ref false in
     let recovering = ref false in
     (* A cut stops the run, as nothing runs after a power cut: once every
@@ -720,7 +732,7 @@ module Crash = struct
         let fs = M.Crash.wrap ctl base in
         let out, l =
           phase ~kept_going:kept_run ~trace ~ctl ~faults:s.cfaults ~cut:s.cut
-            ~stop fs (fun fs ->
+            ~cut_op ~seqs ~stop fs (fun fs ->
               run
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then begin
@@ -750,7 +762,7 @@ module Crash = struct
             recovering := true;
             let rout, _ =
               phase ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~faults:[]
-                ~cut:rcut ~stop rfs (fun fs ->
+                ~cut:rcut ~cut_op:(ref None) ~seqs:(ref []) ~stop rfs (fun fs ->
                   recover ~acked (env_of clock mono fs))
             in
             match (rout, s.rcut) with
@@ -773,6 +785,8 @@ module Crash = struct
     in
     {
       trace = List.rev !trace;
+      cut_op = !cut_op;
+      seqs = !seqs;
       rtrace = ops (List.rev !rtrace);
       acked_at = List.rev !acked_at;
       lost = !lost;
@@ -813,24 +827,49 @@ module Crash = struct
            share of the tier"
           (Plan.state_key st)
 
-  let cut_text = function
+  let cut_text ?at = function
     | None -> "at the end"
-    | Some p -> "before " ^ Plan.pos_text p
+    | Some p -> "before " ^ Plan.pos_text ?at p
+
+  (* A change, numbered by the operation that made it, as the trace shows
+     it. *)
+  let change_text seqs (u : unsynced) =
+    let n =
+      match List.find_opt (fun (s, _) -> s < u.seq) seqs with
+      | Some (_, i) -> Fmt.str "#%d " i
+      | None -> ""
+    in
+    match u.kind with
+    | Data -> Fmt.str "%swrite %s@%d+%d" n u.path u.offset u.length
+    | Truncate -> Fmt.str "%struncate %s to %d" n u.path u.offset
+    | Create -> Fmt.str "%screate %s" n u.path
+    | Mkdir -> Fmt.str "%smkdir %s" n u.path
+    | Unlink -> Fmt.str "%sunlink %s" n u.path
+    | Rmdir -> Fmt.str "%srmdir %s" n u.path
+    | Symlink { target } -> Fmt.str "%ssymlink %s -> %s" n u.path target
+    | Rename { dest } -> Fmt.str "%srename %s to %s" n u.path dest
+    | Chmod { perm } -> Fmt.str "%schmod %s %o" n u.path perm
+    | Chown { uid; gid } -> Fmt.str "%schown %s %Ld:%Ld" n u.path uid gid
 
   let lines (s : Plan.crash) (r : result) =
+    let at p =
+      match r.cut_op with
+      | Some op when Plan.at p op -> Some op
+      | _ -> List.find_opt (Plan.at p) (ops r.trace)
+    in
     [
-      ("cut", Fmt.str "%s, %s" (cut_text s.cut) (state_text s.state));
-      ("faults", Plan.faults_text s.cfaults);
+      ("cut", Fmt.str "%s, %s" (cut_text ~at s.cut) (state_text s.state));
+      ("faults", Plan.faults_text ~at s.cfaults);
       ( "recovery",
         match s.rcut with
         | None -> ""
         | Some (j, st) ->
-            Fmt.str "cut %s of recover, %s, then recover again" (cut_text j)
+            Fmt.str "cut in recover %s, %s, then recover again" (cut_text j)
               (state_text st) );
       ("acked", acked_text r.acked_at);
       (* What the cut may have lost: all of it, none of it, or some. *)
       (let changes =
-         Fmt.str "%a" Fmt.(list ~sep:(any "; ") pp_unsynced) r.lost
+         String.concat "; " (List.map (change_text r.seqs) r.lost)
        in
        match s.state with
        | Drop -> ("lost", changes)

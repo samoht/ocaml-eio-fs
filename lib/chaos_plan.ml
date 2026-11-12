@@ -19,6 +19,7 @@ module Op = struct
     nth : int;
     file_offset : int;
     length : int;
+    dest : string option;
   }
 
   let kind_name : kind -> string = function
@@ -39,6 +40,8 @@ module Op = struct
           t.file_offset t.length
     | `Truncate ->
         Fmt.pf ppf "#%d truncate %s to %d" t.index t.path t.file_offset
+    | `Change when Option.is_some t.dest ->
+        Fmt.pf ppf "#%d rename %s to %s" t.index t.path (Option.get t.dest)
     | k -> Fmt.pf ppf "#%d %s %s" t.index (kind_name k) t.path
 end
 
@@ -72,7 +75,23 @@ type pos = { kind : Op.kind; path : string; nth : int }
 let pos_of (op : Op.t) = { kind = op.kind; path = op.path; nth = op.nth }
 let at p (op : Op.t) = op.kind = p.kind && op.path = p.path && op.nth = p.nth
 let pos_key p = Fmt.str "%s:%s#%d" (Op.kind_name p.kind) p.path p.nth
-let pos_text p = Fmt.str "%s %s #%d" (Op.kind_name p.kind) p.path p.nth
+
+let ordinal n =
+  let suffix =
+    match (n mod 100, n mod 10) with
+    | (11 | 12 | 13), _ -> "th"
+    | _, 1 -> "st"
+    | _, 2 -> "nd"
+    | _, 3 -> "rd"
+    | _ -> "th"
+  in
+  string_of_int n ^ suffix
+
+let pos_text ?(at = fun _ -> None) p =
+  match at p with
+  | Some op -> Fmt.str "%a" Op.pp op
+  | None ->
+      Fmt.str "the %s %s of %s" (ordinal p.nth) (Op.kind_name p.kind) p.path
 
 type trace = Op.t list
 
@@ -212,22 +231,25 @@ let faults_key = function
       String.concat "+"
         (List.map (fun (p, f) -> pos_key p ^ "." ^ Fault.key f) fs)
 
-let faults_text = function
+let faults_text ?at = function
   | [] -> "none"
   | fs ->
       String.concat "; then "
-        (List.map (fun (p, f) -> Fmt.str "%s %a" (pos_text p) Fault.pp f) fs)
+        (List.map
+           (fun (p, f) -> Fmt.str "%s %a" (pos_text ?at p) Fault.pp f)
+           fs)
 
 let check_key s =
   match s.lasting with
   | Some (l, p) -> Fmt.str "from:%s.%s" (pos_key p) (lasting_name l)
   | None -> faults_key s.faults
 
-let check_text s =
+let check_text ?at s =
   match s.lasting with
   | Some (l, p) ->
-      Fmt.str "the filesystem is %s from %s on" (lasting_text l) (pos_text p)
-  | None -> faults_text s.faults
+      Fmt.str "the filesystem is %s from %s on" (lasting_text l)
+        (pos_text ?at p)
+  | None -> faults_text ?at s.faults
 
 (* {1 Crash.check} *)
 
