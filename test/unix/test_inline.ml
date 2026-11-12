@@ -114,8 +114,23 @@ let test_open_out () =
         [ false; true ])
     creates
 
+let strings_r = Alcotest.(result (list string) string)
+
+(* The listing of a directory, a file, a link to one, a dangling link and a
+   missing name: the same names, or the same error. *)
+let test_read_dir () =
+  with_tree @@ fun ~fs ~inline path ->
+  List.iter
+    (fun name ->
+      let listing root () = Eio.Path.read_dir Eio.Path.(root / path name) in
+      Alcotest.check strings_r
+        (Fmt.str "read_dir %s" name)
+        (outcome (listing fs))
+        (outcome (listing inline)))
+    (names @ [ "" ])
+
 (* Everything else is the root's own: a directory opened from it, a rename
-   on it, the listing of a directory. *)
+   on it. *)
 let test_rest () =
   with_tree @@ fun ~fs:_ ~inline path ->
   Eio.Switch.run @@ fun sw ->
@@ -147,6 +162,7 @@ let test_no_hop () =
          (fun () ->
            ignore (Eio.Path.stat ~follow:true Eio.Path.(root / path "file"));
            Eio.Path.with_open_in Eio.Path.(root / path "file") ignore;
+           ignore (Eio.Path.read_dir Eio.Path.(root / path "dir"));
            !ran)
          (fun () -> ran := true))
   in
@@ -159,6 +175,7 @@ let suite =
       Alcotest.test_case "stat" `Quick test_stat;
       Alcotest.test_case "open_in" `Quick test_open_in;
       Alcotest.test_case "open_out" `Quick test_open_out;
+      Alcotest.test_case "read_dir" `Quick test_read_dir;
       Alcotest.test_case "the root's other calls" `Quick test_rest;
       Alcotest.test_case "no system-thread hop" `Quick test_no_hop;
     ] )
