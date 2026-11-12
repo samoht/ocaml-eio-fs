@@ -1022,9 +1022,12 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
   let tree = (Dir.fs dir_fd).tree in
   let old_w, old_name, old_slash = Filesystem.locate_from dir_fd old_path in
   let new_w, new_name, new_slash = Filesystem.locate_from new_dir new_path in
-  (* rename(2) answers EINVAL or EBUSY for a last [.] or [..]. *)
-  if is_dot old_name || is_dot new_name then
-    Error.err ("rename: invalid argument: " ^ new_path);
+  (* rename(2) answers EBUSY for a last [.] or [..], or EEXIST for the
+     target's when it must not replace it. *)
+  let busy path = Error.err ("rename: device or resource busy: " ^ path) in
+  if is_dot old_name then busy old_path;
+  if is_dot new_name then
+    if replace then busy new_path else Error.already_exists new_path;
   (* Both lookups need search permission before the source must exist. *)
   Filesystem.search new_w new_name;
   (* Rename the directory entry itself. In particular, a symlink's target need
