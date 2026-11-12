@@ -31,11 +31,6 @@ assert (Eio.Path.load Eio.Path.(fs / "hello") = "world")
 `Eio_fs.Fs.load dir` returns a new in-memory filesystem holding a copy of the
 tree at `dir`. `Eio_fs.Path.pp_tree` prints a tree on any backend.
 
-The in-memory filesystem resolves a path one component at a time, as
-path_resolution(7) describes, while eio_posix rewrites `x/.` and `x/d/..`
-lexically before the kernel sees them, so the two may answer such a path
-differently.
-
 ## Chaos tests
 
 `Eio_fs.Chaos.check` runs a workload many times on fresh in-memory
@@ -210,6 +205,43 @@ assert (
 - `eio-fs.unix` binds POSIX calls that Eio and `Unix` lack, such as advisory
   locks and extended attributes.
 - `eio-fs.path` does lexical operations on path strings.
+
+## Limitations
+
+- The crash model is ext4 with `data=writeback`, not APFS: on macOS, sync
+  through `Eio_fs_unix.barrier`, which uses `F_FULLFSYNC`.
+- Stale data in a new block comes only from the same offset of a freed block,
+  where ext4 may use any offset: checksum what you read back.
+- A removed file that is still open frees its blocks at once, where ext4 waits
+  for its last close: a failure that needs its bytes in another file before
+  then may not happen on ext4.
+- A filesystem operation takes no time and no other fiber runs during it: to
+  test a race during a slow sync, force it with an `Eio_fs.Chaos.wrap` hook.
+- After a failed sync, a read sees the lost writes as still cached, never
+  evicted: do not trust a read after a failed sync.
+- Some two-fault bugs lie past the default budget: raise `~budget` in a longer
+  run, for instance from `CHAOS_BUDGET`.
+- A run of more than 10,000,000 scheduler turns or 100,000 filesystem
+  operations is refused as too large for a check, and so is a workload whose
+  linear tier needs more runs than the budget: shrink the workload, or raise
+  `~budget` for the last.
+- `Eio_fs.Chaos.check` never swaps a path for a symbolic link between a check
+  and its use: test that attack with `Eio_fs.Chaos.wrap` and
+  `Eio_fs.Chaos.Fault.Swap_symlink`.
+- An in-memory stat keeps no times, block count or link count: test code that
+  compares modification times on a disk.
+- The in-memory filesystem resolves paths as Linux does, while eio_posix
+  rewrites `x/.` and `x/d/..` lexically
+  ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)) and fails a
+  creating open with a trailing slash differently
+  ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)): avoid such
+  paths in code that runs on both.
+- An absolute symbolic link is followed through the root `Eio_fs.Fs.v`
+  returns, where eio_posix refuses it: use relative link targets.
+- `fs.protected_symlinks` is modelled as on, as systemd sets it: in a sticky
+  directory others may write, such as `/tmp`, a link is followed only by its
+  owner or the directory's. Code that relies on following such a link fails
+  here, as it does on most Linux systems.
 
 ## Licence
 
