@@ -549,6 +549,60 @@ let test_perm_sticky () =
   Eio.Path.unlink (fs / "tmp" / "b");
   Alcotest.(check (list string)) "empty" [] (Eio.Path.read_dir (fs / "tmp"))
 
+(* fs.protected_symlinks, 1 on Linux distributions: a link in a sticky
+   world-writable directory is followed, as the last component, only by its
+   owner or when the directory's owner owns it, root included. An
+   intermediate link, lstat and readlink are unaffected. *)
+let test_protected_symlinks () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o777 (fs / "tmp");
+  Eio.Path.chmod ~follow:false ~perm:0o1777 (fs / "tmp");
+  Eio.Path.mkdir ~perm:0o777 (fs / "open");
+  Eio.Path.chmod ~follow:false ~perm:0o777 (fs / "open");
+  Eio.Path.save ~create:(`Exclusive 0o666) (fs / "target") "t";
+  Eio.Path.mkdir ~perm:0o755 (fs / "d");
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "d" / "f") "f";
+  let as_alice = Eio_fs.Fs.as_user alice fs in
+  let as_bob = Eio_fs.Fs.as_user bob fs in
+  Eio.Path.symlink ~link_to:"/target" (as_alice / "tmp" / "l");
+  Eio.Path.symlink ~link_to:"/d" (as_alice / "tmp" / "ld");
+  Eio.Path.symlink ~link_to:"/new" (as_alice / "tmp" / "lw");
+  Eio.Path.symlink ~link_to:"/target" (fs / "tmp" / "rootl");
+  Eio.Path.symlink ~link_to:"/target" (as_alice / "open" / "l");
+  List.iter
+    (fun (who, d) ->
+      denied (who ^ " opens") (fun () ->
+          ignore (Eio.Path.load (d / "tmp" / "l") : string));
+      denied (who ^ " stats") (fun () ->
+          ignore (Eio.Path.stat ~follow:true (d / "tmp" / "l")));
+      denied (who ^ " creates through it") (fun () ->
+          Eio.Path.save ~create:(`If_missing 0o644) (d / "tmp" / "lw") "x");
+      denied (who ^ " follows a trailing slash") (fun () ->
+          ignore (Eio.Path.read_dir (d / "tmp" / "ld/") : string list));
+      Alcotest.(check string)
+        (who ^ " through an intermediate link")
+        "f"
+        (Eio.Path.load (d / "tmp" / "ld" / "f"));
+      Alcotest.(check bool)
+        (who ^ " lstat") true
+        ((Eio.Path.stat ~follow:false (d / "tmp" / "l")).kind = `Symbolic_link);
+      Alcotest.(check string)
+        (who ^ " readlink") "/target"
+        (Eio.Path.read_link (d / "tmp" / "l"));
+      Alcotest.(check string)
+        (who ^ " a link the directory's owner owns")
+        "t"
+        (Eio.Path.load (d / "tmp" / "rootl"));
+      Alcotest.(check string)
+        (who ^ " a directory that is not sticky")
+        "t"
+        (Eio.Path.load (d / "open" / "l")))
+    [ ("root", fs); ("bob", as_bob) ];
+  Alcotest.(check string)
+    "the link's owner" "t"
+    (Eio.Path.load (as_alice / "tmp" / "l"))
+
 (* Listing a directory needs its read bit; looking a name up does not. *)
 let test_perm_read_dir () =
   with_env ~user:alice ~cwd:"/home/alice" @@ fun env ->
@@ -1441,6 +1495,8 @@ let suite =
       Alcotest.test_case "permissions: directory write" `Quick
         test_perm_dir_write;
       Alcotest.test_case "permissions: sticky bit" `Quick test_perm_sticky;
+      Alcotest.test_case "Linux: protected symlinks" `Quick
+        test_protected_symlinks;
       Alcotest.test_case "permissions: read a directory" `Quick
         test_perm_read_dir;
       Alcotest.test_case "permissions: owner, group, others" `Quick
