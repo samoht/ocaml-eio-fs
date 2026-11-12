@@ -794,6 +794,30 @@ let test_linux_rename_dots () =
          exclusive "w/p/." "w/z";
        ])
 
+(* In a directory the user cannot write, Linux checks that permission
+   before the kinds: EACCES. *)
+let test_linux_permission_first () =
+  Eio_mock.Backend.run @@ fun () ->
+  let fs = Eio_fs.Fs.v () in
+  Eio.Path.mkdir ~perm:0o755 (fs / "ro");
+  List.iter (fun d -> Eio.Path.mkdir ~perm:0o755 (fs / "ro" / d)) [ "d"; "e" ];
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "ro/e/x") "x";
+  Eio.Path.save ~create:(`Exclusive 0o644) (fs / "ro/f") "f";
+  Eio.Path.symlink ~link_to:"d" (fs / "ro/l");
+  let a = Eio_fs.Fs.as_user alice fs in
+  Alcotest.(check (list string))
+    "errors"
+    [ "EACCES"; "EACCES"; "EACCES"; "EACCES"; "EACCES"; "EACCES" ]
+    (List.map errno
+       [
+         (fun () -> Eio.Path.rmdir (a / "ro/f"));
+         (fun () -> Eio.Path.rmdir (a / "ro/l"));
+         (fun () -> Eio.Path.rename (a / "ro/d") (a / "ro/e"));
+         (fun () -> Eio.Path.rename (a / "ro/f") (a / "ro/d"));
+         (fun () -> Eio.Path.rename (a / "ro/d") (a / "ro/f"));
+         (fun () -> Eio.Path.unlink (a / "ro/d"));
+       ])
+
 (* Linux: a setgid directory gives new entries its group, and new
    subdirectories its setgid bit; a chown, or a write by a user, clears the
    setuid and setgid bits of a file; a chmod by a user outside the file's
@@ -1371,6 +1395,8 @@ let suite =
         test_linux_eisdir;
       Alcotest.test_case "Linux: rename of a last . or .. is EBUSY" `Quick
         test_linux_rename_dots;
+      Alcotest.test_case "Linux: permission before kind" `Quick
+        test_linux_permission_first;
       Alcotest.test_case "permissions: setgid directories and privilege bits"
         `Quick test_perm_setgid_and_privileges;
       Alcotest.test_case "a directory barrier opens its directory" `Quick
