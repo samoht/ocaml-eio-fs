@@ -132,10 +132,11 @@ val check :
     A sector a write put bytes in, in a 4096-byte page the disk held nothing of,
     past the durable length or in a hole, may instead hold stale data: what the
     disk held there before, at the same place in a page a synced truncation of
-    the file freed, or in a file the cut removed, and else the byte ['7']. Of
-    the uncommitted directory changes, a prefix survives. A failed sync loses
-    the file's unsynced writes, as Linux does, though some of their sectors may
-    already be on disk; the page cache may keep them or evict them. *)
+    the file freed, or in a file removed before the cut or by it, and else the
+    byte ['7']. Of the uncommitted directory changes, a prefix survives. A
+    failed sync loses the file's unsynced writes, as Linux does, though some of
+    their sectors may already be on disk; the page cache may keep them or evict
+    them. *)
 module Crash : sig
   val check :
     ?budget:int ->

@@ -1281,6 +1281,9 @@ module Crash = struct
     mutable clears : metadata_entry Ids.t; (* the pending setuid clears *)
     by_attrs : (int64, metadata_entry Ids.t) Hashtbl.t;
     mutable snapshot : state option; (* the last whole snapshot *)
+    mutable snapped : Cstruct.t Inos.t;
+        (* The bytes of every file a whole snapshot held, by inode: once
+           removed, its blocks are free, even after the snapshot moved on. *)
     mutable durable : state option;
         (* The snapshot with the committed entries replayed over it, or
            [None] until it is built again. *)
@@ -2026,6 +2029,15 @@ module Crash = struct
     ctl.clears <- Ids.empty;
     Hashtbl.reset ctl.by_attrs
 
+  let snap ctl st =
+    ctl.snapshot <- Some st;
+    ctl.durable <- Some st;
+    ctl.snapped <-
+      fold_nodes
+        (fun _ n acc ->
+          match n with File f -> Inos.add f.ino f.data acc | _ -> acc)
+        [] st.tree ctl.snapped
+
   let commit_metadata ctl =
     let owner, root_path = root ctl in
     let st =
@@ -2033,8 +2045,7 @@ module Crash = struct
         (snapshot_at owner root_path)
         (locs_of ~root:(path_segments root_path) (locations ctl))
     in
-    ctl.snapshot <- Some st;
-    ctl.durable <- Some st;
+    snap ctl st;
     reset_journal ctl
 
   (* How the entry that made [ino] put it: where, as what, and the files it
@@ -2848,15 +2859,9 @@ module Crash = struct
              if Hashtbl.mem located id then acc else bytes_of fs.durable :: acc)
            ctl.known []
        and gone_nodes =
-         match ctl.snapshot with
-         | None -> []
-         | Some st ->
-             fold_nodes
-               (fun _ n acc ->
-                 match n with
-                 | File f when not (Inos.mem f.ino inos) -> f.data :: acc
-                 | _ -> acc)
-               [] st.tree []
+         Inos.fold
+           (fun ino data acc -> if Inos.mem ino inos then acc else data :: acc)
+           ctl.snapped []
        in
        removed := gone_files @ gone_nodes);
       restore_root owner root_path tree;
@@ -3700,6 +3705,7 @@ module Crash = struct
       clears = Ids.empty;
       by_attrs = Hashtbl.create 16;
       snapshot = None;
+      snapped = Inos.empty;
       durable = None;
       by_rel = Paths.empty;
       root_box = None;
@@ -3728,9 +3734,7 @@ module Crash = struct
     in
     ctl.root_box <- Some proot;
     ctl.admin <- Some admin;
-    let st = state_of (snapshot_at admin path) no_locs in
-    ctl.snapshot <- Some st;
-    ctl.durable <- Some st;
+    snap ctl (state_of (snapshot_at admin path) no_locs);
     (wrap_cdir ctl ~ino:None ~root:proot ~prefix:"" ~base, path)
 
   let crash ctl = do_crash ctl
