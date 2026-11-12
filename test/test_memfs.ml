@@ -321,6 +321,104 @@ let test_crash_times () =
   Alcotest.(check (list (float 0.))) "f, after" [ 2.; 2. ] (times (disk / "f"));
   Alcotest.(check (list (float 0.))) "the root, after" [ 1.; 1. ] (times disk)
 
+(* Absolute symbolic links, in memory and through eio_posix: the root
+   [Eio_fs.Fs.v] returns is [Eio.Stdenv.fs], which follows one from the
+   root, and a directory opened from it is confined, refusing to follow one
+   with [Permission_denied] in every operation that would. *)
+
+let outcome f =
+  match f () with
+  | v -> "ok " ^ v
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Permission_denied _), _) ->
+      "permission denied"
+  | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> "not found"
+  | exception Eio.Io _ -> "error"
+
+let kind p =
+  Fmt.str "%a" Eio.File.Stat.pp_kind (Eio.Path.stat ~follow:true p).kind
+
+let unit f () =
+  f ();
+  ""
+
+(* [dir] holds [abs], a link to the file [top ^ "/s/target"], and [absdir],
+   one to the directory [top ^ "/s/tdir"]. *)
+let ops (dir : _ Eio.Path.t) =
+  let p x = dir / x in
+  [
+    ("load", fun () -> Eio.Path.load (p "abs"));
+    ("stat", fun () -> kind (p "abs"));
+    ( "stat, not followed",
+      fun () ->
+        Fmt.str "%a" Eio.File.Stat.pp_kind
+          (Eio.Path.stat ~follow:false (p "abs")).kind );
+    ("read_link", fun () -> Filename.basename (Eio.Path.read_link (p "abs")));
+    ("save", unit (fun () -> Eio.Path.save ~create:`Never (p "abs") "T"));
+    ("chmod", unit (fun () -> Eio.Path.chmod ~follow:true ~perm:0o644 (p "abs")));
+    ("read_dir", fun () -> String.concat "," (Eio.Path.read_dir (p "absdir")));
+    ( "create below",
+      unit (fun () ->
+          Eio.Path.save ~create:(`Exclusive 0o644) (p "absdir/x") "x") );
+    ("stat below", fun () -> kind (p "absdir/x"));
+    ("unlink below", unit (fun () -> Eio.Path.unlink (p "absdir/x")));
+    ("mkdir below", unit (fun () -> Eio.Path.mkdir ~perm:0o755 (p "absdir/m")));
+    ("rmdir below", unit (fun () -> Eio.Path.rmdir (p "absdir/m")));
+    ( "symlink below",
+      unit (fun () -> Eio.Path.symlink ~link_to:"z" (p "absdir/y")) );
+    ( "rename below",
+      unit (fun () -> Eio.Path.rename (p "absdir/y") (p "absdir/y2")) );
+    ("unlink renamed", unit (fun () -> Eio.Path.unlink (p "absdir/y2")));
+    ( "open_dir",
+      unit (fun () ->
+          Eio.Switch.run @@ fun sw ->
+          ignore (Eio.Path.open_dir ~sw (p "absdir"))) );
+  ]
+
+let run_ops dir = List.map (fun (n, f) -> n ^ ": " ^ outcome f) (ops dir)
+
+(* What [fs] at [top], and a directory opened there, answer. *)
+let answers fs top =
+  let s = fs / (top ^ "/s") in
+  Eio.Path.mkdirs ~exists_ok:true ~perm:0o755 s;
+  Eio.Path.save ~create:(`Exclusive 0o644) (s / "target") "T";
+  Eio.Path.mkdir ~perm:0o755 (s / "tdir");
+  Eio.Path.symlink ~link_to:(top ^ "/s/target") (s / "abs");
+  Eio.Path.symlink ~link_to:(top ^ "/s/tdir") (s / "absdir");
+  let unconfined = run_ops s in
+  let confined =
+    Eio.Switch.run @@ fun sw -> run_ops (Eio.Path.open_dir ~sw s)
+  in
+  (unconfined, confined)
+
+let test_as_eio_posix () =
+  Eio_posix.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let top = Filename.temp_file "eio-fs-absolute-link" "" in
+  Sys.remove top;
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / top))
+  @@ fun () ->
+  let posix = answers fs top in
+  let mem = answers (Eio_fs.Fs.v ()) top in
+  let check what (p, m) = Alcotest.(check (list string)) what p m in
+  check "Eio.Stdenv.fs and the root" (fst posix, fst mem);
+  check "an opened directory" (snd posix, snd mem);
+  let ok s =
+    match String.index_opt s ':' with
+    | Some i ->
+        String.starts_with ~prefix:": ok" (String.sub s i (String.length s - i))
+    | None -> false
+  in
+  Alcotest.(check (list string))
+    "the root follows" []
+    (List.filter (fun s -> not (ok s)) (fst mem));
+  Alcotest.(check (list string))
+    "an opened directory refuses to follow"
+    [ "stat, not followed"; "read_link" ]
+    (List.filter_map
+       (fun s ->
+         if ok s then Some (List.hd (String.split_on_char ':' s)) else None)
+       (snd mem))
+
 let suite =
   ( "memfs",
     [
@@ -336,4 +434,5 @@ let suite =
         test_freshness_under_check;
       Alcotest.test_case "a power cut keeps the times the disk kept" `Quick
         test_crash_times;
+      Alcotest.test_case "absolute links as eio_posix" `Quick test_as_eio_posix;
     ] )
