@@ -140,6 +140,17 @@ let rec grant_owner p =
       | exception Eio.Io _ -> ())
   | _ | (exception Eio.Io _) -> ()
 
+let rec revoke_writes p =
+  let stat = Eio.Path.stat ~follow:false p in
+  (match stat.kind with
+  | `Symbolic_link | `Regular_file -> ()
+  | `Directory ->
+      List.iter (fun n -> revoke_writes Eio.Path.(p / n)) (Eio.Path.read_dir p)
+  | _ ->
+      Fmt.failwith "%a is not a file, directory or symbolic link" Eio.Path.pp p);
+  if stat.kind <> `Symbolic_link && stat.perm land 0o222 <> 0 then
+    Eio.Path.chmod ~follow:false ~perm:(stat.perm land lnot 0o222) p
+
 type extent = { logical : int; physical : int; length : int }
 
 external seek_data_native : Unix.file_descr -> int -> int option

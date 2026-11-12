@@ -120,6 +120,16 @@ val grant_owner : _ Eio.Path.t -> unit
     it is, for the removal to name; a [p] that is missing or not a directory is
     left alone. It costs a stat per entry and a listing per directory. *)
 
+val revoke_writes : _ Eio.Path.t -> unit
+(** [revoke_writes p] removes every write bit from the file or directory [p] and
+    from each file and directory under it. An entry that has none is left as it
+    is, since a chmod moves its change time even to the same mode, and a
+    symbolic link is neither followed nor changed. It costs a stat per entry and
+    a listing per directory.
+
+    @raise Failure naming an entry that is no file, directory or symbolic link.
+    @raise Eio.Io when an entry cannot be read or changed. *)
+
 (** {1:files Files over a descriptor} *)
 
 val pread :
