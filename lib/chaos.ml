@@ -596,6 +596,8 @@ module Crash = struct
 
   let name = "Eio_fs.Chaos.Crash.check"
 
+  (* The draws a state makes go to [trail], each with the choice it names,
+     out of range or not, and how many it had. *)
   let policy_of trail : Plan.state -> M.Crash.policy = function
     | Drop -> Drop_unsynced
     | Keep -> Survive (fun _ -> true)
@@ -605,12 +607,20 @@ module Crash = struct
           (fun n ->
             let c = if !pos < Array.length v then v.(!pos) else 0 in
             incr pos;
-            let c = if c < n then c else 0 in
             trail := (c, n) :: !trail;
-            c)
+            if c < n then c else 0)
     | Seed s ->
         let rng = Random.State.make [| s |] in
         Choose (fun n -> Random.State.int rng n)
+
+  (* Whether the cut allows [st], given the draws it made: no choice out of
+     range, and no choice for a draw it did not make. *)
+  let allows (st : Plan.state) trail =
+    match st with
+    | Enum v ->
+        List.for_all (fun (c, n) -> c < n) trail
+        && List.length v <= List.length trail
+    | Drop | Keep | Seed _ -> true
 
   type result = {
     trace : run_trace;
@@ -619,6 +629,7 @@ module Crash = struct
     lost : unsynced list;
     left : string list;
     trail : (int * int) list;
+    allowed : bool;
     error : error option;
   }
 
@@ -680,7 +691,7 @@ module Crash = struct
     (outcome, !lost)
 
   let exec ~setup run ~recover (s : Plan.crash) =
-    let trail = ref [] in
+    let trail = ref [] and rtrail = ref [] in
     let acked = ref [] and acked_at = ref [] in
     let trace = ref [] and rtrace = ref [] in
     let lost = ref [] and left = ref [] in
@@ -732,8 +743,7 @@ module Crash = struct
             let rctl, rcut =
               match s.rcut with
               | Some (j, st) ->
-                  ( M.Crash.v ~policy:(policy_of (ref []) st) ~block_size:512 (),
-                    j )
+                  (M.Crash.v ~policy:(policy_of rtrail st) ~block_size:512 (), j)
               | None -> (M.Crash.v ~policy:Drop_unsynced (), None)
             in
             let rfs = M.Crash.wrap rctl base in
@@ -768,6 +778,11 @@ module Crash = struct
       lost = !lost;
       left = !left;
       trail = !trail;
+      allowed =
+        allows s.state !trail
+        && Option.fold ~none:true
+             ~some:(fun (_, st) -> allows st !rtrail)
+             s.rcut;
       error;
     }
 
@@ -937,6 +952,7 @@ module Crash = struct
               | None -> None)
         in
         match found with
+        | Some (s, _) when not (exec s).allowed -> no_longer name ~hash r
         | Some (s, tier) -> ignore (attempt ?matched tier s)
         | None -> no_longer name ~hash r)
     | None ->
