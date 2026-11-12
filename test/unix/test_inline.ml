@@ -116,8 +116,14 @@ let test_open_out () =
 
 let strings_r = Alcotest.(result (list string) string)
 
+let pp_entry ppf ((kind : Eio.File.Stat.kind), name) =
+  Fmt.pf ppf "%s %a" name Eio.File.Stat.pp_kind kind
+
+let entries_r = Alcotest.(result (list (testable pp_entry ( = ))) string)
+
 (* The listing of a directory, a file, a link to one, a dangling link and a
-   missing name: the same names, or the same error. *)
+   missing name, names alone and with their kinds: the same entries, or the
+   same error. *)
 let test_read_dir () =
   with_tree @@ fun ~fs ~inline path ->
   List.iter
@@ -126,7 +132,14 @@ let test_read_dir () =
       Alcotest.check strings_r
         (Fmt.str "read_dir %s" name)
         (outcome (listing fs))
-        (outcome (listing inline)))
+        (outcome (listing inline));
+      let entries root () =
+        Eio.Path.read_dir_entries Eio.Path.(root / path name)
+      in
+      Alcotest.check entries_r
+        (Fmt.str "read_dir_entries %s" name)
+        (outcome (entries fs))
+        (outcome (entries inline)))
     (names @ [ "" ])
 
 (* Everything else is the root's own: a directory opened from it, a rename
@@ -163,6 +176,7 @@ let test_no_hop () =
            ignore (Eio.Path.stat ~follow:true Eio.Path.(root / path "file"));
            Eio.Path.with_open_in Eio.Path.(root / path "file") ignore;
            ignore (Eio.Path.read_dir Eio.Path.(root / path "dir"));
+           ignore (Eio.Path.read_dir_entries Eio.Path.(root / path "dir"));
            !ran)
          (fun () -> ran := true))
   in
