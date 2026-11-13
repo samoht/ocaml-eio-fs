@@ -28,10 +28,11 @@ val full_fsync : Unix.file_descr -> unit
 val sync_dir : _ Eio.Path.t -> unit
 (** [sync_dir dir] makes [dir]'s entries durable: the barrier a commit protocol
     issues after renaming a file into place. A backend that registers a
-    {!Eio_fs_sync.Dir_sync} answers through it; a plain POSIX directory is
-    opened and {!full_fsync}ed on the descriptor that open returns, which
-    resolves every component beneath [dir]'s capability, off the calling fiber's
-    thread. A directory whose handle carries no descriptor takes
+    {!Eio_fs_sync.Dir_sync} answers through it, asked for a full barrier, so
+    [Eio_fs.Chaos.Crash] under [~os:`Macos] keeps what it commits; a plain POSIX
+    directory is opened and {!full_fsync}ed on the descriptor that open returns,
+    which resolves every component beneath [dir]'s capability, off the calling
+    fiber's thread. A directory whose handle carries no descriptor takes
     {!Eio_fs_sync.sync_dir}, and raises as it does.
 
     @raise Eio.Io
@@ -41,11 +42,11 @@ val sync_dir : _ Eio.Path.t -> unit
 val sync_file : _ Eio.File.rw -> unit
 (** [sync_file file] makes [file]'s data durable: the barrier a commit protocol
     issues over the bytes it wrote. A backend that registers a
-    {!Eio_fs_sync.File_sync} answers through it, which is asked before any
-    descriptor [file] carries, so a model of power loss observes the barrier; a
-    plain POSIX file is {!full_fsync}ed on its descriptor, off the calling
-    fiber's thread. A file with neither takes {!Eio_fs_sync.sync_file}, and
-    raises as it does.
+    {!Eio_fs_sync.File_sync} answers through it, asked for a full barrier and
+    before any descriptor [file] carries, so a model of power loss observes the
+    barrier; a plain POSIX file is {!full_fsync}ed on its descriptor, off the
+    calling fiber's thread. A file with neither takes {!Eio_fs_sync.sync_file},
+    and raises as it does.
 
     @raise Eio.Io as [fsync] fails, or as a registered barrier raises. *)
 
