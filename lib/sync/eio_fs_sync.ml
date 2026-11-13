@@ -239,11 +239,16 @@ let tmp_sequence = Atomic.make 0
 (* What a name made beside a target keeps of the target's name. A long one is
    cut at a character boundary and given the digest of the whole, so two names
    cut alike stay apart and the longest suffix, 36 bytes, still fits NAME_MAX:
-   255 bytes, or 255 UTF-16 units, which a byte count bounds. *)
+   255 bytes, or 255 UTF-16 units, which a byte count bounds. Only the last
+   component of a relative path is cut, so the name stays in its directory. *)
 let max_stem = 200
 
-let stem name =
-  if String.length name <= max_stem then name
+let stem path =
+  let base =
+    match String.rindex_opt path '/' with Some i -> i + 1 | None -> 0
+  in
+  let name = String.sub path base (String.length path - base) in
+  if String.length name <= max_stem then path
   else
     let digest = String.sub (Digest.to_hex (Digest.string name)) 0 16 in
     let room = max_stem - String.length digest - 1 in
@@ -251,7 +256,7 @@ let stem name =
       let next = i + Uchar.utf_decode_length (String.get_utf_8_uchar name i) in
       if next > room then i else cut next
     in
-    String.sub name 0 (cut 0) ^ "~" ^ digest
+    String.sub path 0 base ^ String.sub name 0 (cut 0) ^ "~" ^ digest
 
 let fresh_name name =
   let n = Atomic.fetch_and_add tmp_sequence 1 in

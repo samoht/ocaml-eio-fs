@@ -206,8 +206,10 @@ val fresh_name : string -> string
     processes do only if they draw the same salt. [stem] is [name] when it holds
     at most 200 bytes; a longer one is cut at a character boundary and given a
     digest of the whole, so the result is a valid file name whenever [name] is.
-    It is exported for a store whose target name is unknown until its bytes are
-    read. The name is not itself the exclusion: open it with [`Exclusive]. *)
+    Of a relative path, only the last component is cut, so the result stays in
+    that path's directory. It is exported for a store whose target name is
+    unknown until its bytes are read. The name is not itself the exclusion: open
+    it with [`Exclusive]. *)
 
 module Rename = Rename
 (** Capability-dispatched exclusive rename and backend construction. *)
