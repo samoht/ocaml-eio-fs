@@ -1401,6 +1401,10 @@ module Crash = struct
         (* The handles open on each inode: ext4 frees a removed file's blocks
            at its last close. *)
     file_inos : (int, int64) Hashtbl.t; (* the inode of each file, by id *)
+    os : [ `Linux | `Macos ];
+    mutable queued : (unit -> unit) list;
+        (* The commits of the plain syncs a full one has not drained yet,
+           newest first: on macOS, fsync(2) stops in the drive's cache. *)
     pause : unit -> unit;
         (* The time a sync takes, after it took what it covers. *)
     mutable crashed : bool;
@@ -3121,6 +3125,7 @@ module Crash = struct
       if Option.is_none ctl.base then
         invalid_arg "Chaos.Crash: controller was never wrapped";
       ctl.crashed <- true;
+      ctl.queued <- [];
       Eio.Cancel.protect @@ fun () ->
       let data_rng =
         match ctl.policy with
@@ -3774,9 +3779,26 @@ module Crash = struct
      durable bytes, with the lost bytes in the blocks they dirty: a change
      lost to a failed barrier, or made around the wrapper, never becomes
      durable by itself. *)
-  let barrier ?(upto = max_int) ctl fs ~stat sync =
+  (* What a sync makes durable lands now, but on macOS only through a full
+     sync, F_FULLFSYNC: fsync(2) reaches the drive's cache, which a cut
+     loses. A full sync drains the plain ones before it, of any file. *)
+  let durable ctl ~full commit =
+    match ctl.os with
+    | `Linux -> commit ()
+    | `Macos when not full ->
+        ctl.effects <- ctl.effects + 1;
+        ctl.queued <- commit :: ctl.queued
+    | `Macos ->
+        let queued = List.rev ctl.queued in
+        ctl.queued <- [];
+        List.iter (fun f -> f ()) queued;
+        commit ()
+
+  let barrier ?(upto = max_int) ?(full = false) ctl fs ~stat sync =
     match sync () with
     | () ->
+        let st = stat () in
+        durable ctl ~full @@ fun () ->
         let young = split_young ctl fs ~upto in
         if
           fs.pending <> [] || fs.partial <> [] || Option.is_some fs.cache
@@ -3854,7 +3876,6 @@ module Crash = struct
           held;
         lose ctl fs;
         keep_young ctl fs young;
-        let st = stat () in
         fs.synced <- Some st;
         commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
@@ -3914,12 +3935,12 @@ module Crash = struct
     guard cf;
     upto
 
-  let sync_ro cf fs =
+  let sync_ro ~full cf fs =
     let upto = paused cf in
     match fs with
     | None -> commit_attrs cf.ctl ~ino:(file_ino cf)
     | Some fs ->
-        barrier ~upto cf.ctl fs
+        barrier ~upto ~full cf.ctl fs
           ~stat:(fun () -> Eio.File.stat cf.cro)
           (fun () -> sync_base ~full:false cf.cro)
 
@@ -3942,19 +3963,20 @@ module Crash = struct
       (fun (fs : fstate) -> Hashtbl.replace ctl.file_inos fs.id cf.cino)
       fs;
     Switch.on_release sw (fun () -> release cf);
-    let sync cf =
+    let sync ~full cf =
       match dir with
       | Some dir ->
           let upto = paused cf in
-          commit_dir_ino ~upto ctl dir
-      | None -> sync_ro cf fs
+          durable ctl ~full (fun () -> commit_dir_ino ~upto ctl dir)
+      | None -> sync_ro ~full cf fs
     in
     Eio.Resource.T
       ( cf,
         Eio.Resource.handler
           (Eio.Resource.bindings (Eio.File.Pi.ro (module Cro_impl))
           @ [
-              Eio.Resource.H (Eio_fs_sync.File_sync, fun cf ~full:_ -> sync cf);
+              Eio.Resource.H
+                (Eio_fs_sync.File_sync, fun cf ~full -> sync ~full cf);
               Eio.Resource.H
                 ( Sync_failed,
                   fun cf ~evict ->
@@ -4025,12 +4047,14 @@ module Crash = struct
        them. It commits this file's data and nothing else -- the directory
        entries a name lives in are the metadata journal's business, committed by
        [sync_metadata] or a registered [Dir_sync], as fsync(2) divides them. *)
-    let sync cf =
+    let sync_full ~full cf =
       let upto = paused cf in
       let fs = fstate_of cf in
-      barrier ~upto cf.ctl fs
+      barrier ~upto ~full cf.ctl fs
         ~stat:(fun () -> Eio.File.stat cf.cro)
         (fun () -> Eio.File.sync (writable cf))
+
+    let sync cf = sync_full ~full:false cf
 
     let truncate cf len =
       guard cf;
@@ -4065,7 +4089,7 @@ module Crash = struct
                 fail_sync ~evict ~relive:(relive_by_handle cf) cf.ctl fs );
         ]
       (module Crw_impl)
-      ~barrier:(fun cf ~full:_ -> Crw_impl.sync cf)
+      ~barrier:(fun cf ~full -> Crw_impl.sync_full ~full cf)
       state ~base
 
   (* [dplace] is where this directory sits under the boxed directory the
@@ -4445,7 +4469,7 @@ module Crash = struct
        subtree itself is on the inode it opened, even once removed or
        replaced: it commits that directory's own entries. After the power cut it fails like every other
        operation. *)
-    let sync_dir d path =
+    let sync_dir ?(full = false) d path =
       if d.dctl.crashed then raise_power_lost ();
       let upto = d.dctl.seq in
       d.dctl.pause ();
@@ -4454,8 +4478,11 @@ module Crash = struct
          that the caller cannot read. *)
       Eio_fs_sync.sync_dir (d.dbase, path);
       match (d.dino, path_segments path) with
-      | Some ino, [] -> commit_dir_ino ~upto d.dctl ino
-      | _ -> commit_dir ~upto d.dctl ~dir:(resolve d (at d.dplace.prefix path))
+      | Some ino, [] ->
+          durable d.dctl ~full (fun () -> commit_dir_ino ~upto d.dctl ino)
+      | _ ->
+          let dir = resolve d (at d.dplace.prefix path) in
+          durable d.dctl ~full (fun () -> commit_dir ~upto d.dctl ~dir)
 
     let native d path =
       let (Base_dir ((module B), bv)) = d.dboxed in
@@ -4488,7 +4515,7 @@ module Crash = struct
         H (Eio_fs_sync.Modeless, fun d -> Eio_fs_sync.is_modeless d.dbase);
         H
           ( Eio_fs_sync.Dir_sync,
-            fun d ~path ~full:_ -> Cdir_impl.sync_dir d path );
+            fun d ~path ~full -> Cdir_impl.sync_dir ~full d path );
       ]
 
   let wrap_cdir ctl ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
@@ -4512,8 +4539,12 @@ module Crash = struct
   let v ?os ?(policy = Drop_unsynced) ?(trigger = Manual) ?(outside = Dropped)
       ?(block_size = 4096) ?(pause = ignore) () =
     if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
-    ignore os;
+    let os =
+      match os with Some `Macos -> `Macos | Some `Linux | None -> `Linux
+    in
     {
+      os;
+      queued = [];
       policy;
       trigger;
       outside;

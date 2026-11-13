@@ -213,9 +213,14 @@ assert (
 ### What a pass tells you
 
 A power-cut check models ext4 with `data=writeback`: unsynced writes may be
-lost, and directory changes reach the disk in program order. A pass holds for
-that model, not for APFS. On macOS, `fsync` stops at the drive's cache: pass
-`Eio_fs_unix.barrier` to `Eio_fs_sync` so that a sync reaches the disk.
+lost, and directory changes reach the disk in program order. With
+`~os:`Macos` it models APFS on a drive with a cache: `fsync`, as
+`Eio.File.sync` and the portable barriers of `Eio_fs_sync` issue it, stops in
+that cache and alone makes nothing durable, while `Eio_fs_unix.sync_file`,
+`Eio_fs_unix.sync_dir` and `Eio_fs_unix.barrier` are `F_FULLFSYNC` and do.
+Where the sources say nothing of APFS, it keeps ext4's rules, so it may leave
+a state APFS would not, never miss one it would. A program that runs on both
+checks under both.
 
 Where POSIX systems differ, the in-memory filesystem answers as Linux does,
 or, with `~os:`Macos`, as macOS does on its default APFS volume: a name

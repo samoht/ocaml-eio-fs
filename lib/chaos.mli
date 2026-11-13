@@ -200,7 +200,17 @@ val check :
     prefix survives. A failed sync loses the file's unsynced writes, as Linux
     does, though some of their sectors may already be on disk; the page cache
     may keep them or evict them. Before the cut, a read after a failed sync sees
-    them as kept, or, in a scenario of its own, as the disk holds them. *)
+    them as kept, or, in a scenario of its own, as the disk holds them.
+
+    {b macOS.} Under [~os:`Macos] the disk is APFS's, on a drive with a cache.
+    {!Eio.File.sync} and the portable barriers of {!Eio_fs_sync} are fsync(2),
+    which stops in that cache: alone, they make nothing durable. The barriers of
+    [eio-fs.unix] ([Eio_fs_unix.sync_file], [Eio_fs_unix.sync_dir],
+    [Eio_fs_unix.barrier]) are [F_FULLFSYNC]: each makes its file or directory
+    durable, and every fsync(2) before it, of any file. The rest is as above, as
+    no source rules it out on APFS: stale data included, though APFS writes its
+    metadata copy-on-write. So a cut may leave a state APFS would not, never
+    miss one it would. *)
 module Crash : sig
   val check :
     ?budget:int ->
