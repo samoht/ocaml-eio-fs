@@ -733,19 +733,40 @@ let test_errors_linux_returns () =
           P.with_open_out ~create:`Never P.(env#fs / "f") @@ fun f ->
           never [ "EACCES" ] (fun () -> Eio.Flow.copy_string "x" f)))
 
+(* A heap guard bounds the growth of the words live in the heap, as a full
+   major collection counts them, from a compacted start: what the program
+   loaded once is at both ends, and the free space each compiler's GC keeps
+   around it at neither. A count costs a full collection, so a guard counts
+   at every [every]th sample. *)
+module Heap = struct
+  type t = { base : int; every : int; mutable n : int; mutable top : int }
+
+  let live () = (Gc.stat ()).live_words
+
+  let v ?(every = 1) () =
+    Gc.compact ();
+    { base = live (); every; n = 0; top = 0 }
+
+  let sample t =
+    t.n <- t.n + 1;
+    if t.n mod t.every = 0 then t.top <- max t.top (live ())
+
+  let check t bound =
+    let grown = t.top - t.base in
+    if grown > bound then Alcotest.failf "the heap grew by %d words" grown
+end
+
 (* A check keeps no run's operations once it has drawn from them: the heap
    its runs see stays flat as the linear tier goes. *)
 let test_heap_stays_flat () =
-  Gc.compact ();
-  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let heap = Heap.v ~every:20 () in
   Eio_fs.Chaos.check (fun env ->
-      top := max !top (Gc.quick_stat ()).heap_words;
+      Heap.sample heap;
       for i = 1 to 30 do
         try Eio_fs_sync.save P.(env#fs / "k") (string_of_int i)
         with Eio.Io _ -> ()
       done);
-  let grown = !top - base in
-  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  Heap.check heap 1_000_000
 
 (* Ten thousand reads of one file: most are no structure, and the sampled
    tier spreads its runs over them. It builds only the scenarios it runs,
@@ -772,14 +793,12 @@ let test_sampled_heap () =
    100,000 operations. The check keeps only what the report shows, so the
    heap stays flat as the run goes, and the report is short. *)
 let test_busy_heap_stays_flat () =
-  Gc.compact ();
-  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let heap = Heap.v () in
   let report =
     Expect.report (fun () ->
         Eio_fs.Chaos.check (fun env ->
             let rec save n =
-              if n mod 100_000 = 0 then
-                top := max !top (Gc.quick_stat ()).heap_words;
+              if n mod 100_000 = 0 then Heap.sample heap;
               if n > 20_000_000 then failwith "the poll was not stopped";
               match
                 P.save ~create:(`Or_truncate 0o644) P.(env#fs / "f") "x"
@@ -794,16 +813,14 @@ let test_busy_heap_stays_flat () =
   Alcotest.(check string) "error" too_many_ops (Expect.field "error" report);
   let lines = List.length (String.split_on_char '\n' report) in
   if lines > 20 then Alcotest.failf "the report has %d lines" lines;
-  let grown = !top - base in
-  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  Heap.check heap 1_000_000
 
 (* Three fibers that stat a file every 1 ms for 100 s of clock: each stat
    is structural, so the linear tier needs more runs than the budget long
    before the first run ends. The first run stops there, and the heap stays
    flat. *)
 let test_first_run_stops_at_the_budget () =
-  Gc.compact ();
-  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let heap = Heap.v () in
   let stats = ref 0 in
   let report =
     Expect.report (fun () ->
@@ -812,8 +829,7 @@ let test_first_run_stops_at_the_budget () =
               (List.init 3 (fun _ () ->
                    while Eio.Time.now env#clock < 100. do
                      incr stats;
-                     if !stats mod 1000 = 0 then
-                       top := max !top (Gc.quick_stat ()).heap_words;
+                     if !stats mod 1000 = 0 then Heap.sample heap;
                      (try ignore (P.kind ~follow:true P.(env#fs / "x"))
                       with Eio.Io _ -> ());
                      Eio.Time.sleep env#clock 0.001
@@ -824,8 +840,7 @@ let test_first_run_stops_at_the_budget () =
       (String.starts_with ~prefix:"Eio_fs.Chaos.check: the linear tier needs"
          report)
   then Alcotest.failf "not refused by the budget: %s" report;
-  let grown = !top - base in
-  if grown > 1_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  Heap.check heap 1_000_000
 
 (* A recover that syncs [dirs] directories it did not change: those syncs
    commit nothing, so they are no cut, and the runs do not grow with them. *)
@@ -1016,8 +1031,7 @@ let test_read_poll_stops () =
    run stops at its operations. The heap stays flat. Its own bound, past
    that, fails the check when nothing stops the runs. *)
 let test_crash_stat_poll_stops () =
-  Gc.compact ();
-  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let heap = Heap.v () in
   let stats = ref 0 in
   Expect.refused
     ("Eio_fs.Chaos.Crash.check: the run with no cut failed: " ^ too_many_ops)
@@ -1030,28 +1044,25 @@ let test_crash_stat_poll_stops () =
                    incr stats;
                    if !stats > 3_000_000 then
                      failwith "the runs were not stopped";
-                   if !stats mod 1000 = 0 then
-                     top := max !top (Gc.quick_stat ()).heap_words;
+                   if !stats mod 1000 = 0 then Heap.sample heap;
                    (try ignore (P.kind ~follow:true P.(env#fs / "x"))
                     with Eio.Io _ -> ());
                    Eio.Time.sleep env#clock 0.001
                  done)))
         ~recover:(fun ~acked:_ env -> ignore (P.read_dir env#fs)))
     ();
-  let grown = !top - base in
-  if grown > 4_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  Heap.check heap 4_000_000
 
 (* The same for power cuts: a check keeps no run's operations once it has
    drawn from them, so the heap stays flat as runs go, and does not grow
    with the number of runs, nor, as it draws states, with the number of cuts
    times the draws each makes. *)
 let test_crash_heap_stays_flat () =
-  Gc.compact ();
-  let base = (Gc.quick_stat ()).heap_words and top = ref 0 in
+  let heap = Heap.v ~every:20 () in
   let n = 200 in
   Eio_fs.Chaos.Crash.check
     (fun ~ack env ->
-      top := max !top (Gc.quick_stat ()).heap_words;
+      Heap.sample heap;
       for i = 1 to n do
         try
           Eio_fs_sync.save P.(env#fs / Fmt.str "f%d" i) "x";
@@ -1059,14 +1070,13 @@ let test_crash_heap_stays_flat () =
         with Eio.Io _ -> ()
       done)
     ~recover:(fun ~acked env ->
-      top := max !top (Gc.quick_stat ()).heap_words;
+      Heap.sample heap;
       List.iter
         (fun i ->
           if P.load P.(env#fs / Fmt.str "f%d" i) <> "x" then
             Fmt.failwith "f%d lost" i)
         acked);
-  let grown = !top - base in
-  if grown > 2_000_000 then Alcotest.failf "the heap grew by %d words" grown
+  Heap.check heap 2_000_000
 
 (* A workload that catches the cut's cancellation keeps going. *)
 let test_kept_going () =
