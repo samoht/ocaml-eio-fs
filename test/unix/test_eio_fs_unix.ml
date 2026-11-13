@@ -889,13 +889,9 @@ let with_held_lock ~sw ~env ~lock fn =
       await_holder child)
     fn
 
-(* A wait for a lock another process holds is the kernel's blocking request
-   (POSIX fcntl F_SETLKW, "fcntl() shall wait until the request can be
-   satisfied"; flock(2) without LOCK_NB), which answers when the holder lets
-   go: the waiter asks once, says it waits once, and is granted at the
-   release, with no further ask. [take ~on_wait lock fn] is the acquisition
-   under test. The waiter's grant is read after the holder was told to let
-   go, and never before. *)
+(* A wait for a lock another process holds says it waits once and is granted
+   once the holder lets go, and never before. [take ~on_wait lock fn] is the
+   acquisition under test. *)
 let a_wait_answers_at_the_release ~kind take () =
   with_real_dir_env @@ fun env dir ->
   let lock = dir / "lock" in
@@ -1022,11 +1018,11 @@ let counting_waits f =
   let value = on_mono clock f in
   (value, !begun)
 
-(* A wait bounded by [`For] is the same kernel request, raced against its
-   bound: the waiter asks once, says it waits once, and is granted at the
-   release, having begun one wait on the monotonic clock, its bound's. The
-   clock never moves, so a wait that asked again on a cadence would begin a
-   second wait and never ask again. *)
+(* A record lock wait bounded by [`For] is the kernel's blocking request
+   (POSIX fcntl F_SETLKW), raced against its bound: the waiter asks once, says
+   it waits once, and is granted at the release, having begun one wait on the
+   monotonic clock, its bound's. The clock never moves, so a wait that asked
+   again on a cadence would begin a second wait and never ask again. *)
 let a_bounded_wait_answers_at_the_release ~kind take () =
   with_real_dir_env @@ fun env dir ->
   let lock = dir / "lock" in
@@ -1132,8 +1128,7 @@ let lease_free ~env:_ lock =
   Eio_fs_unix.Lease.with_exclusive ~block:`Yes lock (fun _ -> ())
 
 (* A lease wait cancelled in a domain of its own lets that domain end while
-   the holder still holds: the kernel's request it leaves behind holds no
-   join, so the domain ends at once and the holder lets go when told. A wait
+   the holder still holds, and the holder lets go when told. A wait
    that held the domain would end only once the holder let go at its own
    bound, which it answers as [`Exited 3]. *)
 let test_cancelled_lease_wait_ends_its_domain () =
@@ -1522,29 +1517,28 @@ let test_lock_asks_from_the_holder_leave_no_descriptor () =
   Alcotest.(check int)
     "descriptors open once the hold ends" before (open_descriptors ())
 
-(* Lease waits against another process's hold, ended by their [`For] bound or
-   by a cancel, leave no descriptor behind while the holder still holds; a
-   waiter is then granted once the holder lets go. *)
-let test_ended_lease_waits_leave_no_descriptor () =
+(* Waits against another process's hold, ended by their [`For] bound or by a
+   cancel, leave no descriptor behind while the holder still holds; a waiter
+   is then granted once the holder lets go. [take_for seconds lock fn] is the
+   bounded acquisition, [take] the unbounded one. *)
+let ended_waits_leave_no_descriptor ~kind ~take_for take () =
   with_real_dir_env @@ fun env dir ->
   let lock = dir / "lock" in
   Eio.Switch.run @@ fun sw ->
-  let _, release = holding_process ~sw ~env ~kind:"lease" ~lock in
+  let _, release = holding_process ~sw ~env ~kind ~lock in
   let bounded () =
-    match
-      Eio_fs_unix.Lease.with_exclusive ~block:(`For 0.01) lock (fun _ -> ())
-    with
-    | () -> Alcotest.fail "a lease another process holds was granted"
+    match take_for 0.01 lock ignore with
+    | () -> Alcotest.fail "a lock another process holds was granted"
     | exception Eio_fs_unix.Lock_unavailable _ -> ()
   in
   let cancelled () =
     let waiting, now_waiting = Eio.Promise.create () in
     Eio.Fiber.first
       (fun () ->
-        take_lease
+        take
           ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
           lock
-          (fun () -> Alcotest.fail "a lease another process holds was granted"))
+          (fun () -> Alcotest.fail "a lock another process holds was granted"))
       (fun () -> Eio.Promise.await waiting)
   in
   bounded ();
@@ -1559,7 +1553,7 @@ let test_ended_lease_waits_leave_no_descriptor () =
   let waiting, now_waiting = Eio.Promise.create () in
   let granted, now_granted = Eio.Promise.create () in
   Eio.Fiber.fork ~sw (fun () ->
-      take_lease
+      take
         ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
         lock
         (fun () -> Eio.Promise.resolve now_granted ()));
@@ -3549,14 +3543,23 @@ let suite =
       Alcotest.test_case "a cancelled lease wait ends its domain" `Quick
         test_cancelled_lease_wait_ends_its_domain;
       Alcotest.test_case "ended lease waits leave no descriptor" `Quick
-        test_ended_lease_waits_leave_no_descriptor;
+        (ended_waits_leave_no_descriptor ~kind:"lease"
+           ~take_for:(fun seconds lock fn ->
+             Eio_fs_unix.Lease.with_exclusive ~block:(`For seconds) lock
+               (fun _ -> fn ()))
+           take_lease);
+      Alcotest.test_case "ended record lock waits leave no descriptor" `Quick
+        (ended_waits_leave_no_descriptor ~kind:"record"
+           ~take_for:(fun seconds lock fn ->
+             Eio_fs_unix.with_lock ~block:(`For seconds) lock fn)
+           take_record);
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
       Alcotest.test_case "a bounded record lock wait answers at the release"
         `Quick
         (a_bounded_wait_answers_at_the_release ~kind:"record" take_record_for);
       Alcotest.test_case "a bounded lease wait answers at the release" `Quick
-        (a_bounded_wait_answers_at_the_release ~kind:"lease" take_lease_for);
+        (a_wait_answers_at_the_release ~kind:"lease" take_lease_for);
       Alcotest.test_case "a lease wait for a fiber says so" `Quick
         test_lease_wait_for_a_fiber_says_so;
       Alcotest.test_case "lock serializes fibers" `Quick

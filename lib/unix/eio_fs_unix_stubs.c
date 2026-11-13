@@ -53,115 +53,20 @@ CAMLprim value caml_eio_fs_is_darwin(value unit)
 #endif
 }
 
-/* Acquire a BSD flock. The opened file description owns this
-   lock, so a descriptor inherited by an execed supervisor keeps it held when
-   the acquiring process closes its copy. */
-CAMLprim value caml_eio_fs_flock(value fd_v, value mode_v, value nonblocking_v)
+/* Acquire a BSD flock without waiting (LOCK_NB). The opened file description
+   owns this lock, so a descriptor inherited by an execed supervisor keeps it
+   held when the acquiring process closes its copy. */
+CAMLprim value caml_eio_fs_flock(value fd_v, value mode_v)
 {
   int fd = Int_val(fd_v);
   /* OCaml flock_mode: Exclusive = 0, Shared = 1. */
-  int operation = (Int_val(mode_v) == 1 ? LOCK_SH : LOCK_EX)
-    | (Bool_val(nonblocking_v) ? LOCK_NB : 0);
+  int operation = (Int_val(mode_v) == 1 ? LOCK_SH : LOCK_EX) | LOCK_NB;
   caml_release_runtime_system();
   int r = flock(fd, operation);
   int saved_errno = errno;
   caml_acquire_runtime_system();
   if (r == -1)
     caml_unix_error(saved_errno, "flock", Nothing);
-  return Val_unit;
-}
-
-/* A blocking flock on a thread that runs no OCaml and that no one joins. A
-   request in the kernel cannot be withdrawn, so a caller that stops waiting
-   leaves the thread to its answer: it is detached, so it holds no domain's
-   or process's exit. It asks through a duplicate of the descriptor, which
-   shares its open file description and so the lock the kernel grants, then
-   writes the request's errno, 0 once granted, to the pipe whose read end the
-   caller holds, and closes the duplicate and its write end. A caller gone
-   leaves the write to fail, EPIPE with SIGPIPE blocked on this thread. */
-struct flock_wait {
-  int fd;
-  int notify;
-  int operation;
-};
-
-static void *flock_wait_run(void *arg)
-{
-  struct flock_wait *w = arg;
-  int r, err;
-  ssize_t n;
-  do
-    r = flock(w->fd, w->operation);
-  while (r == -1 && errno == EINTR);
-  err = r == -1 ? errno : 0;
-  do
-    n = write(w->notify, &err, sizeof err);
-  while (n == -1 && errno == EINTR);
-  close(w->fd);
-  close(w->notify);
-  free(w);
-  return NULL;
-}
-
-CAMLprim value caml_eio_fs_flock_wait_start(value fd_v, value shared_v)
-{
-  struct flock_wait *w;
-  int fds[2], copy, r;
-  pthread_t thread;
-  pthread_attr_t attr;
-  sigset_t all, previous;
-  if (pipe(fds) == -1)
-    caml_uerror("pipe", Nothing);
-  copy = fcntl(Int_val(fd_v), F_DUPFD_CLOEXEC, 0);
-  w = malloc(sizeof *w);
-  if (copy == -1 || w == NULL) {
-    int err = copy == -1 ? errno : ENOMEM;
-    if (copy != -1)
-      close(copy);
-    free(w);
-    close(fds[0]);
-    close(fds[1]);
-    caml_unix_error(err, "flock", Nothing);
-  }
-  fcntl(fds[0], F_SETFD, FD_CLOEXEC);
-  fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-  w->fd = copy;
-  w->notify = fds[1];
-  w->operation = Bool_val(shared_v) ? LOCK_SH : LOCK_EX;
-  pthread_attr_init(&attr);
-  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-  /* The thread takes no signal: the process's handlers belong to OCaml. */
-  sigfillset(&all);
-  pthread_sigmask(SIG_BLOCK, &all, &previous);
-  r = pthread_create(&thread, &attr, flock_wait_run, w);
-  pthread_sigmask(SIG_SETMASK, &previous, NULL);
-  pthread_attr_destroy(&attr);
-  if (r != 0) {
-    close(copy);
-    close(fds[0]);
-    close(fds[1]);
-    free(w);
-    caml_unix_error(r, "pthread_create", Nothing);
-  }
-  return Val_int(fds[0]);
-}
-
-/* Reads the answer of a flock wait whose pipe is readable: returns once the
-   lock is granted, raises the Unix error the request ended with otherwise.
-   The thread writes its answer whole, under PIPE_BUF, so one read takes it. */
-CAMLprim value caml_eio_fs_flock_wait_answer(value fd_v)
-{
-  int err;
-  ssize_t n;
-  do
-    n = read(Int_val(fd_v), &err, sizeof err);
-  while (n == -1 && errno == EINTR);
-  if (n == -1)
-    caml_uerror("read", Nothing);
-  if (n != sizeof err)
-    caml_unix_error(EIO, "flock", Nothing);
-  if (err != 0)
-    caml_unix_error(err, "flock", Nothing);
   return Val_unit;
 }
 

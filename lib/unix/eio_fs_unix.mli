@@ -412,9 +412,8 @@ val with_lock :
     and answers at the cancel, and [`For seconds] withdraws it at its bound.
     With [`Yes], [`Fibers] or [`For seconds], a lock a fiber of this process
     holds is waited for in this process, and [on_wait ()] is called before that
-    wait too. A wait for a BSD lease on Linux uses the cancellable wait of
-    {!Lease.with_exclusive}; the outstanding kernel request ends once granted,
-    with its private descriptor closed without entering [fn].
+    wait too. A wait for a BSD lease on Linux polls as {!Lease.with_exclusive}'s
+    does.
 
     [path] must be the lock's own regular file: a link, a directory, a FIFO, or
     a name that took the entry between resolution and open is refused with
@@ -592,17 +591,16 @@ module Lease : sig
       removed gate takes the file its name holds then.
 
       With [block] [`Yes] or [`For seconds], a lease another process holds is
-      waited for by the kernel's blocking [flock], which answers when that
-      process lets go: the lease is tried first, [on_wait ()] is called once if
-      it is held (it does nothing by default), and the wait follows, which
-      [`For seconds] answers at its bound if the holder has not let go by then.
-      With [`Yes], [`Fibers] or [`For seconds], a lease a fiber of this process
-      holds is waited for in this process, and [on_wait ()] is called before
-      that wait too. A cancelled wait answers at the cancel. [flock] is no
-      cancellation point, so its request stays with the kernel on a thread of
-      its own, which lets the lease go once granted; the lease belongs to the
-      open file description, which no other caller shares, so that grant takes
-      nothing from anyone.
+      waited for by polling: the lease is tried without waiting, [on_wait ()] is
+      called once if it is held (it does nothing by default), and it is tried
+      again after a sleep that starts at 1 ms and doubles up to 50 ms, until it
+      is granted or [`For seconds] reaches its bound. A waiter takes no place in
+      the kernel's queue, so waiters are not served in the order they arrived,
+      and a release is noticed up to 50 ms late. With [`Yes], [`Fibers] or
+      [`For seconds], a lease a fiber of this process holds is waited for in
+      this process, and [on_wait ()] is called before that wait too. A cancelled
+      wait answers at the cancel and, like a wait that reached its bound, leaves
+      no thread, descriptor or kernel request behind.
 
       Only a path backed by a native Unix descriptor can hold a lease. The path
       must name its own regular file; a link, directory, FIFO, or name changed

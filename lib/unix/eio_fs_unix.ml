@@ -10,17 +10,11 @@ let eio_unix_errors fn =
 
 type flock_mode = Exclusive | Shared
 
-external flock_native : Unix.file_descr -> flock_mode -> bool -> unit
+external flock_native : Unix.file_descr -> flock_mode -> unit
   = "caml_eio_fs_flock"
 
 external flock_unlock_native : Unix.file_descr -> unit
   = "caml_eio_fs_flock_unlock"
-
-external flock_wait_start : Unix.file_descr -> bool -> Unix.file_descr
-  = "caml_eio_fs_flock_wait_start"
-
-external flock_wait_answer : Unix.file_descr -> unit
-  = "caml_eio_fs_flock_wait_answer"
 
 external darwin_full_fsync : Unix.file_descr -> unit
   = "caml_eio_fs_darwin_full_fsync"
@@ -1241,64 +1235,52 @@ let open_keyed ~taken ~key open_rendezvous =
   (file, opened)
 
 module Flock = struct
-  let rec acquire ~shared fd ~nonblocking =
-    match
-      flock_native fd (if shared then Shared else Exclusive) nonblocking
-    with
+  let rec acquire ~shared fd =
+    match flock_native fd (if shared then Shared else Exclusive) with
     | () -> ()
-    | exception Unix.Unix_error (Unix.EINTR, _, _) ->
-        acquire ~shared fd ~nonblocking
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> acquire ~shared fd
 
-  let flock ~shared fd ~nonblocking =
+  let flock ~shared fd =
     Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
-        acquire ~shared fd ~nonblocking)
+        acquire ~shared fd)
 
-  (* The kernel's blocking [flock], which answers when the holder lets go, on a
-     thread of its own that runs no OCaml and that nothing joins
-     (flock_wait_start): a request in the kernel cannot be withdrawn, so a
-     cancelled caller leaves it to that thread and answers at once, and the
-     thread holds no exit. A lock granted after the cancel goes when the
-     caller's [fd] closes, since the thread asked through a duplicate. *)
-  let await_release ~shared fd =
-    let answer = flock_wait_start fd shared in
-    Fun.protect ~finally:(fun () -> Unix.close answer) @@ fun () ->
-    Eio_unix.await_readable answer;
-    flock_wait_answer answer
+  (* A wait polls: [flock] is no cancellation point and a blocking request
+     cannot be withdrawn, so each ask is non-blocking and a cancellable sleep
+     separates them, from 1 ms doubling to [poll_cap]. A cancel or a bound
+     then leaves nothing behind. *)
+  let poll_cap = 0.05
 
   let use_os_lock ~shared ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in
-    let ask ~nonblocking =
+    let ask () =
       Eio.Cancel.protect @@ fun () ->
-      match flock ~shared fd ~nonblocking with
+      match flock ~shared fd with
       | () -> acquired := true
       | exception
           Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
         ->
           ()
     in
-    (match patience with
-    | Wait ->
-        ask ~nonblocking:true;
-        if not !acquired then begin
-          on_wait ();
-          await_release ~shared fd;
-          acquired := true
-        end
-    | Refuse -> ask ~nonblocking:true
-    | Until lapsed ->
-        ask ~nonblocking:true;
-        if (not !acquired) && not (Eio.Promise.is_resolved (Lazy.force lapsed))
-        then begin
-          on_wait ();
-          acquired :=
-            Eio.Fiber.first
-              (fun () ->
-                await_release ~shared fd;
-                true)
-              (fun () ->
-                Eio.Promise.await (Lazy.force lapsed);
-                false)
-        end);
+    let rec poll delay =
+      Eio_unix.sleep delay;
+      ask ();
+      if not !acquired then poll (Float.min poll_cap (delay *. 2.))
+    in
+    ask ();
+    (if not !acquired then
+       match patience with
+       | Refuse -> ()
+       | Wait ->
+           on_wait ();
+           poll 0.001
+       | Until lapsed ->
+           if not (Eio.Promise.is_resolved (Lazy.force lapsed)) then begin
+             on_wait ();
+             (* A grant as the bound lapses is kept: [acquired] says so. *)
+             Eio.Fiber.first
+               (fun () -> poll 0.001)
+               (fun () -> Eio.Promise.await (Lazy.force lapsed))
+           end);
     if not !acquired then raise (refused ());
     fn ()
 end
