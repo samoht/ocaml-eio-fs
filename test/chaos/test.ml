@@ -7,4 +7,5 @@ let () =
       Test_guards.suite;
       Test_states.suite;
       Test_time.suite;
+      Test_env.suite;
     ]
