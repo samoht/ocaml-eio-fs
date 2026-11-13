@@ -106,6 +106,55 @@ let spellings () =
     ~recover:(fun ~acked env ->
       if acked <> [] && P.load P.(env#fs / "d/G") <> "v1" then failwith "lost")
 
+(* "v" written and synced with fsync(2), then synced again, which may fail,
+   then F_FULLFSYNC of another file, which drains the drive's queue: what
+   the first fsync flushed is durable, whatever the second did. With
+   [more], a write between the two is lost when the second fails. *)
+let flushed ?os ~more () =
+  Eio_fs.Chaos.Crash.check ?os
+    ~setup:(fun env ->
+      Eio_fs_sync.save P.(env#fs / "v") "";
+      Eio_fs_sync.save P.(env#fs / "g") "")
+    (fun ~ack env ->
+      match
+        P.with_open_out ~append:true ~create:`Never
+          P.(env#fs / "v")
+          (fun f ->
+            Eio.Flow.copy_string "one" f;
+            Eio.File.sync f;
+            if more then Eio.Flow.copy_string "two" f;
+            try Eio.File.sync f with Eio.Io _ -> ());
+        P.with_open_out ~create:`Never P.(env#fs / "g") Eio_fs_unix.sync_file
+      with
+      | () -> ack ()
+      | exception Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      if
+        acked <> []
+        && not (String.starts_with ~prefix:"one" (P.load P.(env#fs / "v")))
+      then failwith "lost")
+
+(* A failed fsync, then one that succeeds and F_FULLFSYNC of another file:
+   the write the failure lost is not durable, as Linux loses it. *)
+let retried ?os () =
+  Eio_fs.Chaos.Crash.check ?os
+    ~setup:(fun env ->
+      Eio_fs_sync.save P.(env#fs / "v") "";
+      Eio_fs_sync.save P.(env#fs / "g") "")
+    (fun ~ack env ->
+      match
+        P.with_open_out ~append:true ~create:`Never
+          P.(env#fs / "v")
+          (fun f ->
+            Eio.Flow.copy_string "one" f;
+            try Eio.File.sync f with Eio.Io _ -> Eio.File.sync f);
+        P.with_open_out ~create:`Never P.(env#fs / "g") Eio_fs_unix.sync_file
+      with
+      | () -> ack ()
+      | exception Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      if acked <> [] && P.load P.(env#fs / "v") <> "one" then failwith "lost")
+
 let suite =
   ( "macos",
     [
@@ -123,4 +172,18 @@ let suite =
         (replayed `Macos);
       Alcotest.test_case "two spellings of a name are one file" `Quick
         (Expect.passes spellings);
+      Alcotest.test_case "a failed fsync keeps what one before flushed" `Quick
+        (Expect.passes (flushed ~os:`Macos ~more:false));
+      Alcotest.test_case
+        "a failed fsync of a later write keeps an earlier flush" `Quick
+        (Expect.passes (flushed ~os:`Macos ~more:true));
+      Alcotest.test_case "a failed fsync keeps what one before synced" `Quick
+        (Expect.passes (flushed ~more:false));
+      Alcotest.test_case "a failed fsync of a later write keeps an earlier sync"
+        `Quick
+        (Expect.passes (flushed ~more:true));
+      Alcotest.test_case "a retry after a failed fsync is lost on Linux" `Quick
+        (Expect.caught ~tier:"linear" retried);
+      Alcotest.test_case "a retry after a failed fsync is lost on macOS" `Quick
+        (Expect.caught ~tier:"linear" (retried ~os:`Macos));
     ] )
