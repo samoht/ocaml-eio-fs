@@ -211,10 +211,11 @@ val check :
     which stops in that cache: alone, they make nothing durable. The barriers of
     [eio-fs.unix] ([Eio_fs_unix.sync_file], [Eio_fs_unix.sync_dir],
     [Eio_fs_unix.barrier]) are [F_FULLFSYNC]: each makes its file or directory
-    durable, and every fsync(2) before it, of any file. The rest is as above, as
-    no source rules it out on APFS: stale data included, though APFS writes its
-    metadata copy-on-write. So a cut may leave a state APFS would not, never
-    miss one it would. *)
+    durable, and every fsync(2) before it, of any file. A failed fsync(2) loses
+    only the writes no earlier one flushed. The rest is as above, as no source
+    rules it out on APFS: stale data included, though APFS writes its metadata
+    copy-on-write. So a cut may leave a state APFS would not, never miss one it
+    would. *)
 module Crash : sig
   val check :
     ?budget:int ->

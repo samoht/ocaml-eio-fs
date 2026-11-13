@@ -1081,6 +1081,9 @@ module Crash = struct
         (* The pages durable shrinks freed, by index, newest first, as the
            disk held them. *)
     mutable synced : Eio.File.Stat.t option; (* its stat at its last sync *)
+    mutable flushed : int;
+        (* On macOS, the last change a plain fsync flushed to the drive's
+           cache: no later failure loses it. *)
   }
 
   and entry = {
@@ -1089,8 +1092,9 @@ module Crash = struct
     seq : int;
     egen : int;
     cached : bool;
-        (* A truncation a failed sync kept pending, which the page cache
-           already holds: it carries the length only and dirties no block. *)
+        (* A change a failed sync kept pending, which the page cache already
+           holds: a truncation, or on macOS a change an fsync flushed before.
+           It dirties no block. *)
   }
 
   let next_id = Atomic.make 0
@@ -1116,6 +1120,7 @@ module Crash = struct
          | None -> Extents.(add 0 n empty));
       freed = [];
       synced = None;
+      flushed = 0;
     }
 
   (* Maps keyed by a path, where the keys at or under one path are a range. *)
@@ -3673,12 +3678,15 @@ module Crash = struct
       (List.rev young)
 
   (* A failed barrier loses the pending writes, which the page cache keeps:
-     a later change that dirties one of their blocks writes it whole. *)
+     a later change that dirties one of their blocks writes it whole. On
+     macOS, the changes an earlier fsync flushed are in the drive's cache,
+     not lost: they stay pending, as the page cache holds them. *)
   let fail_sync ?(upto = max_int) ?(evict = false) ?(relive = ignore) ctl fs =
     let young = split_young ctl fs ~upto in
     ctl.effects <- ctl.effects + 1;
     let cache = Option.value ~default:(bytes_of fs.durable) fs.cache in
     let pending = List.rev fs.pending in
+    let flushed (e : entry) = e.seq <= fs.flushed in
     (* A kept truncation is in the page cache already. *)
     let changes =
       List.filter_map
@@ -3698,8 +3706,8 @@ module Crash = struct
                (List.map (fun e -> e.change) pending))
     in
     (* Evicted, the pages that failed read as the disk holds them: the
-       durable bytes, with the truncations kept, at the length the file
-       has. None of their writeback landed. *)
+       durable bytes, with what was flushed and the truncations kept, at the
+       length the file has. None of their writeback landed. *)
     let live =
       if not evict then live
       else
@@ -3708,6 +3716,7 @@ module Crash = struct
             (List.filter_map
                (fun e ->
                  match e.change with
+                 | _ when flushed e -> Some e.change
                  | Resize _ -> Some e.change
                  | Write _ -> None)
                pending)
@@ -3724,7 +3733,18 @@ module Crash = struct
        may be on disk, as they stood. *)
     let bs = ctl.block_size in
     let written =
-      dirty_blocks ~writes:true ~bs (Cstruct.length cache) changes
+      let flushed, dirty = List.partition flushed pending in
+      let uncached l =
+        List.filter_map (fun e -> if e.cached then None else Some e.change) l
+      in
+      let len =
+        List.fold_left
+          (fun n -> function
+            | Write { offset; data } -> max n (offset + Cstruct.length data)
+            | Resize m -> m)
+          (Cstruct.length cache) (uncached flushed)
+      in
+      dirty_blocks ~writes:true ~bs len (uncached dirty)
     in
     let version src b =
       let off = b * bs in
@@ -3752,13 +3772,13 @@ module Crash = struct
     List.iter
       (fun e ->
         match e.change with
-        | Resize _ ->
+        | Write _ when not (flushed e) -> ()
+        | Write _ | Resize _ ->
             let e = { e with egen = fs.gen; cached = true } in
             ctl.log <- e :: ctl.log;
             fs.pending <- e :: fs.pending;
             ctl.logged <- ctl.logged + 1;
-            ctl.pending_changes <- ctl.pending_changes + 1
-        | Write _ -> ())
+            ctl.pending_changes <- ctl.pending_changes + 1)
       pending;
     keep_young ctl fs young
 
@@ -3768,7 +3788,8 @@ module Crash = struct
      durable by itself. *)
   (* What a sync makes durable lands now, but on macOS only through a full
      sync, F_FULLFSYNC: fsync(2) reaches the drive's cache, which a cut
-     loses. A full sync drains the plain ones before it, of any file. *)
+     loses. A full sync drains the plain ones before it, of any file: each
+     commits the changes made before its call, which [fail_sync] keeps. *)
   let durable ctl ~full commit =
     match ctl.os with
     | `Linux -> commit ()
@@ -3785,6 +3806,7 @@ module Crash = struct
     match sync () with
     | () ->
         let st = stat in
+        if ctl.os = `Macos && not full then fs.flushed <- max fs.flushed upto;
         durable ctl ~full @@ fun () ->
         let young = split_young ctl fs ~upto in
         if
