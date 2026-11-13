@@ -216,6 +216,28 @@ let test_failed_populate () =
   Alcotest.check tree "the previous tree stands" (Some old_tree)
     (read_back (base / "out"))
 
+(* The pointer is made under a sibling name from [fresh_name], whose counter
+   this process shares: one draw here, then the generation's and the link's.
+   An entry already at that name is not the publication's, and a switch that
+   fails on it leaves it as it was. *)
+let test_taken_link_name_kept () =
+  with_old @@ fun base ->
+  let probe = Eio_fs_sync.fresh_name "out" in
+  let dot = String.rindex probe '.' in
+  let n =
+    int_of_string (String.sub probe (dot + 1) (String.length probe - dot - 1))
+  in
+  let taken = String.sub probe 0 (dot + 1) ^ string_of_int (n + 2) in
+  Eio.Path.save ~create:(`Exclusive 0o644) (base / taken) "someone else's";
+  (match publish ~durable:true base new_tree with
+  | () -> Alcotest.fail "the switch went through a taken name"
+  | exception Eio.Io (Eio.Fs.E (Already_exists _), _) -> ());
+  Alcotest.(check string)
+    "the entry at the link's name stands" "someone else's"
+    (Eio.Path.load (base / taken));
+  Alcotest.check tree "the previous tree stands" (Some old_tree)
+    (read_back (base / "out"))
+
 (* A plain directory is not a pointer: replacing it would need the rename-aside
    this primitive exists to remove, so it is refused and left as it was. *)
 let test_refuses_plain_directory () =
@@ -341,6 +363,7 @@ let suite =
         test_foreign_target_kept;
       Alcotest.test_case "failed producer keeps the previous tree" `Quick
         test_failed_populate;
+      Alcotest.test_case "taken link name kept" `Quick test_taken_link_name_kept;
       Alcotest.test_case "plain directory refused" `Quick
         test_refuses_plain_directory;
       Alcotest.test_case "POSIX read-only generation reclaimed" `Quick
