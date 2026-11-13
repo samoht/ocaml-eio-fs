@@ -1,7 +1,7 @@
 (test
  (name test)
  (modules test test_scaling)
- (libraries eio eio.mock eio_fs eio-fs.sync alcotest cstruct optint))
+ (libraries eio eio.mock eio_fs eio-fs.sync alcotest cstruct fmt optint))
 
 ; A list scan allocates nothing, so a directory that went back to a list of
 ; entries shows only in time. The test that times it reads a clock, which a

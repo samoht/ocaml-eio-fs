@@ -144,9 +144,46 @@ let test_crash_alternating_barriers () =
   in
   at_most "words per round, alternating barriers" ~bound:50_000. (w /. 2000.)
 
+(* One-byte writes at every second offset, N then 2N of them: each leaves a
+   range of its own, and a file that kept its written ranges in a list
+   scanned it on every write, so doubling N quadrupled the words. A linear
+   cost doubles them, and the bound sits between the two. *)
+let disjoint_writes ?(sync = false) fs n =
+  Eio.Switch.run @@ fun sw ->
+  let f = Eio.Path.open_out ~sw ~create:(`Or_truncate 0o644) (fs / "sparse") in
+  words (fun () ->
+      for i = 0 to n - 1 do
+        Eio.File.pwrite_all f
+          ~file_offset:(i63 (2 * i))
+          [ Cstruct.of_string "x" ];
+        if sync then Eio.File.sync f
+      done)
+
+let near_linear ?sync what fs =
+  let n = 2000 in
+  let one = disjoint_writes ?sync (fs ()) n
+  and two = disjoint_writes ?sync (fs ()) (2 * n) in
+  at_most
+    (Fmt.str "%s, %.0f words for %d over %.0f for %d" what two (2 * n) one n)
+    ~bound:3. (two /. one)
+
+let test_disjoint_writes () =
+  Eio_mock.Backend.run @@ fun () ->
+  near_linear "disjoint writes" (fun () -> Eio_fs.Fs.v ())
+
+(* The same writes through the crash model, each synced: a sync adds what
+   its writes covered to the ranges the disk holds. *)
+let test_crash_disjoint_writes () =
+  Eio_mock.Backend.run @@ fun () ->
+  near_linear ~sync:true "crash: disjoint synced writes" (fun () ->
+      Crash.wrap (Crash.v ()) (Eio_fs.Fs.v ()))
+
 let suite =
   ( "scaling",
     [
+      Alcotest.test_case "disjoint writes" `Quick test_disjoint_writes;
+      Alcotest.test_case "crash: disjoint writes" `Quick
+        test_crash_disjoint_writes;
       Alcotest.test_case "crash: appends" `Quick test_crash_appends;
       Alcotest.test_case "crash: many files" `Quick test_crash_many_files;
       Alcotest.test_case "crash: syncs beside pending writes" `Quick
