@@ -8,4 +8,5 @@ let () =
       Test_states.suite;
       Test_time.suite;
       Test_env.suite;
+      Test_macos.suite;
     ]

@@ -3,4 +3,13 @@
 
 (test
  (name test)
- (libraries eio eio.mock eio_fs eio-fs.sync cstruct optint fmt alcotest))
+ (libraries
+  eio
+  eio.mock
+  eio_fs
+  eio-fs.sync
+  eio-fs.unix
+  cstruct
+  optint
+  fmt
+  alcotest))
