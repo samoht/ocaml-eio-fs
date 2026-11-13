@@ -847,9 +847,71 @@ let test_small_copy_buffer () =
     "no read buffer above 4 KiB" true
     (List.for_all (fun n -> n <= 4096) !sizes)
 
+(* A name of NAME_MAX length is a valid target: 255 bytes, or on macOS 255
+   UTF-16 units, which 255 three-byte characters are. The temporaries, links
+   and generations made beside it must be valid names too. *)
+let publish_long_name fs unit =
+  let name = String.concat "" (List.init 255 (fun _ -> unit)) in
+  List.iter
+    (fun d -> Eio.Path.mkdir ~perm:0o755 (fs / d))
+    [ "file"; "tree"; "link" ];
+  Eio_fs_sync.save (fs / "file" / name) "saved";
+  Alcotest.(check string)
+    "a saved file" "saved"
+    (Eio.Path.load (fs / "file" / name));
+  let generation path i =
+    Eio_fs_sync.publish_generation path (fun d ->
+        Eio.Path.save ~create:(`Exclusive 0o644) (d / "f") i)
+  in
+  (* A name sharing all but its last character has generations of its own. *)
+  let other =
+    String.sub name 0 (String.length name - String.length unit) ^ "-"
+  in
+  generation (fs / "tree" / other) "other";
+  List.iter (generation (fs / "tree" / name)) [ "1"; "2"; "3" ];
+  Alcotest.(check string)
+    "a published generation" "3"
+    (Eio.Path.load (fs / "tree" / name / "f"));
+  Alcotest.(check string)
+    "the other name's generation" "other"
+    (Eio.Path.load (fs / "tree" / other / "f"));
+  Alcotest.(check int)
+    "two pointers, one generation of one, two of the other" 5
+    (List.length (Eio.Path.read_dir (fs / "tree")));
+  (match
+     Eio_fs_sync.publish_link ~lock:Eio_fs_sync.Lock.none ~expected:None
+       ~link_to:"target"
+       (fs / "link" / name)
+   with
+  | Ok () -> ()
+  | Error _ -> Alcotest.fail "the link was refused");
+  Alcotest.(check string)
+    "a published link" "target"
+    (Eio.Path.read_link (fs / "link" / name))
+
+let test_long_name_in_memory os unit () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run ~os @@ fun env -> publish_long_name env#fs unit
+
+let test_long_name_on_disk () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-sync-long" "" in
+  Sys.remove dir;
+  Eio.Path.mkdir ~perm:0o755 (fs / dir);
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / dir))
+  @@ fun () -> publish_long_name (fs / dir) "n"
+
 let suite =
   ( "eio_fs_sync",
     [
+      Alcotest.test_case "a 255-byte name in memory" `Quick
+        (test_long_name_in_memory `Linux "n");
+      Alcotest.test_case "a 255-byte name in memory, macOS" `Quick
+        (test_long_name_in_memory `Macos "n");
+      Alcotest.test_case "a 255-unit name in memory, macOS" `Quick
+        (test_long_name_in_memory `Macos "\xe6\x97\xa5");
+      Alcotest.test_case "a 255-byte name on disk" `Quick test_long_name_on_disk;
       Alcotest.test_case "a small value is copied through a small buffer" `Quick
         test_small_copy_buffer;
       Alcotest.test_case "sparse 8 MiB extents and cost" `Quick (fun () ->
