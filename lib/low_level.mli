@@ -13,6 +13,11 @@ module Error : sig
       constructor for. *)
 end
 
+val name_key : [ `Linux | `Macos ] -> string -> string
+(** [name_key os name] is what [os] compares [name] by: [name] itself on Linux,
+    its canonical caseless form on macOS. Two names with one key name one entry.
+*)
+
 (** Flags for {!openat}. *)
 module Open_flags : sig
   val o_rdonly : int

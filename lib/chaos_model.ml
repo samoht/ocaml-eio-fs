@@ -1677,7 +1677,8 @@ module Crash = struct
      [false], and its [.], [..] and empty components gone, as
      path_resolution(7) walks it: one spelling per file. A component that does
      not resolve is kept, and so is a path outside [root]. *)
-  let resolve_at ?(follow_last = true) ~root (Base_dir ((module B), bv)) path =
+  let resolve_at ?(follow_last = true) ?(spell = fun ~dir:_ name -> name) ~root
+      (Base_dir ((module B), bv)) path =
     let render abs rev =
       let p = String.concat "/" (List.rev rev) in
       if abs then "/" ^ p else p
@@ -1698,6 +1699,7 @@ module Crash = struct
           | _ when abs -> go hops abs rev rest
           | _ -> go hops abs (".." :: rev) rest)
       | name :: rest -> (
+          let name = spell ~dir:(render abs rev) name in
           let p = render abs (name :: rev) in
           let target =
             if hops <= 0 || (rest = [] && not follow_last) then None
@@ -4219,11 +4221,31 @@ module Crash = struct
     | Some ino -> [ (p, ino) ]
     | None -> []
 
+  (* On macOS, the spelling of the entry [name] matches in [dir], so that two
+     spellings of one name are one file to the model. *)
+  let spelling d ~dir name =
+    let (Base_dir ((module B), bv)) = as_admin d.dctl d.dplace.proot in
+    let key = Low_level.name_key `Macos name in
+    match B.read_dir bv dir with
+    | names -> (
+        match
+          List.find_opt
+            (fun n -> String.equal (Low_level.name_key `Macos n) key)
+            names
+        with
+        | Some n -> n
+        | None -> name)
+    | exception Eio.Io _ -> name
+
   (* A path from [d]'s root, resolved below the wrapped root. *)
   let resolve ?follow_last d path =
     match d.dctl.base with
     | None -> path
-    | Some (_, root) -> resolve_at ?follow_last ~root d.dplace.proot path
+    | Some (_, root) ->
+        let spell =
+          match d.dctl.os with `Linux -> None | `Macos -> Some (spelling d)
+        in
+        resolve_at ?follow_last ?spell ~root d.dplace.proot path
 
   module Cdir_impl = struct
     type t = cdir

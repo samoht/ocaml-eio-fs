@@ -203,6 +203,8 @@ module Name = struct
     | `Linux | `Macos -> String.length name > 255
 end
 
+let name_key = Name.key
+
 module Dir_node = struct
   (* A node holds no name of its own: its names are the entries of the
      directories that hold it. [entries] maps each name's key, but [.] and
