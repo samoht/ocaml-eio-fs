@@ -1522,6 +1522,51 @@ let test_lock_asks_from_the_holder_leave_no_descriptor () =
   Alcotest.(check int)
     "descriptors open once the hold ends" before (open_descriptors ())
 
+(* Lease waits against another process's hold, ended by their [`For] bound or
+   by a cancel, leave no descriptor behind while the holder still holds; a
+   waiter is then granted once the holder lets go. *)
+let test_ended_lease_waits_leave_no_descriptor () =
+  with_real_dir_env @@ fun env dir ->
+  let lock = dir / "lock" in
+  Eio.Switch.run @@ fun sw ->
+  let _, release = holding_process ~sw ~env ~kind:"lease" ~lock in
+  let bounded () =
+    match
+      Eio_fs_unix.Lease.with_exclusive ~block:(`For 0.01) lock (fun _ -> ())
+    with
+    | () -> Alcotest.fail "a lease another process holds was granted"
+    | exception Eio_fs_unix.Lock_unavailable _ -> ()
+  in
+  let cancelled () =
+    let waiting, now_waiting = Eio.Promise.create () in
+    Eio.Fiber.first
+      (fun () ->
+        take_lease
+          ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+          lock
+          (fun () -> Alcotest.fail "a lease another process holds was granted"))
+      (fun () -> Eio.Promise.await waiting)
+  in
+  bounded ();
+  let before = open_descriptors () in
+  for _ = 1 to 6 do
+    bounded ();
+    cancelled ()
+  done;
+  Alcotest.(check int)
+    "descriptors open after the ended waits, the holder holding" before
+    (open_descriptors ());
+  let waiting, now_waiting = Eio.Promise.create () in
+  let granted, now_granted = Eio.Promise.create () in
+  Eio.Fiber.fork ~sw (fun () ->
+      take_lease
+        ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+        lock
+        (fun () -> Eio.Promise.resolve now_granted ()));
+  Eio.Promise.await waiting;
+  Alcotest.check status "the holder let go when told" (`Exited 0) (release ());
+  Eio.Promise.await granted
+
 (* The descriptors this process holds open on [lock]'s file, each of [/dev/fd]
    matched by inode: macOS's [/dev/fd] reports its own device for each. *)
 let descriptors_on lock =
@@ -3503,6 +3548,8 @@ let suite =
         (a_wait_answers_at_the_release ~kind:"lease" take_lease);
       Alcotest.test_case "a cancelled lease wait ends its domain" `Quick
         test_cancelled_lease_wait_ends_its_domain;
+      Alcotest.test_case "ended lease waits leave no descriptor" `Quick
+        test_ended_lease_waits_leave_no_descriptor;
       Alcotest.test_case "a lease wait answers at a cancel" `Quick
         (a_wait_is_cancellable ~kind:"lease" take_lease ~free:lease_free);
       Alcotest.test_case "a bounded record lock wait answers at the release"
