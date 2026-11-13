@@ -56,12 +56,15 @@ let pp_tree ppf = function
 let publish ~durable fs tree =
   Eio_fs_sync.publish_generation ~durable (fs / "out") (populate tree)
 
-(* A base holding [old_tree], published and committed. *)
+(* A base holding [old_tree], published and committed over an earlier
+   generation, which the next publication reclaims after its switch. *)
 let with_old fn =
   Eio_mock.Backend.run @@ fun () ->
   Eio_fs.run @@ fun env ->
   let ctl = Crash.v () in
-  publish ~durable:true (Crash.wrap ctl env#fs) old_tree;
+  let fs = Crash.wrap ctl env#fs in
+  publish ~durable:true fs [ ("a", "earlier") ];
+  publish ~durable:true fs old_tree;
   fn (Crash.post_crash ctl)
 
 let with_empty fn =

@@ -344,12 +344,17 @@ val publish_generation :
     the old link or the new one throughout, so a reader resolving [path] sees
     one complete generation or the other and never a mixture.
 
+    A reader that resolved [path] sees that generation complete until the second
+    publication after it: a publication keeps the generation it replaces and
+    reclaims the ones older than that. A reader that needs its generation longer
+    holds the {!Lock} the publishers of [path] take.
+
     With [durable] (defaults to [true]), every file and directory in the
     generation is barriered with [barrier] (defaults to {!Barrier.portable})
     before the switch and [path]'s directory after it, so after a crash [path]
-    resolves to the previous generation or the new one, never to neither; the
-    previous generation is removed only once the switch is committed. [durable]
-    [false] keeps only the atomicity.
+    resolves to the previous generation or the new one, never to neither; older
+    generations are removed only once the switch is committed. [durable] [false]
+    keeps only the atomicity.
 
     Reclaiming an owned old or failed staged generation grants its directories
     owner read, write and search permission when necessary. Files and symbolic
@@ -359,16 +364,16 @@ val publish_generation :
     [path] must be absent or a symbolic link, and must have a parent in its
     capability: anything else raises [Invalid_argument] before [populate] runs,
     and is left as it was. A generation is a hidden sibling, a dot, [path]'s
-    basename, [".gen."] and a fresh suffix ({!is_generation}); the one the old
-    link named is reclaimed only when it is a generation of the same basename.
+    basename, [".gen."] and a fresh suffix ({!is_generation}); only generations
+    of the same basename are reclaimed, never a tree a link made by hand names.
     One writer publishes a given [path] at a time; the exclusion is the caller's
     ({!Lock}).
 
     On a failure of [populate], a sync or the switch, the staged generation is
     removed and [path] is unchanged. A barrier failure is reported after the
     switch, the new generation visible with uncertain durability and the
-    previous one retained. A failure to reclaim the previous generation is
-    raised after the switch is committed.
+    previous one retained. A failure to reclaim an older generation is raised
+    after the switch is committed.
 
     @raise Eio.Io
       as the filesystem operations raise. What [populate] raises is propagated.

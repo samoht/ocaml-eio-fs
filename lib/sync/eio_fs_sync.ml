@@ -550,8 +550,9 @@ let discard p =
   Eio.Cancel.protect @@ fun () -> try reclaim p with Eio.Io _ -> ()
 
 (* Stage a fresh sibling generation, commit it whole, rename a pointer to it
-   over the published name, commit that, then reclaim the generation the old
-   pointer named. *)
+   over the published name, commit that, then reclaim the owned generations
+   older than the one the old pointer named, which a reader may still be
+   reading. *)
 let publish_generation ?(durable = true) ?(barrier = Barrier.portable)
     ?(perm = 0o755) path populate =
   let parent, name =
@@ -598,10 +599,15 @@ let publish_generation ?(durable = true) ?(barrier = Barrier.portable)
      discard staged;
      raise e);
   if durable then Barrier.sync_dir barrier parent;
-  (match previous with
-  | Some target when owned_generation ~name target ->
-      reclaim Eio.Path.(parent / target)
-  | Some _ | None -> ());
+  let kept entry =
+    String.equal entry generation
+    || Option.equal String.equal (Some entry) previous
+  in
+  List.iter
+    (fun entry ->
+      if owned_generation ~name entry && not (kept entry) then
+        reclaim Eio.Path.(parent / entry))
+    (Eio.Path.read_dir parent);
   result
 
 module Lock = Lock
