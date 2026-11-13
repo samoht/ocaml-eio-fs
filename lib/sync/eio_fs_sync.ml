@@ -585,13 +585,16 @@ let publish_generation ?(durable = true) ?(barrier = Barrier.portable)
       raise e
   in
   let link = Eio.Path.(parent / fresh_name name) in
+  let linked = ref false in
   (try
      Eio.Cancel.protect @@ fun () ->
      Eio.Path.symlink ~link_to:generation link;
+     linked := true;
      Eio.Path.rename link path
    with e ->
-     Eio.Cancel.protect (fun () ->
-         try Eio.Path.unlink link with Eio.Io _ -> ());
+     if !linked then
+       Eio.Cancel.protect (fun () ->
+           try Eio.Path.unlink link with Eio.Io _ -> ());
      discard staged;
      raise e);
   if durable then Barrier.sync_dir barrier parent;
