@@ -241,16 +241,17 @@ its budget fails and says so. Shrink the workload, or raise `~budget`.
 
 ### Where it differs from eio_posix
 
-Code that runs on both should avoid these:
+The in-memory filesystem answers as the kernel does. eio_posix differs in a
+few corners, which code that runs on both should not depend on:
 
-- `x/.`, `x/d/..` and trailing slashes. The in-memory filesystem resolves them
-  as the kernel does. eio_posix rewrites the first two lexically
-  ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)), and fails a
-  creating open with a trailing slash differently
+- `x/.`, `x/d/..` and a creating open with a trailing slash. eio_posix
+  rewrites the first two lexically
+  ([eio#976](https://github.com/ocaml-multicore/eio/issues/976)), and fails
+  the last differently
   ([eio#975](https://github.com/ocaml-multicore/eio/issues/975)).
-- Directory permissions on macOS. eio_posix needs read permission on each
-  directory a path walks, and follows up to 40 links to stat a path where
-  the kernel stops at 32. The in-memory filesystem answers as the kernel.
+- Directories on macOS. eio_posix needs read permission on each directory a
+  path walks, and follows up to 40 links to stat a path where the kernel
+  stops at 32.
 
 ## Licence
 

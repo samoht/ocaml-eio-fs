@@ -148,13 +148,26 @@ let outcome_text = function
    run. *)
 exception Cut
 
-let env_of clock mono (d : _ Eio.Path.t) : env =
+let env_of clock mono ~(fs : _ Eio.Path.t) ~(cwd : _ Eio.Path.t) : env =
   object
-    method fs = (d :> Eio.Fs.dir_ty Eio.Path.t)
-    method cwd = (d :> Eio.Fs.dir_ty Eio.Path.t)
+    method fs = (fs :> Eio.Fs.dir_ty Eio.Path.t)
+    method cwd = (cwd :> Eio.Fs.dir_ty Eio.Path.t)
     method clock = clock
     method mono_clock = mono
   end
+
+(* The directory [d] opened as eio_posix opens a process's cwd: confined to
+   itself, so an absolute path or link and a [..] above it are refused. It is
+   opened beneath the fault wrapper, so the open is no operation of the run. *)
+let confined ~sw (d : _ Eio.Path.t) =
+  (Eio.Path.open_dir ~sw d :> Eio.Fs.dir_ty Eio.Path.t)
+
+(* [f] on the env over [base], the unconfined root, wrapped by [wrap]. *)
+let with_env ?(wrap = fun d -> (d :> Eio.Fs.dir_ty Eio.Path.t)) clock mono
+    (base : _ Eio.Path.t) f =
+  Eio.Switch.run @@ fun sw ->
+  let cwd = wrap (confined ~sw base) in
+  f (env_of clock mono ~fs:(wrap (base :> Eio.Fs.dir_ty Eio.Path.t)) ~cwd)
 
 (* A run ends once [halted] holds why. *)
 let in_loop ?idle ?(halted = ref None) main =
@@ -742,7 +755,7 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
       in_loop ~halted @@ fun clock mono ->
       st.mono <- Some mono;
       let base = fresh clock in
-      setup (env_of clock mono base);
+      with_env clock mono base setup;
       (* Pages a failed sync evicts read as the disk holds them, which the
          model of the disk knows. *)
       let base =
@@ -753,8 +766,10 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
         then (M.Crash.wrap (M.Crash.v ()) base :> Eio.Fs.dir_ty Eio.Path.t)
         else base
       in
-      let fs = M.wrap (M.Schedule.hook hook) base in
-      match run (env_of clock mono fs) with
+      let wrap d =
+        (M.wrap (M.Schedule.hook hook) d :> Eio.Fs.dir_ty Eio.Path.t)
+      in
+      match with_env ~wrap clock mono base run with
       | () -> Passed
       | exception x -> Raised x
     with
@@ -1074,7 +1089,7 @@ module Crash = struct
       match
         Eio.Switch.run (fun sw ->
             run_sw := Some sw;
-            f wrapped;
+            f wrapped (M.wrap (M.Schedule.hook hook) (confined ~sw fs));
             if not (M.Crash.is_crashed ctl) then synced ())
       with
       | () ->
@@ -1118,7 +1133,7 @@ module Crash = struct
       match
         in_loop ~idle ~halted @@ fun clock mono ->
         let base = fresh clock in
-        setup (env_of clock mono base);
+        with_env clock mono base setup;
         let pause = ref ignore in
         let ctl =
           M.Crash.v ~policy:(policy_of trail s.state) ~block_size:512
@@ -1142,7 +1157,7 @@ module Crash = struct
               end)
             ~kept_going:kept_run ~trace ~ctl ~pause ~mono ~faults:s.cfaults
             ~cut:s.cut ~cut_op ~seqs ~changed ~stop fs
-            (fun fs ->
+            (fun fs cwd ->
               run
                 ~ack:(fun v ->
                   if not (M.Crash.is_crashed ctl) then begin
@@ -1150,7 +1165,7 @@ module Crash = struct
                     acked := v :: !acked;
                     acked_at := trace.last :: !acked_at
                   end)
-                (env_of clock mono fs))
+                (env_of clock mono ~fs ~cwd))
         in
         if not (M.Crash.is_crashed ctl) then begin
           lost := M.Crash.unsynced ctl;
@@ -1179,14 +1194,14 @@ module Crash = struct
                 ~kept_going:kept_recover ~trace:rtrace ~ctl:rctl ~pause:rpause
                 ~mono ~faults:[] ~cut:rcut ~cut_op:(ref None) ~seqs:(ref [])
                 ~changed:rchanged ~stop rfs
-                (fun fs -> recover ~acked (env_of clock mono fs))
+                (fun fs cwd -> recover ~acked (env_of clock mono ~fs ~cwd))
             in
             match (rout, s.rcut) with
             | Passed, None -> None
             | Passed, Some _ -> (
                 if not (M.Crash.is_crashed rctl) then M.Crash.crash rctl;
                 ignore (M.Crash.post_crash rctl : Eio.Fs.dir_ty Eio.Path.t);
-                match recover ~acked (env_of clock mono base) with
+                match with_env clock mono base (recover ~acked) with
                 | () -> None
                 | exception x -> Some (Again x))
             | o, _ -> Some (Recover o))
@@ -1340,7 +1355,7 @@ module Crash = struct
       match
         in_loop (fun clock mono ->
             let d = fresh clock in
-            setup (env_of clock mono d);
+            with_env clock mono d setup;
             files d)
       with
       | Ok l -> l
