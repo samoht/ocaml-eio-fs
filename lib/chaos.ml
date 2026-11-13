@@ -4,6 +4,7 @@ module Plan = Chaos_plan
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t
+  ; cwd : Eio.Fs.dir_ty Eio.Path.t
   ; clock : float Eio.Time.clock_ty Eio.Resource.t
   ; mono_clock : Eio.Time.Mono.ty Eio.Resource.t >
 
@@ -150,6 +151,7 @@ exception Cut
 let env_of clock mono (d : _ Eio.Path.t) : env =
   object
     method fs = (d :> Eio.Fs.dir_ty Eio.Path.t)
+    method cwd = (d :> Eio.Fs.dir_ty Eio.Path.t)
     method clock = clock
     method mono_clock = mono
   end

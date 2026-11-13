@@ -116,11 +116,12 @@
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t
+  ; cwd : Eio.Fs.dir_ty Eio.Path.t
   ; clock : float Eio.Time.clock_ty Eio.Resource.t
   ; mono_clock : Eio.Time.Mono.ty Eio.Resource.t >
-(** The type for what a workload runs with: a fresh in-memory directory and the
-    run's clocks. [Eio_net_chaos.env] has the same shape, with [net] in place of
-    [fs]. *)
+(** The type for what a workload runs with: a fresh in-memory directory, as
+    [fs] and as [cwd], and the run's clocks. [Eio_net_chaos.env] has the same
+    shape, with [net] in place of [fs] and [cwd]. *)
 
 (** {1:checks Checks} *)
 
