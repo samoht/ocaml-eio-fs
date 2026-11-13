@@ -432,17 +432,22 @@ let append_lines ?(durable = true) ?(barrier = Barrier.portable) ?(perm = 0o644)
       Buffer.add_string b l;
       Buffer.add_char b '\n')
     lines;
-  if Buffer.length b > 0 then begin
-    Eio.Switch.run (fun sw ->
-        let file =
-          Eio.Path.open_out ~sw ~append:true ~create:(`If_missing perm) path
-        in
-        Eio.Flow.copy_string (Buffer.contents b) file;
-        if durable then Barrier.sync_file barrier file);
-    (* Every durable append barriers the directory, not only the one that
-       created the file: when that one's barrier failed, nothing else would
-       ever make the entry durable. *)
-    if durable then Barrier.sync_parent barrier path
+  let data = Buffer.contents b in
+  (* Every durable append barriers the file and its directory, an empty one
+     included: when the barriers of the append that created the file failed,
+     nothing else would make its entry durable. *)
+  if durable || data <> "" then begin
+    let create = if data = "" then `Never else `If_missing perm in
+    let opened =
+      Eio.Switch.run @@ fun sw ->
+      match Eio.Path.open_out ~sw ~append:true ~create path with
+      | exception Eio.Io (Eio.Fs.E (Not_found _), _) when data = "" -> false
+      | file ->
+          if data <> "" then Eio.Flow.copy_string data file;
+          if durable then Barrier.sync_file barrier file;
+          true
+    in
+    if opened && durable then Barrier.sync_parent barrier path
   end
 
 (* A file opened read-only still names the inode fsync(2) flushes. A registered

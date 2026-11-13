@@ -327,9 +327,12 @@ val append_lines :
 
     With [durable] (defaults to [true]), the file is barriered after the write
     with [barrier] (defaults to {!Barrier.portable}), then the directory holding
-    it, on every call: a directory barrier that failed on the call that created
-    the file is issued again by the next one. Appends from two writers are not
-    ordered with each other: a caller with several takes a {!Lock} around each.
+    it, on every call, one with nothing to write included: a barrier that failed
+    on the call that created the file is issued again by the next one,
+    [append_lines path []] being the retry that adds no line. A call with
+    [lines] empty on a missing file issues no barrier. Appends from two writers
+    are not ordered with each other: a caller with several takes a {!Lock}
+    around each.
 
     @raise Stdlib.Invalid_argument
       if a line holds LF, before anything is written.
