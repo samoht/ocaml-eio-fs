@@ -83,6 +83,29 @@ let replayed os () =
   Alcotest.(check string)
     "error" "Failure(\"replayed a removed record\")" (Expect.field "error" m)
 
+(* A file made, written and renamed under other spellings of its names,
+   each step synced: it is one file, as on APFS. *)
+let spellings () =
+  Eio_fs.Chaos.Crash.check ~os:`Macos
+    (fun ~ack env ->
+      match
+        P.mkdir ~perm:0o755 P.(env#fs / "D");
+        P.save ~create:(`Exclusive 0o644) P.(env#fs / "d/F") "";
+        P.with_open_out ~create:`Never
+          P.(env#fs / "D/f")
+          (fun f ->
+            Eio.Flow.copy_string "v1" f;
+            Eio_fs_unix.sync_file f);
+        Eio_fs_unix.sync_dir P.(env#fs / "d");
+        Eio_fs_unix.sync_dir env#fs;
+        P.rename P.(env#fs / "d/f") P.(env#fs / "D/g");
+        Eio_fs_unix.sync_dir P.(env#fs / "D")
+      with
+      | () -> ack ()
+      | exception Eio.Io _ -> ())
+    ~recover:(fun ~acked env ->
+      if acked <> [] && P.load P.(env#fs / "d/G") <> "v1" then failwith "lost")
+
 let suite =
   ( "macos",
     [
@@ -98,4 +121,6 @@ let suite =
         (replayed `Linux);
       Alcotest.test_case "a stale record is replayed on macOS" `Quick
         (replayed `Macos);
+      Alcotest.test_case "two spellings of a name are one file" `Quick
+        (Expect.passes spellings);
     ] )
