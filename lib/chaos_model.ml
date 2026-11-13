@@ -2562,8 +2562,9 @@ module Crash = struct
     | None -> ()
 
   (* fsync(2) of a file commits its inode, attributes included: they hold
-     once the image holds the file. *)
-  let commit_attrs ctl ~ino =
+     once the image holds the file. It covers the changes made before
+     [upto], as a barrier on a directory does. *)
+  let commit_attrs ~upto ctl ~ino =
     if Hashtbl.length ctl.by_attrs > 0 then begin
       let ino = ino () in
       (match Hashtbl.find_opt ctl.by_attrs ino with
@@ -2571,7 +2572,7 @@ module Crash = struct
       | Some m ->
           Ids.iter
             (fun _ e ->
-              if not e.synced then begin
+              if (not e.synced) && e.meta.seq <= upto then begin
                 ctl.effects <- ctl.effects + 1;
                 e.synced <- true;
                 refresh ctl e
@@ -3780,10 +3781,10 @@ module Crash = struct
         List.iter (fun f -> f ()) queued;
         commit ()
 
-  let barrier ?(upto = max_int) ?(full = false) ctl fs ~stat sync =
+  let barrier ~upto ?(full = false) ctl fs ~stat sync =
     match sync () with
     | () ->
-        let st = stat () in
+        let st = stat in
         durable ctl ~full @@ fun () ->
         let young = split_young ctl fs ~upto in
         if
@@ -3871,7 +3872,7 @@ module Crash = struct
         lose ctl fs;
         keep_young ctl fs young;
         fs.synced <- Some st;
-        commit_attrs ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
+        commit_attrs ~upto ctl ~ino:(fun () -> st.Eio.File.Stat.ino);
         bump ctl fs ~kind:`Sync ~offset:0 ~len:0
     | exception (Eio.Io _ as e) ->
         fail_sync ~upto ctl fs;
@@ -3900,12 +3901,6 @@ module Crash = struct
     let close cf = close_cfile cf
   end
 
-  (* fsync(2) flushes the file, whichever descriptor names it, so a barrier
-     through a read-only handle commits the file as one through a read-write
-     handle does. A file the model does not track was never written through
-     the wrapper and is durable already. *)
-  let file_ino cf () = (Eio.File.stat cf.cro).ino
-
   (* The bytes a read of the file now sees, after its pages were evicted:
      through the handle, or by the path that still names it. *)
   let relive_by_handle cf img =
@@ -3920,23 +3915,29 @@ module Crash = struct
         rewrite cf.ctl fs img
     | _ | (exception Eio.Io _) -> ()
 
-  (* A sync covers the changes made before it: it takes them, then takes
-     its time, while other fibers run, then makes them durable. *)
+  (* A sync covers the changes made before it: it takes them, and the
+     file's stat, then takes its time, while other fibers run, then makes
+     them durable. *)
   let paused cf =
     guard cf;
-    let upto = cf.ctl.seq in
+    let upto = cf.ctl.seq and st = Eio.File.stat cf.cro in
     cf.ctl.pause ();
     guard cf;
-    upto
+    (upto, st)
 
+  (* fsync(2) flushes the file, whichever descriptor names it, so a barrier
+     through a read-only handle commits the file as one through a read-write
+     handle does. A file the model does not track was never written through
+     the wrapper and is durable already. *)
   let sync_ro ~full cf fs =
-    let upto = paused cf in
+    let upto, stat = paused cf in
     match fs with
-    | None -> commit_attrs cf.ctl ~ino:(file_ino cf)
+    | None ->
+        durable cf.ctl ~full (fun () ->
+            commit_attrs ~upto cf.ctl ~ino:(fun () -> cf.cino))
     | Some fs ->
-        barrier ~upto ~full cf.ctl fs
-          ~stat:(fun () -> Eio.File.stat cf.cro)
-          (fun () -> sync_base ~full:false cf.cro)
+        barrier ~upto ~full cf.ctl fs ~stat (fun () ->
+            sync_base ~full:false cf.cro)
 
   (* A directory opened as a file syncs as that directory's barrier, on the
      inode it opened. *)
@@ -3960,7 +3961,7 @@ module Crash = struct
     let sync ~full cf =
       match dir with
       | Some dir ->
-          let upto = paused cf in
+          let upto, _ = paused cf in
           durable ctl ~full (fun () -> commit_dir_ino ~upto ctl dir)
       | None -> sync_ro ~full cf fs
     in
@@ -4042,11 +4043,10 @@ module Crash = struct
        entries a name lives in are the metadata journal's business, committed by
        [sync_metadata] or a registered [Dir_sync], as fsync(2) divides them. *)
     let sync_full ~full cf =
-      let upto = paused cf in
+      let upto, stat = paused cf in
       let fs = fstate_of cf in
-      barrier ~upto ~full cf.ctl fs
-        ~stat:(fun () -> Eio.File.stat cf.cro)
-        (fun () -> Eio.File.sync (writable cf))
+      barrier ~upto ~full cf.ctl fs ~stat (fun () ->
+          Eio.File.sync (writable cf))
 
     let sync cf = sync_full ~full:false cf
 

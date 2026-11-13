@@ -114,9 +114,9 @@
 
     An operation takes time, and other fibers run meanwhile: a sync of a file or
     a directory 1 ms, any other operation 1 us, and one that fails none. Its
-    effect lands at the end of that time. A sync covers what was written before
-    it: a write another fiber makes while it runs stays unsynced, as Linux's
-    fsync(2) promises nothing about it. *)
+    effect lands at the end of that time. A sync covers the changes made before
+    it: a write, a change of mode or owner, or an entry another fiber makes
+    while it runs stays unsynced: Linux's fsync(2) promises nothing of them. *)
 
 type env =
   < fs : Eio.Fs.dir_ty Eio.Path.t
