@@ -5,6 +5,10 @@
     Both run on fresh in-memory filesystems and choose their scenarios from what
     the workload does.
 
+    Both take [?os], as {!Eio_fs.Fs.v} does: [`Linux], the default, or [`Macos].
+    It picks the filesystem's answers and, for {!Crash}, what a cut keeps of
+    each kind of sync. It comes from the argument, never the host.
+
     {2 Exploration}
 
     A check runs the workload once with no fault and records its operations. Its
