@@ -236,9 +236,26 @@ let bounded_sink ~max_bytes sink =
 let tmp_salt = Unsafe.Random.State.bits (Unsafe.Random.State.make_self_init ())
 let tmp_sequence = Atomic.make 0
 
-let fresh_name stem =
+(* What a name made beside a target keeps of the target's name. A long one is
+   cut at a character boundary and given the digest of the whole, so two names
+   cut alike stay apart and the longest suffix, 36 bytes, still fits NAME_MAX:
+   255 bytes, or 255 UTF-16 units, which a byte count bounds. *)
+let max_stem = 200
+
+let stem name =
+  if String.length name <= max_stem then name
+  else
+    let digest = String.sub (Digest.to_hex (Digest.string name)) 0 16 in
+    let room = max_stem - String.length digest - 1 in
+    let rec cut i =
+      let next = i + Uchar.utf_decode_length (String.get_utf_8_uchar name i) in
+      if next > room then i else cut next
+    in
+    String.sub name 0 (cut 0) ^ "~" ^ digest
+
+let fresh_name name =
   let n = Atomic.fetch_and_add tmp_sequence 1 in
-  stem ^ ".tmp." ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+  stem name ^ ".tmp." ^ string_of_int tmp_salt ^ "." ^ string_of_int n
 
 (* The first names are numbered from [0], so one workload names the same
    temporaries in every run; past [replayable] taken names, the rest are
@@ -247,7 +264,7 @@ let replayable = 64
 
 let fresh_tmp ~collisions (dir, target) =
   if collisions < replayable then
-    (dir, target ^ ".tmp." ^ string_of_int collisions)
+    (dir, stem target ^ ".tmp." ^ string_of_int collisions)
   else (dir, fresh_name target)
 
 let same_file (a : Eio.File.Stat.t) (b : Eio.File.Stat.t) =
@@ -462,7 +479,8 @@ let generation_infix = ".gen."
 
 let fresh_generation name =
   let n = Atomic.fetch_and_add tmp_sequence 1 in
-  "." ^ name ^ generation_infix ^ string_of_int tmp_salt ^ "." ^ string_of_int n
+  "." ^ stem name ^ generation_infix ^ string_of_int tmp_salt ^ "."
+  ^ string_of_int n
 
 let is_digits s i j =
   j > i
@@ -498,7 +516,7 @@ let is_generation s = Option.is_some (generation_of s)
    name, never a path elsewhere a caller linked by hand. *)
 let owned_generation ~name target =
   match generation_of target with
-  | Some owner -> String.equal owner name
+  | Some owner -> String.equal owner (stem name)
   | None -> false
 
 type Eio.Exn.Backend.t += Changed_generation of string

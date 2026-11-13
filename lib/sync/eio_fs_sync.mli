@@ -200,12 +200,14 @@ exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
     [Int64.max_int]); nothing of that write reaches the file. *)
 
 val fresh_name : string -> string
-(** [fresh_name stem] is [stem ^ ".tmp." ^ salt ^ "." ^ n], with [salt] a random
+(** [fresh_name name] is [stem ^ ".tmp." ^ salt ^ "." ^ n], with [salt] a random
     number drawn once per process and [n] a counter shared by every fiber and
     domain, so no two calls in one process answer the same string, and two
-    processes do only if they draw the same salt. It is exported for a store
-    whose target name is unknown until its bytes are read. The name is not
-    itself the exclusion: open it with [`Exclusive]. *)
+    processes do only if they draw the same salt. [stem] is [name] when it holds
+    at most 200 bytes; a longer one is cut at a character boundary and given a
+    digest of the whole, so the result is a valid file name whenever [name] is.
+    It is exported for a store whose target name is unknown until its bytes are
+    read. The name is not itself the exclusion: open it with [`Exclusive]. *)
 
 module Rename = Rename
 (** Capability-dispatched exclusive rename and backend construction. *)
@@ -230,18 +232,19 @@ val publish :
     directory backends without a registered operation; POSIX callers use the
     backend provided by [Eio_fs_unix.exclusive_rename].
 
-    An omitted [tmp] is a sibling name, opened exclusively: [path]'s name with
-    [".tmp.0"] appended, then [".tmp.1"] and so on while the name is taken, so
-    one workload names the same temporaries in every run. Past 64 taken names
-    the rest come from {!fresh_name}, up to 128 names in all. An explicit one is
-    also exclusive, must not exist, must differ from [path] and live on the same
-    filesystem, and is never drawn again: a taken name raises [Already_exists].
-    A process killed between the create and the rename leaves the temporary in
-    place, so a caller naming [tmp] owns every way that name can already be
-    taken. On a failure of [write], the sync or the rename, the temporary is
-    removed and [path] stays intact; a barrier failure is reported after the
-    rename, the new file visible with uncertain durability. A [config] that is
-    not durable keeps only the atomicity.
+    An omitted [tmp] is a sibling name, opened exclusively: [path]'s name, cut
+    as {!fresh_name} cuts a long one, with [".tmp.0"] appended, then [".tmp.1"]
+    and so on while the name is taken, so one workload names the same
+    temporaries in every run. Past 64 taken names the rest come from
+    {!fresh_name}, up to 128 names in all. An explicit one is also exclusive,
+    must not exist, must differ from [path] and live on the same filesystem, and
+    is never drawn again: a taken name raises [Already_exists]. A process killed
+    between the create and the rename leaves the temporary in place, so a caller
+    naming [tmp] owns every way that name can already be taken. On a failure of
+    [write], the sync or the rename, the temporary is removed and [path] stays
+    intact; a barrier failure is reported after the rename, the new file visible
+    with uncertain durability. A [config] that is not durable keeps only the
+    atomicity.
 
     {b Note.} The barriers are [config]'s. {!Barrier.portable}'s are [fsync(2)],
     which on Darwin stops at the drive's cache: a power cut can lose a
@@ -364,10 +367,10 @@ val publish_generation :
     [path] must be absent or a symbolic link, and must have a parent in its
     capability: anything else raises [Invalid_argument] before [populate] runs,
     and is left as it was. A generation is a hidden sibling, a dot, [path]'s
-    basename, [".gen."] and a fresh suffix ({!is_generation}); only generations
-    of the same basename are reclaimed, never a tree a link made by hand names.
-    One writer publishes a given [path] at a time; the exclusion is the caller's
-    ({!Lock}).
+    basename (cut as {!fresh_name} cuts a long one), [".gen."] and a fresh
+    suffix ({!is_generation}); only generations of the same basename are
+    reclaimed, never a tree a link made by hand names. One writer publishes a
+    given [path] at a time; the exclusion is the caller's ({!Lock}).
 
     On a failure of [populate], a sync or the switch, the staged generation is
     removed and [path] is unchanged. A barrier failure is reported after the
