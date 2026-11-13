@@ -3,6 +3,11 @@
 ; Quick check: dune build @fuzz
 ; With AFL: crow start --cpus=4
 
+; Extents is private to eio_fs: its source is compiled in here.
+
+(copy_files#
+ (files ../lib/extents.{ml,mli}))
+
 (executable
  (name fuzz)
  (libraries eio eio.mock eio_fs eio-fs.sync alcobar fmt cstruct optint))

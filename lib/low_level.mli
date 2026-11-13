@@ -130,10 +130,10 @@ val statat : follow:bool -> Dir.fd -> string -> Eio.File.Stat.t
 (** [statat ~follow dir path] is the metadata of [path], following a final
     symbolic link iff [follow] is [true]. *)
 
-val held : Dir.fd -> string -> (int * int) list option
+val held : Dir.fd -> string -> Extents.t option
 (** [held dir path] is the byte ranges writes covered in the regular file
-    [path], in order, following links: the rest of it is a hole. It is [None] if
-    [path] is not a regular file. *)
+    [path], following links: the rest of it is a hole. It is [None] if [path] is
+    not a regular file. *)
 
 val set_times :
   Dir.fd -> string -> atime:float -> mtime:float -> ctime:float -> unit

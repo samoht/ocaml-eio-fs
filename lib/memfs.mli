@@ -28,10 +28,10 @@ val as_user :
 
     @raise Invalid_argument if [path] is not an in-memory directory. *)
 
-val held : _ Eio.Path.t -> (int * int) list option
+val held : _ Eio.Path.t -> Extents.t option
 (** [held path] is the byte ranges writes covered in the regular file [path] of
-    an in-memory filesystem, in order: the rest of it is a hole. It is [None] if
-    [path] is not one. *)
+    an in-memory filesystem: the rest of it is a hole. It is [None] if [path] is
+    not one. *)
 
 val set_times :
   _ Eio.Path.t -> atime:float -> mtime:float -> ctime:float -> unit

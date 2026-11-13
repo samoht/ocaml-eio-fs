@@ -1074,9 +1074,9 @@ module Crash = struct
         (* The blocks failed syncs lost, with the seq each failed at and as
            they stood then: a writeback that failed only partly may have
            written any of them, the one of any failure. *)
-    mutable held : (int * int) list;
-        (* The byte ranges durable writes covered, disjoint and in order:
-           the disk holds the pages they touch, and no other. *)
+    mutable held : Extents.t;
+        (* The byte ranges durable writes covered: the disk holds the pages
+           they touch, and no other. *)
     mutable freed : (int * Cstruct.t) list;
         (* The pages durable shrinks freed, by index, newest first, as the
            disk held them. *)
@@ -1112,11 +1112,8 @@ module Crash = struct
       held =
         (let n = Cstruct.length durable in
          match held with
-         | Some l ->
-             List.filter_map
-               (fun (x, y) -> if x >= n then None else Some (x, min y n))
-               l
-         | None -> if n > 0 then [ (0, n) ] else []);
+         | Some h -> Extents.cut n h
+         | None -> Extents.(add 0 n empty));
       freed = [];
       synced = None;
     }
@@ -1386,7 +1383,7 @@ module Crash = struct
            the tree through: the code under test may run as a user who cannot
            read all of it. *)
     mutable by_rel : fstate list Paths.t; (* the files of [files] by path *)
-    mutable held : string -> (int * int) list option;
+    mutable held : string -> Extents.t option;
         (* The byte ranges writes covered in a file of an in-memory base, by
            path: the rest of it is a hole the disk does not hold. *)
     mutable set_times : string -> times -> unit;
@@ -2685,25 +2682,12 @@ module Crash = struct
      shrink frees the pages past it. *)
   let hold held = function
     | Write { offset; data } ->
-        let a = offset and b = offset + Cstruct.length data in
-        if b <= a then held
-        else
-          let before = List.filter (fun (_, y) -> y < a) held
-          and after = List.filter (fun (x, _) -> x > b) held
-          and over = List.filter (fun (x, y) -> y >= a && x <= b) held in
-          let a = List.fold_left (fun a (x, _) -> min a x) a over
-          and b = List.fold_left (fun b (_, y) -> max b y) b over in
-          before @ ((a, b) :: after)
-    | Resize m ->
-        let m = (m + page - 1) / page * page in
-        List.filter_map
-          (fun (x, y) -> if x >= m then None else Some (x, min y m))
-          held
+        Extents.add offset (offset + Cstruct.length data) held
+    | Resize m -> Extents.cut ((m + page - 1) / page * page) held
 
   (* Whether the disk holds the page of the byte range [\[a, b)]. *)
   let held_at held a b =
-    let a = a / page * page and b = (b + page - 1) / page * page in
-    List.exists (fun (x, y) -> x < b && y > a) held
+    Extents.overlaps (a / page * page) ((b + page - 1) / page * page) held
 
   (* The bytes [change] dirties in a file of [prev] bytes: a write those it
      covers and, past the end, the hole it leaves; a shrink the block it cuts
@@ -2812,9 +2796,9 @@ module Crash = struct
      [old p] is what the freed blocks the page may have been given held, at
      page [p] of its file, and where each was; one of them is drawn. [describe] is told the length and, run by run, what each
      block holds. *)
-  let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false) ?(held = [])
-      ?(old = fun _ -> []) ?(describe = fun _ _ -> ()) ~rng ~bs ~cache durable
-      changes =
+  let writeback ?(over = []) ?(len_upto = max_int) ?(bytes = false)
+      ?(held = Extents.empty) ?(old = fun _ -> []) ?(describe = fun _ _ -> ())
+      ~rng ~bs ~cache durable changes =
     let cached = Array.of_list (List.map snd changes) in
     let changes = Array.of_list (List.map fst changes) in
     let n = Array.length changes in
@@ -3839,7 +3823,33 @@ module Crash = struct
                           (fun (seq, m) -> seq > at && b * ctl.block_size >= m)
                           shrinks))
                 partial);
-        let before = copy_cs (bytes_of fs.durable) and held = fs.held in
+        (* The pages a shrink freed, as the disk held them: only those from
+           the lowest shrink on may be. *)
+        let held = fs.held and before = bytes_of fs.durable in
+        fs.held <- List.fold_left (fun h (c, _) -> hold h c) fs.held pending;
+        let from =
+          List.fold_left
+            (fun m -> function
+              | Resize n, _ -> min m ((n + page - 1) / page * page)
+              | Write _, _ -> m)
+            max_int pending
+        in
+        Extents.fold ~from
+          (fun x y () ->
+            for p = max (x / page) (from / page) to (y - 1) / page do
+              let off = p * page in
+              if
+                (not (held_at fs.held off (off + 1)))
+                && off < Cstruct.length before
+              then
+                fs.freed <-
+                  ( p,
+                    copy_cs
+                      (Cstruct.sub before off
+                         (min page (Cstruct.length before - off))) )
+                  :: List.remove_assoc p fs.freed
+            done)
+          held ();
         (match (fs.cache, fs.evicted) with
         | None, None -> List.iter (fun (c, _) -> apply fs.durable c) pending
         | cache, evicted ->
@@ -3858,24 +3868,6 @@ module Crash = struct
             fs.durable.len <- Cstruct.length c;
             fs.cache <- (if Cstruct.equal c live then None else Some live);
             fs.evicted <- (if Cstruct.equal c e then None else Some e));
-        fs.held <- List.fold_left (fun h (c, _) -> hold h c) fs.held pending;
-        (* The pages a shrink freed, as the disk held them. *)
-        List.iter
-          (fun (x, y) ->
-            for p = x / page to (y - 1) / page do
-              let off = p * page in
-              if
-                (not (held_at fs.held off (off + 1)))
-                && off < Cstruct.length before
-              then
-                fs.freed <-
-                  ( p,
-                    copy_cs
-                      (Cstruct.sub before off
-                         (min page (Cstruct.length before - off))) )
-                  :: List.remove_assoc p fs.freed
-            done)
-          held;
         lose ctl fs;
         keep_young ctl fs young;
         fs.synced <- Some st;

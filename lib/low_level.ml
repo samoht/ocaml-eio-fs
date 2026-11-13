@@ -251,53 +251,21 @@ module File = struct
      costs linear time. *)
   type contents = Literal of string | Buffer of Cstruct.t
 
-  (* [held] is the byte ranges a write covered, disjoint and in order: the
-     rest of the file is a hole. *)
-  type t = {
-    stat : Eio.File.Stat.t;
-    contents : contents;
-    held : (int * int) list;
-  }
+  (* [held] is the byte ranges a write covered: the rest of the file is a
+     hole. *)
+  type t = { stat : Eio.File.Stat.t; contents : contents; held : Extents.t }
 
-  let v ~stat = { stat; contents = Buffer Cstruct.empty; held = [] }
+  let v ~stat = { stat; contents = Buffer Cstruct.empty; held = Extents.empty }
 
   let literal ~stat contents =
     let n = String.length contents in
-    {
-      stat;
-      contents = Literal contents;
-      held = (if n > 0 then [ (0, n) ] else []);
-    }
-
-  let hold held a b =
-    if b <= a then held
-    else
-      let before = List.filter (fun (_, y) -> y < a) held
-      and after = List.filter (fun (x, _) -> x > b) held
-      and over = List.filter (fun (x, y) -> y >= a && x <= b) held in
-      let a = List.fold_left (fun a (x, _) -> min a x) a over
-      and b = List.fold_left (fun b (_, y) -> max b y) b over in
-      before @ ((a, b) :: after)
-
-  let cut held n =
-    List.filter_map
-      (fun (x, y) -> if x >= n then None else Some (x, min y n))
-      held
+    { stat; contents = Literal contents; held = Extents.(add 0 n empty) }
 
   let size f = Optint.Int63.to_int f.stat.size
 
   (* The 512-byte blocks of the 4096-byte pages a write put bytes in, as
      tmpfs counts them: a hole holds none. *)
-  let blocks f =
-    let page = 4096 in
-    let _, n =
-      List.fold_left
-        (fun (last, n) (x, y) ->
-          let a = max (x / page) (last + 1) and b = (y - 1) / page in
-          if y <= x || b < a then (last, n) else (b, n + b - a + 1))
-        (-1, 0) f.held
-    in
-    Int64.of_int (n * (page / 512))
+  let blocks f = Int64.of_int (Extents.pages f.held * (4096 / 512))
 
   let blit t ~src_off dst ~dst_off ~len =
     match t with
@@ -341,7 +309,7 @@ module File = struct
     {
       stat = { f.stat with size };
       contents = Buffer buf;
-      held = hold f.held off (off + len);
+      held = Extents.add off (off + len) f.held;
     }
 
   (* [f] cut or zero-extended to [n] bytes. *)
@@ -361,7 +329,7 @@ module File = struct
     {
       stat = { f.stat with size = Optint.Int63.of_int n };
       contents;
-      held = cut f.held n;
+      held = Extents.cut n f.held;
     }
 end
 
@@ -421,7 +389,7 @@ let truncate_file ~now r =
   match !r with
   | Resource.File f ->
       let stat = changed ~now { f.stat with size = Optint.Int63.zero } in
-      r := File { contents = File.Buffer Cstruct.empty; stat; held = [] }
+      r := File (File.v ~stat)
   | _ -> ()
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
