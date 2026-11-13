@@ -234,7 +234,7 @@ let extents fd ~file_offset ~length ~max =
    barrier. *)
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match Eio_fs_sync.dir_barrier res with
-  | Some barrier -> barrier ~path
+  | Some barrier -> barrier ~path ~full:true
   | None -> (
       Eio.Switch.run @@ fun sw ->
       let handle = Eio.Path.open_in ~sw ~follow:false p in
@@ -252,7 +252,7 @@ let sync_dir ((res, path) as p : _ Eio.Path.t) =
    descriptor takes the portable barrier, its own sync. *)
 let sync_file_or ~portable file =
   match Eio_fs_sync.file_barrier file with
-  | Some barrier -> barrier ()
+  | Some barrier -> barrier ~full:true
   | None -> (
       match Eio_unix.Resource.fd_opt file with
       | None -> portable file

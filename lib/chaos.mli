@@ -129,10 +129,16 @@ type env =
 (** {1:checks Checks} *)
 
 val check :
-  ?budget:int -> ?replay:string -> ?setup:(env -> unit) -> (env -> unit) -> unit
-(** [check ~budget ~replay ~setup run] calls [run] many times, each on a fresh
-    in-memory directory that holds what [setup] (defaults to nothing) made
-    there, with no fault. The first run has no fault either.
+  ?budget:int ->
+  ?replay:string ->
+  ?os:[< `Linux | `Macos ] ->
+  ?setup:(env -> unit) ->
+  (env -> unit) ->
+  unit
+(** [check ~budget ~replay ~os ~setup run] calls [run] many times, each on a
+    fresh in-memory directory that holds what [setup] (defaults to nothing) made
+    there, with no fault. The first run has no fault either. The directory
+    answers as [os] (defaults to [`Linux]) does, as {!Eio_fs.Fs.v} makes it.
 
     The linear tier tries each of these alone, at each structural operation:
 
@@ -199,13 +205,14 @@ module Crash : sig
   val check :
     ?budget:int ->
     ?replay:string ->
+    ?os:[< `Linux | `Macos ] ->
     ?setup:(env -> unit) ->
     (ack:('a -> unit) -> env -> unit) ->
     recover:(acked:'a list -> env -> unit) ->
     unit
-  (** [check ~budget ~replay ~setup run ~recover] cuts the power during [run],
-      and during [recover], and checks that [recover] accepts what each cut
-      leaves.
+  (** [check ~budget ~replay ~os ~setup run ~recover] cuts the power during
+      [run], and during [recover], and checks that [recover] accepts what each
+      cut leaves.
 
       [setup] (defaults to nothing) prepares the directory, and what it makes is
       durable. [run] calls [ack v] once its program has promised that [v] is
@@ -304,8 +311,9 @@ module Crash : sig
   type t
   (** The type for power-cut controllers. *)
 
-  val v : policy -> t
-  (** [v policy] is a controller whose cut rebuilds the disk by [policy]. *)
+  val v : ?os:[< `Linux | `Macos ] -> policy -> t
+  (** [v ~os policy] is a controller whose cut rebuilds the disk by [policy], as
+      [os] (defaults to [`Linux]) keeps it. *)
 
   val wrap : t -> _ Eio.Path.t -> Eio.Fs.dir_ty Eio.Path.t
   (** [wrap t base] is [base] with its writes and directory changes tracked by

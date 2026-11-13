@@ -431,14 +431,14 @@ let close_resource r =
    which no library outside this package can name: eio-fs.unix takes the
    host descriptor a record lock is taken on from it. *)
 let rw_boxed (type s) ?(extra = [])
-    (module X : Eio.File.Pi.WRITE with type t = s) (state : s)
+    (module X : Eio.File.Pi.WRITE with type t = s) ~barrier (state : s)
     ~(base : Eio.File.rw_ty r) : Eio.File.rw_ty r =
   Eio.Resource.T
     ( state,
       Eio.Resource.handler
         (Eio.Resource.bindings (Eio.File.Pi.rw (module X))
         @ [
-            Eio.Resource.H (Eio_fs_sync.File_sync, X.sync);
+            Eio.Resource.H (Eio_fs_sync.File_sync, barrier);
             Eio.Resource.H
               (Eio_fs_internal.Base_file, fun _ -> (base :> Eio.File.ro_ty r));
           ]
@@ -532,7 +532,14 @@ let do_pwrite sched path ~append (base : Eio.File.rw_ty r) ~file_offset bufs =
   | Some (Fault.Write_error c) -> raise_io c path
   | _ -> Eio.File.pwrite_single base ~file_offset bufs
 
-let do_sync sched path (base : Eio.File.rw_ty r) =
+(* A barrier passed on to the file beneath, through the cache of the drive
+   when [full]: through the base's own barrier, or its sync. *)
+let barrier_base ~full (base : Eio.File.rw_ty r) =
+  match Eio_fs_sync.file_barrier base with
+  | Some barrier -> barrier ~full
+  | None -> Eio.File.sync base
+
+let do_sync ?(full = false) sched path (base : Eio.File.rw_ty r) =
   match Schedule.next sched (Op.sync path) with
   | Some (Fault.Sync_error c) ->
       sync_failed ~evict:false base;
@@ -540,7 +547,7 @@ let do_sync sched path (base : Eio.File.rw_ty r) =
   | Some (Fault.Sync_evict c) ->
       sync_failed ~evict:true base;
       raise_io c path
-  | _ -> Eio.File.sync base
+  | _ -> barrier_base ~full base
 
 let do_stat sched path (base : Eio.File.ro_ty r) =
   match Schedule.next sched (Op.stat path) with
@@ -577,15 +584,15 @@ end
 (* fsync(2) flushes the file whichever descriptor names it, so a file opened
    read-only answers [Eio_fs_sync.File_sync] too, scheduled as the read-write
    sync is: through the base's own barrier, or the sync its handle exposes. *)
-let sync_base (Eio.Resource.T (v, ops) as base) =
+let sync_base ~full (Eio.Resource.T (v, ops) as base) =
   match Eio_fs_sync.file_barrier base with
-  | Some barrier -> barrier ()
+  | Some barrier -> barrier ~full
   | None -> (
       match Eio.Resource.get_opt ops Eio.File.Pi.Write with
       | Some (module W) -> W.sync v
       | None -> invalid_arg "Chaos: the base file opened read-only cannot sync")
 
-let sync_ro t =
+let sync_ro t ~full =
   match Schedule.next t.sched (Op.sync t.path) with
   | Some (Fault.Sync_error c) ->
       sync_failed ~evict:false t.ro;
@@ -593,7 +600,7 @@ let sync_ro t =
   | Some (Fault.Sync_evict c) ->
       sync_failed ~evict:true t.ro;
       raise_io c t.path
-  | _ -> sync_base t.ro
+  | _ -> sync_base ~full t.ro
 
 (* A failure a wrapper above injected is told on to the file beneath, so
    stacked wrappers reach the power-loss model at the bottom. *)
@@ -653,6 +660,7 @@ let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =
     ~extra:
       [ Eio.Resource.H (Sync_failed, fun t ~evict -> sync_failed ~evict t.ro) ]
     (module Rw_impl)
+    ~barrier:(fun t ~full -> do_sync ~full t.sched t.path (writable t))
     state ~base
 
 (* {2 Directory wrapper} *)
@@ -835,11 +843,13 @@ module Dir_impl = struct
     let (Base_dir ((module B), bv)) = t.boxed in
     B.native bv path
 
-  let sync_dir t path =
+  let sync_dir ?(full = false) t path =
     (match Schedule.next t.sched (Op.sync path) with
     | Some (Fault.Sync_error c | Fault.Sync_evict c) -> raise_io c path
     | _ -> ());
-    Eio_fs_sync.sync_dir (t.base, path)
+    match Eio_fs_sync.dir_barrier t.base with
+    | Some barrier -> barrier ~path ~full
+    | None -> Eio_fs_sync.sync_dir (t.base, path)
 
   let pp ppf t =
     let (Base_dir ((module B), bv)) = t.boxed in
@@ -877,7 +887,8 @@ let dir_handler =
       Eio.Resource.H
         (Eio_fs_sync.Modeless, fun t -> Eio_fs_sync.is_modeless t.base);
       Eio.Resource.H
-        (Eio_fs_sync.Dir_sync, fun t ~path -> Dir_impl.sync_dir t path);
+        ( Eio_fs_sync.Dir_sync,
+          fun t ~path ~full -> Dir_impl.sync_dir ~full t path );
     ]
 
 let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =
@@ -3910,7 +3921,7 @@ module Crash = struct
     | Some fs ->
         barrier ~upto cf.ctl fs
           ~stat:(fun () -> Eio.File.stat cf.cro)
-          (fun () -> sync_base cf.cro)
+          (fun () -> sync_base ~full:false cf.cro)
 
   (* A directory opened as a file syncs as that directory's barrier, on the
      inode it opened. *)
@@ -3943,7 +3954,7 @@ module Crash = struct
         Eio.Resource.handler
           (Eio.Resource.bindings (Eio.File.Pi.ro (module Cro_impl))
           @ [
-              Eio.Resource.H (Eio_fs_sync.File_sync, sync);
+              Eio.Resource.H (Eio_fs_sync.File_sync, fun cf ~full:_ -> sync cf);
               Eio.Resource.H
                 ( Sync_failed,
                   fun cf ~evict ->
@@ -4054,6 +4065,7 @@ module Crash = struct
                 fail_sync ~evict ~relive:(relive_by_handle cf) cf.ctl fs );
         ]
       (module Crw_impl)
+      ~barrier:(fun cf ~full:_ -> Crw_impl.sync cf)
       state ~base
 
   (* [dplace] is where this directory sits under the boxed directory the
@@ -4474,7 +4486,9 @@ module Crash = struct
           ( Eio_fs_sync.Process_local,
             fun d -> Eio_fs_sync.is_process_local d.dbase );
         H (Eio_fs_sync.Modeless, fun d -> Eio_fs_sync.is_modeless d.dbase);
-        H (Eio_fs_sync.Dir_sync, fun d ~path -> Cdir_impl.sync_dir d path);
+        H
+          ( Eio_fs_sync.Dir_sync,
+            fun d ~path ~full:_ -> Cdir_impl.sync_dir d path );
       ]
 
   let wrap_cdir ctl ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
@@ -4495,9 +4509,10 @@ module Crash = struct
     crash_dir_hook :=
       fun ctl ~ino ~root ~prefix ~base -> wrap_cdir ctl ~ino ~root ~prefix ~base
 
-  let v ?(policy = Drop_unsynced) ?(trigger = Manual) ?(outside = Dropped)
+  let v ?os ?(policy = Drop_unsynced) ?(trigger = Manual) ?(outside = Dropped)
       ?(block_size = 4096) ?(pause = ignore) () =
     if block_size <= 0 then invalid_arg "Chaos.Crash.v: block_size <= 0";
+    ignore os;
     {
       policy;
       trigger;

@@ -191,7 +191,7 @@ end = struct
                  (Eio.Resource.T (Dir.as_root t, Lazy.force self)
                    :> Eio.Fs.dir_ty Eio.Resource.t) );
            H (Eio_fs_sync.Rename.Exclusive, Dir.rename_exclusive);
-           H (Eio_fs_sync.Dir_sync, fun t ~path -> Dir.sync_dir t path);
+           H (Eio_fs_sync.Dir_sync, fun t ~path ~full:_ -> Dir.sync_dir t path);
            (* The tree lives in this process's heap. It answers no native path
            and hands out no descriptor, so nothing outside this process can
            reach a file of it: an exclusion between fibers here is the whole

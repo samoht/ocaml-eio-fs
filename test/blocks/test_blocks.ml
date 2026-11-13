@@ -109,7 +109,7 @@ let run ~init ~injection ~policy wl =
               match Eio_fs_sync.file_barrier f with
               | None -> failwith "no barrier"
               | Some b -> (
-                  match b () with
+                  match b ~full:false with
                   | () -> failwith "the sync did not fail"
                   | exception Eio.Io _ -> ())))
     (letters wl) wl;

@@ -8,7 +8,11 @@ module Rename = Rename
    implementation, so the operation is probed from the handle. *)
 
 type (_, _, _) Eio.Resource.pi +=
-  | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
+  | Dir_sync :
+      ( 't,
+        't -> path:string -> full:bool -> unit,
+        [> `Dir_sync ] )
+      Eio.Resource.pi
 
 let dir_barrier (Eio.Resource.T (v, ops)) =
   Option.map (fun f -> f v) (Eio.Resource.get_opt ops Dir_sync)
@@ -25,7 +29,7 @@ let fsync_handle (Eio.Resource.T (v, ops)) =
 
 let sync_dir ((res, path) as p : _ Eio.Path.t) =
   match dir_barrier res with
-  | Some barrier -> barrier ~path
+  | Some barrier -> barrier ~path ~full:false
   | None -> (
       Eio.Switch.run @@ fun sw ->
       match Eio.Path.open_in ~sw p with
@@ -70,21 +74,21 @@ let rec mkdirs_with ~sync_parent ~exists_ok ~perm p =
    no name. A registered barrier is answered whole: syncing the file behind it
    would be a barrier the wrapper never recorded. *)
 type (_, _, _) Eio.Resource.pi +=
-  | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
+  | File_sync : ('t, 't -> full:bool -> unit, [> `File_sync ]) Eio.Resource.pi
 
 let file_barrier (Eio.Resource.T (v, ops)) =
-  Option.map (fun f () -> f v) (Eio.Resource.get_opt ops File_sync)
+  Option.map (fun f ~full -> f v ~full) (Eio.Resource.get_opt ops File_sync)
 
 let sync_file file =
   match file_barrier file with
-  | Some barrier -> barrier ()
+  | Some barrier -> barrier ~full:false
   | None -> Eio.File.sync file
 
 (* Any handle on the file, read-only included: its registered barrier, else
    the write side the POSIX backends give every handle. *)
 let sync_any_file (Eio.Resource.T (v, ops) as file) =
   match (file_barrier file, Eio.Resource.get_opt ops Eio.File.Pi.Write) with
-  | Some barrier, _ -> barrier ()
+  | Some barrier, _ -> barrier ~full:false
   | None, Some (module W) -> W.sync v
   | None, None ->
       invalid_arg

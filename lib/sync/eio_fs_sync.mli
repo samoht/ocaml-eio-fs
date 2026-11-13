@@ -17,12 +17,18 @@
 (** {1:sync Directory and file barriers} *)
 
 type (_, _, _) Eio.Resource.pi +=
-  | Dir_sync : ('t, 't -> path:string -> unit, [> `Dir_sync ]) Eio.Resource.pi
+  | Dir_sync :
+      ( 't,
+        't -> path:string -> full:bool -> unit,
+        [> `Dir_sync ] )
+      Eio.Resource.pi
         (** The operation a directory-capable backend registers in its resource
             handler: make the entries of the directory at [path] (relative to
-            the resource, as for every DIR operation) durable. *)
+            the resource, as for every DIR operation) durable. [full] asks for
+            them to go through the drive's cache too, as [F_FULLFSYNC] does on
+            Darwin; {!sync_dir} asks [false], [Eio_fs_unix.sync_dir] [true]. *)
 
-val dir_barrier : 'a Eio.Resource.t -> (path:string -> unit) option
+val dir_barrier : 'a Eio.Resource.t -> (path:string -> full:bool -> unit) option
 (** [dir_barrier res] is [Some b] with [b] the directory barrier [res] registers
     through {!Dir_sync}, and [None] if it registers none. *)
 
@@ -51,13 +57,14 @@ val sync_parent : _ Eio.Path.t -> unit
     does, on the directory the barrier lands on. *)
 
 type (_, _, _) Eio.Resource.pi +=
-  | File_sync : ('t, 't -> unit, [> `File_sync ]) Eio.Resource.pi
+  | File_sync : ('t, 't -> full:bool -> unit, [> `File_sync ]) Eio.Resource.pi
         (** The operation a file-capable backend registers in its resource
-            handler: make this file's data durable. A file is itself the
-            resource, so the operation carries no name, where {!Dir_sync} takes
-            the [~path] a directory resource is joined with. *)
+            handler: make this file's data durable, through the drive's cache
+            too when [full], as {!Dir_sync}. A file is itself the resource, so
+            the operation carries no name, where {!Dir_sync} takes the [~path] a
+            directory resource is joined with. *)
 
-val file_barrier : 'a Eio.Resource.t -> (unit -> unit) option
+val file_barrier : 'a Eio.Resource.t -> (full:bool -> unit) option
 (** [file_barrier res] is [Some b] with [b] the file barrier [res] registers
     through {!File_sync}, and [None] if it registers none. *)
 

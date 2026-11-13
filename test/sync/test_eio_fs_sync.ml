@@ -332,7 +332,8 @@ let counting_file ~register base =
     if register then
       [
         Eio.Resource.H
-          (Eio_fs_sync.File_sync, fun (t : Counting_file.t) -> incr t.registered);
+          ( Eio_fs_sync.File_sync,
+            fun (t : Counting_file.t) ~full:_ -> incr t.registered );
       ]
     else []
   in

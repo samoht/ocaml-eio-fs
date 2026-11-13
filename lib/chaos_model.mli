@@ -432,6 +432,7 @@ module Crash : sig
             [Chaos.Crash.wrap], whose controllers all keep it. *)
 
   val v :
+    ?os:[< `Linux | `Macos ] ->
     ?policy:policy ->
     ?trigger:trigger ->
     ?outside:outside ->
@@ -439,11 +440,12 @@ module Crash : sig
     ?pause:(unit -> unit) ->
     unit ->
     t
-  (** [v ~policy ~trigger ~outside ~block_size ~pause ()] is a fresh controller
-      that rebuilds the post-crash image by [policy] (defaults to
-      {!Drop_unsynced}, a single state) and [outside] (defaults to {!Dropped}),
-      and crashes on [trigger] (defaults to {!Manual}). [block_size] (defaults
-      to [4096]) is the byte size of the blocks {!Reorder_unsynced} writes back.
+  (** [v ~os ~policy ~trigger ~outside ~block_size ~pause ()] is a fresh
+      controller for [os]'s durability (defaults to [`Linux]) that rebuilds the
+      post-crash image by [policy] (defaults to {!Drop_unsynced}, a single
+      state) and [outside] (defaults to {!Dropped}), and crashes on [trigger]
+      (defaults to {!Manual}). [block_size] (defaults to [4096]) is the byte
+      size of the blocks {!Reorder_unsynced} writes back.
 
       A sync of a file or a directory covers the changes made before it, runs
       [pause ()] (defaults to doing nothing), then makes them durable. A change

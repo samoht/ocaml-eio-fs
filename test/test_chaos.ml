@@ -238,8 +238,8 @@ let test_read_only_file_sync () =
   match Eio_fs_sync.file_barrier file with
   | None -> Alcotest.fail "a read-only file registers no barrier"
   | Some barrier ->
-      barrier ();
-      expect_io "the scheduled sync failure" barrier
+      barrier ~full:false;
+      expect_io "the scheduled sync failure" (fun () -> barrier ~full:false)
 
 (* [Fault.compare] orders faults by constructor, then by argument, and agrees
    with [Fault.equal]. *)
@@ -2674,7 +2674,7 @@ let test_crash_dir_handle_barrier_by_inode () =
   Eio.Path.save ~create:(`Exclusive 0o644) (fs / "b/d/x") "x";
   Eio.Path.save ~create:(`Exclusive 0o644) (fs / "a/d/y") "y";
   (match Eio_fs_sync.file_barrier h with
-  | Some barrier -> barrier ()
+  | Some barrier -> barrier ~full:false
   | None -> Alcotest.fail "no barrier");
   let post = Crash.post_crash ctl in
   Alcotest.(check (pair bool bool))
@@ -3177,7 +3177,7 @@ let test_crash_stacked_wrappers_relay_failure () =
              (fun g ->
                match Eio_fs_sync.file_barrier g with
                | Some b -> (
-                   match b () with
+                   match b ~full:false with
                    | () -> Alcotest.fail "no failure"
                    | exception Eio.Io _ -> ())
                | None -> Alcotest.fail "no barrier")

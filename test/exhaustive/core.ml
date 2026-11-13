@@ -236,7 +236,7 @@ let exec ~sw ~w ~wu ~dry hs i op =
       | None -> raise Exit
       | Some h -> (
           match Eio_fs_sync.file_barrier h with
-          | Some b -> b ()
+          | Some b -> b ~full:false
           | None -> raise (Anomaly "no file barrier on dir handle")))
 
 (* Fresh fs, durable init, ops through Chaos.Crash over a Chaos wrapper with

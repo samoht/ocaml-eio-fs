@@ -228,7 +228,8 @@ let registered_file ~sw ~register base =
     if register then
       [
         Eio.Resource.H
-          (Eio_fs_sync.File_sync, fun (t : Registered_file.t) -> incr t.calls);
+          ( Eio_fs_sync.File_sync,
+            fun (t : Registered_file.t) ~full:_ -> incr t.calls );
       ]
     else []
   in

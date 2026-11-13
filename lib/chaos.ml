@@ -205,7 +205,8 @@ let add_floor halted ~budget ~floor ~at n =
       if !floor > b then halt halted (Over_budget at)
   | None -> ()
 
-let fresh clock = (Memfs.v ~clock () :> Eio.Fs.dir_ty Eio.Path.t)
+let fresh ~os clock = (Memfs.v ~clock ~os () :> Eio.Fs.dir_ty Eio.Path.t)
+let os_of = function Some `Macos -> `Macos | Some `Linux | None -> `Linux
 
 let rec walk (d : _ Eio.Path.t) prefix f =
   List.iter
@@ -699,7 +700,7 @@ let met_no_fault st (op : Op.t) =
   if Hashtbl.length st.counts > 0 then
     List.iter (Hashtbl.remove st.counts) (targets op)
 
-let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
+let exec_check ?spaces ?cap ?budget ~os ~first ~setup run (s : Plan.check) =
   let marked op =
     List.exists (fun (p, _) -> Plan.at p op) s.faults
     || match s.lasting with Some (_, p) -> Plan.at p op | None -> false
@@ -754,7 +755,7 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
     match
       in_loop ~halted @@ fun clock mono ->
       st.mono <- Some mono;
-      let base = fresh clock in
+      let base = fresh ~os clock in
       with_env clock mono base setup;
       (* Pages a failed sync evicts read as the disk holds them, which the
          model of the disk knows. *)
@@ -763,7 +764,7 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
           List.exists
             (function _, Fault.Evict _ -> true | _ -> false)
             s.faults
-        then (M.Crash.wrap (M.Crash.v ()) base :> Eio.Fs.dir_ty Eio.Path.t)
+        then (M.Crash.wrap (M.Crash.v ~os ()) base :> Eio.Fs.dir_ty Eio.Path.t)
         else base
       in
       let wrap d =
@@ -784,14 +785,15 @@ let exec_check ?spaces ?cap ?budget ~first ~setup run (s : Plan.check) =
   in
   (trace, outcome)
 
-let check ?budget ?replay ?(setup = ignore) run =
+let check ?budget ?replay ?os ?(setup = ignore) run =
+  let os = os_of os in
   let name = check_name in
   let budget = budget_of name budget in
   let replay = Option.map (parse_replay name) replay in
   let spaces = Hashtbl.create 16 in
   (* A replay runs one scenario, whatever the budget. *)
   let first, out =
-    exec_check ~spaces
+    exec_check ~spaces ~os
       ?budget:(if replay = None then Some budget else None)
       ~first:(Hashtbl.create 1) ~setup run Plan.none
   in
@@ -803,7 +805,7 @@ let check ?budget ?replay ?(setup = ignore) run =
      past that, the plan of the next scenarios reads its first ones. *)
   let n = List.length first in
   let exec ?(cap = (4 * n) + 10_000) s =
-    exec_check ~cap ~first:(made first) ~setup run s
+    exec_check ~cap ~os ~first:(made first) ~setup run s
   in
   let again = kept (fst (exec ~cap:(n + 1) Plan.none)) in
 
@@ -939,9 +941,9 @@ module Crash = struct
      so its cut keeps their changes. A check reaches its directory through
      the wrapper alone and builds its own on [Dropped], the same states for
      less work. *)
-  let v = function
-    | Drop_unsynced -> M.Crash.v ~policy:Drop_unsynced ~outside:Kept ()
-    | Survive p -> M.Crash.v ~policy:(Survive p) ~outside:Kept ()
+  let v ?os = function
+    | Drop_unsynced -> M.Crash.v ?os ~policy:Drop_unsynced ~outside:Kept ()
+    | Survive p -> M.Crash.v ?os ~policy:(Survive p) ~outside:Kept ()
 
   let wrap t base = (M.Crash.wrap t base :> Eio.Fs.dir_ty Eio.Path.t)
   let unsynced = M.Crash.unsynced
@@ -1103,7 +1105,7 @@ module Crash = struct
     let outcome = if !kept_going then Kept_going else outcome in
     (outcome, !lost)
 
-  let exec ?cap ?budget ~setup run ~recover (s : Plan.crash) =
+  let exec ?cap ?budget ~os ~setup run ~recover (s : Plan.crash) =
     let trail = ref [] and rtrail = ref [] in
     let acked = ref [] and acked_at = ref [] in
     let marked op = List.exists (fun (p, _) -> Plan.at p op) s.cfaults in
@@ -1132,11 +1134,11 @@ module Crash = struct
     let error =
       match
         in_loop ~idle ~halted @@ fun clock mono ->
-        let base = fresh clock in
+        let base = fresh ~os clock in
         with_env clock mono base setup;
         let pause = ref ignore in
         let ctl =
-          M.Crash.v ~policy:(policy_of trail s.state) ~block_size:512
+          M.Crash.v ~os ~policy:(policy_of trail s.state) ~block_size:512
             ~pause:(fun () -> !pause ())
             ()
         in
@@ -1181,10 +1183,10 @@ module Crash = struct
               let pause () = !rpause () in
               match s.rcut with
               | Some (j, st) ->
-                  ( M.Crash.v ~policy:(policy_of rtrail st) ~block_size:512
+                  ( M.Crash.v ~os ~policy:(policy_of rtrail st) ~block_size:512
                       ~pause (),
                     j )
-              | None -> (M.Crash.v ~policy:Drop_unsynced ~pause (), None)
+              | None -> (M.Crash.v ~os ~policy:Drop_unsynced ~pause (), None)
             in
             let rfs = M.Crash.wrap rctl base in
             recovering := true;
@@ -1321,12 +1323,13 @@ module Crash = struct
             |> String.concat "\n            " );
     ]
 
-  let check ?budget ?replay ?(setup = ignore) run ~recover =
+  let check ?budget ?replay ?os ?(setup = ignore) run ~recover =
+    let os = os_of os in
     let budget = budget_of name budget in
     let replay =
       Option.map (parse_replay ~well_formed:Plan.well_formed name) replay
     in
-    let exec ?cap ?budget s = exec ?cap ?budget ~setup run ~recover s in
+    let exec ?cap ?budget s = exec ?cap ?budget ~os ~setup run ~recover s in
     (* A replay runs one scenario, whatever the budget. *)
     let first =
       exec ?budget:(if replay = None then Some budget else None) Plan.base
@@ -1354,7 +1357,7 @@ module Crash = struct
     let sizes =
       match
         in_loop (fun clock mono ->
-            let d = fresh clock in
+            let d = fresh ~os clock in
             with_env clock mono d setup;
             files d)
       with
