@@ -902,6 +902,41 @@ let test_long_name_on_disk () =
   Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true (fs / dir))
   @@ fun () -> publish_long_name (fs / dir) "n"
 
+(* Only a target's name is cut, never its directories: a temporary made in an
+   ancestor fails where the user may not write, here the first of two
+   100-byte directories. *)
+let test_long_directories () =
+  Eio_mock.Backend.run @@ fun () ->
+  let root = Eio_fs.Fs.v () in
+  let d1 = String.make 100 'a' and d2 = String.make 100 'b' in
+  Eio.Path.mkdir ~perm:0o755 (root / d1);
+  Eio.Path.mkdir ~perm:0o755 (root / d1 / d2);
+  Eio.Path.chown ~follow:true ~uid:1000L ~gid:1000L (root / d1 / d2);
+  let alice = { Eio_fs.uid = 1000; gid = 1000; groups = []; umask = 0o022 } in
+  let dir = Eio_fs.Fs.as_user alice root / d1 / d2 in
+  let target = d1 ^ "/" ^ d2 ^ "/state" in
+  Eio_fs_sync.save (dir / "state") "saved";
+  Alcotest.(check string) "a saved file" "saved" (Eio.Path.load (dir / "state"));
+  Eio_fs_sync.publish_generation (dir / "tree") (fun d ->
+      Eio.Path.save ~create:(`Exclusive 0o644) (d / "f") "g");
+  Alcotest.(check string)
+    "a published generation" "g"
+    (Eio.Path.load (dir / "tree" / "f"));
+  (match
+     Eio_fs_sync.publish_link ~lock:Eio_fs_sync.Lock.none ~expected:None
+       ~link_to:"target" (dir / "link")
+   with
+  | Ok () -> ()
+  | Error _ -> Alcotest.fail "the link was refused");
+  Eio.Path.mkdir ~perm:0o755 (dir / "long");
+  publish_long_name (dir / "long") "n";
+  Alcotest.(check (list string))
+    "nothing made in the ancestor" [ d2 ]
+    (Eio.Path.read_dir (root / d1));
+  Alcotest.(check string)
+    "a fresh name stays in the target's directory" (Filename.dirname target)
+    (Filename.dirname (Eio_fs_sync.fresh_name target))
+
 let suite =
   ( "eio_fs_sync",
     [
@@ -912,6 +947,8 @@ let suite =
       Alcotest.test_case "a 255-unit name in memory, macOS" `Quick
         (test_long_name_in_memory `Macos "\xe6\x97\xa5");
       Alcotest.test_case "a 255-byte name on disk" `Quick test_long_name_on_disk;
+      Alcotest.test_case "names under long directories" `Quick
+        test_long_directories;
       Alcotest.test_case "a small value is copied through a small buffer" `Quick
         test_small_copy_buffer;
       Alcotest.test_case "sparse 8 MiB extents and cost" `Quick (fun () ->
