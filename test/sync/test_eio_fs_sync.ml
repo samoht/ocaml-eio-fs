@@ -588,6 +588,33 @@ let test_append_retries_a_failed_parent_barrier () =
   Alcotest.(check bool) "the directory is barriered again" true (!dir_syncs > 0);
   Alcotest.(check string) "both lines" "1\n2\n" (Eio.Path.load p)
 
+(* A retry with nothing to append still owes the barriers: after it, the log
+   created by an append whose directory barrier failed survives a cut. *)
+let test_append_nothing_retries_the_barriers () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs.run @@ fun env ->
+  let module Chaos = Eio_fs.Chaos.Private in
+  let module Crash = Chaos.Crash in
+  let ctl = Crash.v () in
+  let schedule =
+    Chaos.Schedule.scripted
+      [
+        {
+          trigger = Op_on_path { kind = `Sync; path = "" };
+          fault = Sync_error `Eio;
+        };
+      ]
+  in
+  let p = Chaos.wrap schedule (Crash.wrap ctl env#fs) / "log.jsonl" in
+  (match Eio_fs_sync.append_lines p [ "1" ] with
+  | () -> Alcotest.fail "the directory barrier did not fail"
+  | exception Eio.Io _ -> ());
+  Eio_fs_sync.append_lines p [];
+  Crash.crash ctl;
+  Alcotest.(check string)
+    "the log survives" "1\n"
+    (Eio.Path.load (Crash.post_crash ctl / "log.jsonl"))
+
 (* POSIX truncate leaves unwritten ranges zero. The independent operation
    trace pins the data extents, so filling those gaps with zero writes fails
    even if the published bytes still look right. *)
@@ -980,6 +1007,8 @@ let suite =
       Alcotest.test_case "append refuses a line holding LF" `Quick
         test_append_refuses_lf;
       Alcotest.test_case "append on posix" `Quick test_append_posix;
+      Alcotest.test_case "append nothing retries the barriers" `Quick
+        test_append_nothing_retries_the_barriers;
       Alcotest.test_case "append retries a failed parent barrier" `Quick
         test_append_retries_a_failed_parent_barrier;
       Alcotest.test_case "posix needs no registration" `Quick
