@@ -133,18 +133,39 @@ let test_first_publication () =
     "first: the crash points include one that leaves the name absent" true
     (List.exists Option.is_none outcomes)
 
-(* The generation a publication replaces is reclaimed once the switch is
-   committed, and a crash leaves nothing a later publication trips on. *)
-let test_previous_reclaimed () =
+(* A reader that resolved the pointer reads its generation one file at a time,
+   and a publication between two reads leaves that generation whole. *)
+let test_reader_spans_a_replacement () =
   with_old @@ fun base ->
+  let generation = base / Eio.Path.read_link (base / "out") in
+  let a = Eio.Path.load (generation / "a") in
   publish ~durable:true base new_tree;
-  let entries = List.sort String.compare (Eio.Path.read_dir base) in
+  let b = Eio.Path.load (generation / "sub/b") in
+  Alcotest.(check (pair string string))
+    "both files of the reader's generation" ("old-a", "old-b") (a, b)
+
+(* A publication keeps the generation it replaces and reclaims the owned ones
+   older than that, a stray left by a crash included, so a crash leaves
+   nothing a later publication trips on. *)
+let test_older_reclaimed () =
+  with_old @@ fun base ->
+  let oldest = Eio.Path.read_link (base / "out") in
+  let stray = ".out.gen.1.2" in
+  populate [ (stray ^ "/x", "left by a crash") ] base;
+  publish ~durable:true base new_tree;
+  let previous = Eio.Path.read_link (base / "out") in
+  publish ~durable:true base [ ("a", "third") ];
   let target = Eio.Path.read_link (base / "out") in
   Alcotest.(check (list string))
-    "the pointer and its generation, nothing else"
-    (List.sort String.compare [ "out"; target ])
-    entries;
-  Alcotest.check tree "the new tree" (Some new_tree) (read_back (base / "out"))
+    "the pointer, its generation and the one it replaced"
+    (List.sort String.compare [ "out"; target; previous ])
+    (List.sort String.compare (Eio.Path.read_dir base));
+  Alcotest.(check bool)
+    "the oldest is reclaimed" false
+    (List.mem oldest (Eio.Path.read_dir base));
+  Alcotest.check tree "the latest tree"
+    (Some [ ("a", "third") ])
+    (read_back (base / "out"))
 
 (* A link a caller made by hand names a tree this publication does not own:
    the switch replaces the link and leaves the tree. *)
@@ -282,6 +303,8 @@ let test_posix_readonly_reclaimed () =
       Eio.Path.symlink ~link_to:"../foreign" (dir / "link"));
   let old = Eio.Path.read_link (root / "out") in
   Eio_fs_sync.publish_generation ~durable:true (root / "out")
+    (readonly [ ("readonly/file", "first replacement") ]);
+  Eio_fs_sync.publish_generation ~durable:true (root / "out")
     (readonly [ ("readonly/file", "complete replacement") ]);
   Alcotest.(check string)
     "replacement is complete" "complete replacement"
@@ -356,8 +379,10 @@ let suite =
         test_replace_reorder;
       Alcotest.test_case "first publication, every crash point" `Quick
         test_first_publication;
-      Alcotest.test_case "previous generation reclaimed" `Quick
-        test_previous_reclaimed;
+      Alcotest.test_case "a reader spans one replacement" `Quick
+        test_reader_spans_a_replacement;
+      Alcotest.test_case "older generations reclaimed" `Quick
+        test_older_reclaimed;
       Alcotest.test_case "generation names" `Quick test_generation_names;
       Alcotest.test_case "foreign link target kept" `Quick
         test_foreign_target_kept;
