@@ -334,6 +334,39 @@ let test_clone_tree () =
         | _ -> false
         | exception Eio.Io (Eio.Fs.E (Eio.Fs.Already_exists _), _) -> true)
 
+(* clone_trees clones several directories of one tree into another, the
+   directories above each made, all or none: a name the source lacks, after
+   one that cloned, leaves nothing cloned. Elsewhere than Darwin nothing
+   clones and nothing is written. *)
+let test_clone_trees () =
+  with_real_dir @@ fun dir ->
+  let src = Eio.Path.(dir / "src") and dst = Eio.Path.(dir / "dst") in
+  Eio.Path.mkdirs ~perm:0o755 Eio.Path.(src / "_build" / "default");
+  Eio.Path.save ~create:(`Exclusive 0o644)
+    Eio.Path.(src / "_build" / "default" / "f")
+    "built";
+  Eio.Path.mkdirs ~perm:0o755 Eio.Path.(src / ".lake");
+  Eio.Path.mkdirs ~perm:0o755 dst;
+  let gone p = Eio.Path.kind ~follow:false p = `Not_found in
+  let both = Eio_fs_unix.clone_trees src dst [ "_build/default"; ".lake" ] in
+  if both then
+    Alcotest.(check string)
+      "a nested directory cloned" "built"
+      (Eio.Path.load Eio.Path.(dst / "_build" / "default" / "f"))
+  else
+    Alcotest.(check bool)
+      "nothing cloned" true
+      (gone Eio.Path.(dst / "_build" / "default")
+      && gone Eio.Path.(dst / ".lake"));
+  let dst' = Eio.Path.(dir / "dst2") in
+  Eio.Path.mkdirs ~perm:0o755 dst';
+  Alcotest.(check bool)
+    "a missing name clones none" false
+    (Eio_fs_unix.clone_trees src dst' [ ".lake"; "missing" ]);
+  Alcotest.(check bool)
+    "the one cloned before it is removed" true
+    (gone Eio.Path.(dst' / ".lake"))
+
 (* rmtree removes a whole tree: with [~grant] a directory its owner can
    neither read nor search is granted first, and a symbolic link is removed,
    never followed. Three files of five bytes, a link and three directories are
@@ -1249,6 +1282,7 @@ let suite =
       Alcotest.test_case "statvfs reports raw block capacity" `Quick
         test_statvfs_reports_raw_block_capacity;
       Alcotest.test_case "clone_tree" `Quick test_clone_tree;
+      Alcotest.test_case "clone_trees" `Quick test_clone_trees;
       Alcotest.test_case "rmtree" `Quick test_rmtree;
       Alcotest.test_case "rmtree stops above a refusal" `Quick
         test_rmtree_refused;
