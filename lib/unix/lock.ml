@@ -62,7 +62,7 @@ external pread_head : Unix.file_descr -> int -> string
 type record_lock_wait
 
 external record_lock_wait_start :
-  Unix.file_descr -> Unix.file_descr -> record_lock_wait
+  Unix.file_descr -> Unix.file_descr -> bool -> record_lock_wait
   = "caml_eio_fs_record_lock_wait_start"
 
 external record_lock_wait_end : record_lock_wait -> bool -> bool
@@ -403,13 +403,13 @@ let os_unlock fd =
    fiber waits on the pipe and a cancel reaches it; the cancel then withdraws
    the request before the fiber goes, and a lock granted in that instant is
    let go. *)
-let await_record_lock fd =
+let await_record_lock ?(mode = `Exclusive) fd =
   let answered, notify = Unix.pipe ~cloexec:true () in
   Fun.protect ~finally:(fun () ->
       Unix.close answered;
       Unix.close notify)
   @@ fun () ->
-  let wait = record_lock_wait_start fd notify in
+  let wait = record_lock_wait_start fd notify (mode = `Shared) in
   match Eio_unix.await_readable answered with
   | () -> ignore (record_lock_wait_end wait false : bool)
   | exception (Eio.Cancel.Cancelled _ as e) ->

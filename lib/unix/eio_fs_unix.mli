@@ -341,13 +341,15 @@ val range_holder :
 
     @raise Unix.Unix_error as [fcntl] does. *)
 
-val await_record_lock : Unix.file_descr -> unit
-(** [await_record_lock fd] takes the exclusive POSIX record lock, a write lock,
-    over [fd], from its offset to the end of the file as [lockf] does, by the
-    kernel's blocking request ([fcntl] [F_SETLKW]), and returns once the kernel
-    grants it. The request waits on a thread of its own and the calling fiber
-    waits for its answer, so the domain goes on running other fibers; a cancel
-    withdraws the request, and a lock granted in that instant is let go.
+val await_record_lock :
+  ?mode:[ `Shared | `Exclusive ] -> Unix.file_descr -> unit
+(** [await_record_lock ~mode fd] takes the POSIX record lock over [fd], from its
+    offset to the end of the file as [lockf] does, by the kernel's blocking
+    request ([fcntl] [F_SETLKW]), and returns once the kernel grants it. [mode]
+    is [`Exclusive] (a write lock, the default) or [`Shared] (a read lock). The
+    request waits on a thread of its own and the calling fiber waits for its
+    answer, so the domain goes on running other fibers; a cancel withdraws the
+    request, and a lock granted in that instant is let go.
 
     It is the wait under {!with_lock}, for a caller that keeps its own
     descriptors: the record lock belongs to the process, and closing any

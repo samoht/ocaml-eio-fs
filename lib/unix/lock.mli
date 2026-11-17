@@ -31,7 +31,8 @@ val range_holder :
   [ `Free | `Held of int option ]
 (** See {!Eio_fs_unix.range_holder}. *)
 
-val await_record_lock : Unix.file_descr -> unit
+val await_record_lock :
+  ?mode:[ `Shared | `Exclusive ] -> Unix.file_descr -> unit
 (** See {!Eio_fs_unix.await_record_lock}. *)
 
 type block = [ `Yes | `No | `Fibers | `For of float ]
