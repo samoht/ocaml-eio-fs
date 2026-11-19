@@ -350,6 +350,94 @@ let test_lease_gate_removed_under_a_waiter () =
   | `Gone -> Alcotest.fail "the waiter holds a gate no name holds"
   | `Not_taken -> Alcotest.fail "the waiter never took the lease"
 
+(* Another process, this executable run with [args], with a pipe on its
+   standard input and one on its standard output. *)
+let spawned args =
+  let exe = Sys.executable_name in
+  let stdin_r, stdin_w = Unix.pipe ~cloexec:true () in
+  let stdout_r, stdout_w = Unix.pipe ~cloexec:true () in
+  let pid =
+    Unix.create_process exe
+      (Array.of_list (exe :: args))
+      stdin_r stdout_w Unix.stderr
+  in
+  Unix.close stdin_r;
+  Unix.close stdout_w;
+  (pid, stdin_w, stdout_r)
+
+(* One byte read from [fd], waiting as long as it takes, past signals. *)
+let rec read_byte fd =
+  let b = Bytes.create 1 in
+  match Unix.read fd b 0 1 with
+  | 1 -> Some (Bytes.get b 0)
+  | _ -> None
+  | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_byte fd
+
+let ended = function
+  | Unix.WEXITED n -> `Exited n
+  | Unix.WSIGNALED n | Unix.WSTOPPED n -> `Signaled n
+
+(* A wait for a lease's holders to let go holds nothing whenever its caller's
+   domain runs: the waiting domain is held in a blocking read, the holder lets
+   go, and another process's exclusive take of the lease is granted, which
+   ends that read. The wait returns only once the holder has let go, and holds
+   nothing once it has returned: this process's own exclusive take is granted
+   without waiting. A wait that kept a shared grant until its fiber ran would
+   hold the take off for as long as the domain does not run, as a reader's
+   busy domain did to a check's take of its lease. *)
+let test_await_free_holds_nothing () =
+  with_real_dir_env @@ fun _env dir ->
+  let lock = dir / "lock" in
+  let path = Eio.Path.native_exn lock in
+  let holder, release, said =
+    spawned [ "--hold-until-release"; "lease"; path ]
+  in
+  Alcotest.(check (option char))
+    "the holder holds the lease" (Some 'R') (read_byte said);
+  let resume_r, resume_w = Unix.pipe ~cloexec:true () in
+  let let_go = Atomic.make false in
+  let taken = ref None in
+  let waited = ref None in
+  let waiting, now_waiting = Eio.Promise.create () in
+  Eio.Fiber.both
+    (fun () ->
+      Eio_fs_unix.Lease.await_free
+        ~on_wait:(fun () -> Eio.Promise.resolve now_waiting ())
+        lock;
+      waited := Some (Atomic.get let_go))
+    (fun () ->
+      Eio.Promise.await waiting;
+      let take =
+        Thread.create
+          (fun () ->
+            Atomic.set let_go true;
+            ignore (Unix.write_substring release "X" 0 1 : int);
+            ignore (reap holder : int * Unix.process_status);
+            let taker, input, output =
+              spawned [ "--take-eio-fs-lease"; path ]
+            in
+            let status = ended (snd (reap taker)) in
+            Unix.close input;
+            Unix.close output;
+            taken := Some status;
+            ignore (Unix.write_substring resume_w "T" 0 1 : int))
+          ()
+      in
+      Alcotest.(check (option char))
+        "the domain resumes once the take is granted" (Some 'T')
+        (read_byte resume_r);
+      Thread.join take);
+  List.iter Unix.close [ release; said; resume_r; resume_w ];
+  Alcotest.(check (option status))
+    "another process takes the lease while the waiter's domain does not run"
+    (Some (`Exited 0))
+    !taken;
+  Alcotest.(check (option bool))
+    "the wait returns once the holder has let go" (Some true) !waited;
+  Alcotest.(check bool)
+    "the wait holds nothing once it returns" false
+    (refused (fun () -> Eio_fs_unix.Lease.with_exclusive ~block:`No lock ignore))
+
 (* {1 Signatures}
 
    [with_shared] is the reader operation, on the same lock file as
@@ -618,6 +706,8 @@ let suite =
       lease_readers_test_case;
       lease_readers_alone_test_case;
       lease_gate_removed_test_case;
+      Alcotest.test_case "a wait for a lease's release holds nothing" `Quick
+        test_await_free_holds_nothing;
       Alcotest.test_case "shared leases" `Quick test_shared_lease;
       Alcotest.test_case "refused reader looks leave no descriptor" `Quick
         test_refused_looks_leave_no_descriptor;

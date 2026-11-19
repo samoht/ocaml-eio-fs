@@ -19,6 +19,7 @@
   optint
   mtime
   unix
+  threads.posix
   alcotest))
 
 (rule
