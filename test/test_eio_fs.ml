@@ -158,6 +158,30 @@ let test_unshare () =
            ~prefix:(file "tree/again" ^ ", linked 2 times")
            why)
 
+(* What one entry allocates is its own blocks: a directory's do not include
+   its entries', so a tree's usage is the directory's own allocation plus its
+   file's. A reading that walked the directory would count the file twice in
+   that sum; one that dropped the directory's own blocks would fall short on a
+   filesystem that gives a directory blocks (ext4 gives one, APFS none). *)
+let test_allocated () =
+  Eio_main.run @@ fun env ->
+  let dir = Filename.temp_dir "allocated" "" in
+  let path = Eio.Path.(Eio.Stdenv.fs env / dir) in
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true path)
+  @@ fun () ->
+  let file = Eio.Path.(path / "file") in
+  Eio.Path.save ~create:(`Exclusive 0o644) file (String.make 8192 'a');
+  let own p = Int64.mul (Eio.Path.stat ~follow:false p).blocks 512L in
+  Alcotest.(check int64)
+    "a directory's own blocks" (own path)
+    (Eio_fs.Tree.allocated path);
+  Alcotest.(check int64)
+    "a file's, all of them" (own file)
+    (Eio_fs.Tree.allocated file);
+  Alcotest.(check int64)
+    "the two sum to the tree's usage" (Eio_fs.Tree.usage path).allocated_bytes
+    (Int64.add (Eio_fs.Tree.allocated path) (Eio_fs.Tree.allocated file))
+
 (* [Fs.v ()] is the root of an empty filesystem whatever another root holds. *)
 let test_v_is_empty () =
   Eio_mock.Backend.run @@ fun () ->
@@ -771,6 +795,8 @@ let suite =
       Alcotest.test_case "links" `Quick test_links;
       Alcotest.test_case "unshare" `Quick
         (Host.posix_only "Windows keeps no POSIX mode" test_unshare);
+      Alcotest.test_case "allocated is an entry's own blocks" `Quick
+        test_allocated;
       Alcotest.test_case "load asks its filter about the root first" `Quick
         test_load_filter_refuses_the_root;
       Alcotest.test_case "load refuses a regular file" `Quick
