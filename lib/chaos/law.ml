@@ -225,6 +225,12 @@ let dir_sync =
   dir_handler "Eio_fs.Sync.Dir_sync" (Intercepted `Sync)
     "A fault refuses the barrier before the base's barrier runs."
 
+let adopt =
+  dir_handler "Eio_fs.Sync.Adopt" (Intercepted `Open_write)
+    "A file of the base the caller holds is an open of its path: a fault \
+     refuses it before the base adopts it, or swaps the name for a link after; \
+     the file is wrapped."
+
 let dir_other =
   dir_handler "a base's own interface" Unsupported
     "Not carried over, as anything bound to the base steps around the \
@@ -279,6 +285,7 @@ let handlers =
     process_local;
     modeless;
     dir_sync;
+    adopt;
     dir_other;
     base_file;
     file_sync;
@@ -314,6 +321,7 @@ let binding (type a) iface (Eio.Resource.H (pi, _) : a Eio.Resource.binding) =
   | Eio_fs_sync.Process_local -> `Op process_local
   | Eio_fs_sync.Modeless -> `Op modeless
   | Eio_fs_sync.Dir_sync -> `Op dir_sync
+  | Eio_fs_sync.Adopt -> `Op adopt
   | Eio_fs_sync.File_sync -> `Op file_sync
   | _ -> `Other
 

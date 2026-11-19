@@ -2659,6 +2659,16 @@ let opened_file d ~key ~known ~rel ~perm ~prev found =
         found;
       fs
 
+(* As [opened_file], with the mode the file has, [found]'s or the open's. *)
+let opened_with_mode d ~key ~known ~rel ~perm ~prev found =
+  let fs = opened_file d ~key ~known ~rel ~perm ~prev found in
+  let mode =
+    match found with Some st -> st.Eio.File.Stat.perm | None -> perm
+  in
+  if not (Int.equal fs.mode mode) then d.dctl.effects <- d.dctl.effects + 1;
+  fs.mode <- mode;
+  fs
+
 module Cdir_impl = struct
   type t = cdir
 
@@ -2702,11 +2712,9 @@ module Cdir_impl = struct
       | None -> false
     in
     let base = B.open_out bv ~sw ~follow ~append ~create path in
-    let perm = perm_of create in
-    let fs = opened_file d ~key ~known ~rel ~perm ~prev found in
-    let mode = match found with Some st -> st.perm | None -> perm in
-    if not (Int.equal fs.mode mode) then d.dctl.effects <- d.dctl.effects + 1;
-    fs.mode <- mode;
+    let fs =
+      opened_with_mode d ~key ~known ~rel ~perm:(perm_of create) ~prev found
+    in
     (* An unsynced truncation of pre-existing durable data is itself a change
        that a crash may lose. *)
     if is_trunc create && had_bytes then clog_change d.dctl fs (Resize 0);
@@ -2714,6 +2722,26 @@ module Cdir_impl = struct
       record_metadata d.dctl ~path:spelt ~kind:Create ~resolved:[ rel ]
     end;
     wrap_cfile_rw ~sw d.dctl fs ~append base
+
+  (* A file of the base the caller holds, tracked as an open of [path] that
+     creates and truncates nothing. The file it is is the one the caller
+     holds, whatever [path] names now. *)
+  let adopt_file d ~sw ~path file =
+    live d;
+    let rel = resolve d (at d.dplace.prefix path) in
+    adopt d.dctl [ rel ];
+    let key = file_key d.dplace.proot rel in
+    let known = Hashtbl.mem d.dctl.files key in
+    let prev =
+      if known then Cstruct.empty
+      else read_existing (as_admin d.dctl d.dplace.proot) rel
+    in
+    let base = Eio_fs_sync.adopt ~sw (d.dbase, path) file in
+    let found = Some (Eio.File.stat base) in
+    let fs =
+      opened_with_mode d ~key ~known ~rel ~perm:(perm_of `Never) ~prev found
+    in
+    wrap_cfile_rw ~sw d.dctl fs ~append:false base
 
   let open_subtree d ~sw path =
     live d;
@@ -2927,6 +2955,7 @@ let rec cdir_handler :
          H
            ( Eio_fs_sync.Dir_sync,
              fun d ~path ~full -> Cdir_impl.barrier ~full d path );
+         H (Eio_fs_sync.Adopt, Cdir_impl.adopt_file);
          (* The same place in the model, over another base. *)
          H
            ( Eio_fs_internal.Rebase,

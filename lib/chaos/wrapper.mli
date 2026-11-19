@@ -36,14 +36,16 @@ val wrap : sched -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     steps around [sched]. It answers {!Eio_fs_sync.Process_local} and
     {!Eio_fs_sync.Modeless} as [base] does, and every opened file, a read-only
     one included, registers {!Eio_fs_sync.File_sync} so a barrier through it
-    reaches the wrapper's own sync. A backend's own interfaces are not carried
-    over: a wrapper over a host directory is no native working directory for a
-    child process, and its files hand out no host descriptor, except to
-    [eio-fs.unix], which takes a lock on the descriptor beneath. A rename from
-    an in-memory directory of {!Eio_fs_mem} into a wrapper over the same tree is
-    the in-memory rename, outside [sched]; one from a host directory of another
-    backend into a wrapper is refused by that backend, which finds no directory
-    of its own there. *)
+    reaches the wrapper's own sync. It registers {!Eio_fs_sync.Adopt}: a file of
+    [base] the caller holds, given to {!Eio_fs_sync.adopt}, is wrapped as one
+    opened through it, the hook asked as for that open. A backend's own
+    interfaces are not carried over: a wrapper over a host directory is no
+    native working directory for a child process, and its files hand out no host
+    descriptor, except to [eio-fs.unix], which takes a lock on the descriptor
+    beneath. A rename from an in-memory directory of {!Eio_fs_mem} into a
+    wrapper over the same tree is the in-memory rename, outside [sched]; one
+    from a host directory of another backend into a wrapper is refused by that
+    backend, which finds no directory of its own there. *)
 
 (** {1:shared What the crash model shares} *)
 

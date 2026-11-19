@@ -401,6 +401,16 @@ module Dir_impl = struct
     swap_after t.boxed fault path;
     wrap_rw t.sched ~path ~append file
 
+  (* A file of the base the caller holds, at [path]: the hook answers for it
+     as for an open of [path] that makes nothing, and it is wrapped as one
+     opened through the wrapper is. *)
+  let adopt t ~sw ~path file =
+    let fault = next t.sched `Open_write path in
+    (match fault with Some (Fail c) -> raise_open c path | _ -> ());
+    let file = Eio_fs_sync.adopt ~sw (t.base, path) file in
+    swap_after t.boxed fault path;
+    wrap_rw t.sched ~path ~append:false file
+
   let open_subtree t ~sw path =
     let fault = next t.sched `Open_read path in
     (match fault with Some (Fail c) -> raise_open c path | _ -> ());
@@ -553,6 +563,7 @@ let dir_handler syntax =
       Eio.Resource.H
         ( Eio_fs_sync.Dir_sync,
           fun t ~path ~full -> Dir_impl.barrier ~full t path );
+      Eio.Resource.H (Eio_fs_sync.Adopt, Dir_impl.adopt);
     ]
 
 let wrap_dir ~base ~sched : [ `Close | Eio.Fs.dir_ty ] r =

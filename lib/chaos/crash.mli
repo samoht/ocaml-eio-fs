@@ -217,7 +217,9 @@ val wrap : t -> _ Eio.Path.t -> [ `Close | Eio.Fs.dir_ty ] Eio.Path.t
     {!Eio_fs_sync.Barrier} reaches it through the wrapper. Under {!Dropped} a
     crash rebuilds the tree from the model, so a change made outside the
     wrapper, by name or on the host descriptor [eio-fs.unix] locks, is gone from
-    the post-crash image; under {!Kept} it stays.
+    the post-crash image; under {!Kept} it stays. A file of [base] the caller
+    holds, given to {!Eio_fs_sync.adopt}, is tracked as one opened through the
+    wrapper.
 
     The model reads and rebuilds the tree with root's rights, whatever user
     [base] runs as: on an in-memory directory of {!Eio_fs_mem} it does so

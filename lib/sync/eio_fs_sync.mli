@@ -76,6 +76,38 @@ val is_modeless : _ Eio.Resource.t -> bool
     eio_windows, keeps no Unix mode (a file's reads [0o666] and a chmod below an
     opened directory is refused), and it has no way to say so. *)
 
+type (_, _, _) Eio.Resource.pi +=
+  | Adopt :
+      ( 't,
+        't ->
+        sw:Eio.Switch.t ->
+        path:string ->
+        Eio.File.rw_ty Eio.Resource.t ->
+        Eio.File.rw_ty Eio.Resource.t,
+        [> `Adopt ] )
+      Eio.Resource.pi
+        (** The operation a directory wrapper registers: hand out a file of its
+            base at [path] (relative to the resource, as for every directory
+            operation), wrapped as an open of [path] through the wrapper wraps
+            the file it opens, its release tied to [sw], and refused where that
+            open would be. A wrapper adopts through its base first, so stacked
+            wrappers each apply. *)
+
+val adopt :
+  sw:Eio.Switch.t ->
+  _ Eio.Path.t ->
+  Eio.File.rw_ty Eio.Resource.t ->
+  Eio.File.rw_ty Eio.Resource.t
+(** [adopt ~sw (dir, path) file] is [file], a descriptor the caller holds of the
+    backend under [dir] on the file at [path], with the wrappers [dir] stacks
+    over its backend applied, as an open of [path] through [dir] under [sw]
+    would apply them, without opening the file again: a store that keeps one
+    descriptor per file and process reads and writes it through each caller's
+    directory. A directory that registers no {!Adopt} is the backend's own, and
+    [file] is handed out as it is. Closing the result closes [file].
+
+    @raise Eio.Io where a wrapper of [dir] refuses the open of [path]. *)
+
 (** {1:barriers Barrier pairs} *)
 
 (** The barriers a publication issues: one over a file's bytes, one over a

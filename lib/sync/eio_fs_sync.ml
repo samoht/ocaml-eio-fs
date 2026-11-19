@@ -130,6 +130,25 @@ let is_modeless (Eio.Resource.T (v, ops)) =
   | Some modeless -> modeless v
   | None -> Sys.win32
 
+(* A wrapper hands out the files of its base wrapped as its opens wrap them;
+   it registers [Adopt]. Silence reads as the backend's own directory, which
+   hands a file out as it is. *)
+type (_, _, _) Eio.Resource.pi +=
+  | Adopt :
+      ( 't,
+        't ->
+        sw:Eio.Switch.t ->
+        path:string ->
+        Eio.File.rw_ty Eio.Resource.t ->
+        Eio.File.rw_ty Eio.Resource.t,
+        [> `Adopt ] )
+      Eio.Resource.pi
+
+let adopt ~sw (Eio.Resource.T (v, ops), path) file =
+  match Eio.Resource.get_opt ops Adopt with
+  | Some adopt -> adopt v ~sw ~path file
+  | None -> file
+
 exception Limit_exceeded of { max_bytes : int64; attempted : int64 }
 
 let () =
