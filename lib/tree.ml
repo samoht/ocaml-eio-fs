@@ -54,6 +54,8 @@ let add a b =
 let empty =
   { allocated_bytes = 0L; apparent_bytes = 0L; files = 0; latest_mtime = 0. }
 
+let allocated path = (own (Eio.Path.stat ~follow:false path)).allocated_bytes
+
 let rec grant_owner p =
   match Eio.Path.stat ~follow:false p with
   | { kind = `Directory; perm; _ } -> (

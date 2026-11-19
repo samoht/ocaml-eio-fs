@@ -28,6 +28,14 @@ val usage : ?max_fibers:int -> _ Eio.Path.t -> usage
     @raise Invalid_argument if [max_fibers] is not positive.
     @raise Eio.Io as a stat or a listing of the walk raises. *)
 
+val allocated : _ Eio.Path.t -> int64
+(** [allocated path] is the bytes [path] allocates itself, without following a
+    symbolic link and without its descendants: a directory's own blocks, which
+    {!val-usage} adds to its entries'. It is {!val-usage}'s
+    {!field-allocated_bytes} reading of one entry.
+
+    @raise Eio.Io when the stat fails. *)
+
 val grant_owner : _ Eio.Path.t -> unit
 (** [grant_owner p] grants its owner read, write and search on the directory [p]
     and on each directory under it, so that every entry of the tree can be
