@@ -161,6 +161,8 @@ type step =
   | Dir_barrier of int * string
   | Process_local of int
   | Modeless of int
+  | Adopt of int * int * string
+      (** file, directory, path: a file of the base, held, adopted *)
   | Admin_stat of int * string
   | As_user_stat of int * string
   | Close_dir of int
@@ -216,6 +218,7 @@ let rec pp_step ppf = function
   | Dir_barrier (d, p) -> Fmt.pf ppf "barrier d%d %S" d p
   | Process_local d -> Fmt.pf ppf "process_local d%d" d
   | Modeless d -> Fmt.pf ppf "modeless d%d" d
+  | Adopt (f, d, p) -> Fmt.pf ppf "f%d := adopt d%d %S" f d p
   | Admin_stat (d, p) -> Fmt.pf ppf "admin stat d%d %S" d p
   | As_user_stat (d, p) -> Fmt.pf ppf "as_user stat d%d %S" d p
   | Close_dir d -> Fmt.pf ppf "close d%d" d
@@ -250,6 +253,8 @@ type side = {
       (* the wrapper asked about, latest first *)
   wrapped : bool;
   mutable cancels : bool list; (* per [Cancel]: the wrapper suspended *)
+  base : Eio.Fs.dir_ty Eio.Path.t; (* the bare filesystem under every slot *)
+  prefixes : string option array; (* where each directory is in [base] *)
 }
 
 let at d p = if d = 0 then "/" ^ p else p
@@ -386,6 +391,10 @@ let rec exec side ~sw step =
               let sub = D.open_subtree v ~sw (at d p) in
               let sub = (sub :> Eio.Fs.dir_ty r) in
               side.dirs.(n) <- Some sub;
+              side.prefixes.(n) <-
+                Option.map
+                  (fun prefix -> if prefix = "" then p else prefix ^ "/" ^ p)
+                  side.prefixes.(d);
               opened side (`Dir sub);
               "opened");
         }
@@ -546,6 +555,23 @@ let rec exec side ~sw step =
       match side.dirs.(d) with
       | None -> "no directory"
       | Some dir -> string_of_bool (Eio_fs.Sync.is_modeless dir))
+  | Adopt (f, d, p) -> (
+      match (side.dirs.(d), side.prefixes.(d)) with
+      | Some dir, Some prefix ->
+          let held =
+            Eio.Path.open_out ~sw ~create:`Never
+              Eio.Path.(side.base / if prefix = "" then p else prefix ^ "/" ^ p)
+          in
+          let file =
+            Eio_fs.Sync.adopt ~sw
+              (dir, at d p)
+              (held :> Eio.File.rw_ty Eio.Resource.t)
+          in
+          let file = (file :> Eio.File.ro_ty r) in
+          side.files.(f) <- Some (file, true);
+          opened side (`File file);
+          "adopted"
+      | _ -> "no directory")
   | Admin_stat (d, p) -> (
       match side.dirs.(d) with
       | None -> "no directory"
@@ -763,6 +789,7 @@ let rec entry_of side step =
   | Dir_barrier _ -> op Dir_handler "Eio_fs.Sync.Dir_sync"
   | Process_local _ -> op Dir_handler "Eio_fs.Sync.Process_local"
   | Modeless _ -> op Dir_handler "Eio_fs.Sync.Modeless"
+  | Adopt _ -> op Dir_handler "Eio_fs.Sync.Adopt"
   | Admin_stat _ -> op Dir_handler "Eio_fs_internal.Admin"
   | As_user_stat _ -> op Dir_handler "Eio_fs_internal.Rebase"
   | Close_dir _ -> op Dir_handler "close"
@@ -827,6 +854,8 @@ let record_run ?(fault = fun _ -> None) ?(crash = false) ~wrapped
       kinds = [];
       wrapped;
       cancels;
+      base :> Eio.Fs.dir_ty Eio.Path.t;
+      prefixes = Array.init slots (fun i -> if i = 0 then Some "" else None);
     }
   in
   let live = ref true in
@@ -968,6 +997,7 @@ let dir_uses d =
   [
     Open_in (2, d, "f", true);
     Open_out (2, d, "g", If_missing, false);
+    Adopt (2, d, "f");
     Open_subtree (2, d, ".");
     Mkdir (d, "e");
     Read_dir (d, ".");

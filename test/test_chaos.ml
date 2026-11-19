@@ -191,6 +191,47 @@ let test_open_kinds () =
     [ ("write", "f"); ("read", "f"); ("read", "d") ]
     (List.rev_map (fun (k, p) -> (name k, p)) !seen)
 
+(* A file of the base the caller holds already, given to [adopt], is asked
+   about as an open of its path that may write: a refusal of that open
+   refuses the adoption, and the adopted file's writes are the wrapper's as
+   an opened one's are. A directory that registers no [Adopt], the backend's
+   own, hands the file out as it is. *)
+let test_adopt () =
+  let seen = ref [] in
+  let hook (op : Op.t) =
+    seen := (op.kind, op.path) :: !seen;
+    match (op.kind, op.path) with
+    | `Open_write, "refused" -> Some (Fault.Fail `Eacces)
+    | `Write, "f" -> Some (Fault.Short 2)
+    | _ -> None
+  in
+  with_chaos hook @@ fun ~raw ~chaos ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "f") "xxxx";
+  Eio.Path.save ~create:(`Exclusive 0o644) (raw / "refused") "x";
+  Eio.Switch.run @@ fun sw ->
+  let held name =
+    (Eio.Path.open_out ~sw ~create:`Never (raw / name)
+      :> Eio.File.rw_ty Eio.Resource.t)
+  in
+  let file = held "f" in
+  Alcotest.(check bool)
+    "the backend's own directory hands the file out as it is" true
+    (Eio_fs.Sync.adopt ~sw (raw / "f") file == file);
+  expect_io "a refused open refuses the adoption" (fun () ->
+      ignore (Eio_fs.Sync.adopt ~sw (chaos / "refused") (held "refused")));
+  seen := [];
+  let adopted = Eio_fs.Sync.adopt ~sw (chaos / "f") file in
+  Alcotest.(check bool)
+    "the adoption is asked about as an open that may write" true
+    (List.mem (`Open_write, "f") !seen);
+  Alcotest.(check int)
+    "the wrapper shortens a write through it" 2
+    (Eio.File.pwrite_single adopted ~file_offset:(i63 0)
+       [ Cstruct.of_string "abcd" ]);
+  Alcotest.(check string)
+    "the write reached the held file" "abxx"
+    (Eio.Path.load (raw / "f"))
+
 let test_descriptor_stat_error writable () =
   let observed = ref [] in
   let hook (op : Op.t) =
@@ -538,6 +579,8 @@ let suite =
       Alcotest.test_case "chmod and chown are changes" `Quick
         test_change_error_on_chmod_chown;
       Alcotest.test_case "opens for reading and writing" `Quick test_open_kinds;
+      Alcotest.test_case "an adopted file is an open of its path" `Quick
+        test_adopt;
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "real child cwd" `Quick
         (Host.posix_only "eio_windows 1.7 spawns no process" test_real_child_cwd);

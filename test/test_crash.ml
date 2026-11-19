@@ -1320,6 +1320,41 @@ let test_crash_kept_barrier_on_a_childs_directory () =
 let test_crash_kept_rename_over_a_childs_file_lost () =
   rename_over_a_childs_file ~barrier:false
 
+(* A file of the base the caller holds already, given to [adopt] through the
+   wrapper, is tracked as one opened through it, where a held descriptor's
+   writes would be another writer's: its sync makes what it wrote durable,
+   and its unsynced write is the policy's to drop, where the image keeps what
+   other writers left. *)
+let test_crash_tracks_an_adopted_file () =
+  Eio_main.run @@ fun env ->
+  let fs = Eio.Stdenv.fs env in
+  let dir = Filename.temp_file "eio-fs-crash" "" in
+  Sys.remove dir;
+  let base = Eio.Path.(fs / dir) in
+  Eio.Path.mkdir ~perm:0o755 base;
+  Fun.protect ~finally:(fun () -> Eio.Path.rmtree ~missing_ok:true base)
+  @@ fun () ->
+  let ctl = Crash.v ~policy:Drop_unsynced ~outside:Kept () in
+  let wrapped = Crash.wrap ctl base in
+  Eio.Path.save ~create:(`Exclusive 0o644) (base / "img") "AAAA";
+  Eio.Switch.run (fun sw ->
+      let held =
+        (Eio.Path.open_out ~sw ~create:`Never (base / "img")
+          :> Eio.File.rw_ty Eio.Resource.t)
+      in
+      let img = Eio_fs.Sync.adopt ~sw (wrapped / "img") held in
+      let write s =
+        Eio.File.pwrite_all img ~file_offset:(i63 0) [ Cstruct.of_string s ]
+      in
+      write "BBBB";
+      Eio.File.sync img;
+      write "CCCC");
+  let post = Crash.post_crash ctl in
+  Alcotest.(check string)
+    "the adopted file's synced write is kept and its unsynced one dropped"
+    "BBBB"
+    (Eio.Path.load (post / "img"))
+
 (* A file made through the wrapper, synced, and named by a barrier on its
    directory is one the cut spares: on a disk it keeps its inode and its
    modification time. *)
@@ -1667,6 +1702,9 @@ let suite =
         `Quick
         (Host.posix_only "eio_windows 1.7 has no positioned read"
            test_crash_keeps_an_entry_planted_by_native_name);
+      Alcotest.test_case "crash: an adopted file is tracked" `Quick
+        (Host.posix_only "eio_windows 1.7 has no positioned read"
+           test_crash_tracks_an_adopted_file);
       Alcotest.test_case "crash: kept, a barrier on a child's directory" `Quick
         (Host.posix_only "eio_windows 1.7 has no positioned read"
            test_crash_kept_barrier_on_a_childs_directory);
