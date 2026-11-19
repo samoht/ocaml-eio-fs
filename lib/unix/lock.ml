@@ -597,14 +597,18 @@ let open_keyed ~taken ~key open_lock_file =
   (file, opened)
 
 module Flock = struct
-  let acquire ~shared fd =
+  (* A [look] lets the lock go as it is granted, on the thread that asked, so
+     the grant never outlives the call, however long the asking fiber's domain
+     takes to run it again. *)
+  let acquire ~look ~shared fd =
     retry_eintr
       (fun fd -> flock_native fd (if shared then Shared else Exclusive))
-      fd
+      fd;
+    if look then retry_eintr flock_unlock_native fd
 
-  let flock ~shared fd =
+  let flock ~look ~shared fd =
     Eio_unix.run_in_systhread ~label:"eio-fs-lease-lock" (fun () ->
-        acquire ~shared fd)
+        acquire ~look ~shared fd)
 
   (* A wait polls: [flock] is no cancellation point and a blocking request
      cannot be withdrawn, so each ask is non-blocking and a cancellable sleep
@@ -612,11 +616,11 @@ module Flock = struct
      then leaves nothing behind. *)
   let poll_cap = 0.05
 
-  let use_os_lock ~shared ~patience ~refused ~on_wait fd fn =
+  let use_os_lock ?(look = false) ~shared ~patience ~refused ~on_wait fd fn =
     let acquired = ref false in
     let ask () =
       Eio.Cancel.protect @@ fun () ->
-      match flock ~shared fd with
+      match flock ~look ~shared fd with
       | () -> acquired := true
       | exception
           Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EACCES), _, _)
@@ -710,11 +714,11 @@ let take_inode_gate ~taken ~shared ~patience ~on_wait ~name ~opened_first local
   end;
   !release_reader
 
-let take_lease_lock ~shared ~patience ~on_wait ~name file =
+let take_lease_lock ~look ~shared ~patience ~on_wait ~name file =
   match file_fd file with
   | Some fd ->
       Eio_unix.Fd.use_exn "Eio_fs_unix.Lease.acquire" fd @@ fun raw_fd ->
-      Flock.use_os_lock ~shared ~patience
+      Flock.use_os_lock ~look ~shared ~patience
         ~refused:(fun () -> refusal ~name ~holder:None file)
         ~on_wait raw_fd ignore
   | None ->
@@ -734,7 +738,8 @@ let rec acquire ~sw ?lease ?(block : block = `Yes) ?patience
   let name = Eio_fs_internal.native_name path in
   let steps = ref [] in
   let taken give_back = steps := give_back :: !steps in
-  let shared = lease = Some `Shared in
+  let shared = match lease with Some (`Shared | `Look) -> true | _ -> false in
+  let look = lease = Some `Look in
   let open_lock_file () =
     let file = open_lock_file ~sw ~name ~create path in
     (file, (Eio.File.stat file : Eio.File.Stat.t))
@@ -769,7 +774,8 @@ let rec acquire ~sw ?lease ?(block : block = `Yes) ?patience
     (match lease with
     | None ->
         take_record_lock ~taken ~patience:processes ~on_wait ~name file path
-    | Some _ -> take_lease_lock ~shared ~patience:processes ~on_wait ~name file);
+    | Some _ ->
+        take_lease_lock ~look ~shared ~patience:processes ~on_wait ~name file);
     settle ~name ~opened ~contents ~file path;
     (file, release_reader)
   with
@@ -994,7 +1000,7 @@ module Lease = struct
   let exclusive_refusal path =
     match
       Eio.Switch.run @@ fun sw ->
-      release (taken ~sw ~lease:`Shared ~block:`No ~create:`Never path)
+      release (taken ~sw ~lease:`Look ~block:`No ~create:`Never path)
     with
     | () -> None
     | exception (Lock_unavailable _ as refused) -> Some refused
@@ -1109,6 +1115,14 @@ module Lease = struct
     Eio.Switch.run @@ fun sw ->
     let t = taken ~sw ~lease:`Shared ?block ?create ?on_wait path in
     Fun.protect ~finally:(fun () -> release t) (fun () -> fn t)
+
+  let await_free ?on_wait path =
+    match
+      Eio.Switch.run @@ fun sw ->
+      release (taken ~sw ~lease:`Look ~block:`Yes ~create:`Never ?on_wait path)
+    with
+    | () -> ()
+    | exception Eio.Io (Eio.Fs.E (Eio.Fs.Not_found _), _) -> ()
 end
 
 (* A backend-free component takes its critical section as an

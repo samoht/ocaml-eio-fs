@@ -130,6 +130,9 @@ module Lease : sig
     (t -> 'a) ->
     'a
   (** See {!Eio_fs_unix.Lease.with_shared}. *)
+
+  val await_free : ?on_wait:(unit -> unit) -> _ Eio.Path.t -> unit
+  (** See {!Eio_fs_unix.Lease.await_free}. *)
 end
 
 val lock_section :

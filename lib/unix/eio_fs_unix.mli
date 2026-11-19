@@ -657,6 +657,23 @@ module Lease : sig
       releasing independently acquired readers.
 
       It raises as {!with_exclusive} does. *)
+
+  val await_free : ?on_wait:(unit -> unit) -> _ Eio.Path.t -> unit
+  (** [await_free path] returns once no exclusive holder holds the lease on
+      [path], or at once when [path] is absent. It holds nothing at any time its
+      caller runs: each look is a shared [flock] tried without waiting, which
+      the system thread that asked lets go as it is granted, before it answers.
+      So an exclusive take is never held off by this wait, however long the
+      waiting fiber's domain takes to run again. [on_wait ()] is called once if
+      the lease is held, before the wait. The wait polls, and a cancelled wait
+      answers at the cancel, as {!with_exclusive}'s does. The path checks are
+      those of {!with_exclusive}.
+
+      @raise Eio.Io
+        with {!Eio.Fs.Permission_denied} carrying {!Not_a_lock_file} when [path]
+        is not its own regular file.
+      @raise Invalid_argument when the filesystem provides no Unix descriptor.
+  *)
 end
 
 val lock_section :
