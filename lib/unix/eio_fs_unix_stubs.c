@@ -610,6 +610,13 @@ static long eio_fs_extents_fill(int fd, int64_t offset, int64_t length,
      <sys/fcntl.h>, so its two off_t fields are not naturally aligned; using
      the header's own declaration is what keeps that right, and the field
      offsets are not restated here. */
+  /* APFS places part of what was written and not yet synced, so the file is
+     written back first, as FIEMAP_FLAG_SYNC asks on Linux. */
+  if (fsync(fd) < 0) {
+    *err = errno;
+    *what = "fsync";
+    return -1;
+  }
   int64_t at = offset;
   int64_t end = offset + length;
   while (n < max && at < end) {
@@ -657,6 +664,10 @@ static long eio_fs_extents_fill(int fd, int64_t offset, int64_t length,
   map->fm_start = (__u64)offset;
   map->fm_length = (__u64)length;
   map->fm_extent_count = (__u32)max;
+  /* A filesystem that allocates at writeback (ext4, XFS) gives bytes written
+     and not yet synced no block, so the file is written back before it is
+     mapped. */
+  map->fm_flags = FIEMAP_FLAG_SYNC;
   if (ioctl(fd, FS_IOC_FIEMAP, map) < 0) {
     *err = errno;
     *what = "FS_IOC_FIEMAP";
@@ -667,22 +678,23 @@ static long eio_fs_extents_fill(int fd, int64_t offset, int64_t length,
   int64_t end = offset + length;
   for (__u32 i = 0; i < map->fm_mapped_extents && n < max; i++) {
     struct fiemap_extent *e = &map->fm_extents[i];
+    /* An extent written since the sync has no block address yet, and one
+       stored inline in metadata, unaligned, encoded or encrypted has no block
+       address of its own (btrfs and ext4 report physical 0 for inline data),
+       so there is no physical answer to give about it. That ends the batch
+       the same way a hole does. It is tested first, since a delayed extent is
+       also FIEMAP_EXTENT_UNKNOWN. */
+    if (e->fe_flags
+        & (FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNWRITTEN
+           | FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_NOT_ALIGNED
+           | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED))
+      break;
     if (e->fe_flags & FIEMAP_EXTENT_UNKNOWN) {
       *err = EOPNOTSUPP;
       *what = "FS_IOC_FIEMAP";
       free(map);
       return -1;
     }
-    /* An extent still in the page cache has no block address yet, and one
-       stored inline in metadata, unaligned, encoded or encrypted has no block
-       address of its own (btrfs and ext4 report physical 0 for inline data),
-       so there is no physical answer to give about it. That ends the batch
-       the same way a hole does. */
-    if (e->fe_flags
-        & (FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNWRITTEN
-           | FIEMAP_EXTENT_DATA_INLINE | FIEMAP_EXTENT_NOT_ALIGNED
-           | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_ENCRYPTED))
-      break;
     int64_t logical = (int64_t)e->fe_logical;
     int64_t elength = (int64_t)e->fe_length;
     int64_t lead = expected - logical;

@@ -284,14 +284,15 @@ val extents :
 (** [extents fd ~file_offset ~length ~max] is the physical extents backing the
     [length] bytes of [fd]'s file from byte [file_offset], in increasing logical
     order, at most [max] of them. This is [F_LOG2PHYS_EXT] on Darwin and
-    [FS_IOC_FIEMAP] on Linux, neither of which [Unix] binds.
+    [FS_IOC_FIEMAP] on Linux, neither of which [Unix] binds. The file is written
+    back first, so the bytes written before the call are placed.
 
     The answer stops at the first hole, the end of the range, [max], or bytes
-    the filesystem accepted but has not placed, or placed with no block address
-    of their own (inline, unaligned, encoded or encrypted data). An empty range
-    has no extent. A walk steps past the last extent returned and asks again,
-    ending when the answer is empty. [max] is the batch, so one system-thread
-    hop covers many extents.
+    the filesystem accepted but has not placed, written since, or placed with no
+    block address of their own (inline, unaligned, encoded or encrypted data).
+    An empty range has no extent. A walk steps past the last extent returned and
+    asks again, ending when the answer is empty. [max] is the batch, so one
+    system-thread hop covers many extents.
 
     @raise Invalid_argument
       if [max] is not between 1 and 65,536, [file_offset] or [length] is
