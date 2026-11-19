@@ -803,6 +803,40 @@ let test_extents_of_an_empty_range () =
     "none" 0
     (List.length (Eio_fs_unix.extents fd ~file_offset:0 ~length:0 ~max:16))
 
+(* Bytes written and not yet synced are a file's bytes as much as synced ones.
+   ext4 holds them under delayed allocation, with no block chosen, until
+   writeback, and APFS places part of them, so a map asked of them answers
+   EOPNOTSUPP on one and stops short on the other unless the file is written
+   back first. *)
+let test_extents_place_unsynced_bytes () =
+  with_real_dir @@ fun dir ->
+  (* A filesystem that maps no file refuses a synced one too, and that says
+     nothing about unsynced bytes. *)
+  let probe = Eio.Path.native_exn (dir / "synced.bin") in
+  let pfd = Unix.openfile probe [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close pfd)
+    (fun () ->
+      ignore (Unix.write_substring pfd "x" 0 1 : int);
+      Unix.fsync pfd;
+      mapped (fun () ->
+          ignore (Eio_fs_unix.extents pfd ~file_offset:0 ~length:1 ~max:1)));
+  let path = Eio.Path.native_exn (dir / "unsynced.bin") in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let block = Bytes.make 65536 'x' in
+  let n = Unix.write fd block 0 (Bytes.length block) in
+  Alcotest.(check int) "the whole block was written" (Bytes.length block) n;
+  let es = Eio_fs_unix.extents fd ~file_offset:0 ~length:65536 ~max:16 in
+  Alcotest.(check int)
+    "the extents cover every byte written" 65536
+    (List.fold_left (fun acc (e : Eio_fs_unix.extent) -> acc + e.length) 0 es);
+  List.iter
+    (fun (e : Eio_fs_unix.extent) ->
+      Alcotest.(check bool)
+        "every extent has a device address" true (e.physical >= 0))
+    es
+
 let test_extents_refuse_a_batch_they_cannot_hold () =
   with_sparse_file @@ fun _env fd ~size:_ ->
   let refuses name f =
@@ -1315,6 +1349,8 @@ let suite =
       Alcotest.test_case "extents honour max" `Quick test_extents_honour_max;
       Alcotest.test_case "extents of an empty range" `Quick
         test_extents_of_an_empty_range;
+      Alcotest.test_case "extents place unsynced bytes" `Quick
+        test_extents_place_unsynced_bytes;
       Alcotest.test_case "extents refuse a batch they cannot hold" `Quick
         test_extents_refuse_a_batch_they_cannot_hold;
       Alcotest.test_case "the sparse map does not block Eio" `Quick
