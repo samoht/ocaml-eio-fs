@@ -413,6 +413,20 @@ let with_real_dir fn =
 (* A wrapper carries over none of the backend's own interfaces: a host
    directory behind it is no working directory a child is started in, the
    child being a way around the schedule. *)
+(* The crash model's wrapper does not own the base it was given: closing it
+   leaves the base open for the caller that holds it, as the wrapper takes any
+   path and the caller's directory may be the process's [fs], which eio_linux
+   refuses to close. A wrapper that forwards its close to the base closes the
+   caller's descriptor, and the caller's next read through it fails. *)
+let test_close_keeps_base () =
+  with_real_dir @@ fun dir ->
+  Eio.Path.save ~create:(`Exclusive 0o644) (dir / "kept") "the base's bytes";
+  let crash = Chaos.Private.Crash.wrap (Chaos.Private.Crash.v ()) dir in
+  Eio.Flow.close (fst crash);
+  Alcotest.(check string)
+    "the base reads after the crash model's wrapper closed" "the base's bytes"
+    (Eio.Path.load (dir / "kept"))
+
 let test_real_child_cwd () =
   Eio_main.run @@ fun env ->
   let fs = Eio.Stdenv.fs env in
@@ -584,6 +598,9 @@ let suite =
       Alcotest.test_case "stat error" `Quick test_stat_error;
       Alcotest.test_case "real child cwd" `Quick
         (Host.posix_only "eio_windows 1.7 spawns no process" test_real_child_cwd);
+      Alcotest.test_case "closing a wrapper keeps its base" `Quick
+        (Host.posix_only "eio_windows 1.7 has no positioned read"
+           test_close_keeps_base);
       Alcotest.test_case "directory error" `Quick (test_directory_error false);
       Alcotest.test_case "directory entries error" `Quick
         (test_directory_error true);
