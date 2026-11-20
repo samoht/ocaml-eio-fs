@@ -2485,13 +2485,16 @@ let wrap_cfile_rw ~sw ctl fs ~append base : Eio.File.rw_ty r =
    controller was wrapped over: tracked files are addressed through that
    long-lived root so a crash can rewrite them after any intermediate staging
    subtree is closed, and a subtree held across the rename of its directory
-   follows it there, as the descriptor beneath it does. *)
+   follows it there, as the descriptor beneath it does. [downs] is whether
+   closing the wrapper closes [dbase]: a subdirectory opened through it is the
+   wrapper's, the base given to {!wrap} stays its caller's. *)
 type cdir = {
   dctl : t;
   dbase : Eio.Fs.dir_ty r;
   dboxed : boxed;
   dplace : place;
   dino : int64 option; (* the inode a subtree opened *)
+  downs : bool;
 }
 
 (* Expose the whole crash directory so a rename whose target is itself a
@@ -2942,7 +2945,9 @@ let rec cdir_handler :
     (Eio.Resource.handler
        [
          H (Eio.Fs.Pi.Dir, (module Cdir_impl));
-         H (Eio.Resource.Close, fun d -> Wrapper.close_resource d.dbase);
+         H
+           ( Eio.Resource.Close,
+             fun d -> if d.downs then Wrapper.close_resource d.dbase );
          H (Crash_dir, fun d -> d);
          H (Eio_fs_sync.Rename.Exclusive, Cdir_impl.rename_exclusive);
          (* Who can open these files is the base's to say: the model
@@ -2967,7 +2972,8 @@ let rec cdir_handler :
                  :> [ `Close | Eio.Fs.dir_ty ] r) );
        ])
 
-let wrap_cdir ctl ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
+let wrap_cdir ctl ~owns ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r
+    =
   let place = { proot = root; prefix } in
   ctl.subtrees <- place :: ctl.subtrees;
   (Eio.Resource.T
@@ -2977,11 +2983,12 @@ let wrap_cdir ctl ~ino ~root ~prefix ~base : [ `Close | Eio.Fs.dir_ty ] r =
          dboxed = box_dir base;
          dplace = place;
          dino = ino;
+         downs = owns;
        },
        Lazy.force cdir_handler )
     :> [ `Close | Eio.Fs.dir_ty ] r)
 
-let () = dir_hook := wrap_cdir
+let () = dir_hook := wrap_cdir ~owns:true
 
 let v ?os ?(policy = Drop_unsynced) ?(outside = Dropped) ?(block_size = 4096)
     ?(pause = ignore) () =
@@ -3044,7 +3051,7 @@ let wrap ctl (base, path) =
     (fun rel t ->
       Memfs.set_times (base, rel) ~atime:t.atime ~mtime:t.mtime ~ctime:t.ctime);
   snap ctl (state_of (snapshot_at admin path) no_locs);
-  (wrap_cdir ctl ~ino:None ~root:proot ~prefix:"" ~base, path)
+  (wrap_cdir ctl ~owns:false ~ino:None ~root:proot ~prefix:"" ~base, path)
 
 let is_crashed ctl = ctl.crashed
 
