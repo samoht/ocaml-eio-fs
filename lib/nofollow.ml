@@ -29,6 +29,13 @@ let read_file ~max_bytes ~validate path =
   Eio_fs_internal.bounded_read ~max_bytes ~validate ~stat:(Eio.File.stat file)
     ~read:(Eio.Flow.single_read file)
 
+let run ~max_bytes ~validate ~stat ~read =
+  if max_bytes < 0 || max_bytes = max_int then
+    Fmt.invalid_arg
+      "Eio_fs.Nofollow.run: max_bytes is %d, must be between 0 and max_int - 1"
+      max_bytes;
+  Eio_fs_internal.bounded_read ~max_bytes ~validate ~stat ~read
+
 (* Once opened, a file may have lost its last name to a rename over it,
    which leaves the descriptor reading the file it opened. *)
 let refused ~opened (s : Eio.File.Stat.t) =

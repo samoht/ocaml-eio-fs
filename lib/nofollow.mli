@@ -33,6 +33,23 @@ val read_file :
       when the open or read fails, including when the final component is a
       symbolic link. *)
 
+val run :
+  max_bytes:int ->
+  validate:(Eio.File.Stat.t -> (unit, string) result) ->
+  stat:Eio.File.Stat.t ->
+  read:(Cstruct.t -> int) ->
+  (Cstruct.t, error) result
+(** [run ~max_bytes ~validate ~stat ~read] is {!read_file}'s read, for a caller
+    that opened the file another way: it validates [stat] before asking [read]
+    for bytes and reads through end-of-file with one byte of lookahead past
+    [max_bytes]. The buffer offered to [read] starts at [stat]'s size plus one
+    byte and doubles toward [max_bytes + 1] only while the file keeps answering,
+    so a read costs the file and not the bound. A rejected or partially read
+    buffer, and each one outgrown, is overwritten before the function returns or
+    raises.
+
+    @raise Invalid_argument if [max_bytes] is negative or [max_int]. *)
+
 val with_regular :
   _ Eio.Path.t ->
   (Eio.File.ro_ty Eio.Resource.t -> Eio.File.Stat.t -> 'a) ->
