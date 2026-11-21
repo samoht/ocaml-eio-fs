@@ -39,7 +39,7 @@ depends: [
   "alcotest" {with-test & >= "1.7.0"}
   "alcobar" {with-test}
   "csv" {with-test & >= "2.4"}
-  "eio-net" {with-test & >= "0.1.0" & < "0.2.0"}
+  "eio-net" {with-test & >= "0.1.0"}
   "eio_posix" {with-test & >= "1.7" & os != "win32"}
   "odoc" {with-doc}
 ]
