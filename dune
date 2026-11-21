@@ -5,6 +5,8 @@
 (mdx
  (files README.md)
  (libraries
+  eio-fs
+  eio_fs_sync
   eio-fs.mem
   eio-fs.chaos
   eio-net.chaos
