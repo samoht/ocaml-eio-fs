@@ -1,0 +1,13 @@
+(test
+ (name test)
+ (package eio-fs)
+ (libraries
+  eio-fs.chaos
+  eio-fs.mem
+  eio
+  eio_main
+  alcotest
+  fmt
+  cstruct
+  optint
+  unix))

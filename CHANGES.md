@@ -8,6 +8,7 @@
 - `Lease.await_free` waits for a lease's release while holding nothing, so a slow waiter no longer holds off an exclusive take (#18)
 - `Eio_fs_sync.adopt` wraps a file the caller already holds as the directory's wrappers wrap an open of it (#19)
 - Closing a crash wrapper no longer closes the base directory it was given (#20)
+- `Eio_fs_chaos.Fault.Cancel n` cancels a file's read or write `n` turns in and checks the filesystem's cancel: no byte reaches a buffer after the cancel returns, and a write it stopped stores nothing (#26)
 
 ## 0.1.0 (21/11/2026)
 

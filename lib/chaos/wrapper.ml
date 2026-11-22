@@ -45,7 +45,7 @@ let applies ~space (op : Op.t) : Fault.t -> bool = function
       false
   | Fail _ -> true
   | Evict _ -> op.kind = `Sync
-  | Short _ -> op.kind = `Read || op.kind = `Write
+  | Short _ | Cancel _ -> op.kind = `Read || op.kind = `Write
   | Torn _ -> op.kind = `Write
   | Swap_symlink _ -> (
       match op.kind with `Open_read | `Open_write | `Stat -> true | _ -> false)
@@ -124,32 +124,138 @@ let sync_failed ~evict (Eio.Resource.T (v, ops)) =
   | Some f -> f v ~evict
   | None -> ()
 
+(* {2 Cancels}
+
+   [Fault.Cancel]: the base runs under a cancel of its own, on the wrapper's
+   own buffer, which the cancel's contract is checked against. *)
+
+exception Cancelled_by_fault
+
+let canary = 0xa5
+
+(* [cancelled k f] is [f ()], cancelled [k] turns after it starts, or before
+   it starts if [k <= 0]: [`Done x] if it returned, [`Cancelled] if the cancel
+   stopped it. *)
+let cancelled k f =
+  let finished = ref false and cc = ref None in
+  Switch.run @@ fun sw ->
+  if k > 0 then
+    Fiber.fork ~sw (fun () ->
+        for _ = 1 to k do
+          Fiber.yield ()
+        done;
+        match !cc with
+        | Some c when not !finished -> Eio.Cancel.cancel c Cancelled_by_fault
+        | _ -> ());
+  Eio.Cancel.sub @@ fun c ->
+  cc := Some c;
+  if k <= 0 then Eio.Cancel.cancel c Cancelled_by_fault;
+  match f () with
+  | x ->
+      finished := true;
+      `Done x
+  | exception Eio.Cancel.Cancelled Cancelled_by_fault ->
+      finished := true;
+      `Cancelled
+  | exception e ->
+      finished := true;
+      raise e
+
+(* The first byte of [buf] from [from] that is not the canary. *)
+let written buf ~from =
+  let rec go i =
+    if i >= Cstruct.length buf then None
+    else if not (Int.equal (Cstruct.get_uint8 buf i) canary) then Some i
+    else go (i + 1)
+  in
+  go from
+
+let breach fmt = Fmt.failwith ("Eio_fs_chaos: " ^^ fmt)
+
+(* A few turns for a late completion to land, as a backend that let the
+   cancel return before its operation ended may still complete it. *)
+let settle () =
+  for _ = 1 to 8 do
+    Fiber.yield ()
+  done
+
+(* The buffers of the reads a cancel stopped, checked again at the close. *)
+let check_quiet path quiet =
+  List.iter
+    (fun mine ->
+      match written mine ~from:0 with
+      | Some i ->
+          breach
+            "a read of %s that a cancel stopped wrote byte %d of its buffer \
+             after the cancel returned"
+            path i
+      | None -> ())
+    !quiet
+
+let cancelled_read ~path ~quiet k read dst =
+  let mine = Cstruct.create_unsafe (Cstruct.lenv dst) in
+  Cstruct.memset mine canary;
+  match cancelled k (fun () -> read [ mine ]) with
+  | `Done got ->
+      (match written mine ~from:got with
+      | Some i ->
+          breach
+            "a read of %s that returned %d bytes wrote byte %d of its buffer"
+            path got i
+      | None -> ());
+      ignore
+        (List.fold_left
+           (fun off b ->
+             let n = max 0 (min (Cstruct.length b) (got - off)) in
+             Cstruct.blit mine off b 0 n;
+             off + n)
+           0 dst
+          : int);
+      got
+  | `Cancelled ->
+      settle ();
+      quiet := mine :: !quiet;
+      check_quiet path quiet;
+      read dst
+
+(* The first base write goes from the wrapper's copy, which is noise once
+   the cancel stopped it: a file that holds noise or a byte twice was written
+   by a write that raised [Eio.Cancel.Cancelled]. *)
+let cancelled_write k write bufs =
+  let mine = Cstruct.of_string (Cstruct.copyv bufs) in
+  match cancelled k (fun () -> write [ mine ]) with
+  | `Done got -> got
+  | `Cancelled ->
+      Cstruct.memset mine canary;
+      settle ();
+      write bufs
+
 (* {2 File wrappers} *)
 
 (* Reads are shared between the read-only and read-write wrappers; a read-write
    file coerces to read-only for these. [pos] is the shared streaming cursor. *)
-let do_single_read sched path ~pos (base : Eio.File.ro_ty r) buf =
+let do_single_read sched path ~quiet ~pos (base : Eio.File.ro_ty r) buf =
   let len = Cstruct.length buf in
-  let buf =
+  let read bufs = Eio.Flow.single_read base (List.hd bufs) in
+  let got =
     match next sched ~offset:!pos ~len `Read path with
     | Some (Fail c) -> raise_io c path
-    | Some (Short n) -> Cstruct.sub buf 0 (clamp 1 len n)
-    | _ -> buf
+    | Some (Short n) -> read [ Cstruct.sub buf 0 (clamp 1 len n) ]
+    | Some (Cancel k) -> cancelled_read ~path ~quiet k read [ buf ]
+    | _ -> read [ buf ]
   in
-  let got = Eio.Flow.single_read base buf in
   pos := !pos + got;
   got
 
-let do_pread sched path (base : Eio.File.ro_ty r) ~file_offset bufs =
+let do_pread sched path ~quiet (base : Eio.File.ro_ty r) ~file_offset bufs =
   let len = Cstruct.lenv bufs in
   let offset = Optint.Int63.to_int file_offset in
-  let bufs =
-    match next sched ~offset ~len `Read path with
-    | Some (Fail c) -> raise_io c path
-    | Some (Short n) -> take_v (clamp 1 len n) bufs
-    | _ -> bufs
-  in
-  Eio.File.pread base ~file_offset bufs
+  let read bufs = Eio.File.pread base ~file_offset bufs in
+  match next sched ~offset ~len `Read path with
+  | Some (Fail c) -> raise_io c path
+  | Some (Short n) -> read (take_v (clamp 1 len n) bufs)
+  | Some (Cancel k) when len > 0 -> cancelled_read ~path ~quiet k read bufs
+  | _ -> read bufs
 
 (* Where a streaming write lands: at the cursor, or for a file opened to
    append at its end, wherever the cursor was. *)
@@ -177,6 +283,10 @@ let do_single_write sched path ~append ~pos (base : Eio.File.rw_ty r) bufs =
       pos := off + n;
       Fmt.kstr (raise_io `Enospc) "%s torn@%d" path !pos
   | Some (Fail c) -> raise_io c path
+  | Some (Cancel k) when len > 0 ->
+      let got = cancelled_write k (Eio.Flow.single_write base) bufs in
+      pos := off + got;
+      got
   | _ ->
       let got = Eio.Flow.single_write base bufs in
       pos := off + got;
@@ -196,6 +306,8 @@ let do_pwrite sched path ~append (base : Eio.File.rw_ty r) ~file_offset bufs =
       if n > 0 then Eio.File.pwrite_all base ~file_offset (take_v n bufs);
       Fmt.kstr (raise_io `Enospc) "%s torn@%d" path (off + n)
   | Some (Fail c) -> raise_io c path
+  | Some (Cancel k) when len > 0 ->
+      cancelled_write k (Eio.File.pwrite_single base ~file_offset) bufs
   | _ -> Eio.File.pwrite_single base ~file_offset bufs
 
 (* A barrier passed on to the file beneath, through the cache of the drive
@@ -228,6 +340,7 @@ type file = {
   path : string;
   append : bool;
   pos : int ref;
+  quiet : Cstruct.t list ref; (* the buffers of the reads a cancel stopped *)
   ro : Eio.File.ro_ty r;
   rw : Eio.File.rw_ty r option;
 }
@@ -240,11 +353,21 @@ module Ro_impl = struct
   type t = file
 
   let read_methods = []
-  let single_read t buf = do_single_read t.sched t.path ~pos:t.pos t.ro buf
-  let pread t ~file_offset bufs = do_pread t.sched t.path t.ro ~file_offset bufs
+
+  let single_read t buf =
+    do_single_read t.sched t.path ~quiet:t.quiet ~pos:t.pos t.ro buf
+
+  let pread t ~file_offset bufs =
+    do_pread t.sched t.path ~quiet:t.quiet t.ro ~file_offset bufs
+
   let stat t = do_stat t.sched t.path t.ro
   let seek t off cmd = do_seek ~pos:t.pos t.ro off cmd
-  let close t = close_resource t.ro
+
+  let close t =
+    let quiet = !(t.quiet) in
+    t.quiet := [];
+    close_resource t.ro;
+    check_quiet t.path (ref quiet)
 end
 
 (* fsync(2) flushes the file whichever descriptor names it, so a file opened
@@ -284,7 +407,15 @@ let ro_handler =
 
 let wrap_ro sched ~path base : Eio.File.ro_ty r =
   Eio.Resource.T
-    ( { sched; path; append = false; pos = ref 0; ro = base; rw = None },
+    ( {
+        sched;
+        path;
+        append = false;
+        pos = ref 0;
+        quiet = ref [];
+        ro = base;
+        rw = None;
+      },
       ro_handler )
 
 module Rw_impl = struct
@@ -313,6 +444,7 @@ let wrap_rw sched ~path ~append base : Eio.File.rw_ty r =
       path;
       append;
       pos = ref 0;
+      quiet = ref [];
       ro = (base :> Eio.File.ro_ty r);
       rw = Some base;
     }

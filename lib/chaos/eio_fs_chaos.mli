@@ -370,6 +370,21 @@ module Fault : sig
               in
               Eio_fs_chaos.wrap swap base
             ]} *)
+    | Cancel of int
+        (** A read or a write of a file is cancelled [n] turns of the event loop
+            after it starts, or before it starts if [n <= 0]. If the cancel
+            stopped it, it runs again, so the program sees it complete as with
+            no fault. The wrapper checks the cancel against [base] and raises
+            [Failure] on a breach.
+
+            A read that returned [k] bytes wrote none of its buffer past them. A
+            read the cancel stopped wrote none of it, then, in the turns that
+            follow, or by the file's close. A write the cancel stopped is made
+            again from the caller's buffers, after the copy it was given is
+            overwritten with noise. A file that holds noise or a byte twice was
+            written by a write that raised [Eio.Cancel.Cancelled].
+
+            {!run} does not try it. *)
 
   val pp : t Fmt.t
   (** [pp] formats a fault for logs and reports. *)

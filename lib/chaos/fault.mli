@@ -8,6 +8,7 @@ type t =
   | Short of int
   | Torn of int
   | Swap_symlink of string
+  | Cancel of int
 
 val code_name : code -> string
 (** [code_name c] is [c]'s errno, as ["EIO"]. *)
