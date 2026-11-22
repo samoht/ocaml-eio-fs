@@ -8,6 +8,7 @@
   eio-fs.mem
   eio-fs.chaos
   eio-fs
+  eio_fs_sync
   cstruct
   posix
   alcotest
