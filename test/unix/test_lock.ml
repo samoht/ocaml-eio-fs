@@ -509,7 +509,12 @@ let test_lock_bounded_wait_in_the_holder_keeps_its_hold () =
 (* A descriptor handed to the holder is closed when the hold ends, not kept:
    each refused ask from the holder would otherwise cost the process one
    descriptor for as long as it runs. *)
-let open_descriptors () = Array.length (Sys.readdir "/dev/fd")
+let open_descriptors () = Array.to_list (Sys.readdir "/dev/fd")
+
+(* The descriptors open now that were not in [before]. A count would also see
+   an unrelated descriptor of the runtime closed in between. *)
+let opened_since before =
+  List.filter (fun fd -> not (List.mem fd before)) (open_descriptors ())
 
 let test_lock_asks_from_the_holder_leave_no_descriptor () =
   with_real_dir @@ fun dir ->
@@ -521,8 +526,8 @@ let test_lock_asks_from_the_holder_leave_no_descriptor () =
       | () -> Alcotest.fail "a lock a fiber of this process holds was granted"
       | exception Eio_fs_unix.Lock_unavailable _ -> ()
     done );
-  Alcotest.(check int)
-    "descriptors open once the hold ends" before (open_descriptors ())
+  Alcotest.(check (list string))
+    "descriptors opened once the hold ends" [] (opened_since before)
 
 (* Waits against another process's hold, ended by their [`For] bound or by a
    cancel, leave no descriptor behind while the holder still holds; a waiter
@@ -554,9 +559,9 @@ let ended_waits_leave_no_descriptor ~kind ~take_for take () =
     bounded ();
     cancelled ()
   done;
-  Alcotest.(check int)
-    "descriptors open after the ended waits, the holder holding" before
-    (open_descriptors ());
+  Alcotest.(check (list string))
+    "descriptors opened by the ended waits, the holder holding" []
+    (opened_since before);
   let waiting, now_waiting = Eio.Promise.create () in
   let granted, now_granted = Eio.Promise.create () in
   Eio.Fiber.fork ~sw (fun () ->
