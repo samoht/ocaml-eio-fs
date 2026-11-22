@@ -250,7 +250,8 @@ val seek_data : Unix.file_descr -> file_offset:int -> int option
     absolute and the call moves [fd]'s position as [lseek] does. The call is
     made on a system thread.
 
-    @raise Unix.Unix_error as [lseek]. *)
+    @raise Unix.Unix_error
+      as [lseek], and [ENOSYS] on a system with no [SEEK_DATA], as OpenBSD. *)
 
 val seek_hole : Unix.file_descr -> file_offset:int -> int option
 (** [seek_hole fd ~file_offset] is like {!seek_data} for the next offset at or
@@ -258,7 +259,8 @@ val seek_hole : Unix.file_descr -> file_offset:int -> int option
     so this is [None] only when [file_offset] is at or past the end. This is
     [lseek(SEEK_HOLE)].
 
-    @raise Unix.Unix_error as [lseek]. *)
+    @raise Unix.Unix_error
+      as [lseek], and [ENOSYS] on a system with no [SEEK_HOLE], as OpenBSD. *)
 
 type extent = {
   logical : int;  (** The extent's offset in the file. *)

@@ -542,12 +542,24 @@ struct eio_fs_extent {
   int64_t length;
 };
 
+/* OpenBSD has neither SEEK_DATA nor SEEK_HOLE: there the calls refuse with
+   ENOSYS. */
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+#define EIO_FS_SEEK_DATA SEEK_DATA
+#define EIO_FS_SEEK_HOLE SEEK_HOLE
+#else
+#define EIO_FS_SEEK_DATA (-1)
+#define EIO_FS_SEEK_HOLE (-1)
+#endif
+
 static value eio_fs_seek(value fd_v, value offset_v, int whence,
                          const char *name)
 {
   CAMLparam2(fd_v, offset_v);
   int fd = Int_val(fd_v);
   off_t offset = (off_t)Long_val(offset_v);
+  if (whence < 0)
+    caml_unix_error(ENOSYS, (char *)name, Nothing);
 
   caml_release_runtime_system();
   off_t found = lseek(fd, offset, whence);
@@ -569,12 +581,12 @@ static value eio_fs_seek(value fd_v, value offset_v, int whence,
 
 CAMLprim value caml_eio_fs_seek_data(value fd_v, value offset_v)
 {
-  return eio_fs_seek(fd_v, offset_v, SEEK_DATA, "seek_data");
+  return eio_fs_seek(fd_v, offset_v, EIO_FS_SEEK_DATA, "seek_data");
 }
 
 CAMLprim value caml_eio_fs_seek_hole(value fd_v, value offset_v)
 {
-  return eio_fs_seek(fd_v, offset_v, SEEK_HOLE, "seek_hole");
+  return eio_fs_seek(fd_v, offset_v, EIO_FS_SEEK_HOLE, "seek_hole");
 }
 
 /* Fills [out] with up to [max] extents backing [offset, offset + length), in

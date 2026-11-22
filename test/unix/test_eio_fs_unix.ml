@@ -668,7 +668,14 @@ let hole_start fd ~size =
     (start > 0 && start < size);
   start
 
+(* OpenBSD has no SEEK_DATA or SEEK_HOLE: the calls refuse with ENOSYS. *)
+let seekable f =
+  try f ()
+  with Unix.Unix_error (Unix.ENOSYS, ("seek_data" | "seek_hole"), _) ->
+    Alcotest.skip ()
+
 let test_seek_data_and_hole_walk_the_file () =
+  seekable @@ fun () ->
   with_sparse_file @@ fun _env fd ~size ->
   let first_data =
     some "seek_data 0" (Eio_fs_unix.seek_data fd ~file_offset:0)
