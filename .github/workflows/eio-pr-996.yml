@@ -1,0 +1,127 @@
+name: Eio PR 996
+
+# Records test/interop/kernel/traces and test/interop/windows/traces through
+# eio_windows at the head of ocaml-multicore/eio#996, and runs the Windows
+# test suite against it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [eio-pr-996]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: Record through eio_windows (PR 996)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.5'
+
+      # eio_windows at the head of ocaml-multicore/eio#996, with the iocp
+      # commit its eio_windows.opam pins. OCaml 5.5: iocp at that commit
+      # does not compile against 5.4's headers.
+      - run: |
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#77878c74f279397bef7469957290d959146b7fb0
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+
+      - run: opam install -y dune eio_windows fmt cstruct optint csv
+
+      - run: Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -Name AllowDevelopmentWithoutDevLicense -Value 0
+
+      - run: opam exec -- dune build @test/interop/kernel/regen-traces @test/interop/windows/regen-traces
+        env:
+          REGEN: '1'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-traces-pr996
+          path: |
+            test/interop/kernel/traces/
+            test/interop/windows/traces/
+
+  suite:
+    name: Windows suite (PR 996)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      ALCOTEST_SHOW_ERRORS: 'true'
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.5'
+
+      - run: Remove-Item C:\Strawberry\perl\bin\pkg-config*
+
+      # eio_windows at the head of ocaml-multicore/eio#996, with the iocp
+      # commit its eio_windows.opam pins. OCaml 5.5: iocp at that commit
+      # does not compile against 5.4's headers.
+      - run: |
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#77878c74f279397bef7469957290d959146b7fb0
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+
+      - run: opam install -y . --deps-only --with-test
+      - run: opam exec -- dune build '@install' '@runtest'
+
+  # test/cancel with more seeds, under Eio 1.7, main and the PR head, so a
+  # failure is the PR's or was there before.
+  cancel:
+    name: Cancel seeds (${{ matrix.eio }})
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        eio: ['1.7', 'main', 'pr996']
+    env:
+      ALCOTEST_SHOW_ERRORS: 'true'
+      CANCEL_SEEDS: '500'
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.5'
+
+      - run: Remove-Item C:\Strawberry\perl\bin\pkg-config*
+
+      - if: matrix.eio == 'pr996'
+        run: |
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#77878c74f279397bef7469957290d959146b7fb0
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#144a7c640a784cfbd816fd79f345dd8977b821e4
+
+      - if: matrix.eio == 'main'
+        run: |
+          opam pin add -yn eio.dev git+https://github.com/ocaml-multicore/eio.git#f3e987cdff727c363840dd95c2e0bcea06d205c6
+          opam pin add -yn eio_windows.dev git+https://github.com/ocaml-multicore/eio.git#f3e987cdff727c363840dd95c2e0bcea06d205c6
+          opam pin add -yn eio_main.dev git+https://github.com/ocaml-multicore/eio.git#f3e987cdff727c363840dd95c2e0bcea06d205c6
+
+      - if: matrix.eio == '1.7'
+        run: opam pin add -yn eio_windows 1.7
+
+      - run: opam install -y . --deps-only --with-test
+      - run: opam exec -- dune build '@test/cancel/runtest'
