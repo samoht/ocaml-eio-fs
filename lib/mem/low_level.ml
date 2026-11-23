@@ -188,23 +188,51 @@ module Symlink = struct
   let v ~link_to stat = { stat; link_to; to_dir = false }
 end
 
+module Pipe = struct
+  type t = { chunks : Cstruct.t option Eio.Stream.t; stat : Eio.File.Stat.t }
+
+  let make stat = { chunks = Eio.Stream.create max_int; stat }
+
+  let write t buf =
+    Eio.Stream.add t.chunks (Some buf);
+    Cstruct.length buf
+
+  let read t = Eio.Stream.take t.chunks
+  let close t = Eio.Stream.add t.chunks None
+end
+
 module File = File_node
 module Fd_table = Map.Make (Num)
 
 (* What the tree holds. *)
-module Resource = struct
-  type t = File of File.t | Dir of Dir_node.t | Symlink of Symlink.t
+module Fs_resource = struct
+  type 'a with_stat = Eio.File.Stat.t * 'a
+
+  type t =
+    | Stdin of Eio.Flow.source_ty Eio.Flow.source with_stat
+    | Stdout of Eio.Flow.sink_ty Eio.Flow.sink with_stat
+    | Stderr of Eio.Flow.sink_ty Eio.Flow.sink with_stat
+    | File of File.t
+    | Dir of Dir_node.t
+    | Symlink of Symlink.t
+    | Pipe of Pipe.t
 
   let stat = function
     | File f -> { f.stat with blocks = File.blocks f }
     | Dir dir -> dir.stat
     | Symlink s -> s.stat
+    | Stdin (s, _) | Stdout (s, _) | Stderr (s, _) -> s
+    | Pipe p -> p.stat
 
   let set_stat r stat =
     match r with
     | File f -> File { f with stat }
     | Dir d -> Dir { d with stat }
     | Symlink s -> Symlink { s with stat }
+    | Stdin (_, v) -> Stdin (stat, v)
+    | Stdout (_, v) -> Stdout (stat, v)
+    | Stderr (_, v) -> Stderr (stat, v)
+    | Pipe p -> Pipe { p with stat }
 
   let update r f = r := set_stat !r (f (stat !r))
 end
@@ -224,27 +252,27 @@ let accessed ~now (s : Eio.File.Stat.t) =
 (* A directory's entries changed, and its subdirectories by [subdirs]: each
    one's [..] links it. *)
 let entries_changed ~now ?(subdirs = 0) r =
-  Resource.update r (fun s ->
+  Fs_resource.update r (fun s ->
       { (changed ~now s) with nlink = Int64.add s.nlink (Int64.of_int subdirs) })
 
 (* An inode that lost its only name: an open descriptor still stats it. *)
 let unlinked ~now r =
-  Resource.update r (fun s -> { (inode_changed ~now s) with nlink = 0L })
+  Fs_resource.update r (fun s -> { (inode_changed ~now s) with nlink = 0L })
 
-type resource = Resource.t
+type resource = Fs_resource.t
 
 (* A component that had to be a directory and is not: ENOTDIR. *)
 let as_dir ~path = function
-  | Resource.Dir dir -> dir
+  | Fs_resource.Dir dir -> dir
   | _ -> Error.not_a_directory path
 
 (* O_TRUNC moves mtime and ctime, even on an empty file. *)
 let truncate_file ~now r =
   match !r with
-  | Resource.File f ->
+  | Fs_resource.File f ->
       let stat = changed ~now { f.stat with size = Optint.Int63.zero } in
       r := File (File.v ~stat)
-  | Dir _ | Symlink _ -> ()
+  | Dir _ | Symlink _ | Stdin _ | Stderr _ | Stdout _ | Pipe _ -> ()
 
 (* Descriptors 0 to 2 stay reserved for the standard streams, so a number this
    backend hands out is never one a caller reads as stdin, stdout or stderr. *)
@@ -313,6 +341,18 @@ module Fd = struct
   (* A closed handle answers on its own state, never by its number, which the
      next open may have been handed. *)
   let num t = if t.closed then Error.badf () else t.num
+end
+
+module Resource = struct
+  type 'a t = ([> `Mem_fd ] as 'a) Eio.Resource.t
+
+  type ('t, _, _) Eio.Resource.pi +=
+    | T : ('t, 't -> Fd.t, [> `Mem_fd ]) Eio.Resource.pi
+
+  let fd (Eio.Resource.T (t, ops)) = Eio.Resource.get ops T t
+
+  let fd_opt (Eio.Resource.T (t, ops)) =
+    match Eio.Resource.get_opt ops T with Some f -> Some (f t) | None -> None
 end
 
 module Dir = struct
@@ -404,7 +444,7 @@ module Filesystem = struct
 
   let empty ~device ~(owner : User.t) ~now : t =
     let root =
-      Resource.Dir
+      Fs_resource.Dir
         {
           stat =
             {
@@ -440,7 +480,7 @@ module Filesystem = struct
      parent links of the tree itself. *)
   let rec within (tree : t) r ino =
     match !r with
-    | Resource.Dir d -> (
+    | Fs_resource.Dir d -> (
         Inode.equal d.stat.ino ino
         || (not (Inode.equal d.stat.ino 0L))
            &&
@@ -507,7 +547,7 @@ module Filesystem = struct
 
   (* A lookup in a directory needs its search (x) bit: EACCES. *)
   let search_in w name =
-    if not (User.can w.user (Resource.stat !(here w)) User.x) then
+    if not (User.can w.user (Fs_resource.stat !(here w)) User.x) then
       Error.permission_denied name
 
   (* The entry [name] names in the directory [w] is in, [.] and [..] included,
@@ -528,7 +568,7 @@ module Filesystem = struct
      link's owner, or when the directory's owner owns it, root included:
      EACCES. *)
   let may_follow w name (s : Symlink.t) =
-    let dir = Resource.stat !(here w) in
+    let dir = Fs_resource.stat !(here w) in
     if
       w.os = `Linux
       && dir.perm land 0o1002 = 0o1002
@@ -557,12 +597,13 @@ module Filesystem = struct
     | None -> Error.not_found name
     | Some r -> (
         match !r with
-        | Resource.Dir _ -> push w r
+        | Fs_resource.Dir _ -> push w r
         | Symlink s ->
             follow_link w.follows;
             let target = link_target name s in
             walk (enter w target) (names target)
-        | File _ -> Error.not_a_directory name)
+        | File _ | Stdout _ | Stderr _ | Stdin _ | Pipe _ ->
+            Error.not_a_directory name)
 
   (* [locate w path] is the walk into the directory holding [path]'s last
      component, that component (["."] when [path] has none) and whether
@@ -601,12 +642,12 @@ module Filesystem = struct
       match child w name with Some r -> r | None -> Error.not_found name
     in
     match !r with
-    | Resource.Symlink s when follow || slash ->
+    | Fs_resource.Symlink s when follow || slash ->
         may_follow w name s;
         follow_link w.follows;
         let w, name, slash' = locate w (link_target name s) in
         final ~follow:true w name ~slash:(slash || slash')
-    | Resource.Dir _ -> r
+    | Fs_resource.Dir _ -> r
     | _ when slash -> Error.not_a_directory name
     | _ -> r
 
@@ -727,7 +768,7 @@ module Filesystem = struct
       | [ last ] -> (
           check last;
           match child (at r) last with
-          | Some { contents = Resource.Symlink s } when follow_last ->
+          | Some { contents = Fs_resource.Symlink s } when follow_last ->
               follow_link follows;
               relink (List.rev (last :: seen)) s []
           | _ -> (at r, last))
@@ -737,11 +778,12 @@ module Filesystem = struct
           | None -> Error.not_found path
           | Some r' -> (
               match !r' with
-              | Resource.Dir _ -> walk relink r' (c :: seen) rest
+              | Fs_resource.Dir _ -> walk relink r' (c :: seen) rest
               | Symlink s ->
                   follow_link follows;
                   relink (List.rev (c :: seen)) s rest
-              | File _ -> Error.directory_name path))
+              | File _ | Stdout _ | Stderr _ | Stdin _ | Pipe _ ->
+                  Error.directory_name path))
     in
     let target (s : Symlink.t) = Nt.link_target ~cwd:fs.cwd s.link_to in
     let rec from_drive nt =
@@ -825,10 +867,10 @@ module Filesystem = struct
     | Dir.Fs _ -> cwd ()
     | Dir.Cwd _ ->
         let w = cwd () in
-        { w with base = Some (Resource.stat !(here w)).ino }
+        { w with base = Some (Fs_resource.stat !(here w)).ino }
     | Dir.Dir_fd fd ->
         let r = resource_of fd in
-        { at_root with base = Some (Resource.stat !r).ino; dirs = [ r ] }
+        { at_root with base = Some (Fs_resource.stat !r).ino; dirs = [ r ] }
 
   let windows dir_fd = (Dir.fs dir_fd).os = `Windows
 
@@ -862,14 +904,38 @@ let add_drive fs letter =
     new_stat fs ~user:User.root ~parent:d.stat ~kind:`Directory ~perm:0o777 ()
   in
   Filesystem.add_file fs stat.ino
-    (ref (Resource.Dir (Dir_node.v ~parent:0L stat)));
+    (ref (Fs_resource.Dir (Dir_node.v ~parent:0L stat)));
   root :=
-    Resource.Dir
+    Fs_resource.Dir
       (Dir_node.add fs.os
          (Fmt.str "%c:" (Char.uppercase_ascii letter))
          stat.ino d)
 
-let v ?clock ?cwd ?(owner = User.root) ?os ?drives () =
+let null = Eio.Flow.null
+
+let std_table ?stdin ?stdout ?stderr fs user =
+  let open Fs_resource in
+  let stat = new_stat fs ~user ~kind:`Character_special ~perm:0o400 () in
+  let stdin =
+    match stdin with
+    | Some f -> (f :> Eio.Flow.source_ty Eio.Flow.source)
+    | None -> null
+  in
+  let stdout =
+    match stdout with
+    | Some f -> (f :> Eio.Flow.sink_ty Eio.Flow.sink)
+    | None -> null
+  in
+  let stderr =
+    match stderr with
+    | Some f -> (f :> Eio.Flow.sink_ty Eio.Flow.sink)
+    | None -> null
+  in
+  Fd_table.add (Num.of_int 0) (ref (Stdin (stat, stdin))) Fd_table.empty
+  |> Fd_table.add (Num.of_int 1) (ref (Stdout (stat, stdout)))
+  |> Fd_table.add (Num.of_int 2) (ref (Stderr (stat, stderr)))
+
+let v ?clock ?cwd ?(owner = User.root) ?os ?drives ?stdin ?stdout ?stderr () =
   let now =
     match clock with Some c -> fun () -> Eio.Time.now c | None -> Fun.const 0.
   in
@@ -903,6 +969,8 @@ let v ?clock ?cwd ?(owner = User.root) ?os ?drives () =
       now;
     }
   in
+  let stdio = std_table ?stdin ?stderr ?stdout fs owner in
+  let fs = { fs with fds = stdio } in
   List.iter (add_drive fs) drives;
   fs
 
@@ -914,13 +982,21 @@ let root_path fs =
 let win_path (fd : Fd.t) =
   locked fd.fs @@ fun () -> Filesystem.win_path fd.fs.tree (resource_of fd)
 
-(* Closing an already-closed handle does nothing, as [Eio.Resource.close]
+let close_resource = function
+  | Fs_resource.Pipe p ->
+      Pipe.close p;
+      Fs_resource.Pipe p
+  | v -> v
+
+(* Closing an already-closed handle does nothing, as [Eio.Fs_resource.close]
    specifies and eio's posix backend does. A handle with two owners, a caller
    closing early in front of its switch, is the ordinary reason. *)
 let close (fd : Fd.t) =
   locked fd.fs @@ fun () ->
   if not fd.closed then begin
     fd.closed <- true;
+    let r = Fd_table.find fd.num fd.fs.fds in
+    r := close_resource !r;
     fd.fs.fds <- Fd_table.remove fd.num fd.fs.fds;
     fd.fs.shared <- Fd_table.remove fd.num fd.fs.shared
   end
@@ -931,9 +1007,9 @@ let checker (dir_fd : Dir.fd) =
 
 (* The inodes of [r] and of all below it. *)
 let rec inodes tree r acc =
-  let s = Resource.stat !r in
+  let s = Fs_resource.stat !r in
   match !r with
-  | Resource.Dir d ->
+  | Fs_resource.Dir d ->
       Names.fold
         (fun _ (_, ino) acc ->
           match Entries.find_opt ino tree with
@@ -941,6 +1017,7 @@ let rec inodes tree r acc =
           | None -> acc)
         d.entries (s.ino :: acc)
   | File _ | Symlink _ -> s.ino :: acc
+  | Stdout _ | Stderr _ | Stdin _ | Pipe _ -> acc
 
 (* Whether a program's descriptor holds [r] or anything below it open:
    eio_windows opens every handle without FILE_SHARE_DELETE, so Windows then
@@ -950,7 +1027,7 @@ let held_open fs r =
   let inos = inodes fs.tree r [] in
   Fd_table.exists
     (fun num r' ->
-      Fd_table.mem num fs.shared && List.mem (Resource.stat !r').ino inos)
+      Fd_table.mem num fs.shared && List.mem (Fs_resource.stat !r').ino inos)
     fs.fds
 
 (* open(2): opening an existing file requires the permission bits the access
@@ -963,9 +1040,9 @@ let held_open fs r =
 let check_access ~os ~user path flags r =
   let want = if Open_flags.(mem o_rdwr flags) then User.(r lor w) else User.r in
   match !r with
-  | Resource.File f when not (User.can user f.stat want) ->
+  | Fs_resource.File f when not (User.can user f.stat want) ->
       Error.permission_denied path
-  | Resource.Dir d
+  | Fs_resource.Dir d
     when ((not Open_flags.(mem o_directory flags)) || os = `Macos)
          && not (User.can user d.stat want) ->
       Error.permission_denied path
@@ -973,16 +1050,16 @@ let check_access ~os ~user path flags r =
 
 (* Making or removing an entry needs write and search on its directory. *)
 let check_dir_write ~user rdir path =
-  if not (User.can user (Resource.stat !rdir) User.(w lor x)) then
+  if not (User.can user (Fs_resource.stat !rdir) User.(w lor x)) then
     Error.permission_denied path
 
 (* In a sticky directory only the entry's or the directory's owner removes or
    renames an entry: EPERM. *)
 let check_sticky ~user rdir victim path =
-  let dir = Resource.stat !rdir in
+  let dir = Fs_resource.stat !rdir in
   if
     dir.perm land 0o1000 <> 0
-    && (not (User.owns user (Resource.stat !victim)))
+    && (not (User.owns user (Fs_resource.stat !victim)))
     && not (User.owns user dir)
   then Error.permission_denied path
 
@@ -991,7 +1068,7 @@ let masked ~(user : User.t) perm = perm land 0o7777 land lnot user.umask
 
 (* A directory removed while a handle held it takes no new entry: ENOENT. *)
 let check_live fs rdir path =
-  if not (Entries.mem (Resource.stat !rdir).ino fs.tree) then
+  if not (Entries.mem (Fs_resource.stat !rdir).ino fs.tree) then
     Error.not_found path
 
 (* [.] and [..] name a directory already there, never an entry to make,
@@ -1010,7 +1087,7 @@ let rec through_link ~slash (w : Filesystem.walk) name =
   if w.os = `Linux || not slash then (w, name)
   else
     match Filesystem.child w name with
-    | Some { contents = Resource.Symlink s } ->
+    | Some { contents = Fs_resource.Symlink s } ->
         Filesystem.follow_link w.follows;
         let w, name, _ = Filesystem.locate w (Filesystem.link_target name s) in
         through_link ~slash w name
@@ -1025,8 +1102,8 @@ let new_entry ?(dir = false) dir_fd path add =
   let w, name = if dir then through_link ~slash w name else (w, name) in
   match Filesystem.child w name with
   (* macOS looks a name in directory syntax up as a directory first. *)
-  | Some { contents = Resource.File _ | Symlink _ } when slash && w.os = `Macos
-    ->
+  | Some { contents = Fs_resource.File _ | Symlink _ }
+    when slash && w.os = `Macos ->
       Error.not_a_directory path
   | Some _ -> Error.already_exists path
   | None when slash && not dir -> Error.not_found path
@@ -1049,9 +1126,9 @@ let new_file ~mode fs (w : Filesystem.walk) name =
   in
   let f = File.v ~stat in
   check_name fs name;
-  rdir := Resource.Dir (Dir_node.add fs.os name f.stat.ino dir);
+  rdir := Fs_resource.Dir (Dir_node.add fs.os name f.stat.ino dir);
   entries_changed ~now:stat.ctime rdir;
-  let file = ref (Resource.File f) in
+  let file = ref (Fs_resource.File f) in
   Filesystem.add_file fs f.stat.ino file;
   file
 
@@ -1060,15 +1137,15 @@ let new_file ~mode fs (w : Filesystem.walk) name =
 let opened ~fs ~user path flags r =
   (* eio_windows opens a directory only as one, and a file never as one. *)
   (match (fs.os, !r) with
-  | `Windows, Resource.Dir _ when not Open_flags.(mem o_directory flags) ->
+  | `Windows, Fs_resource.Dir _ when not Open_flags.(mem o_directory flags) ->
       Error.permission_denied path
   | `Windows, (File _ | Symlink _) when Open_flags.(mem o_directory flags) ->
       Error.directory_name path
   | _ -> ());
   (match !r with
-  | Resource.Dir _ when Open_flags.(mem o_rdwr flags) ->
+  | Fs_resource.Dir _ when Open_flags.(mem o_rdwr flags) ->
       Error.err ("open: is a directory: " ^ path)
-  | Resource.Dir _ -> ()
+  | Fs_resource.Dir _ -> ()
   | _ when Open_flags.(mem o_directory flags) ->
       Error.err ("open: not a directory: " ^ path)
   | _ -> ());
@@ -1094,14 +1171,14 @@ let rec open_creating ~mode ~fs ~opened path flags (w : Filesystem.walk) name
   if slash && not (is_dot name) then Error.err ("open: is a directory: " ^ path);
   match child with
   | None -> new_file ~mode fs w name
-  | Some { contents = Resource.Dir _ } when w.os = `Windows ->
+  | Some { contents = Fs_resource.Dir _ } when w.os = `Windows ->
       Error.permission_denied path
   | Some _ when Open_flags.(mem o_excl flags) -> Error.already_exists path
   | Some r -> (
       match !r with
-      | Resource.Symlink _ when Open_flags.(mem o_nofollow flags) ->
+      | Fs_resource.Symlink _ when Open_flags.(mem o_nofollow flags) ->
           Error.symlink_loop ()
-      | Resource.Symlink s ->
+      | Fs_resource.Symlink s ->
           Filesystem.may_follow w name s;
           Filesystem.follow_link w.follows;
           let w, name, slash =
@@ -1129,7 +1206,7 @@ let open_locked ~mode dir_fd path flags =
       let r = Filesystem.lookup ~follow dir_fd path in
       match !r with
       (* O_NOFOLLOW on a symbolic link: ELOOP. *)
-      | Resource.Symlink _ -> Error.symlink_loop ()
+      | Fs_resource.Symlink _ -> Error.symlink_loop ()
       | _ -> opened r
   in
   let num = next_fd_of_fds fs.fds in
@@ -1149,20 +1226,34 @@ let openat ~mode ~sw dir_fd path flags =
   Eio.Switch.on_release sw (fun () -> close fd);
   fd
 
+let pipe ~sw user fs =
+  let stat = default_stat in
+  let pipe = Pipe.make stat in
+  let resource = ref (Fs_resource.Pipe pipe) in
+  let r = next_fd_of_fds fs.fds in
+  fs.fds <- Fd_table.add r resource fs.fds;
+  let w = next_fd_of_fds fs.fds in
+  fs.fds <- Fd_table.add w resource fs.fds;
+  let r = Fd.v ~append:false ~writable:false ~positional:false ~user fs r in
+  let w = Fd.v ~append:false ~writable:true ~positional:false ~user fs w in
+  Eio.Switch.on_release sw (fun () -> close r);
+  Eio.Switch.on_release sw (fun () -> close w);
+  (r, w)
+
 let statat ~follow dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
-  Resource.stat !(Filesystem.lookup ~follow dir_fd path)
+  Fs_resource.stat !(Filesystem.lookup ~follow dir_fd path)
 
 let held dir_fd path =
   locked (Dir.fs dir_fd) @@ fun () ->
   match !(Filesystem.lookup ~follow:true dir_fd path) with
-  | Resource.File f -> Some f.held
-  | Dir _ | Symlink _ -> None
+  | Fs_resource.File f -> Some f.held
+  | Dir _ | Symlink _ | Stdout _ | Stderr _ | Stdin _ | Pipe _ -> None
 
 (* What a disk kept of an inode's times, as a power cut leaves them. *)
 let set_times dir_fd path ~atime ~mtime ~ctime =
   locked (Dir.fs dir_fd) @@ fun () ->
-  Resource.update (Filesystem.lookup ~follow:false dir_fd path) (fun s ->
+  Fs_resource.update (Filesystem.lookup ~follow:false dir_fd path) (fun s ->
       { s with atime; mtime; ctime })
 
 (* chmod(2): only the owner or root: EPERM. *)
@@ -1180,12 +1271,12 @@ let chmod ~follow dir_fd ~perm path =
   if not (Filesystem.windows dir_fd) then begin
     (* Linux keeps no mode on a link: EOPNOTSUPP. macOS does. *)
     (match !r with
-    | Resource.Symlink _ when (Dir.fs dir_fd).os = `Linux ->
+    | Fs_resource.Symlink _ when (Dir.fs dir_fd).os = `Linux ->
         Error.err ("chmod: not supported on a link: " ^ path)
     | _ -> ());
-    if not (User.owns dir_fd.user (Resource.stat !r)) then
+    if not (User.owns dir_fd.user (Fs_resource.stat !r)) then
       Error.permission_denied path;
-    let s = Resource.stat !r in
+    let s = Fs_resource.stat !r in
     let perm = perm land 0o7777 in
     (* Outside the file's group, a user cannot set setgid. *)
     let perm =
@@ -1196,7 +1287,7 @@ let chmod ~follow dir_fd ~perm path =
       else perm
     in
     r :=
-      Resource.set_stat !r
+      Fs_resource.set_stat !r
         (inode_changed ~now:((Dir.fs dir_fd).now ()) { s with perm })
   end
 
@@ -1210,7 +1301,7 @@ let chown ~follow ?uid ?gid dir_fd path =
     Error.not_supported "chown";
   let r = Filesystem.lookup ~follow dir_fd path in
   if not (Filesystem.windows dir_fd) then begin
-    let s = Resource.stat !r in
+    let s = Fs_resource.stat !r in
     let uid = Option.value ~default:s.uid uid in
     let gid = Option.value ~default:s.gid gid in
     let (user : User.t) = dir_fd.user in
@@ -1221,7 +1312,7 @@ let chown ~follow ?uid ?gid dir_fd path =
            && (gid = s.gid || User.in_group user gid))
     then Error.permission_denied path;
     r :=
-      Resource.set_stat !r
+      Fs_resource.set_stat !r
         (inode_changed ~now:((Dir.fs dir_fd).now ())
            (User.without_privileges { s with uid; gid }))
   end
@@ -1232,14 +1323,14 @@ let remove_entry fs (w : Filesystem.walk) name =
   let now = fs.now () in
   let r = Filesystem.here w in
   let d = as_dir ~path:name !r in
-  r := Resource.Dir (Dir_node.remove fs.os name d);
+  r := Fs_resource.Dir (Dir_node.remove fs.os name d);
   Option.iter
     (fun ino ->
       let subdirs =
         match Entries.find_opt ino fs.tree with
         | Some victim ->
             unlinked ~now victim;
-            if (Resource.stat !victim).kind = `Directory then -1 else 0
+            if (Fs_resource.stat !victim).kind = `Directory then -1 else 0
         | None -> 0
       in
       entries_changed ~now ~subdirs r;
@@ -1254,7 +1345,7 @@ let unlink_windows dir_fd path =
   if is_dot name then Error.permission_denied path;
   match Filesystem.child w name with
   | None -> Error.not_found path
-  | Some { contents = Resource.Dir _ } -> Error.permission_denied path
+  | Some { contents = Fs_resource.Dir _ } -> Error.permission_denied path
   | Some victim when (not dir_fd.admin) && held_open fs victim ->
       Error.permission_denied path
   | Some _ -> remove_entry fs w name
@@ -1273,12 +1364,12 @@ let unlink dir_fd path =
     match Filesystem.child w name with
     | None -> Error.not_found path
     (* macOS follows a link in directory syntax: to a directory, EPERM. *)
-    | Some { contents = Resource.Symlink _ } when slash && w.os = `Macos ->
+    | Some { contents = Fs_resource.Symlink _ } when slash && w.os = `Macos ->
         ignore (Filesystem.final ~follow:true w name ~slash);
         is_a_directory ()
     (* A trailing slash is refused before permission: EISDIR on a directory,
      ENOTDIR on anything else, a link to a directory included. *)
-    | Some { contents = Resource.Dir _ } when slash -> is_a_directory ()
+    | Some { contents = Fs_resource.Dir _ } when slash -> is_a_directory ()
     | Some _ when slash -> Error.not_a_directory path
     | Some victim -> (
         (* Permission before kind. *)
@@ -1286,7 +1377,7 @@ let unlink dir_fd path =
         check_dir_write ~user:(checker dir_fd) rdir path;
         check_sticky ~user:(checker dir_fd) rdir victim path;
         match !victim with
-        | Resource.Dir _ -> is_a_directory ()
+        | Fs_resource.Dir _ -> is_a_directory ()
         | _ -> remove_entry (Dir.fs dir_fd) w name)
 
 (* The mode bits a new directory keeps: Linux keeps the sticky bit, macOS
@@ -1308,7 +1399,7 @@ let mkdirat dir_fd ~perm path =
     in
     let dir = Dir_node.v ~parent:d.stat.ino new_stat in
     let ino = new_stat.ino in
-    Filesystem.add_file fs ino (ref (Resource.Dir dir));
+    Filesystem.add_file fs ino (ref (Fs_resource.Dir dir));
     r := Dir (Dir_node.add fs.os name ino d);
     entries_changed ~now:new_stat.ctime ~subdirs:1 r
   in
@@ -1326,7 +1417,7 @@ let embed dir_fd ~perm path ~contents =
     in
     let d = as_dir ~path !r in
     let f = File.literal ~stat contents in
-    Filesystem.add_file fs stat.ino (ref (Resource.File f));
+    Filesystem.add_file fs stat.ino (ref (Fs_resource.File f));
     r := Dir (Dir_node.add fs.os name stat.ino d);
     entries_changed ~now:stat.ctime r
   in
@@ -1348,21 +1439,22 @@ let symlink_windows ~link_to dir_fd path =
     if not (User.is_root dir_fd.user) then Error.permission_denied path;
     let new_stat =
       {
-        (new_stat fs ~user:dir_fd.Dir.user ~parent:(Resource.stat !r)
+        (new_stat fs ~user:dir_fd.Dir.user ~parent:(Fs_resource.stat !r)
            ~kind:`Symbolic_link ~perm:0o777 ())
         with
         size = Optint.Int63.of_int (String.length link_to);
       }
     in
     let d = as_dir ~path !r in
-    let link = ref (Resource.Symlink (Symlink.v ~link_to new_stat)) in
+    let link = ref (Fs_resource.Symlink (Symlink.v ~link_to new_stat)) in
     Filesystem.add_file fs new_stat.ino link;
     r := Dir (Dir_node.add fs.os name new_stat.ino d);
     entries_changed ~now:new_stat.ctime r;
     match !(Filesystem.lookup ~follow:true dir_fd path) with
-    | Resource.Dir _ ->
+    | Fs_resource.Dir _ ->
         link :=
-          Resource.Symlink { (Symlink.v ~link_to new_stat) with to_dir = true }
+          Fs_resource.Symlink
+            { (Symlink.v ~link_to new_stat) with to_dir = true }
     | _ | (exception Eio.Io _) -> ()
   in
   new_entry dir_fd path add
@@ -1378,7 +1470,7 @@ let symlink_posix ~link_to dir_fd path =
   let symlink r name =
     let new_stat =
       {
-        (new_stat fs ~user:dir_fd.Dir.user ~parent:(Resource.stat !r)
+        (new_stat fs ~user:dir_fd.Dir.user ~parent:(Fs_resource.stat !r)
            ~kind:`Symbolic_link ~perm:0o777 ())
         with
         size = Optint.Int63.of_int (String.length link_to);
@@ -1387,7 +1479,7 @@ let symlink_posix ~link_to dir_fd path =
     let d = as_dir ~path !r in
     let link = Symlink.v ~link_to new_stat in
     let ino = new_stat.ino in
-    Filesystem.add_file fs ino (ref (Resource.Symlink link));
+    Filesystem.add_file fs ino (ref (Fs_resource.Symlink link));
     r := Dir (Dir_node.add fs.os name ino d);
     entries_changed ~now:new_stat.ctime r
   in
@@ -1403,7 +1495,7 @@ let read_link dir_fd path =
   let r = Filesystem.lookup ~follow:false dir_fd path in
   match !r with
   | Symlink s ->
-      Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
+      Fs_resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
       s.link_to
   | _ -> Error.err ("readlink: invalid argument: " ^ path)
 
@@ -1412,10 +1504,10 @@ let read_link dir_fd path =
 let entries dir_fd path =
   let r = Filesystem.lookup ~follow:true dir_fd path in
   match !r with
-  | Resource.Dir d when not (User.can (checker dir_fd) d.stat User.r) ->
+  | Fs_resource.Dir d when not (User.can (checker dir_fd) d.stat User.r) ->
       Error.permission_denied path
-  | Resource.Dir dir ->
-      Resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
+  | Fs_resource.Dir dir ->
+      Fs_resource.update r (accessed ~now:((Dir.fs dir_fd).now ()));
       Dir_node.names dir
   | _ when Filesystem.windows dir_fd -> Error.directory_name path
   | _ -> Error.err ("read_dir: not a directory: " ^ path)
@@ -1429,7 +1521,7 @@ let read_dir_entries dir_fd path =
     (fun (name, ino) ->
       let kind =
         match Entries.find_opt ino (Dir.fs dir_fd).tree with
-        | Some res -> (Resource.stat !res).kind
+        | Some res -> (Fs_resource.stat !res).kind
         | None -> `Unknown
       in
       (kind, name))
@@ -1443,10 +1535,11 @@ let rmdir_windows dir_fd path =
   if is_dot name then Error.permission_denied path;
   match Filesystem.child w name with
   | None -> Error.not_found path
-  | Some { contents = Resource.Symlink { to_dir = true; _ } } ->
+  | Some { contents = Fs_resource.Symlink { to_dir = true; _ } } ->
       remove_entry fs w name
-  | Some { contents = Resource.File _ | Symlink _ } -> Error.directory_name path
-  | Some { contents = Resource.Dir d } when not (Dir_node.is_empty d) ->
+  | Some { contents = Fs_resource.File _ | Symlink _ } ->
+      Error.directory_name path
+  | Some { contents = Fs_resource.Dir d } when not (Dir_node.is_empty d) ->
       Error.err ("rmdir: directory not empty: " ^ path)
   | Some victim when (not dir_fd.admin) && held_open fs victim ->
       Error.permission_denied path
@@ -1473,21 +1566,21 @@ let rmdir dir_fd path =
         check_dir_write ~user:(checker dir_fd) rdir path;
         check_sticky ~user:(checker dir_fd) rdir victim path;
         match !victim with
-        | Resource.Dir d when not (Dir_node.is_empty d) ->
+        | Fs_resource.Dir d when not (Dir_node.is_empty d) ->
             Error.err ("rmdir: directory not empty: " ^ path)
-        | Resource.Dir _ -> remove_entry (Dir.fs dir_fd) w name
+        | Fs_resource.Dir _ -> remove_entry (Dir.fs dir_fd) w name
         | _ -> Error.err ("rmdir: not a directory: " ^ path))
 
 (* rename(2) refuses to move a directory below itself (EINVAL) and anything
    over a directory above it (ENOTEMPTY), before it checks permissions. Eio.Fs
    has no constructor for these, which eio_posix raises as a bare [Eio.Io]. *)
 let check_rename_tree tree ~src ~old_parent ~new_parent ~dst new_path =
-  let ino = (Resource.stat !src).ino in
+  let ino = (Fs_resource.stat !src).ino in
   match (!src, Option.map ( ! ) dst) with
-  | Resource.Dir _, _ when Filesystem.within tree new_parent ino ->
+  | Fs_resource.Dir _, _ when Filesystem.within tree new_parent ino ->
       Error.err ("rename: invalid argument, into its own subtree: " ^ new_path)
-  | _, Some (Resource.Dir d) when Filesystem.within tree old_parent d.stat.ino
-    ->
+  | _, Some (Fs_resource.Dir d)
+    when Filesystem.within tree old_parent d.stat.ino ->
       Error.err ("rename: directory not empty: " ^ new_path)
   | _ -> ()
 
@@ -1496,15 +1589,16 @@ let check_rename_tree tree ~src ~old_parent ~new_parent ~dst new_path =
    (ENOTEMPTY). *)
 let check_rename_kinds ~src ~dst new_path =
   match (!src, Option.map ( ! ) dst) with
-  | Resource.Dir _, Some (Resource.File _ | Symlink _) ->
+  | Fs_resource.Dir _, Some (Fs_resource.File _ | Symlink _) ->
       Error.err ("rename: not a directory: " ^ new_path)
-  | (File _ | Symlink _), Some (Resource.Dir _) ->
+  | (File _ | Symlink _), Some (Fs_resource.Dir _) ->
       Error.err ("rename: is a directory: " ^ new_path)
   | _ -> ()
 
 let check_rename_empty ~src ~dst new_path =
   match (!src, Option.map ( ! ) dst) with
-  | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
+  | Fs_resource.Dir _, Some (Fs_resource.Dir d) when not (Dir_node.is_empty d)
+    ->
       Error.err ("rename: directory not empty: " ^ new_path)
   | _ -> ()
 
@@ -1516,22 +1610,23 @@ let move_entry os ino ~old_parent ~old_name old_path ~new_parent ~new_name
   if old_parent == new_parent then begin
     let d = as_dir ~path:new_path !new_parent in
     new_parent :=
-      Resource.Dir
+      Fs_resource.Dir
         (Dir_node.add os new_name ino (Dir_node.remove os old_name d))
   end
   else begin
     let dst = as_dir ~path:new_path !new_parent in
-    new_parent := Resource.Dir (Dir_node.add os new_name ino dst);
+    new_parent := Fs_resource.Dir (Dir_node.add os new_name ino dst);
     let src = as_dir ~path:old_path !old_parent in
-    old_parent := Resource.Dir (Dir_node.remove os old_name src)
+    old_parent := Fs_resource.Dir (Dir_node.remove os old_name src)
   end
 
 (* A directory's [..] names its new parent. *)
 let reparent res ~new_parent =
   match !res with
-  | Resource.Dir d ->
-      res := Resource.Dir { d with parent = (Resource.stat !new_parent).ino }
-  | File _ | Symlink _ -> ()
+  | Fs_resource.Dir d ->
+      res :=
+        Fs_resource.Dir { d with parent = (Fs_resource.stat !new_parent).ino }
+  | File _ | Symlink _ | Stdout _ | Stderr _ | Stdin _ | Pipe _ -> ()
 
 (* rename(2) answers EBUSY for a last [.] or [..], or EEXIST for the target's
    when it must not replace it; macOS answers EINVAL. *)
@@ -1552,7 +1647,7 @@ let check_rename_dots ~os ~replace ~old_path ~old_name new_path new_name =
 let check_rename_slashes ~os ~tree ~old_res ~old_w ~old_slash ~old_path new_w
     new_name ~new_slash new_path =
   match !old_res with
-  | Resource.Dir _ -> ()
+  | Fs_resource.Dir _ -> ()
   | _ when old_slash || new_slash ->
       let dst =
         Option.bind
@@ -1579,8 +1674,8 @@ let check_rename_access ~user ~tree ~old_res ~old_parent ~old_path ~new_parent
   Option.iter (fun dst -> check_sticky ~user new_parent dst new_path) dst;
   check_rename_kinds ~src:old_res ~dst new_path;
   (match !old_res with
-  | Resource.Dir _ when old_parent != new_parent ->
-      if not (User.can user (Resource.stat !old_res) User.w) then
+  | Fs_resource.Dir _ when old_parent != new_parent ->
+      if not (User.can user (Fs_resource.stat !old_res) User.w) then
         Error.permission_denied old_path
   | _ -> ());
   check_rename_empty ~src:old_res ~dst new_path
@@ -1590,12 +1685,12 @@ let check_rename_access ~user ~tree ~old_res ~old_parent ~old_path ~new_parent
    lost its only name. *)
 let renamed ~fs ~old_res ~old_parent ~new_parent ~dst existing =
   let now = fs.now () in
-  let is_dir r = (Resource.stat !r).kind = `Directory in
+  let is_dir r = (Fs_resource.stat !r).kind = `Directory in
   let moved = if is_dir old_res then 1 else 0 in
   let replaced =
     match dst with Some d when is_dir d -> 1 | Some _ | None -> 0
   in
-  Resource.update old_res (inode_changed ~now);
+  Fs_resource.update old_res (inode_changed ~now);
   if old_parent == new_parent then
     entries_changed ~now ~subdirs:(-replaced) new_parent
   else begin
@@ -1638,11 +1733,12 @@ let drive tree r =
    and a directory over one that is not empty. *)
 let check_rename_kinds_windows ~old_res ~dst new_path =
   match (!old_res, Option.map ( ! ) dst) with
-  | Resource.Dir _, Some (Resource.File _ | Symlink _) ->
+  | Fs_resource.Dir _, Some (Fs_resource.File _ | Symlink _) ->
       Error.directory_name new_path
-  | (File _ | Symlink _), Some (Resource.Dir _) ->
+  | (File _ | Symlink _), Some (Fs_resource.Dir _) ->
       Error.permission_denied new_path
-  | Resource.Dir _, Some (Resource.Dir d) when not (Dir_node.is_empty d) ->
+  | Fs_resource.Dir _, Some (Fs_resource.Dir d) when not (Dir_node.is_empty d)
+    ->
       Error.err ("rename: directory not empty: " ^ new_path)
   | _ -> ()
 
@@ -1652,13 +1748,13 @@ let check_rename_windows ~fs ~admin ~old_res ~ino ~old_parent ~new_parent ~dst
     ~old_path new_path =
   let above (d : resource ref) =
     match !d with
-    | Resource.Dir dd -> Filesystem.within fs.tree old_parent dd.stat.ino
+    | Fs_resource.Dir dd -> Filesystem.within fs.tree old_parent dd.stat.ino
     | _ -> false
   in
   let held r = (not admin) && held_open fs r in
   if held old_res then Error.permission_denied old_path;
   (match !old_res with
-  | Resource.Dir _ when Filesystem.within fs.tree new_parent ino ->
+  | Fs_resource.Dir _ when Filesystem.within fs.tree new_parent ino ->
       Error.permission_denied new_path
   | _ -> ());
   (match dst with
@@ -1693,7 +1789,7 @@ let rename_windows ~replace dir_fd old_path new_dir new_path =
          (Permission_denied
             (Eio_fs ("rename: invalid cross-device link: " ^ new_path))));
   check_live fs new_parent new_path;
-  let ino = (Resource.stat !old_res).ino in
+  let ino = (Fs_resource.stat !old_res).ino in
   let existing =
     Dir_node.find os new_name (as_dir ~path:new_path !new_parent)
   in
@@ -1738,7 +1834,7 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
     in
     check_rename_slashes ~os ~tree ~old_res ~old_w ~old_slash ~old_path new_w
       new_name ~new_slash new_path;
-    let ino = Resource.(stat !old_res).ino in
+    let ino = Fs_resource.(stat !old_res).ino in
     let old_parent = Filesystem.here old_w in
     let new_parent = Filesystem.here new_w in
     check_live (Dir.fs new_dir) new_parent new_path;
@@ -1758,7 +1854,7 @@ let rename ?(replace = true) dir_fd old_path new_dir new_path =
           ~old_parent ~old_name ~old_path ~new_parent ~new_name ~new_dir_node
           ~existing new_path
 
-let stat t = locked t.Fd.fs @@ fun () -> Resource.stat !(resource_of t)
+let stat t = locked t.Fd.fs @@ fun () -> Fs_resource.stat !(resource_of t)
 
 (* An offset before the start of a file: EINVAL, which eio_posix raises as a
    bare [Eio.Io]. *)
@@ -1769,7 +1865,7 @@ let check_offset op off =
 (* EISDIR, naming the operation and never the contents. *)
 let not_a_file op r =
   match r with
-  | Resource.Dir _ -> Error.err (op ^ ": is a directory")
+  | Fs_resource.Dir _ -> Error.err (op ^ ": is a directory")
   | _ -> Error.err (op ^ ": not a regular file")
 
 (* write(2) on a descriptor opened read-only: EBADF; ftruncate(2): EINVAL. *)
@@ -1793,7 +1889,8 @@ let written_at (t : Fd.t) (f : File.t) n =
 
 (* A read that asks for bytes, at the end of the file included. *)
 let read_from (t : Fd.t) r bufs =
-  if Cstruct.lenv bufs > 0 then Resource.update r (accessed ~now:(t.fs.now ()))
+  if Cstruct.lenv bufs > 0 then
+    Fs_resource.update r (accessed ~now:(t.fs.now ()))
 
 let writev t bufs =
   locked t.Fd.fs @@ fun () ->
@@ -1813,6 +1910,10 @@ let writev t bufs =
              (Cstruct.length src));
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int (Cstruct.length src));
       Cstruct.length src
+  | Stdout (_, v) -> Eio.Flow.single_write v bufs
+  | Stderr (_, v) -> Eio.Flow.single_write v bufs
+  | Pipe pipe ->
+      List.fold_left (fun acc buf -> Pipe.write pipe buf + acc) 0 bufs
   | r -> not_a_file "writev" r
 
 (* The bytes of [e] from [off] on into [bufs]: how many. At or past the end
@@ -1827,6 +1928,20 @@ let read_at (e : File.t) off bufs =
       read + n)
     0 bufs
 
+let blit_into_bufs buf bufs =
+  let i = ref 0 in
+  let len = Cstruct.length buf in
+  List.iter
+    (fun obuf ->
+      if !i >= len then ()
+      else
+        let olen = Cstruct.length obuf in
+        let actual_len = min (len - !i) olen in
+        Cstruct.blit buf !i obuf 0 actual_len;
+        i := !i + actual_len)
+    bufs;
+  !i
+
 let readv t bufs =
   locked t.Fd.fs @@ fun () ->
   let r = resource_of t in
@@ -1836,6 +1951,11 @@ let readv t bufs =
       let read = read_at e (Optint.Int63.to_int t.pos) bufs in
       t.pos <- Optint.Int63.add t.pos (Optint.Int63.of_int read);
       read
+  | Stdin (_, r) -> Eio.Flow.single_read r (List.hd bufs)
+  | Pipe p -> (
+      match Pipe.read p with
+      | None -> raise End_of_file
+      | Some buf -> blit_into_bufs buf bufs)
   | r -> not_a_file "readv" r
 
 (* Positioned reads and writes never move the cursor. *)
@@ -1845,7 +1965,7 @@ let preadv t ~file_offset bufs =
   check_offset "pread" file_offset;
   let r = resource_of t in
   match !r with
-  | Resource.File e -> (
+  | Fs_resource.File e -> (
       read_from t r bufs;
       let start = Optint.Int63.to_int file_offset in
       if start >= File.size e then raise End_of_file
@@ -1859,8 +1979,8 @@ let pwritev t ~file_offset bufs =
   let r = resource_of t in
   check_writable "pwrite" t;
   match !r with
-  | Resource.File _ when Cstruct.lenv bufs = 0 -> 0
-  | Resource.File e ->
+  | Fs_resource.File _ when Cstruct.lenv bufs = 0 -> 0
+  | Fs_resource.File e ->
       let src = Cstruct.concat bufs in
       (* On an O_APPEND descriptor Linux appends, whatever the offset;
          macOS writes at the offset. *)
@@ -1869,7 +1989,7 @@ let pwritev t ~file_offset bufs =
         else Optint.Int63.to_int file_offset
       in
       r :=
-        Resource.File
+        Fs_resource.File
           (written_at t (File.write e ~off src) (Cstruct.length src));
       Cstruct.length src
   | r -> not_a_file "pwrite" r
@@ -1877,7 +1997,7 @@ let pwritev t ~file_offset bufs =
 let seek_fd t off cmd =
   locked t.Fd.fs @@ fun () ->
   match !(resource_of t) with
-  | Resource.File e ->
+  | Fs_resource.File e ->
       let base =
         match cmd with
         | `Set -> Optint.Int63.zero
@@ -1889,7 +2009,7 @@ let seek_fd t off cmd =
       t.pos <- newpos;
       newpos
   (* lseek(2) on a directory succeeds; its offset is no byte count. *)
-  | Resource.Dir _ -> Optint.Int63.zero
+  | Fs_resource.Dir _ -> Optint.Int63.zero
   | r -> not_a_file "seek" r
 
 let truncate_fd t len =
@@ -1898,15 +2018,16 @@ let truncate_fd t len =
   let r = resource_of t in
   check_writable "truncate" t;
   match !r with
-  | Resource.File e ->
+  | Fs_resource.File e ->
       let f = written t (File.truncate e (Optint.Int63.to_int len)) in
-      r := Resource.File { f with stat = changed ~now:(t.fs.now ()) f.stat }
+      r := Fs_resource.File { f with stat = changed ~now:(t.fs.now ()) f.stat }
   | r -> not_a_file "truncate" r
 
 module Flow = struct
   module Impl = struct
     type t = Fd.t
 
+    let fd (t : t) = t
     let stat = stat
     let single_write = writev
 
@@ -1945,6 +2066,18 @@ module Flow = struct
   end
 
   (* A file and no socket, as eio_posix's. *)
-  let handler = Eio.File.Pi.rw (module Impl)
+  let handler =
+    let bindings = Eio.Resource.bindings @@ Eio.File.Pi.rw (module Impl) in
+    Eio.Resource.handler (bindings @ [ Eio.Resource.H (Resource.T, Impl.fd) ])
+
   let of_fd fd = Eio.Resource.T (fd, handler)
 end
+
+let stdin user t =
+  Fd.v ~append:false ~writable:false ~positional:false ~user t (Num.of_int 0)
+
+let stdout user t =
+  Fd.v ~append:false ~writable:true ~positional:false ~user t (Num.of_int 1)
+
+let stderr user t =
+  Fd.v ~append:false ~writable:true ~positional:false ~user t (Num.of_int 2)

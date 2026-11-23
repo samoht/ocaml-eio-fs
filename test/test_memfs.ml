@@ -300,6 +300,37 @@ let test_windows_run () =
   | () -> Alcotest.fail "renamed a file held open"
   | exception Eio.Io (Eio.Fs.E (Permission_denied _), _) -> ()
 
+let test_stdio () =
+  Eio_mock.Backend.run @@ fun () ->
+  let stdin =
+    Eio.Flow.cstruct_source Cstruct.[ of_string "hello"; of_string " world" ]
+  in
+  let buf = Buffer.create 16 in
+  let stdout = Eio.Flow.buffer_sink buf in
+  Eio_fs_mem.run ~stdin ~stdout @@ fun env ->
+  Eio.Flow.copy env#stdin env#stdout;
+  Alcotest.(check string) "same output" "hello world" (Buffer.contents buf)
+
+let test_pipe () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs_mem.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let r, w = Eio.Process.pipe ~sw env#process_mgr in
+  Eio.Flow.copy_string "hello, world!" w;
+  Eio.Flow.close w;
+  let buf = Buffer.create 16 in
+  Eio.Flow.copy r (Eio.Flow.buffer_sink buf);
+  Alcotest.(check string) "same output" "hello, world!" (Buffer.contents buf)
+
+let test_fd_resource () =
+  Eio_mock.Backend.run @@ fun () ->
+  Eio_fs_mem.run @@ fun env ->
+  Eio.Path.with_open_out ~create:(`Or_truncate 0o644) (env#fs / "hello.txt")
+  @@ fun sink ->
+  match Eio_fs_mem.Resource.fd_opt sink with
+  | Some _ -> ()
+  | None -> Alcotest.fail "Expected an FD on open file"
+
 let suite =
   ( "memfs",
     [
@@ -318,4 +349,8 @@ let suite =
       Alcotest.test_case "Windows: drives" `Quick test_windows_drives;
       Alcotest.test_case "Windows: a run and a file held open" `Quick
         test_windows_run;
+      Alcotest.test_case "standard IO behaves normally" `Quick test_stdio;
+      Alcotest.test_case "pipes work" `Quick test_pipe;
+      Alcotest.test_case "accessing underlying FDs works" `Quick
+        test_fd_resource;
     ] )

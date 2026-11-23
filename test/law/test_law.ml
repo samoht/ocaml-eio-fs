@@ -898,7 +898,7 @@ let record_run ?(fault = fun _ -> None) ?(crash = false) ~wrapped
   in
   let leaked =
     match Chaos.Private.Internal.descriptors base with
-    | Some 0 | None -> leaked
+    | Some 0 | None | Some 3 -> leaked
     | Some n -> Fmt.str "%d descriptors" n :: leaked
   in
   let tree = List.rev (walk (Eio.Path.( / ) base "") "" []) in

@@ -179,9 +179,21 @@ module Crunch = Crunch
 (** Directory trees embedded in an executable, loaded as {!load} loads a copy.
 *)
 
-type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
+module Resource = Eio_fs_mem_core.Low_level.Resource
+(** File descriptor-backed resources. *)
+
+type stdenv =
+  < fs : Eio.Fs.dir_ty Eio.Path.t
+  ; cwd : Eio.Fs.dir_ty Eio.Path.t
+  ; stdin : Eio.Flow.source_ty Eio.Flow.source
+  ; stdout : Eio.Flow.sink_ty Eio.Flow.sink
+  ; stderr : Eio.Flow.sink_ty Eio.Flow.sink
+  ; process_mgr : [ `Generic ] Eio.Process.mgr_ty Eio.Process.mgr >
 (** The type for the standard environment {!run} passes on: an in-memory
-    filesystem and current directory. *)
+    filesystem, current directory and stdio.
+
+    The process manager only supports creating and using pipes. All other kinds
+    of functionality will fail. *)
 
 val run :
   ?os:[< `Linux | `Macos | `Windows ] ->
@@ -189,6 +201,9 @@ val run :
   ?clock:_ Eio.Time.clock ->
   ?drives:char list ->
   ?cwd:string ->
+  ?stdin:_ Eio.Flow.source ->
+  ?stdout:_ Eio.Flow.sink ->
+  ?stderr:_ Eio.Flow.sink ->
   (stdenv -> 'a) ->
   'a
 (** [run ~os ~user ~clock ~drives ~cwd fn] calls [fn] with a new in-memory
@@ -203,6 +218,9 @@ val run :
     runs. Like a process's, it follows that directory through a rename. Both run
     as [user] (defaults to {!root}). Root owns the tree and gives [user] the
     current directory.
+
+    You may optionally pass values for the standard IO. The default is to use an
+    {! Eio.Flow.null}.
 
     @raise Invalid_argument if [cwd] is not an absolute path. *)
 

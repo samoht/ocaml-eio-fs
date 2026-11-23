@@ -34,8 +34,33 @@ let load ?os ?clock ?filter path =
   Image.load ?os ?clock (Image.scan ?filter ~at:(snd path) path)
 
 module Crunch = Crunch
+module Resource = Low_level.Resource
 
-type stdenv = < fs : Eio.Fs.dir_ty Eio.Path.t ; cwd : Eio.Fs.dir_ty Eio.Path.t >
+type stdenv =
+  < fs : Eio.Fs.dir_ty Eio.Path.t
+  ; cwd : Eio.Fs.dir_ty Eio.Path.t
+  ; stdin : Eio.Flow.source_ty Eio.Flow.source
+  ; stdout : Eio.Flow.sink_ty Eio.Flow.sink
+  ; stderr : Eio.Flow.sink_ty Eio.Flow.sink
+  ; process_mgr : [ `Generic ] Eio.Process.mgr_ty Eio.Process.mgr >
+
+let make_process_mgr user t =
+  let module Process_mgr = struct
+    type t = unit
+    type tag = [ `Generic ]
+
+    let pipe () ~sw =
+      let r, w = Low_level.pipe ~sw user t in
+      let r, w = (Low_level.Flow.of_fd r, Low_level.Flow.of_fd w) in
+      ( (r :> [ Eio.Flow.source_ty | `Close ] Eio.Flow.source),
+        (w :> [ Eio.Flow.sink_ty | `Close ] Eio.Flow.sink) )
+
+    let spawn _ = failwith "Eio_fs_mem does not support spawning subprocesses."
+    let environment _ = Eio.Process.Env.empty
+    let getenv_opt t v = environment t |> Eio.Process.Env.get_opt v
+  end in
+  let handler = Eio.Process.Pi.mgr (module Process_mgr) in
+  Eio.Resource.T ((), handler)
 
 (* Root owns the tree and makes the current directory, which it gives to
    [user]. *)
@@ -44,8 +69,8 @@ let absolute os cwd =
   | Some `Windows -> Eio_utils.Nt_path.classify cwd = `Absolute
   | Some (`Linux | `Macos) | None -> String.starts_with ~prefix:"/" cwd
 
-let run ?os ?(user = root) ?clock ?drives ?cwd fn =
-  let t = Low_level.v ?clock ?cwd ?os ?drives () in
+let run ?os ?(user = root) ?clock ?drives ?cwd ?stdin ?stdout ?stderr fn =
+  let t = Low_level.v ?clock ?cwd ?os ?drives ?stdin ?stdout ?stderr () in
   let cwd = Option.value ~default:(Low_level.root_path t) cwd in
   if not (absolute os cwd) then
     Fmt.invalid_arg "Eio_fs_mem.run: cwd is %S, must be an absolute path" cwd;
@@ -56,10 +81,26 @@ let run ?os ?(user = root) ?clock ?drives ?cwd fn =
       Eio.Path.(admin / cwd);
   let fs = (Eio.Path.of_dir (Memfs.fs ~user t) :> Eio.Fs.dir_ty Eio.Path.t) in
   let cwd = (Eio.Path.of_dir (Memfs.cwd ~user t) :> Eio.Fs.dir_ty Eio.Path.t) in
+  let stdin =
+    (Low_level.Flow.of_fd (Low_level.stdin user t)
+      :> Eio.Flow.source_ty Eio.Flow.source)
+  in
+  let stdout =
+    (Low_level.Flow.of_fd (Low_level.stdout user t)
+      :> Eio.Flow.sink_ty Eio.Flow.sink)
+  in
+  let stderr =
+    (Low_level.Flow.of_fd (Low_level.stderr user t)
+      :> Eio.Flow.sink_ty Eio.Flow.sink)
+  in
   (* Resolve the current directory now: it then follows its directory. *)
   ignore (Eio.Path.stat ~follow:true cwd : Eio.File.Stat.t);
   fn
     object
       method fs = fs
       method cwd = cwd
+      method stdin = stdin
+      method stdout = stdout
+      method stderr = stderr
+      method process_mgr = make_process_mgr user t
     end
