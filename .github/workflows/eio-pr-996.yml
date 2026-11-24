@@ -33,10 +33,10 @@ jobs:
       # commit its eio_windows.opam pins. OCaml 5.5: iocp at that commit
       # does not compile against 5.4's headers.
       - run: |
-          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#bc943820a1793a848e11465cb9ed29dfd2ee9bd7
-          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#c1b383a519c9f657bd028cda1a0e16f60fe781df
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
 
       - run: opam install -y dune eio_windows fmt cstruct optint csv
 
@@ -75,10 +75,10 @@ jobs:
       # commit its eio_windows.opam pins. OCaml 5.5: iocp at that commit
       # does not compile against 5.4's headers.
       - run: |
-          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#bc943820a1793a848e11465cb9ed29dfd2ee9bd7
-          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#c1b383a519c9f657bd028cda1a0e16f60fe781df
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
 
       - run: opam install -y . --deps-only --with-test
       - run: opam exec -- dune build '@install' '@runtest'
@@ -109,10 +109,10 @@ jobs:
 
       - if: matrix.eio == 'pr996'
         run: |
-          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#bc943820a1793a848e11465cb9ed29dfd2ee9bd7
-          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
-          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#5965ec9e46c90b79427ca13c0be9e8a88c9a8357
+          opam pin add -yn iocp.dev git+https://github.com/avsm/ocaml-iocp.git#c1b383a519c9f657bd028cda1a0e16f60fe781df
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#d2a40b13527fac070f22e275f5b884f6085db979
 
       - if: matrix.eio == 'main'
         run: |
