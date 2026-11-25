@@ -1,0 +1,86 @@
+name: Eio PR 1005
+
+# Records test/interop/kernel/traces and test/interop/windows/traces through
+# eio_windows at the head of ocaml-multicore/eio#1005 and at its base on main,
+# so a changed row is the PR's, and runs the Windows test suite against it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [eio-pr-1005]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: Record through eio_windows (${{ matrix.eio }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - eio: base
+            repo: ocaml-multicore/eio
+            rev: ddf232ff93066de2af75110edb9d487b73504a30
+          - eio: pr1005
+            repo: avsm/eio
+            rev: da26d37c582099c9eaad2df84eb4d1322d3f7170
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.4'
+
+      - run: |
+          opam pin add -yn eio.dev git+https://github.com/${{ matrix.repo }}.git#${{ matrix.rev }}
+          opam pin add -yn eio_windows.dev git+https://github.com/${{ matrix.repo }}.git#${{ matrix.rev }}
+          opam pin add -yn eio_main.dev git+https://github.com/${{ matrix.repo }}.git#${{ matrix.rev }}
+
+      - run: opam install -y dune eio_windows fmt cstruct optint csv
+
+      - run: Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -Name AllowDevelopmentWithoutDevLicense -Value 0
+
+      - run: opam exec -- dune build @test/interop/kernel/regen-traces @test/interop/windows/regen-traces
+        env:
+          REGEN: '1'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-traces-${{ matrix.eio }}
+          path: |
+            test/interop/kernel/traces/
+            test/interop/windows/traces/
+
+  suite:
+    name: Windows suite (PR 1005)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      ALCOTEST_SHOW_ERRORS: 'true'
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.4'
+
+      - run: Remove-Item C:\Strawberry\perl\bin\pkg-config*
+
+      - run: |
+          opam pin add -yn eio.dev git+https://github.com/avsm/eio.git#da26d37c582099c9eaad2df84eb4d1322d3f7170
+          opam pin add -yn eio_windows.dev git+https://github.com/avsm/eio.git#da26d37c582099c9eaad2df84eb4d1322d3f7170
+          opam pin add -yn eio_main.dev git+https://github.com/avsm/eio.git#da26d37c582099c9eaad2df84eb4d1322d3f7170
+
+      - run: opam install -y . --deps-only --with-test
+      - run: opam exec -- dune build '@install' '@runtest'
