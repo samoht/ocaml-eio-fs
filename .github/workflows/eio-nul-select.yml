@@ -1,0 +1,48 @@
+name: Eio NUL select
+
+# Reads and writes Win32 device paths through eio_windows's unrestricted fs,
+# at the eio main before ocaml-multicore/eio#1000 and at the one after.
+on:
+  workflow_dispatch:
+  push:
+    branches: [eio-nul-select]
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: Device paths (${{ matrix.eio }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - eio: before-1000
+            rev: 07069de0954fd2d991d7b2f6ea555f28c7abc2d4
+          - eio: after-1000
+            rev: ddf232ff93066de2af75110edb9d487b73504a30
+    env:
+      OCAMLRUNPARAM: b
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.4'
+
+      - run: |
+          opam pin add -yn eio.dev git+https://github.com/ocaml-multicore/eio.git#${{ matrix.rev }}
+          opam pin add -yn eio_windows.dev git+https://github.com/ocaml-multicore/eio.git#${{ matrix.rev }}
+
+      - run: opam install -y dune eio_windows
+
+      - run: opam exec -- dune build --root repro ./main.exe
+
+      - shell: bash
+        run: |
+          for c in stat-null load-null load-dot-null save-null; do
+            echo "== $c"
+            repro/_build/default/main.exe $c 2>&1 || echo "exit $?"
+          done
